@@ -4,7 +4,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"image"
+	"image/jpeg"
+	"image/png"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,6 +16,14 @@ import (
 
 	"chromatic/internal/config"
 	"chromatic/internal/database"
+
+	"golang.org/x/image/draw"
+)
+
+const (
+	thumbnailMaxWidth  = 200
+	thumbnailMaxHeight = 200
+	thumbnailQuality   = 80
 )
 
 // Allowed MIME types and max file size
@@ -136,7 +148,18 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: Generate thumbnail for images
+	// Generate thumbnail for images
+	var thumbnailPath string
+	if strings.HasPrefix(mimeType, "image/") && mimeType != "image/gif" {
+		thumbnailPath = filepath.Join(h.cfg.UploadPath, roomID, "thumbnails", fileID+".jpg")
+		if err := generateThumbnail(storedPath, thumbnailPath); err != nil {
+			log.Printf("Failed to generate thumbnail for %s: %v", fileID, err)
+			// Don't fail the upload, just skip thumbnail
+		} else {
+			// Update database with thumbnail path
+			h.db.Exec("UPDATE files SET thumbnail_path = ? WHERE id = ?", thumbnailPath, fileID)
+		}
+	}
 
 	response := map[string]interface{}{
 		"id":           fileID,
@@ -185,22 +208,31 @@ func (h *FileHandler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var storedPath, mimeType string
+	var thumbnailPath *string
 	err := h.db.QueryRow(`
-		SELECT stored_path, mime_type FROM files WHERE id = ?
-	`, id).Scan(&storedPath, &mimeType)
+		SELECT stored_path, mime_type, thumbnail_path FROM files WHERE id = ?
+	`, id).Scan(&storedPath, &mimeType, &thumbnailPath)
 
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
 
-	// For now, serve the original image
-	// TODO: Implement proper thumbnail generation
 	if !strings.HasPrefix(mimeType, "image/") {
 		http.Error(w, "Not an image", http.StatusBadRequest)
 		return
 	}
 
+	// If we have a thumbnail, serve it
+	if thumbnailPath != nil && *thumbnailPath != "" {
+		if _, err := os.Stat(*thumbnailPath); err == nil {
+			w.Header().Set("Content-Type", "image/jpeg")
+			http.ServeFile(w, r, *thumbnailPath)
+			return
+		}
+	}
+
+	// Fall back to original if no thumbnail
 	http.ServeFile(w, r, storedPath)
 }
 
@@ -231,4 +263,78 @@ func getExtensionForMIME(mimeType string) string {
 	default:
 		return ".bin"
 	}
+}
+
+// generateThumbnail creates a resized thumbnail from an image file
+func generateThumbnail(srcPath, dstPath string) error {
+	// Open source file
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return fmt.Errorf("failed to open source: %w", err)
+	}
+	defer srcFile.Close()
+
+	// Decode image
+	srcImage, format, err := image.Decode(srcFile)
+	if err != nil {
+		return fmt.Errorf("failed to decode image: %w", err)
+	}
+
+	log.Printf("Generating thumbnail for %s format image", format)
+
+	// Calculate new dimensions maintaining aspect ratio
+	bounds := srcImage.Bounds()
+	srcWidth := bounds.Dx()
+	srcHeight := bounds.Dy()
+
+	// Calculate scale to fit within max dimensions
+	scaleW := float64(thumbnailMaxWidth) / float64(srcWidth)
+	scaleH := float64(thumbnailMaxHeight) / float64(srcHeight)
+	scale := scaleW
+	if scaleH < scaleW {
+		scale = scaleH
+	}
+
+	// Don't upscale small images
+	if scale >= 1.0 {
+		scale = 1.0
+	}
+
+	newWidth := int(float64(srcWidth) * scale)
+	newHeight := int(float64(srcHeight) * scale)
+
+	// Create destination image
+	dstImage := image.NewRGBA(image.Rect(0, 0, newWidth, newHeight))
+
+	// Use high-quality resampling
+	draw.CatmullRom.Scale(dstImage, dstImage.Bounds(), srcImage, bounds, draw.Over, nil)
+
+	// Ensure directory exists
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
+		return fmt.Errorf("failed to create thumbnail directory: %w", err)
+	}
+
+	// Create destination file
+	dstFile, err := os.Create(dstPath)
+	if err != nil {
+		return fmt.Errorf("failed to create thumbnail file: %w", err)
+	}
+	defer dstFile.Close()
+
+	// Encode as JPEG
+	if err := jpeg.Encode(dstFile, dstImage, &jpeg.Options{Quality: thumbnailQuality}); err != nil {
+		os.Remove(dstPath)
+		return fmt.Errorf("failed to encode thumbnail: %w", err)
+	}
+
+	log.Printf("Generated thumbnail: %s (%dx%d)", dstPath, newWidth, newHeight)
+	return nil
+}
+
+// Register image decoders (required for image.Decode to work)
+func init() {
+	// JPEG decoder is automatically registered via import
+	// PNG decoder is automatically registered via import
+	_ = png.Decode // Trigger registration
+	_ = jpeg.Decode
 }
