@@ -28,13 +28,19 @@ type SFU struct {
 	shutdown bool
 }
 
+// MaxICECandidates is the maximum number of ICE candidates allowed per session
+// to prevent memory exhaustion from ICE candidate flooding attacks
+const MaxICECandidates = 50
+
 // IngestSession represents an active OBS WHIP connection
 type IngestSession struct {
-	StreamKeyToken string
-	PeerConnection *webrtc.PeerConnection
-	VideoTrack     *webrtc.TrackLocalStaticRTP
-	AudioTrack     *webrtc.TrackLocalStaticRTP
-	done           chan struct{}
+	StreamKeyToken    string
+	PeerConnection    *webrtc.PeerConnection
+	VideoTrack        *webrtc.TrackLocalStaticRTP
+	AudioTrack        *webrtc.TrackLocalStaticRTP
+	done              chan struct{}
+	iceCandidateCount int        // Counter for ICE candidates received
+	iceMu             sync.Mutex // Protects iceCandidateCount
 }
 
 // RoomTracks holds the tracks being distributed to a room

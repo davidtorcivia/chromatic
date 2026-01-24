@@ -10,6 +10,17 @@
 
     let { isOpen, onClose }: Props = $props();
 
+    // Validate URLs to prevent javascript: and data: URL attacks
+    function isSafeUrl(url: string | undefined): boolean {
+        if (!url) return false;
+        try {
+            const parsed = new URL(url, window.location.origin);
+            return parsed.protocol === "http:" || parsed.protocol === "https:";
+        } catch {
+            return false;
+        }
+    }
+
     let messageInput = $state("");
     let messagesContainer: HTMLDivElement;
 
@@ -92,15 +103,15 @@
                     </div>
                     {#if msg.type === "text"}
                         <div class="chat-message-content">{msg.content}</div>
-                    {:else if msg.file}
+                    {:else if msg.file && isSafeUrl(msg.file.url)}
                         <div class="chat-message-file">
-                            {#if msg.file.mimeType.startsWith("image/")}
+                            {#if msg.file.mimeType.startsWith("image/") && isSafeUrl(msg.file.thumbnailUrl || msg.file.url)}
                                 <img
                                     src={msg.file.thumbnailUrl || msg.file.url}
                                     alt={msg.file.name}
                                 />
                             {:else}
-                                <a href={msg.file.url} target="_blank"
+                                <a href={msg.file.url} target="_blank" rel="noopener noreferrer"
                                     >{msg.file.name}</a
                                 >
                             {/if}

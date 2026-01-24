@@ -10,13 +10,36 @@ import (
 	"time"
 )
 
-// RequireAuth returns middleware that validates the admin token
-// Uses constant-time comparison to prevent timing attacks
-func RequireAuth(adminToken string) func(http.Handler) http.Handler {
-	adminTokenBytes := []byte(adminToken)
+// SessionValidator is a function that validates session IDs from cookies
+type SessionValidator func(sessionID string) bool
+
+// AuthConfig holds authentication configuration
+type AuthConfig struct {
+	AdminToken       string
+	SessionCookie    string           // Name of the session cookie
+	ValidateSession  SessionValidator // Function to validate session IDs
+}
+
+// RequireAuth returns middleware that validates authentication
+// Checks both httpOnly session cookies and Bearer token headers
+// Cookie-based auth is preferred as it's not vulnerable to XSS
+func RequireAuth(cfg AuthConfig) func(http.Handler) http.Handler {
+	adminTokenBytes := []byte(cfg.AdminToken)
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// First, try to authenticate via session cookie (preferred, secure)
+			if cfg.SessionCookie != "" && cfg.ValidateSession != nil {
+				cookie, err := r.Cookie(cfg.SessionCookie)
+				if err == nil && cookie.Value != "" {
+					if cfg.ValidateSession(cookie.Value) {
+						next.ServeHTTP(w, r)
+						return
+					}
+				}
+			}
+
+			// Fall back to Bearer token authentication (for backwards compatibility)
 			auth := r.Header.Get("Authorization")
 			if auth == "" {
 				http.Error(w, "Authorization required", http.StatusUnauthorized)
@@ -44,16 +67,55 @@ func RequireAuth(adminToken string) func(http.Handler) http.Handler {
 
 // CORSConfig holds CORS configuration
 type CORSConfig struct {
-	AllowedOrigins []string // Empty means allow any (development mode)
+	AllowedOrigins []string // Origins to allow; empty in dev mode allows all
+	ProductionMode bool     // When true, requires explicit origin configuration
+}
+
+// OriginValidator validates origins for CORS and WebSocket
+type OriginValidator struct {
+	allowedOriginMap map[string]bool
+	productionMode   bool
+}
+
+// NewOriginValidator creates a new origin validator
+func NewOriginValidator(allowedOrigins []string, productionMode bool) *OriginValidator {
+	allowedOriginMap := make(map[string]bool)
+	for _, origin := range allowedOrigins {
+		allowedOriginMap[origin] = true
+	}
+	return &OriginValidator{
+		allowedOriginMap: allowedOriginMap,
+		productionMode:   productionMode,
+	}
+}
+
+// IsAllowed checks if an origin is allowed
+// Returns true if:
+// - Origin matches configured allowed origins, OR
+// - Not in production mode and no origins configured (dev mode)
+func (v *OriginValidator) IsAllowed(origin string) bool {
+	if origin == "" {
+		// No origin header (same-origin request or non-browser client)
+		return true
+	}
+
+	// Check if origin is in allowed list
+	if v.allowedOriginMap[origin] {
+		return true
+	}
+
+	// In development mode with no configured origins, allow all
+	if !v.productionMode && len(v.allowedOriginMap) == 0 {
+		return true
+	}
+
+	// Origin not allowed
+	return false
 }
 
 // CORS adds CORS headers for cross-origin requests
 func CORS(cfg CORSConfig) func(http.Handler) http.Handler {
-	// Build a map for quick origin lookup
-	allowedOriginMap := make(map[string]bool)
-	for _, origin := range cfg.AllowedOrigins {
-		allowedOriginMap[origin] = true
-	}
+	validator := NewOriginValidator(cfg.AllowedOrigins, cfg.ProductionMode)
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -61,16 +123,11 @@ func CORS(cfg CORSConfig) func(http.Handler) http.Handler {
 
 			if origin != "" {
 				// Check if origin is allowed
-				if len(cfg.AllowedOrigins) == 0 {
-					// Development mode: allow any origin
+				if validator.IsAllowed(origin) {
 					w.Header().Set("Access-Control-Allow-Origin", origin)
-				} else if allowedOriginMap[origin] {
-					// Production mode: only allow configured origins
-					w.Header().Set("Access-Control-Allow-Origin", origin)
+					w.Header().Set("Access-Control-Allow-Credentials", "true")
 				}
 				// If origin not allowed, don't set the header (browser will block)
-
-				w.Header().Set("Access-Control-Allow-Credentials", "true")
 			}
 
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
@@ -93,6 +150,7 @@ type RateLimiterConfig struct {
 	RequestsPerSecond int           // Max requests per second per IP
 	BurstSize         int           // Max burst size
 	CleanupInterval   time.Duration // How often to clean up old entries
+	TrustedProxies    []string      // IP addresses of trusted reverse proxies
 }
 
 // ipRateLimiter tracks rate limiting state per IP
@@ -111,6 +169,12 @@ func RateLimiter(cfg RateLimiterConfig) func(http.Handler) http.Handler {
 	}
 	if cfg.CleanupInterval <= 0 {
 		cfg.CleanupInterval = 5 * time.Minute
+	}
+
+	// Build trusted proxy map for O(1) lookup
+	trustedProxyMap := make(map[string]bool)
+	for _, proxy := range cfg.TrustedProxies {
+		trustedProxyMap[proxy] = true
 	}
 
 	var mu sync.Mutex
@@ -134,8 +198,8 @@ func RateLimiter(cfg RateLimiterConfig) func(http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Get client IP (handle X-Forwarded-For for proxies)
-			ip := getClientIP(r)
+			// Get client IP (only trust X-Forwarded-For from trusted proxies)
+			ip := getClientIP(r, trustedProxyMap)
 
 			mu.Lock()
 			limiter, exists := limiters[ip]
@@ -176,28 +240,46 @@ func RateLimiter(cfg RateLimiterConfig) func(http.Handler) http.Handler {
 }
 
 // getClientIP extracts the client IP from the request
-func getClientIP(r *http.Request) string {
-	// Check X-Forwarded-For header (for reverse proxies)
+// Only trusts X-Forwarded-For and X-Real-IP headers if the direct connection
+// comes from a trusted proxy. This prevents IP spoofing attacks.
+func getClientIP(r *http.Request, trustedProxies map[string]bool) string {
+	// Get the direct connection IP
+	directIP := r.RemoteAddr
+	// Remove port if present
+	if idx := strings.LastIndex(directIP, ":"); idx != -1 {
+		directIP = directIP[:idx]
+	}
+
+	// If no trusted proxies configured, always use direct IP (secure default)
+	if len(trustedProxies) == 0 {
+		return directIP
+	}
+
+	// Only trust forwarded headers if request came from a trusted proxy
+	if !trustedProxies[directIP] {
+		return directIP
+	}
+
+	// Request came from trusted proxy - trust the forwarded headers
+	// Check X-Forwarded-For header first
 	forwarded := r.Header.Get("X-Forwarded-For")
 	if forwarded != "" {
-		// Take the first IP in the list
+		// Take the first IP in the list (original client IP)
 		ips := strings.Split(forwarded, ",")
-		return strings.TrimSpace(ips[0])
+		clientIP := strings.TrimSpace(ips[0])
+		if clientIP != "" {
+			return clientIP
+		}
 	}
 
 	// Check X-Real-IP header
 	realIP := r.Header.Get("X-Real-IP")
 	if realIP != "" {
-		return realIP
+		return strings.TrimSpace(realIP)
 	}
 
-	// Fall back to RemoteAddr
-	ip := r.RemoteAddr
-	// Remove port if present
-	if idx := strings.LastIndex(ip, ":"); idx != -1 {
-		ip = ip[:idx]
-	}
-	return ip
+	// Fall back to direct IP
+	return directIP
 }
 
 // RequestLogger logs incoming requests

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { auth } from '$lib/api/client';
+
   let adminToken = $state('');
   let isLoading = $state(false);
   let error = $state('');
@@ -9,22 +11,18 @@
     error = '';
 
     try {
-      // Validate token by making a test request
-      const res = await fetch('/api/rooms', {
-        headers: {
-          'Authorization': `Bearer ${adminToken}`
-        }
-      });
-
-      if (res.ok) {
-        // Store token and redirect
-        localStorage.setItem('chromatic_admin_token', adminToken);
-        window.location.href = '/admin';
-      } else {
-        error = 'Invalid admin token';
-      }
+      // Login via secure httpOnly cookie
+      await auth.login(adminToken);
+      // Redirect on success
+      window.location.href = '/admin';
     } catch (err) {
-      error = 'Connection error. Is the server running?';
+      if (err instanceof Error) {
+        error = err.message === 'Invalid token'
+          ? 'Invalid admin token'
+          : err.message;
+      } else {
+        error = 'Connection error. Is the server running?';
+      }
     } finally {
       isLoading = false;
     }

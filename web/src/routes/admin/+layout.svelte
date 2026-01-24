@@ -1,19 +1,26 @@
 <script lang="ts">
     import { onMount } from "svelte";
     import { goto } from "$app/navigation";
+    import { auth, rooms } from "$lib/api/client";
 
-    onMount(() => {
-        const token = localStorage.getItem("chromatic_admin_token");
-        if (!token) {
+    onMount(async () => {
+        // Check if authenticated by making a test API call
+        // If not authenticated, the httpOnly cookie will be missing and we'll get 401
+        try {
+            await rooms.list();
+        } catch {
             goto("/");
         }
     });
 
     let { children } = $props();
 
-    function logout() {
-        localStorage.removeItem("chromatic_admin_token");
-        goto("/");
+    async function logout() {
+        try {
+            await auth.logout();
+        } finally {
+            goto("/");
+        }
     }
 </script>
 

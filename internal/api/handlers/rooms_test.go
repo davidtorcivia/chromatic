@@ -346,7 +346,7 @@ func TestRoomHandler_Join(t *testing.T) {
 		{
 			"slug":          "join-password",
 			"name":          "Password Room",
-			"password":      "secret",
+			"password":      "secret12",
 			"watermarkMode": "none",
 		},
 	}
@@ -407,7 +407,7 @@ func TestRoomHandler_Join(t *testing.T) {
 			slug: "join-password",
 			body: map[string]interface{}{
 				"name":     "Test User",
-				"password": "secret",
+				"password": "secret12",
 			},
 			expectedStatus: http.StatusOK,
 		},
@@ -709,7 +709,7 @@ func TestRoomHandler_PublicInfo(t *testing.T) {
 	createBody := map[string]interface{}{
 		"slug":               "info-test",
 		"name":               "Info Test Room",
-		"password":           "secret",
+		"password":           "secret12",
 		"watermarkMode":      "text",
 		"waitingRoomEnabled": true,
 	}

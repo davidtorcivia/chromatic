@@ -245,6 +245,16 @@ func (h *WHIPHandler) handleICETrickle(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
+	// Check ICE candidate limit to prevent flooding attacks
+	session.iceMu.Lock()
+	if session.iceCandidateCount >= MaxICECandidates {
+		session.iceMu.Unlock()
+		http.Error(w, "Too many ICE candidates", http.StatusTooManyRequests)
+		return
+	}
+	session.iceCandidateCount++
+	session.iceMu.Unlock()
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 	if err != nil {
 		http.Error(w, "Failed to read candidate", http.StatusBadRequest)
@@ -291,30 +301,81 @@ func validateSDP(sdp string) error {
 	// Check for B-frames in H.264 configuration
 	// B-frames in WebRTC cause 2+ second latency due to browser reordering issues
 
-	// Look for profile-level-id patterns that indicate B-frames might be used
-	// Main Profile (4d) and High Profile (64) can use B-frames
-	// Baseline Profile (42) cannot use B-frames - preferred for live streaming
+	// H.264 profile-level-id format: 3 bytes (profile_idc, constraints, level_idc)
+	// Baseline Profile: 42 (0x42) - no B-frames
+	// Constrained Baseline: 42e0 - no B-frames (constraints byte has flag)
+	// Main Profile: 4d (0x4d) - CAN use B-frames
+	// High Profile: 64 (0x64) - CAN use B-frames
 
-	// This is a basic check - in production you might parse SDP more thoroughly
-	if strings.Contains(sdp, "max-br=") {
-		// max-br > 0 indicates B-frame buffering
-		// This is a heuristic - OBS with zerolatency preset shouldn't have this
-		log.Printf("Warning: SDP contains max-br parameter, B-frames may be enabled")
+	// Parse profile-level-id from SDP
+	profileID := extractProfileLevelID(sdp)
+	if profileID == "" {
+		// No H.264 profile found - check if there's any H.264 at all
+		if !strings.Contains(strings.ToLower(sdp), "h264") {
+			log.Printf("Warning: Stream not using H.264 codec, proceeding anyway")
+			return nil
+		}
+		// H.264 present but no profile-level-id - allow with warning
+		log.Printf("Warning: H.264 detected but profile-level-id not found in SDP")
+		return nil
 	}
 
-	// Check for zerolatency indicators (good)
-	if !strings.Contains(sdp, "H264") && !strings.Contains(sdp, "h264") {
-		// Not using H.264 - warn but allow
-		log.Printf("Warning: Stream not using H.264 codec")
-	}
+	// Check the profile byte (first 2 hex digits)
+	if len(profileID) >= 2 {
+		profileByte := strings.ToLower(profileID[:2])
 
-	// Additional validation could be added here:
-	// - Parse fmtp lines for specific parameters
-	// - Check bitrate constraints
-	// - Validate resolution
+		switch profileByte {
+		case "42":
+			// Baseline or Constrained Baseline - safe (no B-frames)
+			log.Printf("H.264 Baseline Profile detected - good for low latency streaming")
+		case "4d":
+			// Main Profile - can use B-frames, reject for safety
+			log.Printf("H.264 Main Profile detected (profile-level-id: %s)", profileID)
+			return ErrBFramesDetected
+		case "64":
+			// High Profile - can use B-frames, reject for safety
+			log.Printf("H.264 High Profile detected (profile-level-id: %s)", profileID)
+			return ErrBFramesDetected
+		case "58":
+			// Extended Profile - can use B-frames
+			log.Printf("H.264 Extended Profile detected (profile-level-id: %s)", profileID)
+			return ErrBFramesDetected
+		default:
+			// Unknown profile - allow with warning
+			log.Printf("Unknown H.264 profile detected (profile-level-id: %s), proceeding anyway", profileID)
+		}
+	}
 
 	return nil
 }
 
+// extractProfileLevelID extracts the profile-level-id from SDP fmtp lines
+// Example: a=fmtp:97 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
+func extractProfileLevelID(sdp string) string {
+	lines := strings.Split(sdp, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "a=fmtp:") {
+			continue
+		}
+
+		// Look for profile-level-id parameter
+		parts := strings.Split(line, " ")
+		if len(parts) < 2 {
+			continue
+		}
+
+		params := strings.Split(parts[1], ";")
+		for _, param := range params {
+			param = strings.TrimSpace(param)
+			if strings.HasPrefix(strings.ToLower(param), "profile-level-id=") {
+				value := strings.TrimPrefix(param, param[:len("profile-level-id=")])
+				return value
+			}
+		}
+	}
+	return ""
+}
+
 // ErrBFramesDetected indicates B-frames are configured
-var ErrBFramesDetected = errors.New("B-frames detected in encoder configuration - set B-frames to 0 in OBS")
+var ErrBFramesDetected = errors.New("B-frames detected: Main/High profile can use B-frames which cause 2+ second latency. Set encoder to Baseline profile or disable B-frames in OBS")

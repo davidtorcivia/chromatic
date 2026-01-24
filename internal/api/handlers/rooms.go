@@ -137,9 +137,13 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// Generate ID
 	id := generateID()
 
-	// Hash password if provided
+	// Hash password if provided (minimum 8 characters for security)
 	var passwordHash *string
-	if req.Password != nil && len(*req.Password) >= 4 {
+	if req.Password != nil {
+		if len(*req.Password) < 8 {
+			http.Error(w, "Password must be at least 8 characters", http.StatusBadRequest)
+			return
+		}
 		hash, err := bcrypt.GenerateFromPassword([]byte(*req.Password), bcrypt.DefaultCost)
 		if err != nil {
 			http.Error(w, "Failed to process password", http.StatusInternalServerError)

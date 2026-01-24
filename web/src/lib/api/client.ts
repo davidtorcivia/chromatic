@@ -1,18 +1,11 @@
 // API client for Chromatic backend
+// Uses httpOnly cookies for secure authentication (not vulnerable to XSS)
 
 const API_BASE = '';
 
-function getAuthHeaders(): HeadersInit {
-    const token = typeof localStorage !== 'undefined'
-        ? localStorage.getItem('chromatic_admin_token')
-        : null;
-
-    return token ? { 'Authorization': `Bearer ${token}` } : {};
-}
-
 export async function apiGet<T>(path: string): Promise<T> {
     const res = await fetch(`${API_BASE}${path}`, {
-        headers: getAuthHeaders()
+        credentials: 'include' // Include httpOnly cookies
     });
 
     if (!res.ok) {
@@ -25,8 +18,8 @@ export async function apiGet<T>(path: string): Promise<T> {
 export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
     const res = await fetch(`${API_BASE}${path}`, {
         method: 'POST',
+        credentials: 'include', // Include httpOnly cookies
         headers: {
-            ...getAuthHeaders(),
             'Content-Type': 'application/json'
         },
         body: body ? JSON.stringify(body) : undefined
@@ -42,8 +35,8 @@ export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
 export async function apiPatch<T>(path: string, body: unknown): Promise<T> {
     const res = await fetch(`${API_BASE}${path}`, {
         method: 'PATCH',
+        credentials: 'include', // Include httpOnly cookies
         headers: {
-            ...getAuthHeaders(),
             'Content-Type': 'application/json'
         },
         body: JSON.stringify(body)
@@ -59,13 +52,23 @@ export async function apiPatch<T>(path: string, body: unknown): Promise<T> {
 export async function apiDelete(path: string): Promise<void> {
     const res = await fetch(`${API_BASE}${path}`, {
         method: 'DELETE',
-        headers: getAuthHeaders()
+        credentials: 'include' // Include httpOnly cookies
     });
 
     if (!res.ok) {
         throw new Error(await res.text());
     }
 }
+
+// Authentication functions
+export const auth = {
+    login: async (token: string): Promise<{ success: boolean; message: string }> => {
+        return apiPost('/api/auth/login', { token });
+    },
+    logout: async (): Promise<{ success: boolean; message: string }> => {
+        return apiPost('/api/auth/logout');
+    }
+};
 
 // Types
 export interface Room {

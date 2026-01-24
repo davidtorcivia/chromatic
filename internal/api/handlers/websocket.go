@@ -1,10 +1,15 @@
 package handlers
 
 import (
+	"crypto/subtle"
 	"encoding/json"
+	"html"
 	"log"
 	"net/http"
+	"regexp"
+	"strings"
 
+	"chromatic/internal/api/middleware"
 	"chromatic/internal/database"
 	"chromatic/internal/webrtc"
 	"chromatic/internal/websocket"
@@ -13,30 +18,57 @@ import (
 	pionwebrtc "github.com/pion/webrtc/v4"
 )
 
-var upgrader = gorillaws.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		// Allow all origins in development
-		// In production, validate against allowed origins
-		return true
-	},
-}
-
 // WebSocketHandler handles WebSocket connections
 type WebSocketHandler struct {
-	db  *database.DB
-	hub *websocket.Hub
-	sfu *webrtc.SFU
+	db              *database.DB
+	hub             *websocket.Hub
+	sfu             *webrtc.SFU
+	originValidator *middleware.OriginValidator
+	adminToken      string
+	upgrader        gorillaws.Upgrader
 }
 
 // NewWebSocketHandler creates a new WebSocketHandler
-func NewWebSocketHandler(db *database.DB, hub *websocket.Hub, sfu *webrtc.SFU) *WebSocketHandler {
-	return &WebSocketHandler{
-		db:  db,
-		hub: hub,
-		sfu: sfu,
+func NewWebSocketHandler(db *database.DB, hub *websocket.Hub, sfu *webrtc.SFU, allowedOrigins []string, productionMode bool, adminToken string) *WebSocketHandler {
+	validator := middleware.NewOriginValidator(allowedOrigins, productionMode)
+
+	h := &WebSocketHandler{
+		db:              db,
+		hub:             hub,
+		sfu:             sfu,
+		originValidator: validator,
+		adminToken:      adminToken,
 	}
+
+	h.upgrader = gorillaws.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			allowed := h.originValidator.IsAllowed(origin)
+			if !allowed {
+				log.Printf("WebSocket connection rejected: origin %s not allowed", origin)
+			}
+			return allowed
+		},
+	}
+
+	return h
+}
+
+// htmlTagsRegex matches HTML tags for stripping
+var htmlTagsRegex = regexp.MustCompile(`<[^>]*>`)
+
+// sanitizeText removes HTML tags and escapes any remaining special characters
+// to prevent XSS attacks in chat messages and participant names
+func sanitizeText(input string) string {
+	// Strip HTML tags
+	stripped := htmlTagsRegex.ReplaceAllString(input, "")
+	// Trim whitespace and limit consecutive whitespace
+	stripped = strings.TrimSpace(stripped)
+	// Escape HTML entities for any remaining special chars
+	escaped := html.EscapeString(stripped)
+	return escaped
 }
 
 // HandleConnection handles WebSocket connection upgrades
@@ -44,11 +76,15 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	slug := r.PathValue("slug")
 	token := r.URL.Query().Get("token")
 	name := r.URL.Query().Get("name")
+	adminAuth := r.URL.Query().Get("admin") // Optional admin token for admin access
 
 	if token == "" || name == "" {
 		http.Error(w, "Missing token or name", http.StatusBadRequest)
 		return
 	}
+
+	// Check if this is an admin connection (using constant-time comparison)
+	isAdminAuth := adminAuth != "" && subtle.ConstantTimeCompare([]byte(adminAuth), []byte(h.adminToken)) == 1
 
 	// Verify the room exists and get its details
 	var roomID string
@@ -91,14 +127,18 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Upgrade connection
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("WebSocket upgrade error: %v", err)
 		return
 	}
 
 	// Create client
-	isAdmin := role == "admin"
+	// Admin if authenticated via admin token OR has admin role in database
+	isAdmin := isAdminAuth || role == "admin"
+	if isAdminAuth {
+		role = "admin" // Set role to admin for authenticated admin
+	}
 	client := &websocket.Client{
 		ID:           participantID,
 		Name:         name,
@@ -263,16 +303,19 @@ func (h *WebSocketHandler) handleChatSend(client *websocket.Client, payload json
 		return
 	}
 
-	if len(data.Content) == 0 || len(data.Content) > 2000 {
+	// Sanitize content to prevent XSS
+	sanitizedContent := sanitizeText(data.Content)
+
+	if len(sanitizedContent) == 0 || len(data.Content) > 2000 {
 		return
 	}
 
 	// Broadcast to all in room
 	h.hub.BroadcastJSON(client.RoomSlug, "chat:message", map[string]interface{}{
 		"participantId":   client.ID,
-		"participantName": client.Name,
+		"participantName": sanitizeText(client.Name),
 		"type":            "text",
-		"content":         data.Content,
+		"content":         sanitizedContent,
 	}, "")
 }
 

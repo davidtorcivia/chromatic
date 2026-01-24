@@ -11,7 +11,7 @@ import (
 // TestRequireAuth tests the authentication middleware
 func TestRequireAuth(t *testing.T) {
 	validToken := "test-admin-token-12345"
-	authMiddleware := RequireAuth(validToken)
+	authMiddleware := RequireAuth(AuthConfig{AdminToken: validToken})
 
 	handler := authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -78,7 +78,7 @@ func TestRequireAuthConstantTime(t *testing.T) {
 	// different token lengths. Actual timing attack prevention is hard
 	// to verify in a unit test, but we verify the behavior is correct.
 	validToken := "test-admin-token-12345"
-	authMiddleware := RequireAuth(validToken)
+	authMiddleware := RequireAuth(AuthConfig{AdminToken: validToken})
 
 	handler := authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -478,60 +478,117 @@ func TestRequestLogger(t *testing.T) {
 
 // TestGetClientIP tests IP extraction from requests
 func TestGetClientIP(t *testing.T) {
-	tests := []struct {
-		name           string
-		remoteAddr     string
-		xForwardedFor  string
-		xRealIP        string
-		expectedIP     string
-	}{
-		{
-			name:       "remote addr only",
-			remoteAddr: "192.168.1.1:12345",
-			expectedIP: "192.168.1.1",
-		},
-		{
-			name:          "x-forwarded-for single",
-			remoteAddr:    "127.0.0.1:12345",
-			xForwardedFor: "203.0.113.1",
-			expectedIP:    "203.0.113.1",
-		},
-		{
-			name:          "x-forwarded-for multiple",
-			remoteAddr:    "127.0.0.1:12345",
-			xForwardedFor: "203.0.113.1, 198.51.100.1, 10.0.0.1",
-			expectedIP:    "203.0.113.1",
-		},
-		{
-			name:       "x-real-ip",
-			remoteAddr: "127.0.0.1:12345",
-			xRealIP:    "203.0.113.50",
-			expectedIP: "203.0.113.50",
-		},
-		{
-			name:          "x-forwarded-for takes precedence",
-			remoteAddr:    "127.0.0.1:12345",
-			xForwardedFor: "203.0.113.1",
-			xRealIP:       "203.0.113.50",
-			expectedIP:    "203.0.113.1",
-		},
-	}
+	// Test with no trusted proxies - should always use direct IP
+	t.Run("no trusted proxies", func(t *testing.T) {
+		tests := []struct {
+			name           string
+			remoteAddr     string
+			xForwardedFor  string
+			xRealIP        string
+			expectedIP     string
+		}{
+			{
+				name:       "remote addr only",
+				remoteAddr: "192.168.1.1:12345",
+				expectedIP: "192.168.1.1",
+			},
+			{
+				name:          "ignores x-forwarded-for without trusted proxies",
+				remoteAddr:    "192.168.1.1:12345",
+				xForwardedFor: "203.0.113.1",
+				expectedIP:    "192.168.1.1", // Uses direct IP, not forwarded
+			},
+			{
+				name:       "ignores x-real-ip without trusted proxies",
+				remoteAddr: "192.168.1.1:12345",
+				xRealIP:    "203.0.113.50",
+				expectedIP: "192.168.1.1", // Uses direct IP
+			},
+		}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("GET", "/", nil)
-			req.RemoteAddr = tt.remoteAddr
-			if tt.xForwardedFor != "" {
-				req.Header.Set("X-Forwarded-For", tt.xForwardedFor)
-			}
-			if tt.xRealIP != "" {
-				req.Header.Set("X-Real-IP", tt.xRealIP)
-			}
+		emptyProxies := make(map[string]bool)
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				req := httptest.NewRequest("GET", "/", nil)
+				req.RemoteAddr = tt.remoteAddr
+				if tt.xForwardedFor != "" {
+					req.Header.Set("X-Forwarded-For", tt.xForwardedFor)
+				}
+				if tt.xRealIP != "" {
+					req.Header.Set("X-Real-IP", tt.xRealIP)
+				}
 
-			ip := getClientIP(req)
-			if ip != tt.expectedIP {
-				t.Errorf("expected IP %q, got %q", tt.expectedIP, ip)
-			}
-		})
-	}
+				ip := getClientIP(req, emptyProxies)
+				if ip != tt.expectedIP {
+					t.Errorf("expected IP %q, got %q", tt.expectedIP, ip)
+				}
+			})
+		}
+	})
+
+	// Test with trusted proxy - should trust forwarded headers from proxy
+	t.Run("with trusted proxy", func(t *testing.T) {
+		trustedProxies := map[string]bool{
+			"127.0.0.1": true,
+			"10.0.0.1":  true,
+		}
+
+		tests := []struct {
+			name           string
+			remoteAddr     string
+			xForwardedFor  string
+			xRealIP        string
+			expectedIP     string
+		}{
+			{
+				name:          "x-forwarded-for from trusted proxy",
+				remoteAddr:    "127.0.0.1:12345",
+				xForwardedFor: "203.0.113.1",
+				expectedIP:    "203.0.113.1",
+			},
+			{
+				name:          "x-forwarded-for multiple from trusted proxy",
+				remoteAddr:    "127.0.0.1:12345",
+				xForwardedFor: "203.0.113.1, 198.51.100.1, 10.0.0.1",
+				expectedIP:    "203.0.113.1",
+			},
+			{
+				name:       "x-real-ip from trusted proxy",
+				remoteAddr: "127.0.0.1:12345",
+				xRealIP:    "203.0.113.50",
+				expectedIP: "203.0.113.50",
+			},
+			{
+				name:          "x-forwarded-for takes precedence from trusted proxy",
+				remoteAddr:    "127.0.0.1:12345",
+				xForwardedFor: "203.0.113.1",
+				xRealIP:       "203.0.113.50",
+				expectedIP:    "203.0.113.1",
+			},
+			{
+				name:          "untrusted proxy - ignores headers",
+				remoteAddr:    "192.168.1.1:12345",
+				xForwardedFor: "203.0.113.1",
+				expectedIP:    "192.168.1.1", // Uses direct IP since proxy not trusted
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				req := httptest.NewRequest("GET", "/", nil)
+				req.RemoteAddr = tt.remoteAddr
+				if tt.xForwardedFor != "" {
+					req.Header.Set("X-Forwarded-For", tt.xForwardedFor)
+				}
+				if tt.xRealIP != "" {
+					req.Header.Set("X-Real-IP", tt.xRealIP)
+				}
+
+				ip := getClientIP(req, trustedProxies)
+				if ip != tt.expectedIP {
+					t.Errorf("expected IP %q, got %q", tt.expectedIP, ip)
+				}
+			})
+		}
+	})
 }

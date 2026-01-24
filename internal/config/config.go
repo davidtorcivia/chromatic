@@ -24,7 +24,9 @@ type Config struct {
 	AdminToken string
 
 	// Security
-	AllowedOrigins []string // Empty = allow all (development mode)
+	AllowedOrigins []string // Required in production mode
+	TrustedProxies []string // IP addresses/CIDRs of trusted reverse proxies
+	ProductionMode bool     // When true, enforces strict security (requires ALLOWED_ORIGINS)
 
 	// TURN
 	TurnSecret       string
@@ -47,7 +49,9 @@ func Load() (*Config, error) {
 		UploadPath:          getEnv("UPLOAD_PATH", "/data/files"),
 		LogoPath:            getEnv("LOGO_PATH", "/data/logos"),
 		AdminToken:          getEnvRequired("ADMIN_TOKEN"),
-		AllowedOrigins:      getEnvList("ALLOWED_ORIGINS", nil), // Empty = allow all
+		AllowedOrigins:      getEnvList("ALLOWED_ORIGINS", nil),
+		TrustedProxies:      getEnvList("TRUSTED_PROXIES", nil),
+		ProductionMode:      getEnvBool("PRODUCTION_MODE", false),
 		TurnSecret:          getEnvRequired("TURN_SECRET"),
 		TurnRealm:           getEnvRequired("TURN_REALM"),
 		TurnExternalURL:     getEnv("TURN_EXTERNAL_URL", ""),
@@ -69,6 +73,11 @@ func Load() (*Config, error) {
 	}
 	if cfg.TurnRealm == "" {
 		return nil, fmt.Errorf("TURN_REALM is required")
+	}
+
+	// In production mode, ALLOWED_ORIGINS is required
+	if cfg.ProductionMode && len(cfg.AllowedOrigins) == 0 {
+		return nil, fmt.Errorf("ALLOWED_ORIGINS is required in production mode")
 	}
 
 	return cfg, nil
@@ -108,6 +117,15 @@ func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
 		if d, err := time.ParseDuration(value); err == nil {
 			return d
 		}
+	}
+	return defaultValue
+}
+
+// getEnvBool gets a boolean environment variable with a default value
+func getEnvBool(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		// Accept "true", "1", "yes" as true
+		return value == "true" || value == "1" || value == "yes"
 	}
 	return defaultValue
 }

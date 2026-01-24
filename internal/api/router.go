@@ -22,7 +22,8 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 
 	streamKeyHandler := handlers.NewStreamKeyHandler(db)
 	fileHandler := handlers.NewFileHandler(db, cfg)
-	wsHandler := handlers.NewWebSocketHandler(db, hub, sfu)
+	wsHandler := handlers.NewWebSocketHandler(db, hub, sfu, cfg.AllowedOrigins, cfg.ProductionMode, cfg.AdminToken)
+	authHandler := handlers.NewAuthHandler(cfg.AdminToken, cfg.ProductionMode)
 
 	// Wire up room live callback to initiate WebRTC subscriptions
 	roomHandler.SetOnRoomLive(wsHandler.InitiateSubscriptionsForRoom)
@@ -43,6 +44,10 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 
 	// Health check
 	mux.HandleFunc("GET /health", handlers.HealthCheck)
+
+	// Auth endpoints (no auth required)
+	mux.HandleFunc("POST /api/auth/login", authHandler.Login)
+	mux.HandleFunc("POST /api/auth/logout", authHandler.Logout)
 
 	// WHIP endpoints (no auth - stream key is in URL)
 	mux.Handle("/whip/", whipHandler)
@@ -69,7 +74,12 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	adminMux.HandleFunc("POST /api/rooms/{slug}/admit-all", roomHandler.AdmitAll)
 
 	// Wrap admin routes with auth middleware
-	mux.Handle("/api/", middleware.RequireAuth(cfg.AdminToken)(adminMux))
+	authConfig := middleware.AuthConfig{
+		AdminToken:      cfg.AdminToken,
+		SessionCookie:   handlers.SessionCookieName,
+		ValidateSession: authHandler.ValidateSession,
+	}
+	mux.Handle("/api/", middleware.RequireAuth(authConfig)(adminMux))
 
 	// File endpoints (session auth)
 	mux.HandleFunc("POST /api/rooms/{slug}/files", fileHandler.Upload)
@@ -91,9 +101,10 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	// Apply global middleware
 	var handler http.Handler = mux
 
-	// CORS configuration - in development allow any origin, in production use allowed origins
+	// CORS configuration - requires ALLOWED_ORIGINS in production mode
 	corsConfig := middleware.CORSConfig{
 		AllowedOrigins: cfg.AllowedOrigins,
+		ProductionMode: cfg.ProductionMode,
 	}
 	handler = middleware.CORS(corsConfig)(handler)
 
@@ -101,6 +112,7 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	rateLimitConfig := middleware.RateLimiterConfig{
 		RequestsPerSecond: 20,
 		BurstSize:         50,
+		TrustedProxies:    cfg.TrustedProxies,
 	}
 	handler = middleware.RateLimiter(rateLimitConfig)(handler)
 
