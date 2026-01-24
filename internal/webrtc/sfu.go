@@ -39,6 +39,7 @@ type IngestSession struct {
 	VideoTrack        *webrtc.TrackLocalStaticRTP
 	AudioTrack        *webrtc.TrackLocalStaticRTP
 	done              chan struct{}
+	closeOnce         sync.Once  // Ensures done channel is closed only once
 	iceCandidateCount int        // Counter for ICE candidates received
 	iceMu             sync.Mutex // Protects iceCandidateCount
 }
@@ -57,6 +58,7 @@ type Subscriber struct {
 	ID             string
 	PeerConnection *webrtc.PeerConnection
 	done           chan struct{}
+	closeOnce      sync.Once // Ensures done channel is closed only once
 }
 
 // NewSFU creates a new SFU instance
@@ -180,7 +182,10 @@ func (s *SFU) RemoveIngest(streamKeyToken string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if session, ok := s.ingests[streamKeyToken]; ok {
-		close(session.done)
+		// Use sync.Once to prevent double-close panic
+		session.closeOnce.Do(func() {
+			close(session.done)
+		})
 		delete(s.ingests, streamKeyToken)
 	}
 }
@@ -206,21 +211,41 @@ func (s *SFU) GetRoomTracks(roomSlug string) *RoomTracks {
 func (s *SFU) Shutdown() {
 	s.mu.Lock()
 	s.shutdown = true
-	s.mu.Unlock()
+
+	// Collect tokens to avoid modifying map while iterating
+	tokens := make([]string, 0, len(s.ingests))
+	for token := range s.ingests {
+		tokens = append(tokens, token)
+	}
 
 	// Close all ingest sessions
-	for token := range s.ingests {
-		s.RemoveIngest(token)
+	for _, token := range tokens {
+		if session, ok := s.ingests[token]; ok {
+			session.closeOnce.Do(func() {
+				close(session.done)
+			})
+			if session.PeerConnection != nil {
+				session.PeerConnection.Close()
+			}
+			delete(s.ingests, token)
+		}
 	}
 
 	// Close all subscriber connections
 	for _, room := range s.rooms {
 		room.mu.Lock()
-		for _, sub := range room.Subscribers {
-			sub.PeerConnection.Close()
+		for id, sub := range room.Subscribers {
+			sub.closeOnce.Do(func() {
+				close(sub.done)
+			})
+			if sub.PeerConnection != nil {
+				sub.PeerConnection.Close()
+			}
+			delete(room.Subscribers, id)
 		}
 		room.mu.Unlock()
 	}
+	s.mu.Unlock()
 
 	log.Println("SFU shutdown complete")
 }
@@ -237,7 +262,10 @@ func (rt *RoomTracks) RemoveSubscriber(id string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	if sub, ok := rt.Subscribers[id]; ok {
-		close(sub.done)
+		// Use sync.Once to prevent double-close panic
+		sub.closeOnce.Do(func() {
+			close(sub.done)
+		})
 		delete(rt.Subscribers, id)
 	}
 }

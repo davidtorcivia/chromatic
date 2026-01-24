@@ -15,7 +15,7 @@ func TestRoomHandler_Create(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db)
+	handler := NewRoomHandler(db, "test-secret")
 
 	tests := []struct {
 		name           string
@@ -120,7 +120,7 @@ func TestRoomHandler_Get(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db)
+	handler := NewRoomHandler(db, "test-secret")
 
 	// Create a test room first
 	createBody := map[string]interface{}{
@@ -175,7 +175,7 @@ func TestRoomHandler_Update(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db)
+	handler := NewRoomHandler(db, "test-secret")
 
 	// Create a test room
 	createBody := map[string]interface{}{
@@ -266,7 +266,7 @@ func TestRoomHandler_Delete(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db)
+	handler := NewRoomHandler(db, "test-secret")
 
 	// Create a test room
 	createBody := map[string]interface{}{
@@ -327,7 +327,7 @@ func TestRoomHandler_Join(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db)
+	handler := NewRoomHandler(db, "test-secret")
 
 	// Create rooms for testing
 	rooms := []map[string]interface{}{
@@ -472,7 +472,7 @@ func TestRoomHandler_WaitingRoom(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db)
+	handler := NewRoomHandler(db, "test-secret")
 
 	// Create a waiting room
 	createBody := map[string]interface{}{
@@ -556,7 +556,7 @@ func TestRoomHandler_CheckParticipantStatus(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db)
+	handler := NewRoomHandler(db, "test-secret")
 
 	// Create a waiting room
 	createBody := map[string]interface{}{
@@ -646,7 +646,7 @@ func TestRoomHandler_List(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db)
+	handler := NewRoomHandler(db, "test-secret")
 
 	// Create some test rooms
 	rooms := []map[string]interface{}{
@@ -703,7 +703,7 @@ func TestRoomHandler_PublicInfo(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db)
+	handler := NewRoomHandler(db, "test-secret")
 
 	// Create a room with password
 	createBody := map[string]interface{}{

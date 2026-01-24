@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"regexp"
@@ -26,12 +27,16 @@ type RoomHandler struct {
 	hub interface {
 		BroadcastJSON(roomSlug string, msgType string, payload interface{}, excludeID string) error
 	}
-	onRoomLive func(roomSlug string) // Called when room goes live
+	onRoomLive   func(roomSlug string) // Called when room goes live
+	tokenManager *TokenManager         // For generating signed WebSocket tokens
 }
 
 // NewRoomHandler creates a new RoomHandler
-func NewRoomHandler(db *database.DB) *RoomHandler {
-	return &RoomHandler{db: db}
+func NewRoomHandler(db *database.DB, tokenSecret string) *RoomHandler {
+	return &RoomHandler{
+		db:           db,
+		tokenManager: NewTokenManager(tokenSecret),
+	}
 }
 
 // SetSFU sets the SFU reference (for stream binding)
@@ -397,8 +402,13 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate join token
-	token := generateID()
+	// Generate signed join token (valid for 24 hours)
+	token, err := h.tokenManager.GenerateToken(participantID, slug, req.Name, 24*time.Hour)
+	if err != nil {
+		log.Printf("Failed to generate token: %v", err)
+		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+		return
+	}
 
 	response := map[string]interface{}{
 		"participantId": participantID,
@@ -516,9 +526,21 @@ func (h *RoomHandler) CheckParticipantStatus(w http.ResponseWriter, r *http.Requ
 func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 	now := time.Now()
 
+	// Use transaction to ensure atomicity of room lookup and status update
+	// This prevents race conditions with multiple OBS connections
+	tx, err := h.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		if tx != nil {
+			tx.Rollback()
+		}
+	}()
+
 	// Find the room bound to this stream key
 	var roomSlug string
-	err := h.db.QueryRow(`
+	err = tx.QueryRow(`
 		SELECT r.slug FROM rooms r
 		JOIN stream_keys sk ON sk.id = r.stream_key_id
 		WHERE sk.key_token = ? AND r.status = 'pending'
@@ -528,17 +550,34 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 
 	if err != nil {
 		// No room bound to this stream key yet - that's okay
+		tx.Rollback()
+		tx = nil
 		return nil
 	}
 
 	// Update room status to live
-	_, err = h.db.Exec(`
+	result, err := tx.Exec(`
 		UPDATE rooms SET status = 'live', started_at = ?
 		WHERE slug = ? AND status = 'pending'
 	`, now, roomSlug)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to update room status: %w", err)
 	}
+
+	// Check if we actually updated a row (another transaction might have beaten us)
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		// Room was already taken by another stream, rollback
+		tx.Rollback()
+		tx = nil
+		return nil
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+	tx = nil // Prevent deferred rollback
 
 	// Bind ingest tracks to room for distribution
 	if h.sfu != nil {
@@ -564,8 +603,28 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 
 // OnStreamEnd is called when OBS stops streaming
 func (h *RoomHandler) OnStreamEnd(streamKeyToken string) {
-	// Note: We don't automatically end the room when OBS disconnects
-	// The admin may want to reconnect. Use the timeout logic in the SFU instead.
+	// Find the room associated with this stream key
+	var roomSlug string
+	err := h.db.QueryRow(`
+		SELECT r.slug FROM rooms r
+		JOIN stream_keys sk ON sk.id = r.stream_key_id
+		WHERE sk.key_token = ? AND r.status = 'live'
+	`, streamKeyToken).Scan(&roomSlug)
+
+	if err != nil {
+		// No live room for this stream key - that's fine
+		return
+	}
+
+	// Notify connected clients that the stream has paused
+	// The admin may reconnect, so we don't end the room
+	if h.hub != nil {
+		h.hub.BroadcastJSON(roomSlug, "stream:paused", map[string]interface{}{
+			"message": "Stream disconnected. Waiting for reconnection...",
+		}, "")
+	}
+
+	log.Printf("Stream paused for room %s (OBS disconnected)", roomSlug)
 }
 
 func (h *RoomHandler) getRoomBySlug(slug string) (*models.Room, error) {

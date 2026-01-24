@@ -25,6 +25,7 @@ type WebSocketHandler struct {
 	sfu             *webrtc.SFU
 	originValidator *middleware.OriginValidator
 	adminToken      string
+	tokenManager    *TokenManager
 	upgrader        gorillaws.Upgrader
 }
 
@@ -38,6 +39,7 @@ func NewWebSocketHandler(db *database.DB, hub *websocket.Hub, sfu *webrtc.SFU, a
 		sfu:             sfu,
 		originValidator: validator,
 		adminToken:      adminToken,
+		tokenManager:    NewTokenManager(adminToken), // Use adminToken as HMAC secret
 	}
 
 	h.upgrader = gorillaws.Upgrader{
@@ -86,11 +88,32 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	// Check if this is an admin connection (using constant-time comparison)
 	isAdminAuth := adminAuth != "" && subtle.ConstantTimeCompare([]byte(adminAuth), []byte(h.adminToken)) == 1
 
+	// Validate the signed token
+	tokenPayload, err := h.tokenManager.ValidateToken(token)
+	if err != nil {
+		log.Printf("Invalid WebSocket token: %v", err)
+		http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
+		return
+	}
+
+	// Verify token matches the requested room and name
+	if tokenPayload.RoomSlug != slug {
+		http.Error(w, "Token not valid for this room", http.StatusForbidden)
+		return
+	}
+	if tokenPayload.Name != name {
+		http.Error(w, "Token not valid for this name", http.StatusForbidden)
+		return
+	}
+
+	// Use participant ID from the validated token
+	participantID := tokenPayload.ParticipantID
+
 	// Verify the room exists and get its details
 	var roomID string
 	var roomStatus string
 	var streamKeyID *string
-	err := h.db.QueryRow("SELECT id, status, stream_key_id FROM rooms WHERE slug = ?", slug).Scan(&roomID, &roomStatus, &streamKeyID)
+	err = h.db.QueryRow("SELECT id, status, stream_key_id FROM rooms WHERE slug = ?", slug).Scan(&roomID, &roomStatus, &streamKeyID)
 	if err != nil {
 		http.Error(w, "Room not found", http.StatusNotFound)
 		return
@@ -103,21 +126,19 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Look up participant to determine role and verify admission
-	var participantID, role, color string
+	var role, color string
 	var isAdmitted bool
 	err = h.db.QueryRow(`
-		SELECT id, role, COALESCE(color, ''), is_admitted
+		SELECT role, COALESCE(color, ''), is_admitted
 		FROM participants
-		WHERE room_id = ? AND name = ?
-		ORDER BY joined_at DESC LIMIT 1
-	`, roomID, name).Scan(&participantID, &role, &color, &isAdmitted)
+		WHERE id = ? AND room_id = ?
+	`, participantID, roomID).Scan(&role, &color, &isAdmitted)
 
 	if err != nil {
-		// Create participant record if not exists (for admin or direct join)
-		participantID = token
-		role = "viewer"
-		color = assignColor(token)
-		isAdmitted = true // Default to admitted for WebSocket connections
+		// Participant not found - this shouldn't happen with valid tokens
+		log.Printf("Participant not found for valid token: %s", participantID)
+		http.Error(w, "Participant not found", http.StatusNotFound)
+		return
 	}
 
 	// Check if participant is admitted (waiting room check)

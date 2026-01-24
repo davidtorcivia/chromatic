@@ -58,6 +58,7 @@ type Client struct {
 	Conn         *websocket.Conn
 	Send         chan []byte
 	done         chan struct{}
+	closeOnce    sync.Once // Ensures Send channel is closed only once
 	IsAdmin      bool
 	AudioEnabled bool
 	VideoEnabled bool
@@ -130,7 +131,10 @@ func (h *Hub) unregisterClient(client *Client) {
 	if room, ok := h.rooms[client.RoomSlug]; ok {
 		if _, ok := room.Clients[client.ID]; ok {
 			delete(room.Clients, client.ID)
-			close(client.Send)
+			// Use sync.Once to prevent double-close panic
+			client.closeOnce.Do(func() {
+				close(client.Send)
+			})
 			log.Printf("Client %s (%s) left room %s", client.ID, client.Name, client.RoomSlug)
 
 			// Clean up empty rooms
@@ -158,8 +162,10 @@ func (h *Hub) broadcastToRoom(msg *RoomMessage) {
 		select {
 		case client.Send <- msg.Message:
 		default:
-			// Client's send buffer is full, close it
-			close(client.Send)
+			// Client's send buffer is full, close it safely
+			client.closeOnce.Do(func() {
+				close(client.Send)
+			})
 			delete(room.Clients, id)
 		}
 	}

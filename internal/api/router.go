@@ -16,7 +16,7 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	mux := http.NewServeMux()
 
 	// Create handlers
-	roomHandler := handlers.NewRoomHandler(db)
+	roomHandler := handlers.NewRoomHandler(db, cfg.AdminToken) // Use admin token as signing secret
 	roomHandler.SetSFU(sfu)
 	roomHandler.SetHub(hub)
 
