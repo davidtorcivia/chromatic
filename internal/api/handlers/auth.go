@@ -5,10 +5,11 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
-	"log"
 	"net/http"
 	"sync"
 	"time"
+
+	"chromatic/internal/logger"
 )
 
 const (
@@ -89,8 +90,8 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	// Generate session ID
 	sessionID, err := generateSessionID()
 	if err != nil {
-		log.Printf("Failed to generate session ID: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		logger.Error("Failed to generate session ID", "error", err)
+		http.Error(w, "Authentication service temporarily unavailable", http.StatusInternalServerError)
 		return
 	}
 
@@ -123,7 +124,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		"message": "Login successful",
 	})
 
-	log.Printf("Admin logged in successfully")
+	logger.Info("Admin logged in successfully")
 }
 
 // Logout handles admin logout requests

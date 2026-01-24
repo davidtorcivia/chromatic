@@ -35,7 +35,7 @@ jobs:
           file: coverage.out
           fail_ci_if_error: false
 
-  # Frontend type checking and build
+  # Frontend type checking, tests, and build
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
@@ -57,6 +57,9 @@ jobs:
 
       - name: Type check
         run: npm run check
+
+      - name: Run tests
+        run: npm run test
 
       - name: Build
         run: npm run build
@@ -93,5 +96,5 @@ jobs:
         with:
           scan-type: 'fs'
           scan-ref: '.'
-          severity: 'HIGH,CRITICAL'
-          exit-code: '0'  # Don't fail on vulnerabilities for now
+          severity: 'CRITICAL'
+          exit-code: '1'  # Fail on critical vulnerabilities

@@ -4,13 +4,13 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"html"
-	"log"
 	"net/http"
 	"regexp"
 	"strings"
 
 	"chromatic/internal/api/middleware"
 	"chromatic/internal/database"
+	"chromatic/internal/logger"
 	"chromatic/internal/webrtc"
 	"chromatic/internal/websocket"
 
@@ -49,7 +49,7 @@ func NewWebSocketHandler(db *database.DB, hub *websocket.Hub, sfu *webrtc.SFU, a
 			origin := r.Header.Get("Origin")
 			allowed := h.originValidator.IsAllowed(origin)
 			if !allowed {
-				log.Printf("WebSocket connection rejected: origin %s not allowed", origin)
+				logger.Warn("WebSocket connection rejected", "origin", origin, "reason", "origin not allowed")
 			}
 			return allowed
 		},
@@ -91,7 +91,7 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	// Validate the signed token
 	tokenPayload, err := h.tokenManager.ValidateToken(token)
 	if err != nil {
-		log.Printf("Invalid WebSocket token: %v", err)
+		logger.Warn("Invalid WebSocket token", "room", slug, "error", err)
 		http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
 		return
 	}
@@ -136,7 +136,7 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 
 	if err != nil {
 		// Participant not found - this shouldn't happen with valid tokens
-		log.Printf("Participant not found for valid token: %s", participantID)
+		logger.Warn("Participant not found for valid token", "participant_id", participantID, "room", slug)
 		http.Error(w, "Participant not found", http.StatusNotFound)
 		return
 	}
@@ -150,7 +150,7 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	// Upgrade connection
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("WebSocket upgrade error: %v", err)
+		logger.Error("WebSocket upgrade failed", "participant_id", participantID, "room", slug, "error", err)
 		return
 	}
 
@@ -215,7 +215,7 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 			h.hub.BroadcastJSON(c.RoomSlug, "participant:left", map[string]interface{}{
 				"participantId": c.ID,
 			}, "")
-			log.Printf("Client %s (%s) disconnected from room %s", c.ID, c.Name, c.RoomSlug)
+			logger.Info("Client disconnected", "participant_id", c.ID, "name", c.Name, "room", c.RoomSlug)
 		},
 	)
 }
@@ -225,7 +225,7 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 	// Create subscriber connection and get offer
 	_, offer, err := h.sfu.CreateSubscriberConnection(roomSlug, client.ID)
 	if err != nil {
-		log.Printf("Failed to create subscriber connection for %s: %v", client.ID, err)
+		logger.Error("Failed to create subscriber connection", "participant_id", client.ID, "room", roomSlug, "error", err)
 		return
 	}
 
@@ -234,7 +234,7 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 		"sdp": offer.SDP,
 	})
 
-	log.Printf("Sent WebRTC offer to client %s for room %s", client.ID, roomSlug)
+	logger.Debug("Sent WebRTC offer to client", "participant_id", client.ID, "room", roomSlug)
 }
 
 // InitiateSubscriptionsForRoom sends WebRTC offers to all clients in a room
@@ -244,7 +244,7 @@ func (h *WebSocketHandler) InitiateSubscriptionsForRoom(roomSlug string) {
 	for _, client := range clients {
 		go h.initiateSubscription(client, roomSlug)
 	}
-	log.Printf("Initiated subscriptions for %d clients in room %s", len(clients), roomSlug)
+	logger.Info("Initiated subscriptions for room", "room", roomSlug, "client_count", len(clients))
 }
 
 // sendRoomState sends the initial room state to a newly connected client
@@ -312,7 +312,7 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 	case "admin:end-session":
 		h.handleAdminEndSession(client)
 	default:
-		log.Printf("Unknown message type: %s", msg.Type)
+		logger.Debug("Unknown message type", "type", msg.Type, "participant_id", client.ID)
 	}
 }
 
@@ -393,11 +393,11 @@ func (h *WebSocketHandler) handleSignalOffer(client *websocket.Client, payload j
 		SDP string `json:"sdp"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
-		log.Printf("Invalid signal offer from %s: %v", client.ID, err)
+		logger.Warn("Invalid signal offer", "participant_id", client.ID, "error", err)
 		return
 	}
 
-	log.Printf("Received voice offer from %s", client.ID)
+	logger.Debug("Received voice offer", "participant_id", client.ID, "room", client.RoomSlug)
 
 	// Create a peer connection to receive the client's voice audio
 	// and create an answer
@@ -407,7 +407,7 @@ func (h *WebSocketHandler) handleSignalOffer(client *websocket.Client, payload j
 	})
 
 	if err != nil {
-		log.Printf("Failed to handle voice offer from %s: %v", client.ID, err)
+		logger.Error("Failed to handle voice offer", "participant_id", client.ID, "error", err)
 		return
 	}
 
@@ -416,12 +416,12 @@ func (h *WebSocketHandler) handleSignalOffer(client *websocket.Client, payload j
 		"sdp": answer,
 	})
 
-	log.Printf("Sent voice answer to client %s", client.ID)
+	logger.Debug("Sent voice answer", "participant_id", client.ID)
 }
 
 // forwardVoiceTrack forwards a participant's voice track to all other participants in the room
 func (h *WebSocketHandler) forwardVoiceTrack(roomSlug, participantID string, track *pionwebrtc.TrackRemote) {
-	log.Printf("Forwarding voice track from %s to room %s", participantID, roomSlug)
+	logger.Debug("Forwarding voice track", "participant_id", participantID, "room", roomSlug)
 
 	// Get all clients in the room except the sender
 	clients := h.hub.GetRoomClients(roomSlug)
@@ -432,7 +432,7 @@ func (h *WebSocketHandler) forwardVoiceTrack(roomSlug, participantID string, tra
 
 		// Add the voice track to this client's subscriber connection
 		if err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, client.ID, participantID, track); err != nil {
-			log.Printf("Failed to add voice track to subscriber %s: %v", client.ID, err)
+			logger.Warn("Failed to add voice track to subscriber", "subscriber_id", client.ID, "source_id", participantID, "error", err)
 			continue
 		}
 
@@ -448,7 +448,7 @@ func (h *WebSocketHandler) handleSignalAnswer(client *websocket.Client, payload 
 		SDP string `json:"sdp"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
-		log.Printf("Invalid signal answer from %s: %v", client.ID, err)
+		logger.Warn("Invalid signal answer", "participant_id", client.ID, "error", err)
 		return
 	}
 
@@ -458,11 +458,11 @@ func (h *WebSocketHandler) handleSignalAnswer(client *websocket.Client, payload 
 	}
 
 	if err := h.sfu.SetSubscriberAnswer(client.RoomSlug, client.ID, answer); err != nil {
-		log.Printf("Failed to set subscriber answer for %s: %v", client.ID, err)
+		logger.Error("Failed to set subscriber answer", "participant_id", client.ID, "error", err)
 		return
 	}
 
-	log.Printf("Set WebRTC answer from client %s", client.ID)
+	logger.Debug("Set WebRTC answer from client", "participant_id", client.ID)
 }
 
 func (h *WebSocketHandler) handleSignalCandidate(client *websocket.Client, payload json.RawMessage) {
@@ -473,7 +473,7 @@ func (h *WebSocketHandler) handleSignalCandidate(client *websocket.Client, paylo
 		UsernameFragment *string `json:"usernameFragment,omitempty"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
-		log.Printf("Invalid ICE candidate from %s: %v", client.ID, err)
+		logger.Warn("Invalid ICE candidate", "participant_id", client.ID, "error", err)
 		return
 	}
 
@@ -485,11 +485,11 @@ func (h *WebSocketHandler) handleSignalCandidate(client *websocket.Client, paylo
 	}
 
 	if err := h.sfu.AddSubscriberICECandidate(client.RoomSlug, client.ID, candidate); err != nil {
-		log.Printf("Failed to add ICE candidate for %s: %v", client.ID, err)
+		logger.Warn("Failed to add ICE candidate", "participant_id", client.ID, "error", err)
 		return
 	}
 
-	log.Printf("Added ICE candidate from client %s", client.ID)
+	logger.Debug("Added ICE candidate from client", "participant_id", client.ID)
 }
 
 func (h *WebSocketHandler) handleAdminMute(client *websocket.Client, payload json.RawMessage) {

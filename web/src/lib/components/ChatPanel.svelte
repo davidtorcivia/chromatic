@@ -2,13 +2,29 @@
     import { onMount } from "svelte";
     import { session } from "$lib/stores/session.svelte";
     import { chatStore } from "$lib/stores/chat.svelte";
+    import { uploadFile, type UploadedFile } from "$lib/api/client";
 
     interface Props {
         isOpen: boolean;
         onClose: () => void;
+        roomSlug: string;
+        participantId: string;
     }
 
-    let { isOpen, onClose }: Props = $props();
+    let { isOpen, onClose, roomSlug, participantId }: Props = $props();
+
+    // Allowed file types (must match backend)
+    const ALLOWED_TYPES = [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+        "audio/mpeg",
+        "audio/wav",
+        "audio/ogg",
+        "application/pdf",
+    ];
+    const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
 
     // Validate URLs to prevent javascript: and data: URL attacks
     function isSafeUrl(url: string | undefined): boolean {
@@ -23,6 +39,10 @@
 
     let messageInput = $state("");
     let messagesContainer: HTMLDivElement;
+    let fileInput: HTMLInputElement;
+    let uploadProgress = $state<number | null>(null);
+    let uploadError = $state<string | null>(null);
+    let isDragOver = $state(false);
 
     onMount(() => {
         // Subscribe to chat messages
@@ -68,6 +88,89 @@
         });
     }
 
+    function formatFileSize(bytes: number): string {
+        if (bytes < 1024) return `${bytes} B`;
+        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+        return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    }
+
+    function handleFileSelect() {
+        fileInput?.click();
+    }
+
+    function handleFileInputChange(e: Event) {
+        const input = e.target as HTMLInputElement;
+        const file = input.files?.[0];
+        if (file) {
+            handleFileUpload(file);
+        }
+        // Reset input so same file can be selected again
+        input.value = "";
+    }
+
+    async function handleFileUpload(file: File) {
+        uploadError = null;
+
+        // Validate file type
+        if (!ALLOWED_TYPES.includes(file.type)) {
+            uploadError = "File type not allowed. Use images, audio, or PDF.";
+            return;
+        }
+
+        // Validate file size
+        if (file.size > MAX_FILE_SIZE) {
+            uploadError = `File too large. Maximum size is ${formatFileSize(MAX_FILE_SIZE)}.`;
+            return;
+        }
+
+        uploadProgress = 0;
+
+        try {
+            const uploadedFile = await uploadFile(
+                roomSlug,
+                file,
+                participantId,
+                (progress) => {
+                    uploadProgress = progress;
+                }
+            );
+
+            // Send chat:file message via WebSocket
+            session.send("chat:file", {
+                fileId: uploadedFile.id,
+                name: uploadedFile.originalName,
+                mimeType: uploadedFile.mimeType,
+                url: uploadedFile.url,
+                thumbnailUrl: uploadedFile.thumbnailUrl,
+            });
+
+            uploadProgress = null;
+        } catch (err) {
+            uploadError = err instanceof Error ? err.message : "Upload failed";
+            uploadProgress = null;
+        }
+    }
+
+    function handleDragOver(e: DragEvent) {
+        e.preventDefault();
+        isDragOver = true;
+    }
+
+    function handleDragLeave(e: DragEvent) {
+        e.preventDefault();
+        isDragOver = false;
+    }
+
+    function handleDrop(e: DragEvent) {
+        e.preventDefault();
+        isDragOver = false;
+
+        const file = e.dataTransfer?.files?.[0];
+        if (file) {
+            handleFileUpload(file);
+        }
+    }
+
     $effect(() => {
         if (isOpen) {
             chatStore.setVisible(true);
@@ -82,7 +185,14 @@
 </script>
 
 {#if isOpen}
-    <div class="chat-panel">
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+        class="chat-panel"
+        class:drag-over={isDragOver}
+        ondragover={handleDragOver}
+        ondragleave={handleDragLeave}
+        ondrop={handleDrop}
+    >
         <div class="chat-header">
             <h3>Chat</h3>
             <button class="btn btn-icon btn-ghost" onclick={onClose}>
@@ -106,14 +216,24 @@
                     {:else if msg.file && isSafeUrl(msg.file.url)}
                         <div class="chat-message-file">
                             {#if msg.file.mimeType.startsWith("image/") && isSafeUrl(msg.file.thumbnailUrl || msg.file.url)}
-                                <img
-                                    src={msg.file.thumbnailUrl || msg.file.url}
-                                    alt={msg.file.name}
-                                />
+                                <a href={msg.file.url} target="_blank" rel="noopener noreferrer">
+                                    <img
+                                        src={msg.file.thumbnailUrl || msg.file.url}
+                                        alt={msg.file.name}
+                                    />
+                                </a>
+                            {:else if msg.file.mimeType.startsWith("audio/")}
+                                <div class="audio-file">
+                                    <span class="file-name">{msg.file.name}</span>
+                                    <audio controls src={msg.file.url} preload="metadata">
+                                        <track kind="captions" />
+                                    </audio>
+                                </div>
                             {:else}
-                                <a href={msg.file.url} target="_blank" rel="noopener noreferrer"
-                                    >{msg.file.name}</a
-                                >
+                                <a href={msg.file.url} target="_blank" rel="noopener noreferrer" class="file-link">
+                                    <span class="file-icon">📄</span>
+                                    <span class="file-name">{msg.file.name}</span>
+                                </a>
                             {/if}
                         </div>
                     {/if}
@@ -125,7 +245,46 @@
             {/if}
         </div>
 
+        {#if uploadProgress !== null}
+            <div class="upload-progress">
+                <div class="upload-progress-bar" style="width: {uploadProgress}%"></div>
+                <span class="upload-progress-text">Uploading... {uploadProgress}%</span>
+            </div>
+        {/if}
+
+        {#if uploadError}
+            <div class="upload-error">
+                <span>{uploadError}</span>
+                <button class="btn-dismiss" onclick={() => uploadError = null}>✕</button>
+            </div>
+        {/if}
+
+        {#if isDragOver}
+            <div class="drop-overlay">
+                <div class="drop-overlay-content">
+                    <span class="drop-icon">📎</span>
+                    <span>Drop file to upload</span>
+                </div>
+            </div>
+        {/if}
+
         <form class="chat-input-container" onsubmit={handleSubmit}>
+            <input
+                type="file"
+                bind:this={fileInput}
+                onchange={handleFileInputChange}
+                accept={ALLOWED_TYPES.join(",")}
+                class="file-input-hidden"
+            />
+            <button
+                type="button"
+                class="btn btn-icon btn-ghost"
+                onclick={handleFileSelect}
+                disabled={uploadProgress !== null}
+                title="Attach file (images, audio, PDF - max 5MB)"
+            >
+                📎
+            </button>
             <input
                 type="text"
                 class="input"
@@ -207,10 +366,128 @@
         cursor: pointer;
     }
 
+    .chat-message-file .audio-file {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-xs);
+    }
+
+    .chat-message-file audio {
+        width: 100%;
+        height: 32px;
+    }
+
+    .chat-message-file .file-link {
+        display: flex;
+        align-items: center;
+        gap: var(--space-sm);
+        padding: var(--space-sm);
+        background: var(--color-bg);
+        border-radius: var(--radius-md);
+        text-decoration: none;
+        color: var(--color-text);
+    }
+
+    .chat-message-file .file-link:hover {
+        background: var(--color-border);
+    }
+
+    .chat-message-file .file-icon {
+        font-size: 1.25rem;
+    }
+
+    .chat-message-file .file-name {
+        font-size: 0.75rem;
+        word-break: break-word;
+    }
+
     .chat-empty {
         text-align: center;
         color: var(--color-text-subtle);
         padding: var(--space-xl);
+    }
+
+    .upload-progress {
+        position: relative;
+        height: 24px;
+        background: var(--color-bg);
+        border-top: 1px solid var(--color-border);
+    }
+
+    .upload-progress-bar {
+        position: absolute;
+        top: 0;
+        left: 0;
+        height: 100%;
+        background: var(--color-primary);
+        opacity: 0.3;
+        transition: width 0.2s ease;
+    }
+
+    .upload-progress-text {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        font-size: 0.75rem;
+        color: var(--color-text-muted);
+    }
+
+    .upload-error {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: var(--space-sm) var(--space-md);
+        background: var(--color-error);
+        color: white;
+        font-size: 0.75rem;
+    }
+
+    .upload-error .btn-dismiss {
+        background: none;
+        border: none;
+        color: white;
+        cursor: pointer;
+        padding: var(--space-xs);
+    }
+
+    .drop-overlay {
+        position: absolute;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.7);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 10;
+        pointer-events: none;
+    }
+
+    .drop-overlay-content {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: var(--space-sm);
+        color: white;
+        font-size: 1rem;
+    }
+
+    .drop-icon {
+        font-size: 2rem;
+    }
+
+    .chat-panel.drag-over {
+        border: 2px dashed var(--color-primary);
+    }
+
+    .file-input-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        border: 0;
     }
 
     .chat-input-container {

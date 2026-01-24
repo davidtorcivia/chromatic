@@ -8,7 +8,6 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,6 +15,7 @@ import (
 
 	"chromatic/internal/config"
 	"chromatic/internal/database"
+	"chromatic/internal/logger"
 
 	"golang.org/x/image/draw"
 )
@@ -153,7 +153,7 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(mimeType, "image/") && mimeType != "image/gif" {
 		thumbnailPath = filepath.Join(h.cfg.UploadPath, roomID, "thumbnails", fileID+".jpg")
 		if err := generateThumbnail(storedPath, thumbnailPath); err != nil {
-			log.Printf("Failed to generate thumbnail for %s: %v", fileID, err)
+			logger.Warn("Failed to generate thumbnail", "file_id", fileID, "error", err)
 			// Don't fail the upload, just skip thumbnail
 		} else {
 			// Update database with thumbnail path
@@ -280,7 +280,7 @@ func generateThumbnail(srcPath, dstPath string) error {
 		return fmt.Errorf("failed to decode image: %w", err)
 	}
 
-	log.Printf("Generating thumbnail for %s format image", format)
+	logger.Debug("Generating thumbnail", "format", format, "source", srcPath)
 
 	// Calculate new dimensions maintaining aspect ratio
 	bounds := srcImage.Bounds()
@@ -327,7 +327,7 @@ func generateThumbnail(srcPath, dstPath string) error {
 		return fmt.Errorf("failed to encode thumbnail: %w", err)
 	}
 
-	log.Printf("Generated thumbnail: %s (%dx%d)", dstPath, newWidth, newHeight)
+	logger.Debug("Generated thumbnail", "path", dstPath, "width", newWidth, "height", newHeight)
 	return nil
 }
 

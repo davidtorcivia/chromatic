@@ -82,6 +82,8 @@ export interface Room {
     streamKeyId?: string;
     watermarkMode: string;
     watermarkText?: string;
+    watermarkLogoPosition?: string;
+    watermarkOpacity?: number;
     status: 'pending' | 'live' | 'ended';
     createdAt: string;
     startedAt?: string;
@@ -138,3 +140,97 @@ export const streamKeys = {
     create: (name: string) => apiPost<StreamKey>('/api/stream-keys', { name }),
     delete: (id: string) => apiDelete(`/api/stream-keys/${id}`)
 };
+
+// Config types
+export interface AppConfig {
+    defaultWatermarkText?: string;
+    defaultWatermarkLogoPath?: string;
+    defaultWatermarkLogoUrl?: string;
+    turnExternalUrl?: string;
+    turnExternalUsername?: string;
+    hasTurnCredential: boolean;
+    publicUrl: string;
+    whipFormat: string;
+}
+
+export interface UpdateConfigRequest {
+    defaultWatermarkText?: string;
+    turnExternalUrl?: string;
+    turnExternalUsername?: string;
+    turnExternalCredential?: string;
+}
+
+// Config API functions
+export const appConfig = {
+    get: () => apiGet<AppConfig>('/api/config'),
+    update: (data: UpdateConfigRequest) => apiPatch<AppConfig>('/api/config', data),
+    uploadLogo: async (file: File): Promise<{ logoUrl: string; path: string }> => {
+        const formData = new FormData();
+        formData.append('logo', file);
+        const res = await fetch(`${API_BASE}/api/config/logo`, {
+            method: 'POST',
+            credentials: 'include',
+            body: formData
+        });
+        if (!res.ok) {
+            throw new Error(await res.text());
+        }
+        return res.json();
+    },
+    deleteLogo: () => apiDelete('/api/config/logo')
+};
+
+// File upload types
+export interface UploadedFile {
+    id: string;
+    originalName: string;
+    mimeType: string;
+    sizeBytes: number;
+    url: string;
+    thumbnailUrl?: string;
+}
+
+// File upload function with progress callback
+export async function uploadFile(
+    roomSlug: string,
+    file: File,
+    participantId: string,
+    onProgress?: (percent: number) => void
+): Promise<UploadedFile> {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        const formData = new FormData();
+        formData.append('file', file);
+
+        xhr.upload.addEventListener('progress', (e) => {
+            if (e.lengthComputable && onProgress) {
+                onProgress(Math.round((e.loaded / e.total) * 100));
+            }
+        });
+
+        xhr.addEventListener('load', () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+                try {
+                    resolve(JSON.parse(xhr.responseText));
+                } catch {
+                    reject(new Error('Invalid response'));
+                }
+            } else {
+                reject(new Error(xhr.responseText || 'Upload failed'));
+            }
+        });
+
+        xhr.addEventListener('error', () => {
+            reject(new Error('Network error'));
+        });
+
+        xhr.addEventListener('abort', () => {
+            reject(new Error('Upload cancelled'));
+        });
+
+        xhr.open('POST', `${API_BASE}/api/rooms/${roomSlug}/files`);
+        xhr.withCredentials = true;
+        xhr.setRequestHeader('X-Participant-ID', participantId);
+        xhr.send(formData);
+    });
+}

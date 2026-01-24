@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,38 +12,56 @@ import (
 	"chromatic/internal/api"
 	"chromatic/internal/config"
 	"chromatic/internal/database"
+	"chromatic/internal/logger"
 	"chromatic/internal/webrtc"
 	"chromatic/internal/websocket"
 )
 
 func main() {
-	// Load configuration
+	// Load configuration first (we need production mode for logger)
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
+		// Can't use structured logger yet, fall back to standard
+		slog.Error("Failed to load configuration", "error", err)
+		os.Exit(1)
 	}
+
+	// Initialize structured logger
+	logger.Initialize(cfg.ProductionMode)
+
+	logger.Info("Starting Chromatic server",
+		"port", cfg.Port,
+		"public_url", cfg.PublicURL,
+		"production_mode", cfg.ProductionMode,
+	)
 
 	// Initialize database
 	db, err := database.New(cfg.DatabasePath)
 	if err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
+		logger.Error("Failed to initialize database", "error", err, "path", cfg.DatabasePath)
+		os.Exit(1)
 	}
 	defer db.Close()
 
 	// Run migrations
 	if err := db.Migrate(); err != nil {
-		log.Fatalf("Failed to run migrations: %v", err)
+		logger.Error("Failed to run migrations", "error", err)
+		os.Exit(1)
 	}
+	logger.Info("Database initialized", "path", cfg.DatabasePath)
 
 	// Initialize WebRTC SFU
 	sfu, err := webrtc.NewSFU(cfg)
 	if err != nil {
-		log.Fatalf("Failed to initialize SFU: %v", err)
+		logger.Error("Failed to initialize SFU", "error", err)
+		os.Exit(1)
 	}
+	logger.Info("WebRTC SFU initialized")
 
 	// Initialize WebSocket hub
 	hub := websocket.NewHub()
 	go hub.Run()
+	logger.Info("WebSocket hub started")
 
 	// Create HTTP router
 	router := api.NewRouter(cfg, db, sfu, hub)
@@ -59,19 +77,19 @@ func main() {
 
 	// Start server in goroutine
 	go func() {
-		log.Printf("Chromatic server starting on %s", cfg.ListenAddr())
-		log.Printf("Public URL: %s", cfg.PublicURL)
+		logger.Info("HTTP server listening", "addr", cfg.ListenAddr())
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server error: %v", err)
+			logger.Error("Server error", "error", err)
+			os.Exit(1)
 		}
 	}()
 
 	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	sig := <-quit
 
-	log.Println("Shutting down server...")
+	logger.Info("Shutdown signal received", "signal", sig.String())
 
 	// Graceful shutdown with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -79,14 +97,16 @@ func main() {
 
 	// Stop accepting new WebRTC connections
 	sfu.Shutdown()
+	logger.Info("WebRTC SFU stopped")
 
 	// Close all WebSocket connections
 	hub.Shutdown()
+	logger.Info("WebSocket hub stopped")
 
 	// Shutdown HTTP server
 	if err := server.Shutdown(ctx); err != nil {
-		log.Printf("Server forced to shutdown: %v", err)
+		logger.Error("Server forced to shutdown", "error", err)
 	}
 
-	log.Println("Server stopped")
+	logger.Info("Server stopped gracefully")
 }

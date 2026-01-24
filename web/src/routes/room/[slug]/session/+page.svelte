@@ -347,7 +347,12 @@
         </div>
     </div>
 
-    <ChatPanel isOpen={isChatOpen} onClose={() => (isChatOpen = false)} />
+    <ChatPanel
+        isOpen={isChatOpen}
+        onClose={() => (isChatOpen = false)}
+        roomSlug={slug}
+        participantId={sessionData?.participantId || ""}
+    />
     <BrowserToast />
 </main>
 

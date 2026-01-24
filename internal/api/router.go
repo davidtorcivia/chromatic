@@ -22,6 +22,7 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 
 	streamKeyHandler := handlers.NewStreamKeyHandler(db)
 	fileHandler := handlers.NewFileHandler(db, cfg)
+	configHandler := handlers.NewConfigHandler(db, cfg)
 	wsHandler := handlers.NewWebSocketHandler(db, hub, sfu, cfg.AllowedOrigins, cfg.ProductionMode, cfg.AdminToken)
 	authHandler := handlers.NewAuthHandler(cfg.AdminToken, cfg.ProductionMode)
 
@@ -72,6 +73,13 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	adminMux.HandleFunc("GET /api/rooms/{slug}/waiting", roomHandler.ListWaiting)
 	adminMux.HandleFunc("POST /api/rooms/{slug}/admit/{id}", roomHandler.AdmitParticipant)
 	adminMux.HandleFunc("POST /api/rooms/{slug}/admit-all", roomHandler.AdmitAll)
+
+	// Config (admin)
+	adminMux.HandleFunc("GET /api/config", configHandler.Get)
+	adminMux.HandleFunc("PATCH /api/config", configHandler.Update)
+	adminMux.HandleFunc("POST /api/config/logo", configHandler.UploadLogo)
+	adminMux.HandleFunc("GET /api/config/logo", configHandler.GetLogo)
+	adminMux.HandleFunc("DELETE /api/config/logo", configHandler.DeleteLogo)
 
 	// Wrap admin routes with auth middleware
 	authConfig := middleware.AuthConfig{

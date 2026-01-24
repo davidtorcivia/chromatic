@@ -5,12 +5,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"regexp"
 	"time"
 
 	"chromatic/internal/database"
+	"chromatic/internal/logger"
 	"chromatic/internal/models"
 
 	"golang.org/x/crypto/bcrypt"
@@ -81,7 +81,8 @@ func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
-		http.Error(w, "Database error", http.StatusInternalServerError)
+		logger.Error("Failed to list rooms", "error", err, "status_filter", status)
+		http.Error(w, "Failed to retrieve rooms", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -97,7 +98,8 @@ func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 			&room.CreatedAt, &room.StartedAt, &room.EndedAt,
 		)
 		if err != nil {
-			http.Error(w, "Database error", http.StatusInternalServerError)
+			logger.Error("Failed to scan room row", "error", err)
+			http.Error(w, "Failed to retrieve rooms", http.StatusInternalServerError)
 			return
 		}
 		rooms = append(rooms, room)
@@ -223,13 +225,16 @@ func (h *RoomHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// Build update query dynamically
 	// Note: In production, use a proper query builder
 	allowed := map[string]string{
-		"name":               "name",
-		"scheduledAt":        "scheduled_at",
-		"durationMinutes":    "duration_minutes",
-		"waitingRoomEnabled": "waiting_room_enabled",
-		"streamKeyId":        "stream_key_id",
-		"watermarkMode":      "watermark_mode",
-		"watermarkText":      "watermark_text",
+		"name":                  "name",
+		"scheduledAt":           "scheduled_at",
+		"durationMinutes":       "duration_minutes",
+		"waitingRoomEnabled":    "waiting_room_enabled",
+		"streamKeyId":           "stream_key_id",
+		"watermarkMode":         "watermark_mode",
+		"watermarkText":         "watermark_text",
+		"watermarkLogoPath":     "watermark_logo_path",
+		"watermarkLogoPosition": "watermark_logo_position",
+		"watermarkOpacity":      "watermark_opacity",
 	}
 
 	query := "UPDATE rooms SET "
@@ -405,8 +410,8 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 	// Generate signed join token (valid for 24 hours)
 	token, err := h.tokenManager.GenerateToken(participantID, slug, req.Name, 24*time.Hour)
 	if err != nil {
-		log.Printf("Failed to generate token: %v", err)
-		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+		logger.Error("Failed to generate join token", "error", err, "room", slug, "participant", participantID)
+		http.Error(w, "Failed to generate authentication token", http.StatusInternalServerError)
 		return
 	}
 
@@ -583,7 +588,7 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 	if h.sfu != nil {
 		if err := h.sfu.BindIngestToRoom(streamKeyToken, roomSlug); err != nil {
 			// Log but don't fail - room is already marked live
-			log.Printf("Warning: failed to bind ingest to room %s: %v", roomSlug, err)
+			logger.Warn("Failed to bind ingest to room", "room", roomSlug, "error", err)
 		}
 	}
 
@@ -597,7 +602,7 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 		h.onRoomLive(roomSlug)
 	}
 
-	log.Printf("Room %s is now live", roomSlug)
+	logger.Info("Room is now live", "room", roomSlug)
 	return nil
 }
 
@@ -624,7 +629,7 @@ func (h *RoomHandler) OnStreamEnd(streamKeyToken string) {
 		}, "")
 	}
 
-	log.Printf("Stream paused for room %s (OBS disconnected)", roomSlug)
+	logger.Info("Stream paused (OBS disconnected)", "room", roomSlug)
 }
 
 func (h *RoomHandler) getRoomBySlug(slug string) (*models.Room, error) {

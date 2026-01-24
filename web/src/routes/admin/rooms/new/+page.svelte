@@ -13,8 +13,10 @@
     let password = $state("");
     let waitingRoomEnabled = $state(false);
     let streamKeyId = $state<string>("");
-    let watermarkMode = $state<"none" | "text">("text");
+    let watermarkMode = $state<"none" | "text" | "logo" | "both">("text");
     let watermarkText = $state("{{ name }} - {{ date }}");
+    let watermarkLogoPosition = $state<"top-left" | "top-right" | "bottom-left" | "bottom-right">("bottom-right");
+    let watermarkOpacity = $state(0.3);
 
     onMount(async () => {
         try {
@@ -70,8 +72,16 @@
                 roomData.streamKeyId = streamKeyId;
             }
 
-            if (watermarkMode === "text" && watermarkText) {
+            if (watermarkMode === "text" || watermarkMode === "both") {
                 roomData.watermarkText = watermarkText;
+            }
+
+            if (watermarkMode === "logo" || watermarkMode === "both") {
+                roomData.watermarkLogoPosition = watermarkLogoPosition;
+            }
+
+            if (watermarkMode !== "none") {
+                roomData.watermarkOpacity = watermarkOpacity;
             }
 
             await rooms.create(roomData);
@@ -220,12 +230,30 @@
                                 value="text"
                                 bind:group={watermarkMode}
                             />
-                            <span>Text Watermark</span>
+                            <span>Text</span>
+                        </label>
+                        <label class="radio-label">
+                            <input
+                                type="radio"
+                                name="watermarkMode"
+                                value="logo"
+                                bind:group={watermarkMode}
+                            />
+                            <span>Logo</span>
+                        </label>
+                        <label class="radio-label">
+                            <input
+                                type="radio"
+                                name="watermarkMode"
+                                value="both"
+                                bind:group={watermarkMode}
+                            />
+                            <span>Both</span>
                         </label>
                     </div>
                 </div>
 
-                {#if watermarkMode === "text"}
+                {#if watermarkMode === "text" || watermarkMode === "both"}
                     <div class="form-group">
                         <label for="watermarkText">Watermark Text</label>
                         <input
@@ -236,9 +264,38 @@
                             placeholder={"{{ name }} - {{ date }}"}
                         />
                         <span class="form-hint">
-                            Use {"{{ name }}"} for viewer name, {"{{ date }}"} for
-                            current date
+                            Variables: {"{{ name }}"}, {"{{ room }}"}, {"{{ date }}"}, {"{{ time }}"}
                         </span>
+                    </div>
+                {/if}
+
+                {#if watermarkMode === "logo" || watermarkMode === "both"}
+                    <div class="form-group">
+                        <label for="logoPosition">Logo Position</label>
+                        <select id="logoPosition" class="input" bind:value={watermarkLogoPosition}>
+                            <option value="top-left">Top Left</option>
+                            <option value="top-right">Top Right</option>
+                            <option value="bottom-left">Bottom Left</option>
+                            <option value="bottom-right">Bottom Right</option>
+                        </select>
+                        <span class="form-hint">
+                            Logo is configured in <a href="/admin/settings">Settings</a>
+                        </span>
+                    </div>
+                {/if}
+
+                {#if watermarkMode !== "none"}
+                    <div class="form-group">
+                        <label for="opacity">Watermark Opacity: {Math.round(watermarkOpacity * 100)}%</label>
+                        <input
+                            type="range"
+                            id="opacity"
+                            class="range-input"
+                            min="0.1"
+                            max="1"
+                            step="0.1"
+                            bind:value={watermarkOpacity}
+                        />
                     </div>
                 {/if}
             </div>
@@ -407,5 +464,32 @@
 
     .btn-secondary:hover {
         background: var(--color-border);
+    }
+
+    .range-input {
+        width: 100%;
+        height: 6px;
+        background: var(--color-surface-elevated);
+        border-radius: var(--radius-full);
+        appearance: none;
+        cursor: pointer;
+    }
+
+    .range-input::-webkit-slider-thumb {
+        appearance: none;
+        width: 16px;
+        height: 16px;
+        background: var(--color-primary);
+        border-radius: 50%;
+        cursor: pointer;
+    }
+
+    .range-input::-moz-range-thumb {
+        width: 16px;
+        height: 16px;
+        background: var(--color-primary);
+        border-radius: 50%;
+        cursor: pointer;
+        border: none;
     }
 </style>

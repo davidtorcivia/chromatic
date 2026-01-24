@@ -148,6 +148,49 @@ chromatic/
 
 See [API Documentation](docs/api.md) for detailed endpoint documentation.
 
+## Deployment
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for detailed production deployment instructions.
+
+## Development Troubleshooting
+
+### WebSocket connection refused
+- Ensure both backend (port 3000) and frontend (port 5173) are running
+- Check that `PUBLIC_URL` matches your development URL
+
+### Stream not connecting
+- Verify stream key token is correct in OBS
+- Check backend logs for WHIP errors
+- Ensure ports 3478 (TURN) are accessible
+
+### "Video not playing" in browser
+- Check browser console for WebRTC errors
+- Ensure ICE servers are being provided
+- Try disabling firewall temporarily to test
+
+### SQLite "database locked" errors
+- Only one write connection at a time
+- Restart the server to clear stuck locks
+- Check disk space is available
+
+### High stream latency
+- Set B-frames to 0 in OBS (critical!)
+- Use `zerolatency` tune preset
+- Reduce video resolution/bitrate if needed
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+Please ensure:
+- All tests pass (`make test`)
+- Code follows existing style
+- Documentation is updated if needed
+
 ## Browser Support
 
 | Browser | Support | Notes |
