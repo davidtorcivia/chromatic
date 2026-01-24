@@ -169,6 +169,9 @@ chromatic/
 | [docs/BACKUP.md](docs/BACKUP.md) | Backup and restore procedures |
 | [docs/DEPLOYMENT_CHECKLIST.md](docs/DEPLOYMENT_CHECKLIST.md) | Pre-flight checklist |
 | [docs/api.md](docs/api.md) | API reference |
+| [docs/VOICE_CHAT.md](docs/VOICE_CHAT.md) | Voice chat system details |
+| [e2e/README.md](e2e/README.md) | End-to-end testing guide |
+| [tests/load/README.md](tests/load/README.md) | Load testing guide |
 
 ## Third-Party TURN Support
 
@@ -183,6 +186,8 @@ See [DEPLOYMENT.md#third-party-turn-servers](DEPLOYMENT.md#third-party-turn-serv
 
 ## Monitoring
 
+### Prometheus Metrics
+
 Prometheus-compatible metrics at `/metrics`:
 
 ```bash
@@ -194,6 +199,26 @@ Key metrics:
 - `chromatic_websocket_connections` - Active WebSocket connections
 - `chromatic_whip_ingests` - Active WHIP streams
 - `chromatic_active_subscribers` - WebRTC subscribers
+- `chromatic_messages_chat_total` - Total chat messages
+- `chromatic_errors_total` - Total errors
+
+### Grafana Dashboard
+
+A pre-built Grafana dashboard is included:
+
+```bash
+# Start monitoring stack with Chromatic
+cd deployments
+docker-compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+```
+
+Access Grafana at `http://localhost:3001` (admin/admin)
+
+The dashboard shows:
+- Active rooms, viewers, and streams
+- Connection history
+- Message throughput
+- Error rates
 
 ## Browser Compatibility
 
@@ -211,14 +236,26 @@ Key metrics:
 ### Running Tests
 
 ```bash
-# Run all tests
+# Run all backend tests
 make test
+
+# Run with race detector
+go test -race ./...
 
 # Run with coverage
 make test-coverage
 
 # Run specific package
 go test ./internal/webrtc/...
+
+# Run frontend tests
+cd web && npm test
+
+# Run E2E tests (requires server running)
+cd e2e && npm test
+
+# Run load tests (requires k6)
+k6 run tests/load/scenarios/concurrent-viewers.js
 ```
 
 ### Building

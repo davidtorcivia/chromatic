@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"crypto/subtle"
+	"fmt"
 	"log"
 	"net/http"
 	"runtime/debug"
@@ -326,6 +327,140 @@ func Recoverer(next http.Handler) http.Handler {
 		}()
 
 		next.ServeHTTP(w, r)
+	})
+}
+
+// EndpointRateLimiterConfig holds configuration for endpoint-specific rate limiting
+type EndpointRateLimiterConfig struct {
+	RequestsPerWindow int           // Max requests per window
+	WindowDuration    time.Duration // Time window (e.g., 1 minute, 1 hour)
+	TrustedProxies    []string      // IP addresses of trusted reverse proxies
+	KeyExtractor      func(r *http.Request) string // Custom key extraction (e.g., include room slug)
+}
+
+// endpointRateLimiter tracks rate limiting state per key
+type endpointRateLimiter struct {
+	requests   int
+	windowStart time.Time
+}
+
+// EndpointRateLimiter creates a rate limiter for specific endpoints with time-window based limits
+func EndpointRateLimiter(cfg EndpointRateLimiterConfig) func(http.Handler) http.Handler {
+	if cfg.RequestsPerWindow <= 0 {
+		cfg.RequestsPerWindow = 10
+	}
+	if cfg.WindowDuration <= 0 {
+		cfg.WindowDuration = time.Minute
+	}
+
+	// Build trusted proxy map for O(1) lookup
+	trustedProxyMap := make(map[string]bool)
+	for _, proxy := range cfg.TrustedProxies {
+		trustedProxyMap[proxy] = true
+	}
+
+	var mu sync.Mutex
+	limiters := make(map[string]*endpointRateLimiter)
+
+	// Cleanup goroutine - run every window duration
+	go func() {
+		ticker := time.NewTicker(cfg.WindowDuration)
+		for range ticker.C {
+			mu.Lock()
+			now := time.Now()
+			for key, limiter := range limiters {
+				// Remove entries older than 2 windows
+				if now.Sub(limiter.windowStart) > cfg.WindowDuration*2 {
+					delete(limiters, key)
+				}
+			}
+			mu.Unlock()
+		}
+	}()
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Get the rate limit key
+			var key string
+			if cfg.KeyExtractor != nil {
+				key = cfg.KeyExtractor(r)
+			} else {
+				key = getClientIP(r, trustedProxyMap)
+			}
+
+			mu.Lock()
+			now := time.Now()
+			limiter, exists := limiters[key]
+
+			if !exists || now.Sub(limiter.windowStart) > cfg.WindowDuration {
+				// New window
+				limiter = &endpointRateLimiter{
+					requests:    1,
+					windowStart: now,
+				}
+				limiters[key] = limiter
+				mu.Unlock()
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Within existing window
+			if limiter.requests >= cfg.RequestsPerWindow {
+				mu.Unlock()
+				// Calculate seconds until window resets
+				retryAfter := int(cfg.WindowDuration.Seconds() - now.Sub(limiter.windowStart).Seconds())
+				if retryAfter < 1 {
+					retryAfter = 1
+				}
+				w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
+				http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+				return
+			}
+
+			limiter.requests++
+			mu.Unlock()
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// RoomJoinRateLimiter creates a rate limiter for room join attempts (password protection)
+// Keys by IP + room slug to limit password guessing per room
+func RoomJoinRateLimiter(trustedProxies []string) func(http.Handler) http.Handler {
+	return EndpointRateLimiter(EndpointRateLimiterConfig{
+		RequestsPerWindow: 5,            // 5 attempts
+		WindowDuration:    time.Minute,  // per minute
+		TrustedProxies:    trustedProxies,
+		KeyExtractor: func(r *http.Request) string {
+			// Build trusted proxy map
+			trustedProxyMap := make(map[string]bool)
+			for _, proxy := range trustedProxies {
+				trustedProxyMap[proxy] = true
+			}
+			ip := getClientIP(r, trustedProxyMap)
+			slug := r.PathValue("slug")
+			return fmt.Sprintf("%s:%s", ip, slug)
+		},
+	})
+}
+
+// RoomCreationRateLimiter creates a rate limiter for room creation (admin protection)
+// 10 rooms per hour per IP
+func RoomCreationRateLimiter(trustedProxies []string) func(http.Handler) http.Handler {
+	return EndpointRateLimiter(EndpointRateLimiterConfig{
+		RequestsPerWindow: 10,          // 10 rooms
+		WindowDuration:    time.Hour,   // per hour
+		TrustedProxies:    trustedProxies,
+	})
+}
+
+// FileUploadRateLimiter creates a rate limiter for file uploads
+// 10 uploads per minute per IP
+func FileUploadRateLimiter(trustedProxies []string) func(http.Handler) http.Handler {
+	return EndpointRateLimiter(EndpointRateLimiterConfig{
+		RequestsPerWindow: 10,           // 10 uploads
+		WindowDuration:    time.Minute,  // per minute
+		TrustedProxies:    trustedProxies,
 	})
 }
 

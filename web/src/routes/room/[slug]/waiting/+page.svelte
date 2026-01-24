@@ -5,10 +5,16 @@
 
     const slug = $page.params.slug!;
 
-    let status = $state<"waiting" | "admitted" | "ended" | "error">("waiting");
+    // Reconnection configuration
+    const RECONNECT_MAX_ATTEMPTS = 10;
+    const RECONNECT_BASE_DELAY = 1000; // 1 second
+    const RECONNECT_MAX_DELAY = 30000; // 30 seconds
+
+    let status = $state<"waiting" | "admitted" | "ended" | "error" | "connection_failed">("waiting");
     let error = $state("");
     let eventSource: EventSource | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout>;
+    let reconnectAttempts = $state(0);
 
     // Get session data from storage
     let sessionData: {
@@ -40,8 +46,26 @@
         }
     });
 
+    // Calculate delay with exponential backoff and jitter
+    function getReconnectDelay(): number {
+        const exponentialDelay = Math.min(
+            RECONNECT_BASE_DELAY * Math.pow(2, reconnectAttempts),
+            RECONNECT_MAX_DELAY
+        );
+        // Add jitter (±25% randomization to prevent thundering herd)
+        const jitter = exponentialDelay * 0.25 * (Math.random() * 2 - 1);
+        return Math.floor(exponentialDelay + jitter);
+    }
+
     function connectSSE() {
         if (!sessionData) return;
+
+        // Check if we've exceeded max retry attempts
+        if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
+            status = "connection_failed";
+            error = "Unable to connect to the waiting room. Please check your connection and try again.";
+            return;
+        }
 
         // Close existing connection if any
         if (eventSource) {
@@ -50,6 +74,11 @@
 
         const url = `/api/rooms/${slug}/waiting/events/${sessionData.participantId}`;
         eventSource = new EventSource(url);
+
+        eventSource.onopen = () => {
+            // Reset retry count on successful connection
+            reconnectAttempts = 0;
+        };
 
         eventSource.onmessage = (event) => {
             try {
@@ -73,11 +102,23 @@
             console.error("SSE error", e);
             eventSource?.close();
 
-            // Reconnect after a delay (with exponential backoff)
+            reconnectAttempts++;
+
+            // Check if max retries exceeded
+            if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
+                status = "connection_failed";
+                error = "Unable to connect to the waiting room. Please check your connection and try again.";
+                return;
+            }
+
+            // Reconnect with exponential backoff
+            const delay = getReconnectDelay();
+            console.log(`SSE reconnecting in ${delay}ms (attempt ${reconnectAttempts}/${RECONNECT_MAX_ATTEMPTS})`);
+
             reconnectTimer = setTimeout(() => {
                 // Before reconnecting, check status via API
                 checkStatusAndReconnect();
-            }, 3000);
+            }, delay);
         };
     }
 
@@ -107,12 +148,29 @@
                 error = "You have been removed from the waiting room.";
                 status = "error";
             } else {
-                // Other error, try to reconnect
+                // Other error, increment attempts and try to reconnect with backoff
+                reconnectAttempts++;
+
+                if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
+                    status = "connection_failed";
+                    error = "Unable to connect to the waiting room. Please check your connection and try again.";
+                    return;
+                }
+
+                const delay = getReconnectDelay();
                 reconnectTimer = setTimeout(() => {
                     connectSSE();
-                }, 5000);
+                }, delay);
             }
         }
+    }
+
+    function handleRetry() {
+        // Reset retry state and attempt to connect again
+        reconnectAttempts = 0;
+        status = "waiting";
+        error = "";
+        connectSSE();
     }
 
     function handleLeave() {
@@ -150,6 +208,20 @@
                 <button class="btn btn-primary" onclick={handleLeave}>
                     Return Home
                 </button>
+            </div>
+        {:else if status === "connection_failed"}
+            <div class="waiting-card error">
+                <div class="error-icon">!</div>
+                <h1>Connection Lost</h1>
+                <p>{error}</p>
+                <div class="button-group">
+                    <button class="btn btn-primary" onclick={handleRetry}>
+                        Try Again
+                    </button>
+                    <button class="btn btn-secondary" onclick={handleLeave}>
+                        Leave
+                    </button>
+                </div>
             </div>
         {:else if status === "error"}
             <div class="waiting-card error">
@@ -227,6 +299,27 @@
 
     .waiting-card.error h1 {
         color: var(--color-error);
+    }
+
+    .error-icon {
+        width: 60px;
+        height: 60px;
+        margin: 0 auto var(--space-lg);
+        background: var(--color-error);
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 2rem;
+        font-weight: bold;
+        color: white;
+    }
+
+    .button-group {
+        display: flex;
+        gap: var(--space-sm);
+        justify-content: center;
+        margin-top: var(--space-lg);
     }
 
     .btn-secondary {

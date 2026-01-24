@@ -1,0 +1,49 @@
+# Prometheus configuration for Chromatic monitoring
+#
+# Usage with Docker Compose:
+#   Add to docker-compose.yml or use docker-compose.monitoring.yml
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+  # Attach these labels to any time series or alerts when communicating with
+  # external systems (federation, remote storage, Alertmanager).
+  external_labels:
+    monitor: 'chromatic-monitor'
+
+# Alertmanager configuration (optional)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#           - alertmanager:9093
+
+# Rule files for alerting (optional)
+# rule_files:
+#   - "alert.rules.yml"
+
+scrape_configs:
+  # Chromatic application metrics
+  - job_name: 'chromatic'
+    static_configs:
+      - targets: ['chromatic:3000']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Optional: Node exporter for system metrics
+  # - job_name: 'node'
+  #   static_configs:
+  #     - targets: ['node-exporter:9100']
+
+  # Optional: Caddy metrics (if enabled)
+  # - job_name: 'caddy'
+  #   static_configs:
+  #     - targets: ['caddy:2019']
+  #   metrics_path: '/metrics'

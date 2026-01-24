@@ -143,13 +143,15 @@
                             class="input slug-input"
                             bind:value={slug}
                             placeholder="my-color-session"
-                            pattern="[a-z0-9-]+"
+                            pattern="[a-z0-9-]{3,64}"
+                            minlength="3"
                             maxlength="64"
                             required
+                            title="3-64 characters: lowercase letters, numbers, and hyphens only"
                         />
                     </div>
                     <span class="form-hint"
-                        >Lowercase letters, numbers, and hyphens only</span
+                        >3-64 characters: lowercase letters, numbers, and hyphens only</span
                     >
                 </div>
             </div>

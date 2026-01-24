@@ -67,7 +67,8 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 
 	// Rooms
 	adminMux.HandleFunc("GET /api/rooms", roomHandler.List)
-	adminMux.HandleFunc("POST /api/rooms", roomHandler.Create)
+	// Room creation rate limited: 10 per hour
+	adminMux.Handle("POST /api/rooms", middleware.RoomCreationRateLimiter(cfg.TrustedProxies)(http.HandlerFunc(roomHandler.Create)))
 	adminMux.HandleFunc("GET /api/rooms/{slug}", roomHandler.Get)
 	adminMux.HandleFunc("PATCH /api/rooms/{slug}", roomHandler.Update)
 	adminMux.HandleFunc("DELETE /api/rooms/{slug}", roomHandler.Delete)
@@ -94,16 +95,16 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	}
 	mux.Handle("/api/", middleware.RequireAuth(authConfig)(adminMux))
 
-	// File endpoints (session auth)
-	mux.HandleFunc("POST /api/rooms/{slug}/files", fileHandler.Upload)
+	// File endpoints (session auth) - rate limited: 10 per minute
+	mux.Handle("POST /api/rooms/{slug}/files", middleware.FileUploadRateLimiter(cfg.TrustedProxies)(http.HandlerFunc(fileHandler.Upload)))
 	mux.HandleFunc("GET /api/files/{id}", fileHandler.Download)
 	mux.HandleFunc("GET /api/files/{id}/thumbnail", fileHandler.Thumbnail)
 
 	// WebSocket endpoint
 	mux.HandleFunc("GET /ws/room/{slug}", wsHandler.HandleConnection)
 
-	// Join API (password validation, etc.)
-	mux.HandleFunc("POST /api/rooms/{slug}/join", roomHandler.Join)
+	// Join API (password validation, etc.) - rate limited: 5 per minute per room per IP
+	mux.Handle("POST /api/rooms/{slug}/join", middleware.RoomJoinRateLimiter(cfg.TrustedProxies)(http.HandlerFunc(roomHandler.Join)))
 	mux.HandleFunc("GET /api/rooms/{slug}/info", roomHandler.PublicInfo)
 	mux.HandleFunc("GET /api/rooms/{slug}/status/{id}", roomHandler.CheckParticipantStatus)
 	mux.HandleFunc("GET /api/rooms/{slug}/waiting/events/{id}", roomHandler.WaitingEvents)

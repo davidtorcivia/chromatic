@@ -173,6 +173,8 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 		AudioEnabled: true,
 		VideoEnabled: true,
 	}
+	// Initialize chat rate limiter: 30 messages per minute
+	client.InitChatRateLimiter()
 
 	// Assign color if not set
 	if color == "" {
@@ -351,6 +353,13 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 }
 
 func (h *WebSocketHandler) handleChatSend(client *websocket.Client, payload json.RawMessage) {
+	// Check chat rate limit: 30 messages per minute
+	if !client.AllowChatMessage() {
+		logger.Debug("Chat rate limit exceeded", "participant_id", client.ID, "room", client.RoomSlug)
+		// Silently drop the message - don't spam the client with errors
+		return
+	}
+
 	var data struct {
 		Content string `json:"content"`
 	}

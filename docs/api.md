@@ -635,11 +635,32 @@ ws://host/ws/room/{slug}?token={jwt}&name={viewerName}
 
 ## Rate Limits
 
-| Endpoint | Limit |
-|----------|-------|
-| General | 20 req/sec per IP |
-| File Upload | 5MB max file size |
-| Logo Upload | 1MB max file size |
+Chromatic implements granular rate limiting to protect against abuse:
+
+### HTTP Endpoints
+
+| Endpoint | Limit | Description |
+|----------|-------|-------------|
+| General API | 20 req/sec/IP | Token bucket with burst of 20 |
+| Room Creation | 10/hour/IP | Prevents room spam |
+| Room Join (Password) | 5/min/IP/room | Prevents password brute-force |
+| File Upload | 10/min/IP | Prevents upload spam |
+
+### WebSocket Messages
+
+| Message Type | Limit | Description |
+|--------------|-------|-------------|
+| Chat Messages | 30/min/user | Prevents chat spam |
+| Cursor Updates | 50/sec | Client-side throttled to 20Hz |
+
+### File Size Limits
+
+| File Type | Limit |
+|-----------|-------|
+| File Upload | 5MB max |
+| Logo Upload | 1MB max |
+
+When rate limited, the server returns `429 Too Many Requests` with a `Retry-After` header indicating when to retry.
 
 ## Error Codes
 

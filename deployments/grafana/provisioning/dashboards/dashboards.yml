@@ -1,0 +1,14 @@
+# Grafana dashboard provisioning
+# Auto-loads dashboards from the dashboards folder
+
+apiVersion: 1
+
+providers:
+  - name: 'Chromatic'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

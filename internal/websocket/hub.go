@@ -64,6 +64,65 @@ type Client struct {
 	IsAdmin      bool
 	AudioEnabled bool
 	VideoEnabled bool
+
+	// Rate limiting for chat messages (30 per minute)
+	chatRateLimiter *RateLimiter
+}
+
+// RateLimiter tracks rate limits per client
+type RateLimiter struct {
+	mu           sync.Mutex
+	windowStart  time.Time
+	requests     int
+	maxRequests  int
+	windowDuration time.Duration
+}
+
+// NewRateLimiter creates a new rate limiter
+func NewRateLimiter(maxRequests int, windowDuration time.Duration) *RateLimiter {
+	return &RateLimiter{
+		windowStart:  time.Now(),
+		requests:     0,
+		maxRequests:  maxRequests,
+		windowDuration: windowDuration,
+	}
+}
+
+// Allow checks if a request is allowed under the rate limit
+func (r *RateLimiter) Allow() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+
+	// Reset window if expired
+	if now.Sub(r.windowStart) > r.windowDuration {
+		r.windowStart = now
+		r.requests = 0
+	}
+
+	// Check if under limit
+	if r.requests >= r.maxRequests {
+		return false
+	}
+
+	r.requests++
+	return true
+}
+
+// InitChatRateLimiter initializes the chat message rate limiter
+// 30 messages per minute per client
+func (c *Client) InitChatRateLimiter() {
+	c.chatRateLimiter = NewRateLimiter(30, time.Minute)
+}
+
+// AllowChatMessage checks if the client can send another chat message
+func (c *Client) AllowChatMessage() bool {
+	if c.chatRateLimiter == nil {
+		// If not initialized, initialize it now (backwards compatibility)
+		c.InitChatRateLimiter()
+	}
+	return c.chatRateLimiter.Allow()
 }
 
 // RoomMessage is a message to be broadcast to a room

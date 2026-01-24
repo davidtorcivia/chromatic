@@ -74,7 +74,23 @@ export class WebRTCManager {
 
         // Handle incoming tracks
         this.pc.ontrack = (event) => {
-            console.log('Received track:', event.track.kind);
+            console.log('Received track:', event.track.kind, 'id:', event.track.id, 'streams:', event.streams.length);
+
+            // Check if this is a voice track from another participant
+            // Server creates voice tracks with ID format: "voice-{participantId}"
+            const trackId = event.track.id;
+            if (trackId.startsWith('voice-')) {
+                const participantId = trackId.substring(6); // Remove "voice-" prefix
+                console.log('Identified voice track from participant:', participantId);
+
+                // Call the voice track callback if provided
+                if (this.options.onVoiceTrack) {
+                    this.options.onVoiceTrack(participantId, event.track);
+                }
+                return;
+            }
+
+            // Not a voice track - it's the main stream
             this.options.onTrack(event);
         };
 

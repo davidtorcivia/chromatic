@@ -31,6 +31,7 @@
     let streamVolume = $state(1.0);
     let voiceVolume = $state(1.0);
     let showVolumeControls = $state(false);
+    let streamError = $state<string | null>(null);
 
     // Get session data from storage
     let sessionData: {
@@ -195,7 +196,23 @@
     function handleTrack(event: RTCTrackEvent) {
         console.log('Received track:', event.track.kind, event.streams);
 
-        if (videoElement && event.streams[0]) {
+        // Clear any previous error state
+        streamError = null;
+
+        // Validate we have the video element and stream
+        if (!videoElement) {
+            console.error('Video element not available');
+            streamError = "Video player not ready. Please refresh the page.";
+            return;
+        }
+
+        if (!event.streams || event.streams.length === 0 || !event.streams[0]) {
+            console.error('No stream available in track event');
+            streamError = "Stream not available. The host may need to restart streaming.";
+            return;
+        }
+
+        try {
             videoElement.srcObject = event.streams[0];
             hasStream = true;
             console.log('Attached stream to video element');
@@ -209,6 +226,10 @@
 
             // Start polling stats for latency display
             startStatsPolling();
+        } catch (err) {
+            console.error('Failed to attach stream to video element:', err);
+            streamError = "Failed to display stream. Please try refreshing the page.";
+            hasStream = false;
         }
     }
 
@@ -388,7 +409,15 @@
                 />
             {/if}
 
-            {#if !hasStream}
+            {#if streamError}
+                <div class="stream-offline error">
+                    <div class="error-icon">!</div>
+                    <p class="error-message">{streamError}</p>
+                    <button class="btn btn-primary" onclick={() => window.location.reload()}>
+                        Refresh Page
+                    </button>
+                </div>
+            {:else if !hasStream}
                 <div class="stream-offline">
                     <div class="waiting-spinner"></div>
                     <p>{isLive ? "Connecting to stream..." : "Waiting for stream..."}</p>
@@ -579,6 +608,30 @@
         background: rgba(0, 0, 0, 0.8);
         color: var(--color-text-muted);
         gap: var(--space-md);
+    }
+
+    .stream-offline.error {
+        gap: var(--space-lg);
+    }
+
+    .stream-offline .error-icon {
+        width: 60px;
+        height: 60px;
+        background: var(--color-error);
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 2rem;
+        font-weight: bold;
+        color: white;
+    }
+
+    .stream-offline .error-message {
+        color: var(--color-text);
+        font-size: 1rem;
+        text-align: center;
+        max-width: 300px;
     }
 
     .controls-overlay {
