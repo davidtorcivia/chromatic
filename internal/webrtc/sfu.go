@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"chromatic/internal/config"
+	"chromatic/internal/metrics"
 
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/intervalpli"
@@ -256,6 +257,8 @@ func (rt *RoomTracks) AddSubscriber(sub *Subscriber) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	rt.Subscribers[sub.ID] = sub
+	// Track active subscriber
+	metrics.Get().ActiveSubscribers.Add(1)
 }
 
 // RemoveSubscriber removes a subscriber from a room
@@ -268,6 +271,8 @@ func (rt *RoomTracks) RemoveSubscriber(id string) {
 			close(sub.done)
 		})
 		delete(rt.Subscribers, id)
+		// Track subscriber removal
+		metrics.Get().ActiveSubscribers.Add(-1)
 	}
 }
 
@@ -443,6 +448,45 @@ func (s *SFU) AddSubscriberICECandidate(roomSlug, subscriberID string, candidate
 	return nil
 }
 
+// HandleIceRestart handles an ICE restart request from a subscriber
+func (s *SFU) HandleIceRestart(roomSlug, subscriberID, sdpOffer string) (string, error) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return "", fmt.Errorf("room not found: %s", roomSlug)
+	}
+
+	room.mu.RLock()
+	sub, ok := room.Subscribers[subscriberID]
+	room.mu.RUnlock()
+
+	if !ok {
+		return "", fmt.Errorf("subscriber not found: %s", subscriberID)
+	}
+
+	// Set the new offer from the client
+	offer := webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer,
+		SDP:  sdpOffer,
+	}
+
+	if err := sub.PeerConnection.SetRemoteDescription(offer); err != nil {
+		return "", fmt.Errorf("failed to set remote description: %w", err)
+	}
+
+	// Create answer
+	answer, err := sub.PeerConnection.CreateAnswer(nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create answer: %w", err)
+	}
+
+	if err := sub.PeerConnection.SetLocalDescription(answer); err != nil {
+		return "", fmt.Errorf("failed to set local description: %w", err)
+	}
+
+	log.Printf("ICE restart completed for subscriber %s", subscriberID)
+	return answer.SDP, nil
+}
+
 // GetIngestForRoom finds the ingest session bound to a room's stream key
 func (s *SFU) GetIngestForRoom(roomSlug string, getStreamKeyToken func(slug string) (string, error)) (*IngestSession, error) {
 	token, err := getStreamKeyToken(roomSlug)
@@ -577,10 +621,11 @@ func (s *SFU) RemoveVoiceSession(roomSlug, participantID string) {
 }
 
 // AddVoiceTrackToSubscriber adds a voice track from one participant to another's subscriber connection
-func (s *SFU) AddVoiceTrackToSubscriber(roomSlug, subscriberID, voiceOwnerID string, remoteTrack *webrtc.TrackRemote) error {
+// Returns the renegotiation offer SDP that needs to be sent to the subscriber
+func (s *SFU) AddVoiceTrackToSubscriber(roomSlug, subscriberID, voiceOwnerID string, remoteTrack *webrtc.TrackRemote) (string, error) {
 	room := s.GetRoomTracksForSlug(roomSlug)
 	if room == nil {
-		return fmt.Errorf("room not found: %s", roomSlug)
+		return "", fmt.Errorf("room not found: %s", roomSlug)
 	}
 
 	room.mu.RLock()
@@ -588,7 +633,7 @@ func (s *SFU) AddVoiceTrackToSubscriber(roomSlug, subscriberID, voiceOwnerID str
 	room.mu.RUnlock()
 
 	if !ok {
-		return fmt.Errorf("subscriber not found: %s", subscriberID)
+		return "", fmt.Errorf("subscriber not found: %s", subscriberID)
 	}
 
 	// Create a local track to forward the remote track
@@ -598,13 +643,13 @@ func (s *SFU) AddVoiceTrackToSubscriber(roomSlug, subscriberID, voiceOwnerID str
 		fmt.Sprintf("voice-stream-%s", voiceOwnerID),
 	)
 	if err != nil {
-		return fmt.Errorf("failed to create local track: %w", err)
+		return "", fmt.Errorf("failed to create local track: %w", err)
 	}
 
 	// Add the track to the subscriber's peer connection
 	_, err = sub.PeerConnection.AddTrack(localTrack)
 	if err != nil {
-		return fmt.Errorf("failed to add track: %w", err)
+		return "", fmt.Errorf("failed to add track: %w", err)
 	}
 
 	// Start forwarding RTP packets from remote to local track
@@ -624,5 +669,82 @@ func (s *SFU) AddVoiceTrackToSubscriber(roomSlug, subscriberID, voiceOwnerID str
 	}()
 
 	log.Printf("Added voice track from %s to subscriber %s", voiceOwnerID, subscriberID)
+
+	// Create renegotiation offer to notify subscriber of new track
+	offer, err := sub.PeerConnection.CreateOffer(nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create renegotiation offer: %w", err)
+	}
+
+	if err := sub.PeerConnection.SetLocalDescription(offer); err != nil {
+		return "", fmt.Errorf("failed to set local description: %w", err)
+	}
+
+	// Wait for ICE gathering
+	gatherComplete := webrtc.GatheringCompletePromise(sub.PeerConnection)
+	<-gatherComplete
+
+	return sub.PeerConnection.LocalDescription().SDP, nil
+}
+
+// RenegotiateSubscriber creates a new offer for a subscriber after tracks have changed
+// This is used when voice tracks are added or removed
+func (s *SFU) RenegotiateSubscriber(roomSlug, subscriberID string) (string, error) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return "", fmt.Errorf("room not found: %s", roomSlug)
+	}
+
+	room.mu.RLock()
+	sub, ok := room.Subscribers[subscriberID]
+	room.mu.RUnlock()
+
+	if !ok {
+		return "", fmt.Errorf("subscriber not found: %s", subscriberID)
+	}
+
+	// Create new offer
+	offer, err := sub.PeerConnection.CreateOffer(nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create offer: %w", err)
+	}
+
+	if err := sub.PeerConnection.SetLocalDescription(offer); err != nil {
+		return "", fmt.Errorf("failed to set local description: %w", err)
+	}
+
+	// Wait for ICE gathering
+	gatherComplete := webrtc.GatheringCompletePromise(sub.PeerConnection)
+	<-gatherComplete
+
+	log.Printf("Renegotiation offer created for subscriber %s", subscriberID)
+	return sub.PeerConnection.LocalDescription().SDP, nil
+}
+
+// HandleRenegotiationAnswer processes an answer from a subscriber during renegotiation
+func (s *SFU) HandleRenegotiationAnswer(roomSlug, subscriberID, sdpAnswer string) error {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return fmt.Errorf("room not found: %s", roomSlug)
+	}
+
+	room.mu.RLock()
+	sub, ok := room.Subscribers[subscriberID]
+	room.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("subscriber not found: %s", subscriberID)
+	}
+
+	answer := webrtc.SessionDescription{
+		Type: webrtc.SDPTypeAnswer,
+		SDP:  sdpAnswer,
+	}
+
+	if err := sub.PeerConnection.SetRemoteDescription(answer); err != nil {
+		return fmt.Errorf("failed to set remote description: %w", err)
+	}
+
+	log.Printf("Renegotiation answer processed for subscriber %s", subscriberID)
 	return nil
 }

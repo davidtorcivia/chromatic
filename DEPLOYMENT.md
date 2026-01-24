@@ -305,18 +305,253 @@ docker-compose logs -f
 docker-compose logs -f chromatic
 ```
 
-## External TURN Server (Optional)
+## Third-Party TURN Servers
 
-For better global connectivity, you can add an external TURN service like Twilio:
+Chromatic includes a self-hosted Coturn server by default, but you may want to use a third-party TURN service for:
 
-1. Sign up for Twilio (or similar service)
-2. Get TURN credentials
-3. Configure in admin Settings page or via environment:
+- **Better global coverage**: CDN-like distributed TURN relays worldwide
+- **Reduced infrastructure**: No need to manage TURN server ports/firewall
+- **Reliability**: Enterprise-grade uptime and redundancy
+- **Scalability**: Handle thousands of concurrent connections without server upgrades
+
+### When to Use Third-Party TURN
+
+| Scenario | Recommendation |
+|----------|----------------|
+| Small team, single region | Self-hosted Coturn is fine |
+| Global audience | Use third-party TURN |
+| Corporate firewalls blocking UDP | Third-party TURN with TCP fallback |
+| High reliability requirements | Third-party TURN |
+| Cost-sensitive deployment | Self-hosted Coturn |
+
+### Supported Third-Party TURN Providers
+
+Chromatic supports any standard TURN service. Here are setup instructions for popular providers:
+
+---
+
+### Twilio Network Traversal Service
+
+**Pricing**: Pay-per-GB (~$0.40/GB for TURN relay)
+
+**Setup**:
+
+1. Create a Twilio account at https://www.twilio.com
+2. Navigate to **Console > Network Traversal > Manage**
+3. Note your **Account SID** and **Auth Token**
+4. Generate TURN credentials (temporary tokens are more secure)
+
+**Configuration**:
 
 ```bash
+# In your .env file
 TURN_EXTERNAL_URL=turn:global.turn.twilio.com:3478?transport=udp
-TURN_EXTERNAL_USER=your_twilio_username
-TURN_EXTERNAL_PASS=your_twilio_credential
+TURN_EXTERNAL_USER=<Account_SID>
+TURN_EXTERNAL_PASS=<Auth_Token>
+```
+
+**For temporary credentials** (recommended for production):
+
+Twilio recommends generating short-lived credentials using their API. You'll need to integrate this into your server. Example credential format:
+```
+Username: <Account_SID>:<timestamp>
+Password: Base64(HMAC-SHA1(<Auth_Token>, <username>))
+```
+
+**Multiple protocols for firewall traversal**:
+```bash
+# UDP (fastest)
+TURN_EXTERNAL_URL=turn:global.turn.twilio.com:3478?transport=udp
+
+# TCP (works through more firewalls)
+TURN_EXTERNAL_URL=turn:global.turn.twilio.com:443?transport=tcp
+
+# TLS (most compatible with corporate firewalls)
+TURN_EXTERNAL_URL=turns:global.turn.twilio.com:443?transport=tcp
+```
+
+---
+
+### Xirsys
+
+**Pricing**: Free tier (500MB/month), paid plans start at $10/month
+
+**Setup**:
+
+1. Create account at https://xirsys.com
+2. Create a channel in the dashboard
+3. Get your credentials from **My Credentials**
+
+**Configuration**:
+
+```bash
+# In your .env file
+TURN_EXTERNAL_URL=turn:ws.xirsys.com:80?transport=udp
+TURN_EXTERNAL_USER=<your-xirsys-username>
+TURN_EXTERNAL_PASS=<your-xirsys-credential>
+```
+
+**Regional endpoints** (for lower latency):
+```bash
+# US East
+TURN_EXTERNAL_URL=turn:us-east-1.xirsys.com:80?transport=udp
+
+# EU West
+TURN_EXTERNAL_URL=turn:eu-west-1.xirsys.com:80?transport=udp
+
+# Asia Pacific
+TURN_EXTERNAL_URL=turn:ap-southeast-1.xirsys.com:80?transport=udp
+```
+
+---
+
+### Metered TURN
+
+**Pricing**: Free tier (50GB/month), pay-as-you-go ~$0.05/GB
+
+**Setup**:
+
+1. Create account at https://www.metered.ca/stun-turn
+2. Create an application
+3. Get credentials from the dashboard
+
+**Configuration**:
+
+```bash
+# In your .env file
+TURN_EXTERNAL_URL=turn:a.relay.metered.ca:443?transport=tcp
+TURN_EXTERNAL_USER=<api-key>
+TURN_EXTERNAL_PASS=<api-secret>
+```
+
+**With TURN over TLS** (for restrictive firewalls):
+```bash
+TURN_EXTERNAL_URL=turns:a.relay.metered.ca:443?transport=tcp
+```
+
+---
+
+### Cloudflare Calls (Beta)
+
+**Pricing**: Part of Cloudflare Workers/Stream pricing
+
+**Note**: Cloudflare Calls provides TURN as part of their WebRTC offering. Check their documentation for the latest integration details.
+
+---
+
+### Google Cloud STUN/TURN
+
+**Pricing**: No free tier for TURN, charges for compute/bandwidth
+
+Google provides STUN servers for free but requires custom infrastructure for TURN:
+```bash
+# Free STUN only (no relay capability)
+stun:stun.l.google.com:19302
+stun:stun1.l.google.com:19302
+```
+
+For full TURN support, deploy your own Coturn on Google Cloud or use a third-party service.
+
+---
+
+### Multiple TURN Servers
+
+Chromatic supports using both self-hosted and third-party TURN servers simultaneously. The client will try servers in order and use the first working one.
+
+```bash
+# In your .env file - use both self-hosted and Twilio
+TURN_EXTERNAL_URL=turn:global.turn.twilio.com:3478?transport=udp
+TURN_EXTERNAL_USER=<twilio_sid>
+TURN_EXTERNAL_PASS=<twilio_token>
+
+# Self-hosted Coturn will also be included automatically
+```
+
+The ICE servers sent to clients will include:
+1. Your self-hosted Coturn (if running)
+2. The external TURN server (if configured)
+3. Public STUN servers (for direct connectivity)
+
+---
+
+### Disabling Self-Hosted TURN
+
+If you only want to use third-party TURN (e.g., to simplify firewall rules):
+
+1. Comment out the `coturn` service in `docker-compose.yml`
+2. Remove ports 3478, 5349, and 49152-65535 from firewall
+3. Configure third-party TURN via environment variables
+
+---
+
+### Testing TURN Connectivity
+
+**Using trickle-ice tool**:
+
+1. Visit https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/
+2. Add your TURN server with credentials
+3. Click "Gather candidates"
+4. Verify you get "relay" type candidates
+
+**Using turnutils_uclient** (from Coturn):
+
+```bash
+turnutils_uclient -u <username> -w <password> <turn-server>:3478
+```
+
+**Expected output**: Should show successful allocation and data transmission.
+
+---
+
+### Monitoring TURN Usage
+
+**Self-hosted Coturn**:
+```bash
+# View Coturn logs
+docker-compose logs -f coturn
+
+# Check active sessions (if redis enabled)
+docker-compose exec coturn turnadmin -l
+```
+
+**Third-party providers**: Check their respective dashboards for:
+- Bandwidth usage
+- Active connections
+- Geographic distribution
+- Error rates
+
+---
+
+### TURN Security Best Practices
+
+1. **Use time-limited credentials** when possible (Twilio, Xirsys support this)
+2. **Rotate credentials** regularly if using static credentials
+3. **Monitor bandwidth** to detect abuse
+4. **Set up billing alerts** on third-party services
+5. **Use TURN over TLS** (turns://) when clients are behind strict firewalls
+
+## Prometheus Metrics
+
+Chromatic exposes Prometheus-compatible metrics at `/metrics`:
+
+```bash
+curl https://stream.yourdomain.com/metrics
+```
+
+**Available metrics**:
+- `chromatic_active_rooms` - Current active rooms
+- `chromatic_websocket_connections` - Active WebSocket connections
+- `chromatic_whip_ingests` - Active WHIP streams from OBS
+- `chromatic_active_subscribers` - WebRTC subscribers receiving stream
+- `chromatic_waiting_participants` - Participants in waiting rooms
+- `chromatic_rooms_created_total` - Total rooms created
+- `chromatic_messages_chat_total` - Total chat messages
+- `chromatic_files_uploaded_total` - Total file uploads
+- `chromatic_uptime_seconds` - Server uptime
+
+**Grafana dashboard** example query:
+```promql
+rate(chromatic_messages_chat_total[5m])
 ```
 
 ## Support

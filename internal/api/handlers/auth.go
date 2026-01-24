@@ -6,9 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
-	"sync"
 	"time"
 
+	"chromatic/internal/database"
 	"chromatic/internal/logger"
 )
 
@@ -21,12 +21,9 @@ const (
 
 // AuthHandler handles authentication endpoints
 type AuthHandler struct {
+	db             *database.DB
 	adminToken     string
 	productionMode bool
-
-	// Session store (in-memory for simplicity)
-	sessions   map[string]*Session
-	sessionsMu sync.RWMutex
 }
 
 // Session represents an authenticated session
@@ -36,12 +33,12 @@ type Session struct {
 	ExpiresAt time.Time
 }
 
-// NewAuthHandler creates a new auth handler
-func NewAuthHandler(adminToken string, productionMode bool) *AuthHandler {
+// NewAuthHandler creates a new auth handler with database persistence
+func NewAuthHandler(db *database.DB, adminToken string, productionMode bool) *AuthHandler {
 	h := &AuthHandler{
+		db:             db,
 		adminToken:     adminToken,
 		productionMode: productionMode,
-		sessions:       make(map[string]*Session),
 	}
 
 	// Start session cleanup goroutine
@@ -50,18 +47,18 @@ func NewAuthHandler(adminToken string, productionMode bool) *AuthHandler {
 	return h
 }
 
-// cleanupExpiredSessions periodically removes expired sessions
+// cleanupExpiredSessions periodically removes expired sessions from the database
 func (h *AuthHandler) cleanupExpiredSessions() {
 	ticker := time.NewTicker(15 * time.Minute)
 	for range ticker.C {
-		h.sessionsMu.Lock()
-		now := time.Now()
-		for id, session := range h.sessions {
-			if now.After(session.ExpiresAt) {
-				delete(h.sessions, id)
-			}
+		result, err := h.db.Exec("DELETE FROM sessions WHERE expires_at < ?", time.Now())
+		if err != nil {
+			logger.Error("Failed to cleanup expired sessions", "error", err)
+			continue
 		}
-		h.sessionsMu.Unlock()
+		if affected, _ := result.RowsAffected(); affected > 0 {
+			logger.Debug("Cleaned up expired sessions", "count", affected)
+		}
 	}
 }
 
@@ -95,16 +92,17 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create session
-	session := &Session{
-		ID:        sessionID,
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(SessionDuration),
+	// Create session in database
+	expiresAt := time.Now().Add(SessionDuration)
+	_, err = h.db.Exec(
+		"INSERT INTO sessions (id, expires_at) VALUES (?, ?)",
+		sessionID, expiresAt,
+	)
+	if err != nil {
+		logger.Error("Failed to create session", "error", err)
+		http.Error(w, "Authentication service temporarily unavailable", http.StatusInternalServerError)
+		return
 	}
-
-	h.sessionsMu.Lock()
-	h.sessions[sessionID] = session
-	h.sessionsMu.Unlock()
 
 	// Set httpOnly cookie
 	cookie := &http.Cookie{
@@ -137,10 +135,11 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	// Get session from cookie
 	cookie, err := r.Cookie(SessionCookieName)
 	if err == nil {
-		// Remove session from store
-		h.sessionsMu.Lock()
-		delete(h.sessions, cookie.Value)
-		h.sessionsMu.Unlock()
+		// Remove session from database
+		_, err = h.db.Exec("DELETE FROM sessions WHERE id = ?", cookie.Value)
+		if err != nil {
+			logger.Warn("Failed to delete session from database", "error", err)
+		}
 	}
 
 	// Clear cookie
@@ -163,19 +162,20 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 
 // ValidateSession checks if a session ID is valid
 func (h *AuthHandler) ValidateSession(sessionID string) bool {
-	h.sessionsMu.RLock()
-	session, exists := h.sessions[sessionID]
-	h.sessionsMu.RUnlock()
+	var expiresAt time.Time
+	err := h.db.QueryRow(
+		"SELECT expires_at FROM sessions WHERE id = ?",
+		sessionID,
+	).Scan(&expiresAt)
 
-	if !exists {
+	if err != nil {
+		// Session not found or database error
 		return false
 	}
 
-	if time.Now().After(session.ExpiresAt) {
+	if time.Now().After(expiresAt) {
 		// Session expired, clean it up
-		h.sessionsMu.Lock()
-		delete(h.sessions, sessionID)
-		h.sessionsMu.Unlock()
+		h.db.Exec("DELETE FROM sessions WHERE id = ?", sessionID)
 		return false
 	}
 

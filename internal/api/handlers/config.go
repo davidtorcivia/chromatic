@@ -2,9 +2,14 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"chromatic/internal/config"
 	"chromatic/internal/database"
@@ -278,4 +283,167 @@ func (h *ConfigHandler) DeleteLogo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// TURNTestResult represents the result of a TURN server test
+type TURNTestResult struct {
+	Server      string `json:"server"`
+	Reachable   bool   `json:"reachable"`
+	Latency     int64  `json:"latency,omitempty"` // milliseconds
+	Error       string `json:"error,omitempty"`
+	Protocol    string `json:"protocol,omitempty"`
+	TestType    string `json:"testType"` // "self-hosted" or "external"
+}
+
+// TURNTestResponse represents the full TURN test response
+type TURNTestResponse struct {
+	Success bool             `json:"success"`
+	Results []TURNTestResult `json:"results"`
+	Message string           `json:"message,omitempty"`
+}
+
+// TestTURN tests connectivity to configured TURN servers
+func (h *ConfigHandler) TestTURN(w http.ResponseWriter, r *http.Request) {
+	var results []TURNTestResult
+
+	// Test self-hosted TURN server (Coturn)
+	if h.cfg.TurnRealm != "" {
+		turnHost := h.cfg.TurnRealm
+		if !strings.Contains(turnHost, ":") {
+			turnHost = turnHost + ":3478"
+		}
+
+		result := testTURNServer(turnHost, "udp", "self-hosted")
+		results = append(results, result)
+
+		// Also test TCP
+		tcpResult := testTURNServer(turnHost, "tcp", "self-hosted")
+		results = append(results, tcpResult)
+	}
+
+	// Test external TURN server if configured
+	if h.cfg.TurnExternalURL != "" {
+		host, protocol, err := parseTURNURL(h.cfg.TurnExternalURL)
+		if err != nil {
+			results = append(results, TURNTestResult{
+				Server:    h.cfg.TurnExternalURL,
+				Reachable: false,
+				Error:     fmt.Sprintf("Invalid TURN URL: %v", err),
+				TestType:  "external",
+			})
+		} else {
+			result := testTURNServer(host, protocol, "external")
+			results = append(results, result)
+		}
+	}
+
+	// Also check database for configured TURN
+	var turnURL *string
+	h.db.QueryRow(`SELECT turn_external_url FROM config WHERE id = 1`).Scan(&turnURL)
+	if turnURL != nil && *turnURL != "" && *turnURL != h.cfg.TurnExternalURL {
+		host, protocol, err := parseTURNURL(*turnURL)
+		if err != nil {
+			results = append(results, TURNTestResult{
+				Server:    *turnURL,
+				Reachable: false,
+				Error:     fmt.Sprintf("Invalid TURN URL: %v", err),
+				TestType:  "external (database)",
+			})
+		} else {
+			result := testTURNServer(host, protocol, "external (database)")
+			results = append(results, result)
+		}
+	}
+
+	// Calculate overall success
+	success := false
+	for _, r := range results {
+		if r.Reachable {
+			success = true
+			break
+		}
+	}
+
+	response := TURNTestResponse{
+		Success: success,
+		Results: results,
+	}
+
+	if len(results) == 0 {
+		response.Message = "No TURN servers configured"
+	} else if success {
+		response.Message = "At least one TURN server is reachable"
+	} else {
+		response.Message = "No TURN servers are reachable"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// testTURNServer tests connectivity to a TURN server
+func testTURNServer(host, protocol, testType string) TURNTestResult {
+	result := TURNTestResult{
+		Server:   host,
+		Protocol: protocol,
+		TestType: testType,
+	}
+
+	// Determine network type
+	network := "tcp"
+	if protocol == "udp" {
+		network = "udp"
+	}
+
+	start := time.Now()
+	timeout := 5 * time.Second
+
+	conn, err := net.DialTimeout(network, host, timeout)
+	if err != nil {
+		result.Reachable = false
+		result.Error = err.Error()
+		logger.Warn("TURN server test failed", "host", host, "protocol", protocol, "error", err)
+		return result
+	}
+	defer conn.Close()
+
+	result.Reachable = true
+	result.Latency = time.Since(start).Milliseconds()
+	logger.Info("TURN server test succeeded", "host", host, "protocol", protocol, "latency_ms", result.Latency)
+
+	return result
+}
+
+// parseTURNURL parses a TURN URL and returns host:port and protocol
+func parseTURNURL(turnURL string) (host string, protocol string, err error) {
+	// Handle turn: and turns: schemes
+	turnURL = strings.TrimPrefix(turnURL, "turn:")
+	turnURL = strings.TrimPrefix(turnURL, "turns:")
+	turnURL = strings.TrimPrefix(turnURL, "//")
+
+	// Check for transport parameter
+	protocol = "udp" // default
+	if strings.Contains(turnURL, "?") {
+		parts := strings.SplitN(turnURL, "?", 2)
+		turnURL = parts[0]
+		query, err := url.ParseQuery(parts[1])
+		if err == nil {
+			if transport := query.Get("transport"); transport != "" {
+				protocol = strings.ToLower(transport)
+			}
+		}
+	}
+
+	// Parse host:port
+	host = turnURL
+	if !strings.Contains(host, ":") {
+		// Add default port based on protocol
+		if protocol == "tcp" || protocol == "tls" {
+			host = host + ":443"
+		} else {
+			host = host + ":3478"
+		}
+	}
+
+	return host, protocol, nil
 }

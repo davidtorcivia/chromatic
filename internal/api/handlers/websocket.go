@@ -11,6 +11,7 @@ import (
 	"chromatic/internal/api/middleware"
 	"chromatic/internal/database"
 	"chromatic/internal/logger"
+	"chromatic/internal/metrics"
 	"chromatic/internal/webrtc"
 	"chromatic/internal/websocket"
 
@@ -249,14 +250,25 @@ func (h *WebSocketHandler) InitiateSubscriptionsForRoom(roomSlug string) {
 
 // sendRoomState sends the initial room state to a newly connected client
 func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) {
-	// Get room info
+	// Get room info including watermark settings
 	var roomName string
 	var isLive bool
 	var roomStatus string
+	var watermarkMode string
+	var watermarkText *string
+	var watermarkLogoPath *string
+	var watermarkLogoPosition string
+	var watermarkOpacity float64
 
 	err := h.db.QueryRow(`
-		SELECT name, status FROM rooms WHERE slug = ?
-	`, slug).Scan(&roomName, &roomStatus)
+		SELECT name, status,
+			COALESCE(watermark_mode, 'none'),
+			watermark_text,
+			watermark_logo_path,
+			COALESCE(watermark_logo_position, 'bottom-right'),
+			COALESCE(watermark_opacity, 0.3)
+		FROM rooms WHERE slug = ?
+	`, slug).Scan(&roomName, &roomStatus, &watermarkMode, &watermarkText, &watermarkLogoPath, &watermarkLogoPosition, &watermarkOpacity)
 
 	if err != nil {
 		return
@@ -278,11 +290,26 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 		})
 	}
 
+	// Build room data with watermark config
+	roomData := map[string]interface{}{
+		"slug":                  slug,
+		"name":                  roomName,
+		"watermarkMode":         watermarkMode,
+		"watermarkLogoPosition": watermarkLogoPosition,
+		"watermarkOpacity":      watermarkOpacity,
+	}
+
+	// Add optional watermark fields if set
+	if watermarkText != nil {
+		roomData["watermarkText"] = *watermarkText
+	}
+	if watermarkLogoPath != nil && *watermarkLogoPath != "" {
+		// Construct logo URL for client
+		roomData["watermarkLogoUrl"] = "/api/config/logo"
+	}
+
 	client.SendJSON("room:state", map[string]interface{}{
-		"room": map[string]interface{}{
-			"slug": slug,
-			"name": roomName,
-		},
+		"room":         roomData,
 		"participants": participantData,
 		"isLive":       isLive,
 		"iceServers":   h.sfu.GetICEServers(),
@@ -293,10 +320,13 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket.Message) {
 	switch msg.Type {
 	case "chat:send":
+		metrics.Get().TotalMessagesChat.Add(1)
 		h.handleChatSend(client, msg.Payload)
 	case "cursor":
+		metrics.Get().TotalMessagesCursor.Add(1)
 		h.handleCursor(client, msg.Payload)
 	case "media:toggle":
+		metrics.Get().TotalMessagesMedia.Add(1)
 		h.handleMediaToggle(client, msg.Payload)
 	case "signal:offer":
 		h.handleSignalOffer(client, msg.Payload)
@@ -304,6 +334,10 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 		h.handleSignalAnswer(client, msg.Payload)
 	case "signal:candidate":
 		h.handleSignalCandidate(client, msg.Payload)
+	case "signal:ice-restart":
+		h.handleIceRestart(client, msg.Payload)
+	case "signal:renegotiate-answer":
+		h.handleRenegotiateAnswer(client, msg.Payload)
 	// Admin commands
 	case "admin:mute":
 		h.handleAdminMute(client, msg.Payload)
@@ -431,15 +465,20 @@ func (h *WebSocketHandler) forwardVoiceTrack(roomSlug, participantID string, tra
 		}
 
 		// Add the voice track to this client's subscriber connection
-		if err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, client.ID, participantID, track); err != nil {
+		// This returns a renegotiation offer that must be sent to the client
+		offerSDP, err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, client.ID, participantID, track)
+		if err != nil {
 			logger.Warn("Failed to add voice track to subscriber", "subscriber_id", client.ID, "source_id", participantID, "error", err)
 			continue
 		}
 
-		// Notify client about the new voice track
-		client.SendJSON("voice:track", map[string]interface{}{
-			"participantId": participantID,
+		// Send renegotiation offer to client so it can receive the new voice track
+		client.SendJSON("signal:renegotiate", map[string]interface{}{
+			"sdp":           offerSDP,
+			"participantId": participantID, // Who the voice track belongs to
 		})
+
+		logger.Debug("Sent renegotiation offer for voice track", "subscriber_id", client.ID, "source_id", participantID)
 	}
 }
 
@@ -490,6 +529,52 @@ func (h *WebSocketHandler) handleSignalCandidate(client *websocket.Client, paylo
 	}
 
 	logger.Debug("Added ICE candidate from client", "participant_id", client.ID)
+}
+
+func (h *WebSocketHandler) handleIceRestart(client *websocket.Client, payload json.RawMessage) {
+	var data struct {
+		SDP string `json:"sdp"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		logger.Warn("Invalid ICE restart request", "participant_id", client.ID, "error", err)
+		return
+	}
+
+	logger.Info("Processing ICE restart", "participant_id", client.ID, "room", client.RoomSlug)
+
+	// Handle the ICE restart offer and get answer
+	answer, err := h.sfu.HandleIceRestart(client.RoomSlug, client.ID, data.SDP)
+	if err != nil {
+		logger.Error("Failed to handle ICE restart", "participant_id", client.ID, "error", err)
+		return
+	}
+
+	// Send answer back to client
+	client.SendJSON("signal:answer", map[string]interface{}{
+		"sdp": answer,
+	})
+
+	logger.Debug("Sent ICE restart answer", "participant_id", client.ID)
+}
+
+func (h *WebSocketHandler) handleRenegotiateAnswer(client *websocket.Client, payload json.RawMessage) {
+	var data struct {
+		SDP string `json:"sdp"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		logger.Warn("Invalid renegotiate answer", "participant_id", client.ID, "error", err)
+		return
+	}
+
+	logger.Debug("Processing renegotiation answer", "participant_id", client.ID, "room", client.RoomSlug)
+
+	// Process the renegotiation answer
+	if err := h.sfu.HandleRenegotiationAnswer(client.RoomSlug, client.ID, data.SDP); err != nil {
+		logger.Error("Failed to handle renegotiation answer", "participant_id", client.ID, "error", err)
+		return
+	}
+
+	logger.Debug("Renegotiation completed", "participant_id", client.ID)
 }
 
 func (h *WebSocketHandler) handleAdminMute(client *websocket.Client, payload json.RawMessage) {

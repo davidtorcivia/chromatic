@@ -16,6 +16,7 @@ import (
 	"chromatic/internal/config"
 	"chromatic/internal/database"
 	"chromatic/internal/logger"
+	"chromatic/internal/metrics"
 
 	"golang.org/x/image/draw"
 )
@@ -172,6 +173,9 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(mimeType, "image/") {
 		response["thumbnailUrl"] = fmt.Sprintf("/api/files/%s/thumbnail", fileID)
 	}
+
+	// Track file upload
+	metrics.Get().TotalFilesUploaded.Add(1)
 
 	w.WriteHeader(http.StatusCreated)
 	respondJSON(w, response)

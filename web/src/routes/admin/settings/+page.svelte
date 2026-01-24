@@ -1,11 +1,13 @@
 <script lang="ts">
     import { onMount } from "svelte";
-    import { appConfig, type AppConfig } from "$lib/api/client";
+    import { appConfig, type AppConfig, type TURNTestResponse } from "$lib/api/client";
 
     let config = $state<AppConfig | null>(null);
     let isLoading = $state(true);
     let isSaving = $state(false);
     let isUploadingLogo = $state(false);
+    let isTesting = $state(false);
+    let turnTestResults = $state<TURNTestResponse | null>(null);
     let error = $state("");
     let successMessage = $state("");
 
@@ -134,6 +136,24 @@
             navigator.clipboard.writeText(config.whipFormat);
             successMessage = "WHIP URL format copied to clipboard";
             setTimeout(() => (successMessage = ""), 3000);
+        }
+    }
+
+    async function handleTestTurn() {
+        isTesting = true;
+        turnTestResults = null;
+        error = "";
+
+        try {
+            turnTestResults = await appConfig.testTurn();
+            if (turnTestResults.success) {
+                successMessage = "TURN connectivity test passed!";
+                setTimeout(() => (successMessage = ""), 5000);
+            }
+        } catch (e: any) {
+            error = e.message || "Failed to test TURN connectivity";
+        } finally {
+            isTesting = false;
         }
     }
 </script>
@@ -307,14 +327,71 @@
                     {/if}
                 </div>
 
-                <button
-                    type="submit"
-                    class="btn btn-primary"
-                    disabled={isSaving}
-                >
-                    {isSaving ? "Saving..." : "Save TURN Settings"}
-                </button>
+                <div class="button-row">
+                    <button
+                        type="submit"
+                        class="btn btn-primary"
+                        disabled={isSaving}
+                    >
+                        {isSaving ? "Saving..." : "Save TURN Settings"}
+                    </button>
+                    <button
+                        type="button"
+                        class="btn btn-secondary"
+                        onclick={handleTestTurn}
+                        disabled={isTesting}
+                    >
+                        {isTesting ? "Testing..." : "Test TURN Connectivity"}
+                    </button>
+                </div>
             </form>
+
+            {#if turnTestResults}
+                <div class="turn-test-results">
+                    <h3>Connectivity Test Results</h3>
+                    <div class="test-summary" class:success={turnTestResults.success} class:failure={!turnTestResults.success}>
+                        {turnTestResults.message}
+                    </div>
+                    {#if turnTestResults.results.length > 0}
+                        <table class="test-results-table">
+                            <thead>
+                                <tr>
+                                    <th>Server</th>
+                                    <th>Type</th>
+                                    <th>Protocol</th>
+                                    <th>Status</th>
+                                    <th>Latency</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {#each turnTestResults.results as result}
+                                    <tr>
+                                        <td><code>{result.server}</code></td>
+                                        <td>{result.testType}</td>
+                                        <td>{result.protocol || 'n/a'}</td>
+                                        <td>
+                                            {#if result.reachable}
+                                                <span class="status-badge success">Reachable</span>
+                                            {:else}
+                                                <span class="status-badge failure">Failed</span>
+                                            {/if}
+                                        </td>
+                                        <td>
+                                            {#if result.latency}
+                                                {result.latency}ms
+                                            {:else if result.error}
+                                                <span class="error-text" title={result.error}>Error</span>
+                                            {:else}
+                                                -
+                                            {/if}
+                                        </td>
+                                    </tr>
+                                {/each}
+                            </tbody>
+                        </table>
+                    {/if}
+                </div>
+            {/if}
         </section>
     {/if}
 </div>
@@ -497,5 +574,93 @@
 
     .btn-danger-text:hover {
         background: rgba(239, 68, 68, 0.1);
+    }
+
+    .button-row {
+        display: flex;
+        gap: var(--space-sm);
+        flex-wrap: wrap;
+    }
+
+    .turn-test-results {
+        margin-top: var(--space-lg);
+        padding-top: var(--space-lg);
+        border-top: 1px solid var(--color-border);
+    }
+
+    .turn-test-results h3 {
+        font-size: 0.875rem;
+        font-weight: 600;
+        margin: 0 0 var(--space-sm);
+    }
+
+    .test-summary {
+        padding: var(--space-sm) var(--space-md);
+        border-radius: var(--radius-md);
+        font-size: 0.875rem;
+        margin-bottom: var(--space-md);
+    }
+
+    .test-summary.success {
+        background: rgba(34, 197, 94, 0.1);
+        border: 1px solid var(--color-success);
+        color: var(--color-success);
+    }
+
+    .test-summary.failure {
+        background: rgba(239, 68, 68, 0.1);
+        border: 1px solid var(--color-error);
+        color: var(--color-error);
+    }
+
+    .test-results-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.875rem;
+    }
+
+    .test-results-table th,
+    .test-results-table td {
+        padding: var(--space-sm);
+        text-align: left;
+        border-bottom: 1px solid var(--color-border);
+    }
+
+    .test-results-table th {
+        font-weight: 500;
+        color: var(--color-text-muted);
+        font-size: 0.75rem;
+        text-transform: uppercase;
+    }
+
+    .test-results-table code {
+        font-size: 0.75rem;
+        background: var(--color-surface-elevated);
+        padding: 0.1em 0.3em;
+        border-radius: var(--radius-sm);
+    }
+
+    .status-badge {
+        display: inline-block;
+        padding: 0.15em 0.5em;
+        border-radius: var(--radius-sm);
+        font-size: 0.75rem;
+        font-weight: 500;
+    }
+
+    .status-badge.success {
+        background: rgba(34, 197, 94, 0.1);
+        color: var(--color-success);
+    }
+
+    .status-badge.failure {
+        background: rgba(239, 68, 68, 0.1);
+        color: var(--color-error);
+    }
+
+    .error-text {
+        color: var(--color-error);
+        cursor: help;
+        text-decoration: underline dotted;
     }
 </style>

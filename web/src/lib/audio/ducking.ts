@@ -23,14 +23,45 @@ export class AudioDuckingManager {
     private config: DuckingConfig;
     private isAdmin: boolean;
     private voiceAnalysers: Map<string, AnalyserNode> = new Map();
+    private voiceGainNodes: Map<string, GainNode> = new Map();
     private isDucked: boolean = false;
     private releaseTimer: ReturnType<typeof setTimeout> | null = null;
     private monitorFrame: number | null = null;
+    private baseStreamVolume: number = 1.0;
+    private voiceVolume: number = 1.0;
 
     constructor(streamElement: HTMLMediaElement, isAdmin: boolean, config?: Partial<DuckingConfig>) {
         this.streamElement = streamElement;
         this.isAdmin = isAdmin;
         this.config = { ...DEFAULT_CONFIG, ...config };
+        this.baseStreamVolume = streamElement.volume;
+    }
+
+    // Volume control methods
+    setStreamVolume(volume: number): void {
+        this.baseStreamVolume = Math.max(0, Math.min(1, volume));
+        // Apply immediately if not ducked, otherwise apply with duck level
+        if (!this.isDucked) {
+            this.streamElement.volume = this.baseStreamVolume;
+        } else {
+            this.streamElement.volume = this.baseStreamVolume * this.config.duckLevel;
+        }
+    }
+
+    getStreamVolume(): number {
+        return this.baseStreamVolume;
+    }
+
+    setVoiceVolume(volume: number): void {
+        this.voiceVolume = Math.max(0, Math.min(1, volume));
+        // Apply to all voice gain nodes
+        for (const gainNode of this.voiceGainNodes.values()) {
+            gainNode.gain.value = this.voiceVolume;
+        }
+    }
+
+    getVoiceVolume(): number {
+        return this.voiceVolume;
     }
 
     async addVoiceTrack(participantId: string, track: MediaStreamTrack): Promise<void> {
@@ -41,8 +72,17 @@ export class AudioDuckingManager {
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 256;
 
+        // Create gain node for volume control
+        const gainNode = ctx.createGain();
+        gainNode.gain.value = this.voiceVolume;
+
+        // Connect: source -> analyser -> gainNode -> destination
         source.connect(analyser);
+        analyser.connect(gainNode);
+        gainNode.connect(ctx.destination);
+
         this.voiceAnalysers.set(participantId, analyser);
+        this.voiceGainNodes.set(participantId, gainNode);
 
         // Start monitoring if not already
         if (!this.monitorFrame) {
@@ -51,6 +91,13 @@ export class AudioDuckingManager {
     }
 
     removeVoiceTrack(participantId: string): void {
+        // Disconnect and remove gain node
+        const gainNode = this.voiceGainNodes.get(participantId);
+        if (gainNode) {
+            gainNode.disconnect();
+            this.voiceGainNodes.delete(participantId);
+        }
+
         this.voiceAnalysers.delete(participantId);
 
         if (this.voiceAnalysers.size === 0 && this.monitorFrame) {
@@ -115,7 +162,8 @@ export class AudioDuckingManager {
         }, this.config.holdTime);
     }
 
-    private animateVolume(target: number, duration: number): void {
+    private animateVolume(targetMultiplier: number, duration: number): void {
+        const targetVolume = this.baseStreamVolume * targetMultiplier;
         const start = this.streamElement.volume;
         const startTime = performance.now();
 
@@ -124,7 +172,7 @@ export class AudioDuckingManager {
             const progress = Math.min(1, elapsed / duration);
             const eased = this.easeOutQuad(progress);
 
-            this.streamElement.volume = start + (target - start) * eased;
+            this.streamElement.volume = start + (targetVolume - start) * eased;
 
             if (progress < 1) {
                 requestAnimationFrame(animate);
@@ -145,6 +193,11 @@ export class AudioDuckingManager {
         if (this.releaseTimer) {
             clearTimeout(this.releaseTimer);
         }
+        // Disconnect all gain nodes
+        for (const gainNode of this.voiceGainNodes.values()) {
+            gainNode.disconnect();
+        }
+        this.voiceGainNodes.clear();
         this.voiceAnalysers.clear();
     }
 }

@@ -1,18 +1,34 @@
 # Chromatic
 
-Self-hosted, low-latency streaming platform for professional colorists to conduct remote grading sessions with advertising creatives and directors.
+**Self-hosted, low-latency streaming platform for professional colorists to conduct remote grading sessions with advertising creatives and directors.**
 
-## Features
+Chromatic enables real-time color-critical streaming from DaVinci Resolve via OBS, with interactive review tools, voice chat, and client-friendly browser-based viewing. Built for small teams (2-8 viewers) who need sub-second latency without compromising on color accuracy.
 
-- **High-Fidelity Streaming**: 8-10 Mbps WebRTC streaming optimized for color-critical work on MacBook Pro XDR displays
-- **Sub-second Latency**: Real-time WebRTC streaming from DaVinci Resolve via OBS
-- **Interactive Review**: Laser pointer visible to all participants for precise feedback
-- **Client-Friendly**: No-install, browser-based viewing optimized for non-technical stakeholders
-- **Voice Chat**: Built-in audio with intelligent ducking when participants speak
-- **File Sharing**: Share images, audio references, and PDFs during sessions
-- **Watermarking**: Text and logo watermarks with anti-tampering protection
-- **Waiting Room**: Control when participants can enter sessions
-- **Password Protection**: Secure rooms with password access
+## Key Features
+
+### Streaming
+- **Sub-second latency**: WebRTC streaming optimized for real-time collaboration
+- **High fidelity**: Up to 10 Mbps streaming for color-critical work
+- **OBS integration**: Native WHIP protocol support (OBS 30+)
+- **SFU architecture**: Efficient one-to-many broadcasting via Pion WebRTC
+
+### Collaboration
+- **Laser pointer**: Interactive pointing visible to all participants
+- **Voice chat**: Built-in audio with intelligent ducking when speaking
+- **Chat messaging**: Text communication during sessions
+- **File sharing**: Share images, audio references, and PDFs
+
+### Security & Access Control
+- **Waiting room**: Approve participants before they join
+- **Password protection**: Secure rooms with passwords
+- **Watermarking**: Text and logo watermarks with tamper detection
+- **Session management**: Persistent sessions, kick/mute controls
+
+### Operations
+- **Self-hosted**: Full control over your data
+- **Docker deployment**: One-command deployment with Caddy + Coturn
+- **Third-party TURN**: Support for Twilio, Xirsys, Metered, and others
+- **Prometheus metrics**: Built-in monitoring endpoint
 
 ## Quick Start
 
@@ -20,163 +36,213 @@ Self-hosted, low-latency streaming platform for professional colorists to conduc
 
 - Go 1.22+
 - Node.js 20+
-- Docker (optional, for deployment)
+- Docker and Docker Compose (for deployment)
 - OBS Studio 30+ (for streaming)
 
 ### Development
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/chromatic.git
-   cd chromatic
-   ```
+```bash
+# Clone and enter directory
+git clone https://github.com/yourorg/chromatic.git
+cd chromatic
 
-2. Install dependencies:
-   ```bash
-   make deps
-   ```
+# Install dependencies
+make deps
 
-3. Set up environment variables:
-   ```bash
-   cp deployments/.env.example .env
-   # Edit .env with your configuration
-   ```
+# Configure environment
+cp deployments/.env.example .env
+# Edit .env with your settings
 
-4. Run the backend:
-   ```bash
-   make dev
-   ```
+# Run backend (terminal 1)
+make dev
 
-5. Run the frontend (in a separate terminal):
-   ```bash
-   make dev-frontend
-   ```
+# Run frontend (terminal 2)
+make dev-frontend
+```
 
-### Docker Deployment
+Access at `http://localhost:5173`
 
-1. Configure environment:
-   ```bash
-   cd deployments
-   cp .env.example .env
-   # Generate secrets:
-   # ADMIN_TOKEN=$(openssl rand -hex 32)
-   # TURN_SECRET=$(openssl rand -hex 32)
-   ```
+### Production Deployment
 
-2. Build and run:
-   ```bash
-   make docker-build
-   make docker-up
-   ```
+```bash
+cd deployments
+
+# Configure
+cp .env.example .env
+nano .env  # Set ADMIN_TOKEN, TURN_SECRET, PUBLIC_URL, etc.
+
+# Deploy
+docker-compose up -d
+
+# Verify
+curl https://stream.yourdomain.com/health
+```
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for complete instructions.
 
 ## OBS Configuration
 
-Configure OBS for WHIP streaming:
+1. Open **OBS Settings > Stream**
+2. Set Service to **WHIP**
+3. Enter Server URL: `https://stream.yourdomain.com/whip/{stream-key}`
 
-1. Open OBS Settings → Stream
-2. Service: **WHIP**
-3. Server: `https://your-domain.com/whip/{stream-key}`
+### Critical Encoder Settings
 
-### Required Encoder Settings
+| Setting | Value | Why |
+|---------|-------|-----|
+| Profile | **Baseline** | Main/High can use B-frames |
+| B-Frames | **0** | Non-zero causes 2+ second latency |
+| Keyframe Interval | 2 seconds | Balance latency vs recovery |
+| Tune | zerolatency | Optimizes for real-time |
+| Bitrate | 6000-10000 Kbps | Adjust for your bandwidth |
 
-| Setting | Value |
-|---------|-------|
-| Encoder | x264 / NVENC / QSV |
-| Rate Control | CBR |
-| Bitrate | 6000-10000 Kbps |
-| Keyframe Interval | 2 seconds |
-| Profile | High |
-| Tune | zerolatency |
-| **B-Frames** | **0** (CRITICAL) |
-
-> ⚠️ **Important**: B-frames MUST be set to 0. Non-zero values cause 2+ second latency due to browser reordering issues.
+> **Warning**: B-frames MUST be disabled. This is the #1 cause of high latency issues.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         DOCKER HOST                              │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │                    CHROMATIC SERVER                         │ │
-│  │                                                             │ │
-│  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐     │ │
-│  │  │   Caddy     │    │  Chromatic  │    │   Coturn    │     │ │
-│  │  │  (Proxy)    │───▶│   (Go/SFU)  │    │   (TURN)    │     │ │
-│  │  └─────────────┘    └──────┬──────┘    └─────────────┘     │ │
-│  │                            │                                │ │
-│  │                     ┌──────┴──────┐                        │ │
-│  │                     │   SQLite    │                        │ │
-│  │                     │  (WAL Mode) │                        │ │
-│  │                     └─────────────┘                        │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-         ▲                        ▲                         ▲
-         │ HTTPS/WSS              │ WHIP                    │ WebRTC
-    ┌────┴────┐              ┌────┴────┐              ┌─────┴─────┐
-    │ Browser │              │   OBS   │              │  Clients  │
-    │ (Admin) │              │ Studio  │              │  (2-8)    │
-    └─────────┘              └─────────┘              └───────────┘
+                           Internet
+                              │
+                    ┌─────────┴─────────┐
+                    │      Caddy        │
+                    │  (SSL + Proxy)    │
+                    └─────────┬─────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              │               │               │
+     ┌────────┴────────┐     │      ┌────────┴────────┐
+     │    Chromatic    │     │      │     Coturn      │
+     │   (Go Server)   │     │      │   (TURN Relay)  │
+     │                 │     │      │                 │
+     │ ├ HTTP API      │  SQLite    │ ├ NAT Traversal │
+     │ ├ WebSocket     │  (WAL)     │ └ Media Relay   │
+     │ └ SFU (Pion)    │     │      │                 │
+     └─────────────────┘     │      └─────────────────┘
+              ▲               │               ▲
+              │               │               │
+     ┌────────┴────────┐     │      ┌────────┴────────┐
+     │   OBS Studio    │─────┘      │    Viewers      │
+     │     (WHIP)      │            │   (Browser)     │
+     └─────────────────┘            └─────────────────┘
 ```
 
 ## Technology Stack
 
-- **Backend**: Go 1.22+, Pion WebRTC v4
-- **Frontend**: SvelteKit 2, Svelte 5
-- **Database**: SQLite with WAL mode
-- **Reverse Proxy**: Caddy
-- **TURN Server**: Coturn
-- **Containerization**: Docker Compose
+| Component | Technology |
+|-----------|------------|
+| Backend | Go 1.22+, Pion WebRTC v4 |
+| Frontend | SvelteKit 2, Svelte 5 |
+| Database | SQLite with WAL mode |
+| Reverse Proxy | Caddy (auto SSL) |
+| TURN Server | Coturn |
+| Container | Docker Compose |
 
 ## Project Structure
 
 ```
 chromatic/
-├── cmd/chromatic/              # Application entrypoint
+├── cmd/chromatic/          # Application entrypoint
 ├── internal/
-│   ├── api/                    # HTTP handlers
-│   ├── config/                 # Configuration
-│   ├── database/               # SQLite + migrations
-│   ├── models/                 # Data models
-│   ├── webrtc/                 # Pion WebRTC, SFU, WHIP
-│   └── websocket/              # Real-time messaging
-├── web/                        # SvelteKit frontend
-├── deployments/                # Docker configs
-└── docs/                       # Documentation
+│   ├── api/                # HTTP handlers and middleware
+│   ├── config/             # Configuration management
+│   ├── database/           # SQLite + migrations
+│   ├── metrics/            # Prometheus metrics
+│   ├── webrtc/             # Pion WebRTC, SFU, WHIP
+│   └── websocket/          # Real-time messaging hub
+├── web/                    # SvelteKit frontend
+│   └── src/
+│       ├── lib/            # Shared components and stores
+│       └── routes/         # Pages and layouts
+├── deployments/            # Docker configs
+│   ├── Dockerfile
+│   ├── docker-compose.yml
+│   └── Caddyfile
+└── docs/                   # Documentation
 ```
 
-## API Reference
+## Documentation
 
-See [API Documentation](docs/api.md) for detailed endpoint documentation.
+| Document | Description |
+|----------|-------------|
+| [DEPLOYMENT.md](DEPLOYMENT.md) | Production deployment guide |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Common issues and solutions |
+| [docs/BACKUP.md](docs/BACKUP.md) | Backup and restore procedures |
+| [docs/DEPLOYMENT_CHECKLIST.md](docs/DEPLOYMENT_CHECKLIST.md) | Pre-flight checklist |
+| [docs/api.md](docs/api.md) | API reference |
 
-## Deployment
+## Third-Party TURN Support
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for detailed production deployment instructions.
+Chromatic supports external TURN providers for better global connectivity:
 
-## Development Troubleshooting
+- **Twilio**: Enterprise-grade, pay-per-GB
+- **Xirsys**: Free tier available
+- **Metered**: Generous free tier, low cost
+- **Cloudflare Calls**: Beta
 
-### WebSocket connection refused
-- Ensure both backend (port 3000) and frontend (port 5173) are running
-- Check that `PUBLIC_URL` matches your development URL
+See [DEPLOYMENT.md#third-party-turn-servers](DEPLOYMENT.md#third-party-turn-servers) for setup instructions.
 
-### Stream not connecting
-- Verify stream key token is correct in OBS
-- Check backend logs for WHIP errors
-- Ensure ports 3478 (TURN) are accessible
+## Monitoring
 
-### "Video not playing" in browser
-- Check browser console for WebRTC errors
-- Ensure ICE servers are being provided
-- Try disabling firewall temporarily to test
+Prometheus-compatible metrics at `/metrics`:
 
-### SQLite "database locked" errors
-- Only one write connection at a time
-- Restart the server to clear stuck locks
-- Check disk space is available
+```bash
+curl https://stream.yourdomain.com/metrics
+```
 
-### High stream latency
-- Set B-frames to 0 in OBS (critical!)
-- Use `zerolatency` tune preset
-- Reduce video resolution/bitrate if needed
+Key metrics:
+- `chromatic_active_rooms` - Current active rooms
+- `chromatic_websocket_connections` - Active WebSocket connections
+- `chromatic_whip_ingests` - Active WHIP streams
+- `chromatic_active_subscribers` - WebRTC subscribers
+
+## Browser Compatibility
+
+| Browser | Status | Notes |
+|---------|--------|-------|
+| Safari 15+ (macOS) | Reference | Best color management |
+| Chrome 90+ (macOS) | Primary | Most users |
+| Chrome 90+ (Windows) | Supported | Gamma shifts possible |
+| Edge 90+ | Supported | Chromium-based |
+| Firefox 90+ | Degraded | WebRTC quirks |
+| Mobile Safari/Chrome | Supported | Voice only |
+
+## Development
+
+### Running Tests
+
+```bash
+# Run all tests
+make test
+
+# Run with coverage
+make test-coverage
+
+# Run specific package
+go test ./internal/webrtc/...
+```
+
+### Building
+
+```bash
+# Build binary
+make build
+
+# Build Docker image
+make docker-build
+
+# Build frontend only
+make build-frontend
+```
+
+### Code Style
+
+```bash
+# Format code
+make fmt
+
+# Run linter
+make lint
+```
 
 ## Contributing
 
@@ -188,20 +254,27 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for detailed production deployment instructio
 
 Please ensure:
 - All tests pass (`make test`)
-- Code follows existing style
+- Code follows existing style (`make lint`)
 - Documentation is updated if needed
 
-## Browser Support
+## Troubleshooting
 
-| Browser | Support | Notes |
-|---------|---------|-------|
-| Safari 15+ (macOS) | ✅ Reference | Best color management |
-| Chrome 90+ (macOS) | ✅ Primary | Most users |
-| Chrome 90+ (Windows) | ✅ Supported | Gamma shifts possible |
-| Edge 90+ | ✅ Supported | Chromium-based |
-| Firefox 90+ | ⚠️ Degraded | WebRTC quirks |
-| Mobile Safari | ✅ Supported | Voice only, no camera |
-| Mobile Chrome | ✅ Supported | Voice only, no camera |
+### Stream has high latency
+- Set B-frames to **0** in OBS
+- Use **Baseline** profile (not Main or High)
+- Set tune to **zerolatency**
+
+### Viewers stuck on "Connecting..."
+- Check TURN server is running
+- Verify firewall allows UDP ports 49152-65535
+- Try third-party TURN if behind corporate firewall
+
+### OBS shows "Invalid stream key"
+- Verify stream key exists in admin dashboard
+- Check WHIP URL format (no trailing slash)
+- Ensure SSL certificate is valid
+
+See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for more solutions.
 
 ## License
 
@@ -212,3 +285,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 - [Pion WebRTC](https://github.com/pion/webrtc) - Pure Go WebRTC implementation
 - [SvelteKit](https://kit.svelte.dev/) - Web application framework
 - [Coturn](https://github.com/coturn/coturn) - TURN server
+- [Caddy](https://caddyserver.com/) - Automatic HTTPS reverse proxy

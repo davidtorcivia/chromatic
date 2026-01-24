@@ -7,7 +7,8 @@
 
     let status = $state<"waiting" | "admitted" | "ended" | "error">("waiting");
     let error = $state("");
-    let pollInterval: ReturnType<typeof setInterval>;
+    let eventSource: EventSource | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout>;
 
     // Get session data from storage
     let sessionData: {
@@ -26,18 +27,61 @@
 
         sessionData = JSON.parse(stored);
 
-        // Start polling for admission status
-        checkStatus();
-        pollInterval = setInterval(checkStatus, 3000);
+        // Connect to SSE endpoint for push notifications
+        connectSSE();
     });
 
     onDestroy(() => {
-        if (pollInterval) {
-            clearInterval(pollInterval);
+        if (eventSource) {
+            eventSource.close();
+        }
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
         }
     });
 
-    async function checkStatus() {
+    function connectSSE() {
+        if (!sessionData) return;
+
+        // Close existing connection if any
+        if (eventSource) {
+            eventSource.close();
+        }
+
+        const url = `/api/rooms/${slug}/waiting/events/${sessionData.participantId}`;
+        eventSource = new EventSource(url);
+
+        eventSource.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+
+                if (data.event === "admitted") {
+                    status = "admitted";
+                    eventSource?.close();
+                    // Redirect to session
+                    window.location.href = `/room/${slug}/session`;
+                } else if (data.event === "ended") {
+                    status = "ended";
+                    eventSource?.close();
+                }
+            } catch (e) {
+                console.error("Failed to parse SSE message", e);
+            }
+        };
+
+        eventSource.onerror = (e) => {
+            console.error("SSE error", e);
+            eventSource?.close();
+
+            // Reconnect after a delay (with exponential backoff)
+            reconnectTimer = setTimeout(() => {
+                // Before reconnecting, check status via API
+                checkStatusAndReconnect();
+            }, 3000);
+        };
+    }
+
+    async function checkStatusAndReconnect() {
         if (!sessionData) return;
 
         try {
@@ -45,22 +89,28 @@
 
             if (result.roomStatus === "ended") {
                 status = "ended";
-                clearInterval(pollInterval);
                 return;
             }
 
             if (result.isAdmitted) {
                 status = "admitted";
-                clearInterval(pollInterval);
                 // Redirect to session
                 window.location.href = `/room/${slug}/session`;
+                return;
             }
+
+            // Still waiting, reconnect SSE
+            connectSSE();
         } catch (e: any) {
             // If participant not found, may have been removed
             if (e.message.includes("not found")) {
                 error = "You have been removed from the waiting room.";
                 status = "error";
-                clearInterval(pollInterval);
+            } else {
+                // Other error, try to reconnect
+                reconnectTimer = setTimeout(() => {
+                    connectSSE();
+                }, 5000);
             }
         }
     }

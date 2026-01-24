@@ -160,6 +160,22 @@ export interface UpdateConfigRequest {
     turnExternalCredential?: string;
 }
 
+// TURN test types
+export interface TURNTestResult {
+    server: string;
+    reachable: boolean;
+    latency?: number;
+    error?: string;
+    protocol?: string;
+    testType: string;
+}
+
+export interface TURNTestResponse {
+    success: boolean;
+    results: TURNTestResult[];
+    message?: string;
+}
+
 // Config API functions
 export const appConfig = {
     get: () => apiGet<AppConfig>('/api/config'),
@@ -177,7 +193,8 @@ export const appConfig = {
         }
         return res.json();
     },
-    deleteLogo: () => apiDelete('/api/config/logo')
+    deleteLogo: () => apiDelete('/api/config/logo'),
+    testTurn: () => apiPost<TURNTestResponse>('/api/config/test-turn')
 };
 
 // File upload types

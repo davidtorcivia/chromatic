@@ -3,12 +3,10 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -16,7 +14,7 @@ import (
 	"chromatic/internal/database"
 )
 
-func setupFileTest(t *testing.T) (*FileHandler, *RoomHandler, func()) {
+func setupFileTest(t *testing.T) (*FileHandler, *RoomHandler, *database.DB, func()) {
 	db, dbCleanup := database.NewTestDB(t)
 
 	// Create temp directories for file storage
@@ -37,10 +35,11 @@ func setupFileTest(t *testing.T) (*FileHandler, *RoomHandler, func()) {
 		os.RemoveAll(uploadPath)
 	}
 
-	return fileHandler, roomHandler, cleanup
+	return fileHandler, roomHandler, db, cleanup
 }
 
-func createTestRoom(t *testing.T, handler *RoomHandler, slug string) {
+// createTestRoom creates a room and returns its ID
+func createTestRoom(t *testing.T, handler *RoomHandler, db *database.DB, slug string) string {
 	createBody := map[string]interface{}{
 		"slug":          slug,
 		"name":          "Test Room",
@@ -53,6 +52,25 @@ func createTestRoom(t *testing.T, handler *RoomHandler, slug string) {
 	handler.Create(rr, req)
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("failed to create test room: %s", rr.Body.String())
+	}
+
+	// Get the room ID
+	var roomID string
+	err := db.QueryRow("SELECT id FROM rooms WHERE slug = ?", slug).Scan(&roomID)
+	if err != nil {
+		t.Fatalf("failed to get room ID: %v", err)
+	}
+	return roomID
+}
+
+// createTestParticipant creates a participant record for FK constraint satisfaction
+func createTestParticipant(t *testing.T, db *database.DB, roomID, participantID string) {
+	_, err := db.Exec(`
+		INSERT INTO participants (id, room_id, name, role, color, is_admitted)
+		VALUES (?, ?, 'Test User', 'viewer', '#FF0000', TRUE)
+	`, participantID, roomID)
+	if err != nil {
+		t.Fatalf("failed to create test participant: %v", err)
 	}
 }
 
@@ -68,10 +86,16 @@ func createMultipartRequest(filename string, content []byte, contentType string)
 }
 
 func TestFileHandler_Upload(t *testing.T) {
-	fileHandler, roomHandler, cleanup := setupFileTest(t)
+	fileHandler, roomHandler, db, cleanup := setupFileTest(t)
 	defer cleanup()
 
-	createTestRoom(t, roomHandler, "upload-test")
+	roomID := createTestRoom(t, roomHandler, db, "upload-test")
+
+	// Create participants for each test case that uses a participant ID
+	createTestParticipant(t, db, roomID, "user-123")
+	createTestParticipant(t, db, roomID, "user-456")
+	createTestParticipant(t, db, roomID, "user-789")
+	createTestParticipant(t, db, roomID, "unknown") // For uploads without explicit participant ID
 
 	tests := []struct {
 		name           string
@@ -166,10 +190,10 @@ func TestFileHandler_Upload(t *testing.T) {
 }
 
 func TestFileHandler_Upload_InvalidMIME(t *testing.T) {
-	fileHandler, roomHandler, cleanup := setupFileTest(t)
+	fileHandler, roomHandler, db, cleanup := setupFileTest(t)
 	defer cleanup()
 
-	createTestRoom(t, roomHandler, "mime-test")
+	createTestRoom(t, roomHandler, db, "mime-test")
 
 	// Create a file with disallowed MIME type (executable)
 	content := []byte("MZ\x00\x00") // DOS executable header
@@ -192,10 +216,10 @@ func TestFileHandler_Upload_InvalidMIME(t *testing.T) {
 }
 
 func TestFileHandler_Upload_TooLarge(t *testing.T) {
-	fileHandler, roomHandler, cleanup := setupFileTest(t)
+	fileHandler, roomHandler, db, cleanup := setupFileTest(t)
 	defer cleanup()
 
-	createTestRoom(t, roomHandler, "size-test")
+	createTestRoom(t, roomHandler, db, "size-test")
 
 	// Create a file larger than 5MB
 	content := make([]byte, 6*1024*1024)
@@ -214,7 +238,7 @@ func TestFileHandler_Upload_TooLarge(t *testing.T) {
 }
 
 func TestFileHandler_Upload_RoomNotFound(t *testing.T) {
-	fileHandler, _, cleanup := setupFileTest(t)
+	fileHandler, _, _, cleanup := setupFileTest(t)
 	defer cleanup()
 
 	body, contentType := createMultipartRequest("test.png", createTestPNG(), "image/png")
@@ -232,10 +256,11 @@ func TestFileHandler_Upload_RoomNotFound(t *testing.T) {
 }
 
 func TestFileHandler_Download(t *testing.T) {
-	fileHandler, roomHandler, cleanup := setupFileTest(t)
+	fileHandler, roomHandler, db, cleanup := setupFileTest(t)
 	defer cleanup()
 
-	createTestRoom(t, roomHandler, "download-test")
+	roomID := createTestRoom(t, roomHandler, db, "download-test")
+	createTestParticipant(t, db, roomID, "unknown") // For default uploader
 
 	// First upload a file
 	body, contentType := createMultipartRequest("download.png", createTestPNG(), "image/png")
@@ -288,10 +313,11 @@ func TestFileHandler_Download(t *testing.T) {
 }
 
 func TestFileHandler_Thumbnail(t *testing.T) {
-	fileHandler, roomHandler, cleanup := setupFileTest(t)
+	fileHandler, roomHandler, db, cleanup := setupFileTest(t)
 	defer cleanup()
 
-	createTestRoom(t, roomHandler, "thumb-test")
+	roomID := createTestRoom(t, roomHandler, db, "thumb-test")
+	createTestParticipant(t, db, roomID, "unknown") // For default uploader
 
 	// Upload an image (which should generate a thumbnail)
 	body, contentType := createMultipartRequest("thumb.png", createTestPNG(), "image/png")
@@ -301,6 +327,10 @@ func TestFileHandler_Thumbnail(t *testing.T) {
 
 	uploadRR := httptest.NewRecorder()
 	fileHandler.Upload(uploadRR, uploadReq)
+
+	if uploadRR.Code != http.StatusCreated {
+		t.Fatalf("failed to upload test file: %s", uploadRR.Body.String())
+	}
 
 	var uploadResp map[string]interface{}
 	json.Unmarshal(uploadRR.Body.Bytes(), &uploadResp)

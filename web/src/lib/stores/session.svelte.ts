@@ -7,6 +7,12 @@ export interface RoomState {
     name: string;
     isLive: boolean;
     participants: Participant[];
+    // Watermark configuration
+    watermarkMode: 'none' | 'text' | 'logo' | 'both';
+    watermarkText?: string;
+    watermarkLogoUrl?: string;
+    watermarkLogoPosition?: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+    watermarkOpacity: number;
 }
 
 export interface SessionState {
@@ -15,7 +21,14 @@ export interface SessionState {
     participantId: string | null;
     isAdmin: boolean;
     error: string | null;
+    reconnecting: boolean;
+    reconnectAttempt: number;
 }
+
+// Reconnection configuration
+const RECONNECT_BASE_DELAY = 1000; // 1 second
+const RECONNECT_MAX_DELAY = 30000; // 30 seconds
+const RECONNECT_MAX_ATTEMPTS = 10;
 
 // Create reactive state using Svelte 5 runes
 export function createSessionStore() {
@@ -24,14 +37,33 @@ export function createSessionStore() {
         room: null,
         participantId: null,
         isAdmin: false,
-        error: null
+        error: null,
+        reconnecting: false,
+        reconnectAttempt: 0
     });
 
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     const messageHandlers = new Map<string, (payload: unknown) => void>();
 
+    // Store connection params for reconnection
+    let connectionParams: { roomSlug: string; token: string; name: string } | null = null;
+
+    // Calculate exponential backoff delay with jitter
+    function getReconnectDelay(attempt: number): number {
+        // Exponential backoff: base * 2^attempt
+        const exponentialDelay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
+        // Cap at max delay
+        const cappedDelay = Math.min(exponentialDelay, RECONNECT_MAX_DELAY);
+        // Add jitter (±20%)
+        const jitter = cappedDelay * (0.8 + Math.random() * 0.4);
+        return Math.round(jitter);
+    }
+
     function connect(roomSlug: string, token: string, name: string) {
+        // Store params for reconnection
+        connectionParams = { roomSlug, token, name };
+
         if (ws) {
             ws.close();
         }
@@ -44,6 +76,8 @@ export function createSessionStore() {
         ws.onopen = () => {
             state.connected = true;
             state.error = null;
+            state.reconnecting = false;
+            state.reconnectAttempt = 0;
             console.log('WebSocket connected');
         };
 
@@ -51,11 +85,25 @@ export function createSessionStore() {
             state.connected = false;
             console.log('WebSocket closed', e.code, e.reason);
 
-            // Attempt reconnection if not intentional
-            if (e.code !== 1000) {
-                reconnectTimer = setTimeout(() => {
-                    connect(roomSlug, token, name);
-                }, 3000);
+            // Attempt reconnection if not intentional close
+            if (e.code !== 1000 && connectionParams) {
+                if (state.reconnectAttempt < RECONNECT_MAX_ATTEMPTS) {
+                    state.reconnecting = true;
+                    const delay = getReconnectDelay(state.reconnectAttempt);
+                    state.reconnectAttempt++;
+
+                    console.log(`Reconnecting in ${delay}ms (attempt ${state.reconnectAttempt}/${RECONNECT_MAX_ATTEMPTS})`);
+
+                    reconnectTimer = setTimeout(() => {
+                        if (connectionParams) {
+                            connect(connectionParams.roomSlug, connectionParams.token, connectionParams.name);
+                        }
+                    }, delay);
+                } else {
+                    state.reconnecting = false;
+                    state.error = 'Connection lost. Please refresh the page.';
+                    console.error('Max reconnection attempts reached');
+                }
             }
         };
 
@@ -80,7 +128,15 @@ export function createSessionStore() {
         switch (msg.type) {
             case 'room:state':
                 const roomState = msg.payload as {
-                    room: { slug: string; name: string };
+                    room: {
+                        slug: string;
+                        name: string;
+                        watermarkMode?: 'none' | 'text' | 'logo' | 'both';
+                        watermarkText?: string;
+                        watermarkLogoUrl?: string;
+                        watermarkLogoPosition?: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+                        watermarkOpacity?: number;
+                    };
                     participants: Participant[];
                     isLive: boolean;
                     iceServers: RTCIceServer[];
@@ -89,7 +145,13 @@ export function createSessionStore() {
                     slug: roomState.room.slug,
                     name: roomState.room.name,
                     isLive: roomState.isLive,
-                    participants: roomState.participants
+                    participants: roomState.participants,
+                    // Map watermark configuration
+                    watermarkMode: roomState.room.watermarkMode || 'none',
+                    watermarkText: roomState.room.watermarkText,
+                    watermarkLogoUrl: roomState.room.watermarkLogoUrl,
+                    watermarkLogoPosition: roomState.room.watermarkLogoPosition || 'bottom-right',
+                    watermarkOpacity: roomState.room.watermarkOpacity ?? 0.3
                 };
                 // Emit ICE servers for WebRTC connection
                 messageHandlers.get('iceServers')?.(roomState.iceServers);
@@ -152,7 +214,9 @@ export function createSessionStore() {
     function disconnect() {
         if (reconnectTimer) {
             clearTimeout(reconnectTimer);
+            reconnectTimer = null;
         }
+        connectionParams = null;
         if (ws) {
             ws.close(1000);
             ws = null;
@@ -162,7 +226,9 @@ export function createSessionStore() {
             room: null,
             participantId: null,
             isAdmin: false,
-            error: null
+            error: null,
+            reconnecting: false,
+            reconnectAttempt: 0
         };
     }
 

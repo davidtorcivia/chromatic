@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 
+	"chromatic/internal/metrics"
+
 	"github.com/pion/webrtc/v4"
 )
 
@@ -177,6 +179,8 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 
 		switch state {
 		case webrtc.PeerConnectionStateConnected:
+			// Track active WHIP ingest
+			metrics.Get().ActiveWHIPIngests.Add(1)
 			if h.onStreamStart != nil {
 				if err := h.onStreamStart(token); err != nil {
 					log.Printf("Error on stream start: %v", err)
@@ -185,6 +189,8 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 		case webrtc.PeerConnectionStateDisconnected,
 			webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed:
+			// Track WHIP ingest ended
+			metrics.Get().ActiveWHIPIngests.Add(-1)
 			h.sfu.RemoveIngest(token)
 			if h.onStreamEnd != nil {
 				h.onStreamEnd(token)

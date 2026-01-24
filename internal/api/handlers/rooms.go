@@ -7,16 +7,90 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sync"
 	"time"
 
 	"chromatic/internal/database"
 	"chromatic/internal/logger"
+	"chromatic/internal/metrics"
 	"chromatic/internal/models"
 
 	"golang.org/x/crypto/bcrypt"
 )
 
 var slugRegex = regexp.MustCompile(`^[a-z0-9-]{3,64}$`)
+
+// WaitingSubscription represents a waiting room participant's SSE connection
+type WaitingSubscription struct {
+	ParticipantID string
+	Channel       chan string // "admitted" or "ended"
+}
+
+// WaitingManager tracks waiting room SSE subscriptions
+type WaitingManager struct {
+	mu            sync.RWMutex
+	subscriptions map[string]*WaitingSubscription // key: participantID
+}
+
+// NewWaitingManager creates a new waiting manager
+func NewWaitingManager() *WaitingManager {
+	return &WaitingManager{
+		subscriptions: make(map[string]*WaitingSubscription),
+	}
+}
+
+// Subscribe adds a participant's SSE subscription
+func (m *WaitingManager) Subscribe(participantID string) chan string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ch := make(chan string, 1)
+	m.subscriptions[participantID] = &WaitingSubscription{
+		ParticipantID: participantID,
+		Channel:       ch,
+	}
+	return ch
+}
+
+// Unsubscribe removes a participant's SSE subscription
+func (m *WaitingManager) Unsubscribe(participantID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if sub, ok := m.subscriptions[participantID]; ok {
+		close(sub.Channel)
+		delete(m.subscriptions, participantID)
+	}
+}
+
+// NotifyAdmitted sends admission notification to a participant
+func (m *WaitingManager) NotifyAdmitted(participantID string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if sub, ok := m.subscriptions[participantID]; ok {
+		select {
+		case sub.Channel <- "admitted":
+		default:
+			// Channel full or closed, skip
+		}
+	}
+}
+
+// NotifyAllAdmitted sends admission notification to all waiting participants
+func (m *WaitingManager) NotifyAllAdmitted(participantIDs []string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, id := range participantIDs {
+		if sub, ok := m.subscriptions[id]; ok {
+			select {
+			case sub.Channel <- "admitted":
+			default:
+			}
+		}
+	}
+}
 
 // RoomHandler handles room-related HTTP requests
 type RoomHandler struct {
@@ -27,15 +101,17 @@ type RoomHandler struct {
 	hub interface {
 		BroadcastJSON(roomSlug string, msgType string, payload interface{}, excludeID string) error
 	}
-	onRoomLive   func(roomSlug string) // Called when room goes live
-	tokenManager *TokenManager         // For generating signed WebSocket tokens
+	onRoomLive     func(roomSlug string) // Called when room goes live
+	tokenManager   *TokenManager         // For generating signed WebSocket tokens
+	waitingManager *WaitingManager       // For waiting room SSE notifications
 }
 
 // NewRoomHandler creates a new RoomHandler
 func NewRoomHandler(db *database.DB, tokenSecret string) *RoomHandler {
 	return &RoomHandler{
-		db:           db,
-		tokenManager: NewTokenManager(tokenSecret),
+		db:             db,
+		tokenManager:   NewTokenManager(tokenSecret),
+		waitingManager: NewWaitingManager(),
 	}
 }
 
@@ -195,6 +271,9 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Status:             models.RoomStatusPending,
 		CreatedAt:          time.Now(),
 	}
+
+	// Track room creation
+	metrics.Get().TotalRoomsCreated.Add(1)
 
 	w.WriteHeader(http.StatusCreated)
 	respondJSON(w, room)
@@ -415,6 +494,13 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Track join request
+	metrics.Get().TotalJoinRequests.Add(1)
+	if !isAdmitted {
+		// Track waiting participant
+		metrics.Get().WaitingParticipants.Add(1)
+	}
+
 	response := map[string]interface{}{
 		"participantId": participantID,
 		"token":         token,
@@ -481,6 +567,12 @@ func (h *RoomHandler) AdmitParticipant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Track admitted participant
+	metrics.Get().WaitingParticipants.Add(-1)
+
+	// Notify waiting participant via SSE
+	h.waitingManager.NotifyAdmitted(participantID)
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -488,7 +580,28 @@ func (h *RoomHandler) AdmitParticipant(w http.ResponseWriter, r *http.Request) {
 func (h *RoomHandler) AdmitAll(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 
-	_, err := h.db.Exec(`
+	// First, get list of waiting participants for notification
+	rows, err := h.db.Query(`
+		SELECT p.id FROM participants p
+		JOIN rooms r ON r.id = p.room_id
+		WHERE r.slug = ? AND p.is_admitted = FALSE
+	`, slug)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	var waitingIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			waitingIDs = append(waitingIDs, id)
+		}
+	}
+	rows.Close()
+
+	// Update all to admitted
+	_, err = h.db.Exec(`
 		UPDATE participants SET is_admitted = TRUE
 		WHERE room_id = (SELECT id FROM rooms WHERE slug = ?) AND is_admitted = FALSE
 	`, slug)
@@ -497,6 +610,12 @@ func (h *RoomHandler) AdmitAll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
+
+	// Track admitted participants
+	metrics.Get().WaitingParticipants.Add(-int64(len(waitingIDs)))
+
+	// Notify all waiting participants via SSE
+	h.waitingManager.NotifyAllAdmitted(waitingIDs)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -676,6 +795,91 @@ func assignColor(id string) string {
 func respondJSON(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)
+}
+
+// WaitingEvents provides Server-Sent Events for waiting room status updates
+// This replaces polling with push notifications for instant admission notification
+func (h *RoomHandler) WaitingEvents(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	participantID := r.PathValue("id")
+
+	// Verify participant exists and is in waiting state
+	var isAdmitted bool
+	var roomStatus string
+	err := h.db.QueryRow(`
+		SELECT p.is_admitted, r.status
+		FROM participants p
+		JOIN rooms r ON r.id = p.room_id
+		WHERE r.slug = ? AND p.id = ?
+	`, slug, participantID).Scan(&isAdmitted, &roomStatus)
+
+	if err != nil {
+		http.Error(w, "Participant not found", http.StatusNotFound)
+		return
+	}
+
+	// If already admitted or room ended, return immediately
+	if isAdmitted {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		fmt.Fprintf(w, "data: {\"event\":\"admitted\"}\n\n")
+		return
+	}
+
+	if roomStatus == "ended" {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		fmt.Fprintf(w, "data: {\"event\":\"ended\"}\n\n")
+		return
+	}
+
+	// Set SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Subscribe to notifications
+	ch := h.waitingManager.Subscribe(participantID)
+	defer h.waitingManager.Unsubscribe(participantID)
+
+	// Send initial heartbeat
+	fmt.Fprintf(w, ": heartbeat\n\n")
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	// Wait for events or client disconnect
+	ctx := r.Context()
+	ticker := time.NewTicker(30 * time.Second) // Send periodic heartbeats
+	defer ticker.Stop()
+
+	for {
+		select {
+		case event, ok := <-ch:
+			if !ok {
+				return // Channel closed
+			}
+			fmt.Fprintf(w, "data: {\"event\":\"%s\"}\n\n", event)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			return // Close connection after notification
+
+		case <-ticker.C:
+			// Send heartbeat to keep connection alive
+			fmt.Fprintf(w, ": heartbeat\n\n")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+
+		case <-ctx.Done():
+			// Client disconnected
+			return
+		}
+	}
 }
 
 // HealthCheck is a simple health check endpoint

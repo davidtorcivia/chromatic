@@ -7,6 +7,7 @@ import (
 	"chromatic/internal/api/middleware"
 	"chromatic/internal/config"
 	"chromatic/internal/database"
+	"chromatic/internal/metrics"
 	"chromatic/internal/webrtc"
 	"chromatic/internal/websocket"
 )
@@ -24,7 +25,7 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	fileHandler := handlers.NewFileHandler(db, cfg)
 	configHandler := handlers.NewConfigHandler(db, cfg)
 	wsHandler := handlers.NewWebSocketHandler(db, hub, sfu, cfg.AllowedOrigins, cfg.ProductionMode, cfg.AdminToken)
-	authHandler := handlers.NewAuthHandler(cfg.AdminToken, cfg.ProductionMode)
+	authHandler := handlers.NewAuthHandler(db, cfg.AdminToken, cfg.ProductionMode)
 
 	// Wire up room live callback to initiate WebRTC subscriptions
 	roomHandler.SetOnRoomLive(wsHandler.InitiateSubscriptionsForRoom)
@@ -45,6 +46,9 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 
 	// Health check
 	mux.HandleFunc("GET /health", handlers.HealthCheck)
+
+	// Prometheus metrics endpoint
+	mux.HandleFunc("GET /metrics", metrics.Handler())
 
 	// Auth endpoints (no auth required)
 	mux.HandleFunc("POST /api/auth/login", authHandler.Login)
@@ -80,6 +84,7 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	adminMux.HandleFunc("POST /api/config/logo", configHandler.UploadLogo)
 	adminMux.HandleFunc("GET /api/config/logo", configHandler.GetLogo)
 	adminMux.HandleFunc("DELETE /api/config/logo", configHandler.DeleteLogo)
+	adminMux.HandleFunc("POST /api/config/test-turn", configHandler.TestTURN)
 
 	// Wrap admin routes with auth middleware
 	authConfig := middleware.AuthConfig{
@@ -101,6 +106,7 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	mux.HandleFunc("POST /api/rooms/{slug}/join", roomHandler.Join)
 	mux.HandleFunc("GET /api/rooms/{slug}/info", roomHandler.PublicInfo)
 	mux.HandleFunc("GET /api/rooms/{slug}/status/{id}", roomHandler.CheckParticipantStatus)
+	mux.HandleFunc("GET /api/rooms/{slug}/waiting/events/{id}", roomHandler.WaitingEvents)
 
 	// Static files (SvelteKit build)
 	staticHandler := http.FileServer(http.Dir("./static"))

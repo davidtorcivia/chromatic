@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"chromatic/internal/metrics"
+
 	"github.com/gorilla/websocket"
 )
 
@@ -118,9 +120,13 @@ func (h *Hub) registerClient(client *Client) {
 			Clients: make(map[string]*Client),
 		}
 		h.rooms[client.RoomSlug] = room
+		// Track new active room
+		metrics.Get().ActiveRooms.Add(1)
 	}
 
 	room.Clients[client.ID] = client
+	// Track WebSocket connections
+	metrics.Get().ActiveWebsockets.Add(1)
 	log.Printf("Client %s (%s) joined room %s", client.ID, client.Name, client.RoomSlug)
 }
 
@@ -135,11 +141,15 @@ func (h *Hub) unregisterClient(client *Client) {
 			client.closeOnce.Do(func() {
 				close(client.Send)
 			})
+			// Track WebSocket disconnection
+			metrics.Get().ActiveWebsockets.Add(-1)
 			log.Printf("Client %s (%s) left room %s", client.ID, client.Name, client.RoomSlug)
 
 			// Clean up empty rooms
 			if len(room.Clients) == 0 {
 				delete(h.rooms, client.RoomSlug)
+				// Track room closure
+				metrics.Get().ActiveRooms.Add(-1)
 			}
 		}
 	}

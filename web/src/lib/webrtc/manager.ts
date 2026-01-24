@@ -5,6 +5,9 @@ export interface WebRTCManagerOptions {
     onTrack: (event: RTCTrackEvent) => void;
     onVoiceTrack?: (participantId: string, track: MediaStreamTrack) => void;
     sendSignal: (type: string, payload: unknown) => void;
+    onConnectionStateChange?: (state: RTCPeerConnectionState) => void;
+    onIceRestart?: () => void;
+    onRenegotiation?: () => void;
 }
 
 export class WebRTCManager {
@@ -13,6 +16,8 @@ export class WebRTCManager {
     private localStream: MediaStream | null = null;
     private audioSender: RTCRtpSender | null = null;
     private isMicMuted: boolean = true;
+    private iceRestartPending: boolean = false;
+    private connectionLostTimeout: ReturnType<typeof setTimeout> | null = null;
 
     constructor(options: WebRTCManagerOptions) {
         this.options = options;
@@ -87,7 +92,35 @@ export class WebRTCManager {
 
         // Handle connection state changes
         this.pc.onconnectionstatechange = () => {
-            console.log('Connection state:', this.pc?.connectionState);
+            const state = this.pc?.connectionState;
+            console.log('Connection state:', state);
+
+            // Notify callback
+            if (state) {
+                this.options.onConnectionStateChange?.(state);
+            }
+
+            // Handle connection failures
+            if (state === 'disconnected') {
+                // Give it some time to recover before triggering ICE restart
+                this.connectionLostTimeout = setTimeout(() => {
+                    if (this.pc?.connectionState === 'disconnected') {
+                        console.log('Connection still disconnected, attempting ICE restart');
+                        this.performIceRestart();
+                    }
+                }, 5000);
+            } else if (state === 'failed') {
+                // Immediate ICE restart on failure
+                console.log('Connection failed, attempting ICE restart');
+                this.performIceRestart();
+            } else if (state === 'connected') {
+                // Clear timeout if reconnected
+                if (this.connectionLostTimeout) {
+                    clearTimeout(this.connectionLostTimeout);
+                    this.connectionLostTimeout = null;
+                }
+                this.iceRestartPending = false;
+            }
         };
 
         this.pc.oniceconnectionstatechange = () => {
@@ -97,6 +130,37 @@ export class WebRTCManager {
         this.pc.onicegatheringstatechange = () => {
             console.log('ICE gathering state:', this.pc?.iceGatheringState);
         };
+    }
+
+    // Perform ICE restart to recover from connection issues
+    async performIceRestart(): Promise<void> {
+        if (!this.pc || this.iceRestartPending) {
+            return;
+        }
+
+        this.iceRestartPending = true;
+        console.log('Performing ICE restart...');
+        this.options.onIceRestart?.();
+
+        try {
+            const offer = await this.pc.createOffer({ iceRestart: true });
+            await this.pc.setLocalDescription(offer);
+
+            // Send offer to server for ICE restart
+            this.options.sendSignal('signal:ice-restart', {
+                sdp: offer.sdp
+            });
+
+            console.log('Sent ICE restart offer');
+        } catch (err) {
+            console.error('Failed to perform ICE restart:', err);
+            this.iceRestartPending = false;
+        }
+    }
+
+    // Get current connection state
+    getConnectionState(): RTCPeerConnectionState | null {
+        return this.pc?.connectionState ?? null;
     }
 
     // Get stats for latency display
@@ -217,8 +281,46 @@ export class WebRTCManager {
         console.log('Set remote description for voice answer');
     }
 
+    // Handle server-initiated renegotiation (e.g., when voice tracks are added)
+    async handleRenegotiation(sdp: string, participantId?: string): Promise<void> {
+        if (!this.pc) {
+            console.warn('Received renegotiation but no peer connection');
+            return;
+        }
+
+        console.log('Handling server-initiated renegotiation', participantId ? `for voice from ${participantId}` : '');
+        this.options.onRenegotiation?.();
+
+        try {
+            // Set the new offer from server
+            const offer: RTCSessionDescriptionInit = {
+                type: 'offer',
+                sdp: sdp
+            };
+            await this.pc.setRemoteDescription(offer);
+
+            // Create answer
+            const answer = await this.pc.createAnswer();
+            await this.pc.setLocalDescription(answer);
+
+            // Send answer back to server
+            this.options.sendSignal('signal:renegotiate-answer', {
+                sdp: answer.sdp
+            });
+
+            console.log('Sent renegotiation answer');
+        } catch (err) {
+            console.error('Failed to handle renegotiation:', err);
+        }
+    }
+
     // Clean up
     close(): void {
+        if (this.connectionLostTimeout) {
+            clearTimeout(this.connectionLostTimeout);
+            this.connectionLostTimeout = null;
+        }
+
         if (this.localStream) {
             this.localStream.getTracks().forEach(track => track.stop());
             this.localStream = null;
