@@ -1,0 +1,51 @@
+# Binaries
+/bin/
+/chromatic
+/chromatic.exe
+
+# Build artifacts
+/web/build/
+/web/.svelte-kit/
+/web/node_modules/
+
+# Data directories (production)
+/data/
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test coverage
+coverage/
+*.cover
+
+# Temporary files
+tmp/
+temp/
+
+# Debug files
+debug
+*.test
+
+# CGO build artifacts
+*.a
+*.o
+*.so
+
+# Air live reload
+.air.toml
+tmp/

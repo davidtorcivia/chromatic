@@ -1,0 +1,26 @@
+services:
+  chromatic:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.dev
+    container_name: chromatic_dev
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_PATH=/data/chromatic.db
+      - UPLOAD_PATH=/data/files
+      - LOGO_PATH=/data/logos
+      - ADMIN_TOKEN=dev-admin-token-change-in-production
+      - PUBLIC_URL=http://localhost:3000
+      - TURN_SECRET=dev-turn-secret
+      - TURN_REALM=localhost
+      - PORT=3000
+    volumes:
+      - ../:/app
+      - chromatic_data_dev:/data
+    working_dir: /app
+    command: [ "go", "run", "./cmd/chromatic" ]
+
+volumes:
+  chromatic_data_dev:

@@ -1,0 +1,126 @@
+package database
+
+import (
+	"database/sql"
+	"embed"
+	"fmt"
+	"io/fs"
+	"log"
+	"sort"
+	"strings"
+
+	_ "github.com/mattn/go-sqlite3"
+)
+
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
+
+// DB wraps a sql.DB connection with application-specific methods
+type DB struct {
+	*sql.DB
+}
+
+// New creates a new database connection with WAL mode enabled
+func New(path string) (*DB, error) {
+	// SQLite connection string with WAL mode and other optimizations
+	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on&_synchronous=NORMAL", path)
+
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	// Verify connection
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	// Set connection pool settings (SQLite works best with single connection for writes)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	log.Printf("Database connected: %s (WAL mode)", path)
+
+	return &DB{db}, nil
+}
+
+// Migrate runs all pending migrations
+func (db *DB) Migrate() error {
+	// Create migrations table if not exists
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS _migrations (
+			id INTEGER PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create migrations table: %w", err)
+	}
+
+	// Get list of migration files
+	entries, err := fs.ReadDir(migrationsFS, "migrations")
+	if err != nil {
+		return fmt.Errorf("failed to read migrations directory: %w", err)
+	}
+
+	// Sort migrations by name
+	var migrations []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".sql") {
+			migrations = append(migrations, entry.Name())
+		}
+	}
+	sort.Strings(migrations)
+
+	// Apply each migration
+	for _, name := range migrations {
+		applied, err := db.isMigrationApplied(name)
+		if err != nil {
+			return fmt.Errorf("failed to check migration %s: %w", name, err)
+		}
+		if applied {
+			continue
+		}
+
+		log.Printf("Applying migration: %s", name)
+
+		content, err := migrationsFS.ReadFile("migrations/" + name)
+		if err != nil {
+			return fmt.Errorf("failed to read migration %s: %w", name, err)
+		}
+
+		// Execute migration in a transaction
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction: %w", err)
+		}
+
+		if _, err := tx.Exec(string(content)); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to execute migration %s: %w", name, err)
+		}
+
+		if _, err := tx.Exec("INSERT INTO _migrations (name) VALUES (?)", name); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to record migration %s: %w", name, err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("failed to commit migration %s: %w", name, err)
+		}
+
+		log.Printf("Applied migration: %s", name)
+	}
+
+	return nil
+}
+
+func (db *DB) isMigrationApplied(name string) (bool, error) {
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM _migrations WHERE name = ?", name).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}

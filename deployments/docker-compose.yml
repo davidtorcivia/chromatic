@@ -1,0 +1,31 @@
+services:
+  chromatic:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+    container_name: chromatic
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - DATABASE_PATH=/data/chromatic.db
+      - UPLOAD_PATH=/data/files
+      - LOGO_PATH=/data/logos
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+      - PUBLIC_URL=${PUBLIC_URL}
+      - TURN_SECRET=${TURN_SECRET}
+      - TURN_REALM=${TURN_REALM}
+      - PORT=3000
+    volumes:
+      - chromatic_data:/data
+
+  coturn:
+    image: coturn/coturn:latest
+    container_name: chromatic_turn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: [ "-c", "/etc/coturn/turnserver.conf" ]
+
+volumes:
+  chromatic_data:
