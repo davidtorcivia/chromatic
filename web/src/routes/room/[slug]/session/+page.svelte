@@ -4,9 +4,11 @@
     import { session } from "$lib/stores/session.svelte";
     import { unlockAudio } from "$lib/audio/context";
     import { WebRTCManager } from "$lib/webrtc/manager";
+    import { AudioDuckingManager } from "$lib/audio/ducking";
     import LaserPointerOverlay from "$lib/components/LaserPointerOverlay.svelte";
     import ChatPanel from "$lib/components/ChatPanel.svelte";
     import WatermarkOverlay from "$lib/components/WatermarkOverlay.svelte";
+    import BrowserToast from "$lib/components/BrowserToast.svelte";
 
     const slug = $page.params.slug!;
 
@@ -16,8 +18,12 @@
     let controlsTimer: ReturnType<typeof setTimeout>;
     let participantName = $state("Viewer");
     let webrtcManager: WebRTCManager | null = null;
+    let audioDuckingManager: AudioDuckingManager | null = null;
     let iceServers: RTCIceServer[] = [];
     let hasStream = $state(false);
+    let isMuted = $state(false); // Stream audio mute state
+    let isMicEnabled = $state(false); // Microphone state
+    let hasMicPermission = $state(false); // Whether mic permission was granted
 
     // Get session data from storage
     let sessionData: {
@@ -103,6 +109,22 @@
             window.location.href = `/room/${slug}`;
         });
 
+        // Handle voice tracks from other participants
+        session.onMessage("voice:track", async (payload: unknown) => {
+            const data = payload as { participantId: string; track: MediaStreamTrack };
+            if (audioDuckingManager && data.track) {
+                await audioDuckingManager.addVoiceTrack(data.participantId, data.track);
+            }
+        });
+
+        // Handle answer to our voice offer (when we send mic audio)
+        session.onMessage("signal:voice-answer", async (payload: unknown) => {
+            const data = payload as { sdp: string };
+            if (webrtcManager) {
+                await webrtcManager.handleVoiceAnswer(data.sdp);
+            }
+        });
+
         // Handle watermark tampering
         window.addEventListener("chromatic:tampering", handleTampering);
 
@@ -112,6 +134,10 @@
 
     onDestroy(() => {
         cleanupWebRTC();
+        if (audioDuckingManager) {
+            audioDuckingManager.destroy();
+            audioDuckingManager = null;
+        }
         session.disconnect();
         window.removeEventListener("chromatic:tampering", handleTampering);
     });
@@ -122,6 +148,7 @@
         webrtcManager = new WebRTCManager({
             iceServers,
             onTrack: handleTrack,
+            onVoiceTrack: handleVoiceTrack,
             sendSignal: (type, payload) => session.send(type, payload)
         });
 
@@ -135,6 +162,20 @@
             videoElement.srcObject = event.streams[0];
             hasStream = true;
             console.log('Attached stream to video element');
+
+            // Initialize audio ducking manager for the stream
+            // Determine if user is admin (check role in session)
+            const isAdmin = roomState?.participants?.find(
+                (p: { id: string }) => p.id === sessionData?.participantId
+            )?.role === 'admin';
+            audioDuckingManager = new AudioDuckingManager(videoElement, isAdmin ?? false);
+        }
+    }
+
+    function handleVoiceTrack(participantId: string, track: MediaStreamTrack) {
+        console.log('Received voice track from:', participantId);
+        if (audioDuckingManager) {
+            audioDuckingManager.addVoiceTrack(participantId, track);
         }
     }
 
@@ -176,6 +217,36 @@
         }
     }
 
+    function toggleMute() {
+        isMuted = !isMuted;
+        if (videoElement) {
+            videoElement.muted = isMuted;
+        }
+    }
+
+    async function toggleMic() {
+        if (!hasMicPermission) {
+            // Request microphone permission first
+            if (webrtcManager) {
+                const granted = await webrtcManager.requestMicrophone();
+                if (granted) {
+                    hasMicPermission = true;
+                    isMicEnabled = true;
+                    webrtcManager.setMicEnabled(true);
+                } else {
+                    alert("Microphone access is required for voice chat.");
+                }
+            }
+        } else {
+            // Toggle mic state
+            isMicEnabled = !isMicEnabled;
+            webrtcManager?.setMicEnabled(isMicEnabled);
+        }
+
+        // Notify server of media toggle
+        session.send("media:toggle", { audio: isMicEnabled });
+    }
+
     // Get room state
     let roomState = $derived(session.state.room);
     let participants = $derived(roomState?.participants || []);
@@ -189,7 +260,7 @@
 <main class="session-page" onmousemove={handleMouseMove}>
     <div class="video-wrapper">
         <div class="video-container">
-            <video bind:this={videoElement} autoplay playsinline muted={false}>
+            <video bind:this={videoElement} autoplay playsinline muted={isMuted}>
                 <track kind="captions" />
             </video>
 
@@ -244,6 +315,21 @@
                 <div class="controls">
                     <button
                         class="btn btn-icon btn-ghost"
+                        onclick={toggleMic}
+                        title={isMicEnabled ? "Mute Mic" : "Enable Mic"}
+                        class:mic-active={isMicEnabled}
+                    >
+                        {isMicEnabled ? "🎤" : "🎙️"}
+                    </button>
+                    <button
+                        class="btn btn-icon btn-ghost"
+                        onclick={toggleMute}
+                        title={isMuted ? "Unmute Stream" : "Mute Stream"}
+                    >
+                        {isMuted ? "🔇" : "🔊"}
+                    </button>
+                    <button
+                        class="btn btn-icon btn-ghost"
                         onclick={toggleChat}
                         title="Chat"
                     >
@@ -262,6 +348,7 @@
     </div>
 
     <ChatPanel isOpen={isChatOpen} onClose={() => (isChatOpen = false)} />
+    <BrowserToast />
 </main>
 
 <style>
@@ -380,6 +467,11 @@
         background: rgba(0, 0, 0, 0.6);
         padding: var(--space-sm);
         border-radius: var(--radius-lg);
+    }
+
+    .controls button.mic-active {
+        background: var(--color-success);
+        border-radius: var(--radius-md);
     }
 
     @media (max-width: 768px) {

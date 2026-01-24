@@ -46,11 +46,12 @@ type IngestSession struct {
 
 // RoomTracks holds the tracks being distributed to a room
 type RoomTracks struct {
-	mu          sync.RWMutex
-	RoomSlug    string
-	VideoTrack  *webrtc.TrackLocalStaticRTP
-	AudioTrack  *webrtc.TrackLocalStaticRTP
-	Subscribers map[string]*Subscriber
+	mu            sync.RWMutex
+	RoomSlug      string
+	VideoTrack    *webrtc.TrackLocalStaticRTP
+	AudioTrack    *webrtc.TrackLocalStaticRTP
+	Subscribers   map[string]*Subscriber
+	VoiceSessions map[string]*VoiceSession // Participant voice connections
 }
 
 // Subscriber represents a client receiving the stream
@@ -471,4 +472,157 @@ func (s *SFU) IsRoomLive(roomSlug string) bool {
 	defer room.mu.RUnlock()
 
 	return room.VideoTrack != nil || room.AudioTrack != nil
+}
+
+// VoiceSession represents a participant's voice connection
+type VoiceSession struct {
+	ParticipantID  string
+	PeerConnection *webrtc.PeerConnection
+	AudioTrack     *webrtc.TrackLocalStaticRTP
+	done           chan struct{}
+	closeOnce      sync.Once
+}
+
+// HandleVoiceOffer processes an offer from a client wanting to send voice audio
+// Returns the SDP answer to send back to the client
+func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP string, onTrack func(participantID string, track *webrtc.TrackRemote)) (string, error) {
+	// Create a peer connection
+	pc, err := s.CreatePeerConnection()
+	if err != nil {
+		return "", fmt.Errorf("failed to create peer connection: %w", err)
+	}
+
+	// Set the handler for when we receive the audio track
+	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		log.Printf("Received voice track from %s: %s", participantID, track.Kind())
+		if track.Kind() == webrtc.RTPCodecTypeAudio {
+			onTrack(participantID, track)
+		}
+	})
+
+	// Set the remote description (the offer)
+	offer := webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer,
+		SDP:  offerSDP,
+	}
+	if err := pc.SetRemoteDescription(offer); err != nil {
+		pc.Close()
+		return "", fmt.Errorf("failed to set remote description: %w", err)
+	}
+
+	// Create answer
+	answer, err := pc.CreateAnswer(nil)
+	if err != nil {
+		pc.Close()
+		return "", fmt.Errorf("failed to create answer: %w", err)
+	}
+
+	// Set local description
+	if err := pc.SetLocalDescription(answer); err != nil {
+		pc.Close()
+		return "", fmt.Errorf("failed to set local description: %w", err)
+	}
+
+	// Wait for ICE gathering
+	gatherComplete := webrtc.GatheringCompletePromise(pc)
+	<-gatherComplete
+
+	// Store the voice session
+	room := s.GetRoomTracks(roomSlug)
+	room.mu.Lock()
+	if room.VoiceSessions == nil {
+		room.VoiceSessions = make(map[string]*VoiceSession)
+	}
+	room.VoiceSessions[participantID] = &VoiceSession{
+		ParticipantID:  participantID,
+		PeerConnection: pc,
+		done:           make(chan struct{}),
+	}
+	room.mu.Unlock()
+
+	// Handle connection state
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		log.Printf("Voice connection state for %s: %s", participantID, state)
+		switch state {
+		case webrtc.PeerConnectionStateDisconnected,
+			webrtc.PeerConnectionStateFailed,
+			webrtc.PeerConnectionStateClosed:
+			s.RemoveVoiceSession(roomSlug, participantID)
+		}
+	})
+
+	return pc.LocalDescription().SDP, nil
+}
+
+// RemoveVoiceSession removes a voice session
+func (s *SFU) RemoveVoiceSession(roomSlug, participantID string) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return
+	}
+
+	room.mu.Lock()
+	defer room.mu.Unlock()
+
+	if session, ok := room.VoiceSessions[participantID]; ok {
+		session.closeOnce.Do(func() {
+			close(session.done)
+		})
+		if session.PeerConnection != nil {
+			session.PeerConnection.Close()
+		}
+		delete(room.VoiceSessions, participantID)
+		log.Printf("Removed voice session for %s from room %s", participantID, roomSlug)
+	}
+}
+
+// AddVoiceTrackToSubscriber adds a voice track from one participant to another's subscriber connection
+func (s *SFU) AddVoiceTrackToSubscriber(roomSlug, subscriberID, voiceOwnerID string, remoteTrack *webrtc.TrackRemote) error {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return fmt.Errorf("room not found: %s", roomSlug)
+	}
+
+	room.mu.RLock()
+	sub, ok := room.Subscribers[subscriberID]
+	room.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("subscriber not found: %s", subscriberID)
+	}
+
+	// Create a local track to forward the remote track
+	localTrack, err := webrtc.NewTrackLocalStaticRTP(
+		remoteTrack.Codec().RTPCodecCapability,
+		fmt.Sprintf("voice-%s", voiceOwnerID),
+		fmt.Sprintf("voice-stream-%s", voiceOwnerID),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create local track: %w", err)
+	}
+
+	// Add the track to the subscriber's peer connection
+	_, err = sub.PeerConnection.AddTrack(localTrack)
+	if err != nil {
+		return fmt.Errorf("failed to add track: %w", err)
+	}
+
+	// Start forwarding RTP packets from remote to local track
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, _, err := remoteTrack.Read(buf)
+			if err != nil {
+				log.Printf("Voice track read error for %s: %v", voiceOwnerID, err)
+				return
+			}
+			if _, err := localTrack.Write(buf[:n]); err != nil {
+				log.Printf("Voice track write error to %s: %v", subscriberID, err)
+				return
+			}
+		}
+	}()
+
+	log.Printf("Added voice track from %s to subscriber %s", voiceOwnerID, subscriberID)
+	return nil
 }

@@ -1,14 +1,18 @@
-// WebRTC Manager - handles peer connection for receiving stream
+// WebRTC Manager - handles peer connection for receiving stream and sending voice
 
 export interface WebRTCManagerOptions {
     iceServers: RTCIceServer[];
     onTrack: (event: RTCTrackEvent) => void;
+    onVoiceTrack?: (participantId: string, track: MediaStreamTrack) => void;
     sendSignal: (type: string, payload: unknown) => void;
 }
 
 export class WebRTCManager {
     private pc: RTCPeerConnection | null = null;
     private options: WebRTCManagerOptions;
+    private localStream: MediaStream | null = null;
+    private audioSender: RTCRtpSender | null = null;
+    private isMicMuted: boolean = true;
 
     constructor(options: WebRTCManagerOptions) {
         this.options = options;
@@ -113,8 +117,114 @@ export class WebRTCManager {
         return { rtt };
     }
 
+    // Request microphone access and prepare for sending
+    async requestMicrophone(): Promise<boolean> {
+        try {
+            this.localStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true
+                },
+                video: false
+            });
+
+            // Start muted by default
+            this.localStream.getAudioTracks().forEach(track => {
+                track.enabled = false;
+            });
+
+            console.log('Microphone access granted');
+            return true;
+        } catch (err) {
+            console.error('Failed to get microphone access:', err);
+            return false;
+        }
+    }
+
+    // Enable/disable microphone
+    setMicEnabled(enabled: boolean): void {
+        this.isMicMuted = !enabled;
+
+        if (this.localStream) {
+            this.localStream.getAudioTracks().forEach(track => {
+                track.enabled = enabled;
+            });
+        }
+
+        // If we have a peer connection and local stream, add/update track
+        if (enabled && this.pc && this.localStream) {
+            this.addLocalAudioTrack();
+        }
+
+        console.log('Microphone', enabled ? 'enabled' : 'muted');
+    }
+
+    // Check if mic is currently enabled
+    isMicEnabled(): boolean {
+        return !this.isMicMuted;
+    }
+
+    // Add local audio track to peer connection
+    private async addLocalAudioTrack(): Promise<void> {
+        if (!this.pc || !this.localStream) return;
+
+        const audioTrack = this.localStream.getAudioTracks()[0];
+        if (!audioTrack) return;
+
+        // Check if we already have a sender
+        if (this.audioSender) {
+            // Replace track
+            await this.audioSender.replaceTrack(audioTrack);
+        } else {
+            // Add new track
+            this.audioSender = this.pc.addTrack(audioTrack, this.localStream);
+
+            // Need to renegotiate - create and send offer
+            await this.renegotiate();
+        }
+    }
+
+    // Renegotiate the connection after adding tracks
+    private async renegotiate(): Promise<void> {
+        if (!this.pc) return;
+
+        try {
+            const offer = await this.pc.createOffer();
+            await this.pc.setLocalDescription(offer);
+
+            // Send offer to server
+            this.options.sendSignal('signal:offer', {
+                sdp: offer.sdp
+            });
+
+            console.log('Sent renegotiation offer for voice');
+        } catch (err) {
+            console.error('Failed to renegotiate:', err);
+        }
+    }
+
+    // Handle answer for voice renegotiation
+    async handleVoiceAnswer(sdp: string): Promise<void> {
+        if (!this.pc) return;
+
+        const answer: RTCSessionDescriptionInit = {
+            type: 'answer',
+            sdp: sdp
+        };
+
+        await this.pc.setRemoteDescription(answer);
+        console.log('Set remote description for voice answer');
+    }
+
     // Clean up
     close(): void {
+        if (this.localStream) {
+            this.localStream.getTracks().forEach(track => track.stop());
+            this.localStream = null;
+        }
+        this.audioSender = null;
+
         if (this.pc) {
             this.pc.close();
             this.pc = null;

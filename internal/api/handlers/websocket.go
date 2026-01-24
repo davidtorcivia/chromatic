@@ -388,9 +388,59 @@ func (h *WebSocketHandler) handleMediaToggle(client *websocket.Client, payload j
 }
 
 func (h *WebSocketHandler) handleSignalOffer(client *websocket.Client, payload json.RawMessage) {
-	// Client-initiated offer - used for client webcam/mic streams
-	// For now, we only support server-initiated subscription (handleSignalAnswer)
-	log.Printf("Received signal offer from %s (client media not yet supported)", client.ID)
+	// Client-initiated offer - used for client microphone streams (voice chat)
+	var data struct {
+		SDP string `json:"sdp"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		log.Printf("Invalid signal offer from %s: %v", client.ID, err)
+		return
+	}
+
+	log.Printf("Received voice offer from %s", client.ID)
+
+	// Create a peer connection to receive the client's voice audio
+	// and create an answer
+	answer, err := h.sfu.HandleVoiceOffer(client.RoomSlug, client.ID, data.SDP, func(participantID string, track *pionwebrtc.TrackRemote) {
+		// When we receive the audio track from this client, forward it to others
+		h.forwardVoiceTrack(client.RoomSlug, participantID, track)
+	})
+
+	if err != nil {
+		log.Printf("Failed to handle voice offer from %s: %v", client.ID, err)
+		return
+	}
+
+	// Send answer back to client
+	client.SendJSON("signal:voice-answer", map[string]interface{}{
+		"sdp": answer,
+	})
+
+	log.Printf("Sent voice answer to client %s", client.ID)
+}
+
+// forwardVoiceTrack forwards a participant's voice track to all other participants in the room
+func (h *WebSocketHandler) forwardVoiceTrack(roomSlug, participantID string, track *pionwebrtc.TrackRemote) {
+	log.Printf("Forwarding voice track from %s to room %s", participantID, roomSlug)
+
+	// Get all clients in the room except the sender
+	clients := h.hub.GetRoomClients(roomSlug)
+	for _, client := range clients {
+		if client.ID == participantID {
+			continue // Don't send to self
+		}
+
+		// Add the voice track to this client's subscriber connection
+		if err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, client.ID, participantID, track); err != nil {
+			log.Printf("Failed to add voice track to subscriber %s: %v", client.ID, err)
+			continue
+		}
+
+		// Notify client about the new voice track
+		client.SendJSON("voice:track", map[string]interface{}{
+			"participantId": participantID,
+		})
+	}
 }
 
 func (h *WebSocketHandler) handleSignalAnswer(client *websocket.Client, payload json.RawMessage) {

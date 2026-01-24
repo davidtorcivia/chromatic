@@ -12,6 +12,8 @@
             | "bottom-right";
         opacity?: number;
         participantName: string;
+        logoSize?: number; // Size in pixels (default 80)
+        logoPadding?: number; // Padding from edges (default 20)
     }
 
     let {
@@ -21,11 +23,26 @@
         logoPosition = "bottom-right",
         opacity = 0.3,
         participantName,
+        logoSize = 80,
+        logoPadding = 20,
     }: Props = $props();
 
     let canvasEl: HTMLCanvasElement;
     let observer: MutationObserver;
     let animationFrame: number;
+    let logoImage: HTMLImageElement | null = null;
+    let logoLoaded = false;
+
+    // Load and cache logo image
+    function loadLogo(url: string): Promise<HTMLImageElement> {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            img.crossOrigin = "anonymous";
+            img.onload = () => resolve(img);
+            img.onerror = () => reject(new Error(`Failed to load logo: ${url}`));
+            img.src = url;
+        });
+    }
 
     // Template variable replacement
     function processText(template: string): string {
@@ -40,6 +57,44 @@
                     minute: "2-digit",
                 }),
             );
+    }
+
+    // Calculate logo position based on logoPosition prop
+    function getLogoPosition(
+        canvasWidth: number,
+        canvasHeight: number,
+        imgWidth: number,
+        imgHeight: number
+    ): { x: number; y: number } {
+        // Scale image to fit within logoSize while maintaining aspect ratio
+        const scale = Math.min(logoSize / imgWidth, logoSize / imgHeight);
+        const scaledWidth = imgWidth * scale;
+        const scaledHeight = imgHeight * scale;
+
+        let x: number;
+        let y: number;
+
+        switch (logoPosition) {
+            case "top-left":
+                x = logoPadding;
+                y = logoPadding;
+                break;
+            case "top-right":
+                x = canvasWidth - scaledWidth - logoPadding;
+                y = logoPadding;
+                break;
+            case "bottom-left":
+                x = logoPadding;
+                y = canvasHeight - scaledHeight - logoPadding;
+                break;
+            case "bottom-right":
+            default:
+                x = canvasWidth - scaledWidth - logoPadding;
+                y = canvasHeight - scaledHeight - logoPadding;
+                break;
+        }
+
+        return { x, y };
     }
 
     function draw() {
@@ -77,7 +132,35 @@
         }
 
         // Draw logo watermark
-        // Note: In production, load and cache the logo image
+        if ((mode === "logo" || mode === "both") && logoImage && logoLoaded) {
+            const scale = Math.min(
+                logoSize / logoImage.width,
+                logoSize / logoImage.height
+            );
+            const scaledWidth = logoImage.width * scale;
+            const scaledHeight = logoImage.height * scale;
+
+            const pos = getLogoPosition(
+                canvasEl.width,
+                canvasEl.height,
+                logoImage.width,
+                logoImage.height
+            );
+
+            // Add subtle shadow for visibility on any background
+            ctx.shadowColor = "rgba(0, 0, 0, 0.5)";
+            ctx.shadowBlur = 4;
+            ctx.shadowOffsetX = 1;
+            ctx.shadowOffsetY = 1;
+
+            ctx.drawImage(logoImage, pos.x, pos.y, scaledWidth, scaledHeight);
+
+            // Reset shadow
+            ctx.shadowColor = "transparent";
+            ctx.shadowBlur = 0;
+            ctx.shadowOffsetX = 0;
+            ctx.shadowOffsetY = 0;
+        }
 
         animationFrame = requestAnimationFrame(draw);
     }
@@ -134,8 +217,20 @@
         );
     }
 
-    onMount(() => {
+    onMount(async () => {
         if (mode !== "none") {
+            // Load logo if needed
+            if ((mode === "logo" || mode === "both") && logoUrl) {
+                try {
+                    logoImage = await loadLogo(logoUrl);
+                    logoLoaded = true;
+                    console.log("Logo loaded successfully:", logoUrl);
+                } catch (err) {
+                    console.error("Failed to load logo:", err);
+                    // Continue without logo
+                }
+            }
+
             draw();
             setupTamperDetection();
         }
