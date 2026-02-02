@@ -32,10 +32,18 @@ Thumbs.db
 # Test coverage
 coverage/
 *.cover
+coverage.out
+handlers.out
+
+# Local tooling
+.claude/
 
 # Temporary files
 tmp/
 temp/
+
+# Backup files
+*.bak
 
 # Debug files
 debug
