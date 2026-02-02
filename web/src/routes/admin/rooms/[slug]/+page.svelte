@@ -340,7 +340,7 @@
                         class="input"
                         bind:value={password}
                         placeholder={room.hasPassword ? "Room has password" : "No password set"}
-                        minlength="4"
+                        minlength="8"
                     />
                 </div>
 

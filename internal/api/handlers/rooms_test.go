@@ -5,17 +5,37 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
+	"time"
 
+	"chromatic/internal/config"
 	"chromatic/internal/database"
 )
+
+const roomsTestTokenSecret = "test-secret"
+
+func newTestRoomHandler(db *database.DB) *RoomHandler {
+	cfg := &config.Config{}
+	return NewRoomHandler(db, cfg, roomsTestTokenSecret)
+}
+
+func createJoinTokenForTest(t *testing.T, handler *RoomHandler, participantID, roomSlug string) string {
+	t.Helper()
+
+	token, err := handler.tokenManager.GenerateToken(participantID, roomSlug, "Test User", time.Hour)
+	if err != nil {
+		t.Fatalf("failed to create join token: %v", err)
+	}
+	return token
+}
 
 // TestRoomHandler_Create tests room creation
 func TestRoomHandler_Create(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db, "test-secret")
+	handler := newTestRoomHandler(db)
 
 	tests := []struct {
 		name           string
@@ -120,7 +140,7 @@ func TestRoomHandler_Get(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db, "test-secret")
+	handler := newTestRoomHandler(db)
 
 	// Create a test room first
 	createBody := map[string]interface{}{
@@ -175,7 +195,7 @@ func TestRoomHandler_Update(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db, "test-secret")
+	handler := newTestRoomHandler(db)
 
 	// Create a test room
 	createBody := map[string]interface{}{
@@ -266,7 +286,7 @@ func TestRoomHandler_Delete(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db, "test-secret")
+	handler := newTestRoomHandler(db)
 
 	// Create a test room
 	createBody := map[string]interface{}{
@@ -327,7 +347,7 @@ func TestRoomHandler_Join(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db, "test-secret")
+	handler := newTestRoomHandler(db)
 
 	// Create rooms for testing
 	rooms := []map[string]interface{}{
@@ -472,7 +492,7 @@ func TestRoomHandler_WaitingRoom(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db, "test-secret")
+	handler := newTestRoomHandler(db)
 
 	// Create a waiting room
 	createBody := map[string]interface{}{
@@ -556,7 +576,7 @@ func TestRoomHandler_CheckParticipantStatus(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db, "test-secret")
+	handler := newTestRoomHandler(db)
 
 	// Create a waiting room
 	createBody := map[string]interface{}{
@@ -585,11 +605,13 @@ func TestRoomHandler_CheckParticipantStatus(t *testing.T) {
 	var joinResp map[string]interface{}
 	json.Unmarshal(joinRR.Body.Bytes(), &joinResp)
 	participantID := joinResp["participantId"].(string)
+	token := joinResp["token"].(string)
 
 	t.Run("check status - not admitted", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/rooms/status-test/status/"+participantID, nil)
 		req.SetPathValue("slug", "status-test")
 		req.SetPathValue("id", participantID)
+		req.URL.RawQuery = "token=" + url.QueryEscape(token)
 
 		rr := httptest.NewRecorder()
 		handler.CheckParticipantStatus(rr, req)
@@ -616,6 +638,7 @@ func TestRoomHandler_CheckParticipantStatus(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/rooms/status-test/status/"+participantID, nil)
 		req.SetPathValue("slug", "status-test")
 		req.SetPathValue("id", participantID)
+		req.URL.RawQuery = "token=" + url.QueryEscape(token)
 
 		rr := httptest.NewRecorder()
 		handler.CheckParticipantStatus(rr, req)
@@ -628,9 +651,11 @@ func TestRoomHandler_CheckParticipantStatus(t *testing.T) {
 	})
 
 	t.Run("check status - invalid participant", func(t *testing.T) {
+		invalidToken := createJoinTokenForTest(t, handler, "invalid-id", "status-test")
 		req := httptest.NewRequest("GET", "/api/rooms/status-test/status/invalid-id", nil)
 		req.SetPathValue("slug", "status-test")
 		req.SetPathValue("id", "invalid-id")
+		req.URL.RawQuery = "token=" + url.QueryEscape(invalidToken)
 
 		rr := httptest.NewRecorder()
 		handler.CheckParticipantStatus(rr, req)
@@ -646,7 +671,7 @@ func TestRoomHandler_List(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db, "test-secret")
+	handler := newTestRoomHandler(db)
 
 	// Create some test rooms
 	rooms := []map[string]interface{}{
@@ -703,7 +728,7 @@ func TestRoomHandler_PublicInfo(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
 	defer cleanup()
 
-	handler := NewRoomHandler(db, "test-secret")
+	handler := newTestRoomHandler(db)
 
 	// Create a room with password
 	createBody := map[string]interface{}{

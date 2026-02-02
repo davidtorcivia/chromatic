@@ -24,7 +24,7 @@ func TestSanitizeText(t *testing.T) {
 		{
 			name:     "script tag",
 			input:    "<script>alert('xss')</script>",
-			expected: "alert(&#39;xss&#39;)",
+			expected: "alert('xss')",
 		},
 		{
 			name:     "nested tags",
@@ -34,7 +34,7 @@ func TestSanitizeText(t *testing.T) {
 		{
 			name:     "html entities",
 			input:    "Hello <World> & \"Friends\"",
-			expected: "Hello  &amp; &#34;Friends&#34;", // <World> is stripped as it looks like HTML tag
+			expected: "Hello  & \"Friends\"", // <World> is stripped as it looks like HTML tag
 		},
 		{
 			name:     "img tag with onerror",
@@ -59,17 +59,17 @@ func TestSanitizeText(t *testing.T) {
 		{
 			name:     "ampersand in text",
 			input:    "Rock & Roll",
-			expected: "Rock &amp; Roll",
+			expected: "Rock & Roll",
 		},
 		{
 			name:     "quotes in text",
 			input:    `He said "Hello"`,
-			expected: "He said &#34;Hello&#34;",
+			expected: `He said "Hello"`,
 		},
 		{
 			name:     "less than in text",
 			input:    "5 < 10",
-			expected: "5 &lt; 10",
+			expected: "5 < 10",
 		},
 		{
 			name:     "emoji preserved",
@@ -312,9 +312,9 @@ func TestChatMessageParsing(t *testing.T) {
 			shouldBeValid:   false,
 		},
 		{
-			name:            "long content",
-			payload:         `{"content":"` + string(make([]byte, 2001)) + `"}`,
-			shouldBeValid:   false,
+			name:          "long content",
+			payload:       `{"content":"` + string(make([]byte, 2001)) + `"}`,
+			shouldBeValid: false,
 		},
 	}
 
@@ -428,10 +428,10 @@ func TestCursorMessageParsing(t *testing.T) {
 // TestMediaToggleParsing tests media toggle message parsing
 func TestMediaToggleParsing(t *testing.T) {
 	tests := []struct {
-		name       string
-		payload    string
-		wantAudio  *bool
-		wantVideo  *bool
+		name      string
+		payload   string
+		wantAudio *bool
+		wantVideo *bool
 	}{
 		{
 			name:      "audio only",

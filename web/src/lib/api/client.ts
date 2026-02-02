@@ -124,15 +124,17 @@ export const rooms = {
     end: (slug: string) => apiPost(`/api/rooms/${slug}/end`),
     info: (slug: string) => apiGet<RoomInfo>(`/api/rooms/${slug}/info`),
     join: (slug: string, name: string, password?: string) =>
-        apiPost<{ participantId: string; token: string; isAdmitted: boolean; waitingRoom: boolean; color: string }>(
+        apiPost<{ participantId: string; token: string; isAdmitted: boolean; waitingRoom: boolean; color: string; name: string }>(
             `/api/rooms/${slug}/join`,
             { name, password }
         ),
     listWaiting: (slug: string) => apiGet<{ id: string; name: string; joinedAt: string }[]>(`/api/rooms/${slug}/waiting`),
     admit: (slug: string, participantId: string) => apiPost(`/api/rooms/${slug}/admit/${participantId}`),
     admitAll: (slug: string) => apiPost(`/api/rooms/${slug}/admit-all`),
-    checkStatus: (slug: string, participantId: string) =>
-        apiGet<{ isAdmitted: boolean; roomStatus: string }>(`/api/rooms/${slug}/status/${participantId}`)
+    checkStatus: (slug: string, participantId: string, token: string) =>
+        apiGet<{ isAdmitted: boolean; roomStatus: string }>(
+            `/api/rooms/${slug}/status/${participantId}?token=${encodeURIComponent(token)}`
+        )
 };
 
 export const streamKeys = {
@@ -211,7 +213,7 @@ export interface UploadedFile {
 export async function uploadFile(
     roomSlug: string,
     file: File,
-    participantId: string,
+    joinToken: string,
     onProgress?: (percent: number) => void
 ): Promise<UploadedFile> {
     return new Promise((resolve, reject) => {
@@ -247,7 +249,7 @@ export async function uploadFile(
 
         xhr.open('POST', `${API_BASE}/api/rooms/${roomSlug}/files`);
         xhr.withCredentials = true;
-        xhr.setRequestHeader('X-Participant-ID', participantId);
+        xhr.setRequestHeader('X-Join-Token', joinToken);
         xhr.send(formData);
     });
 }

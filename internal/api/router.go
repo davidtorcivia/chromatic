@@ -2,6 +2,8 @@ package api
 
 import (
 	"net/http"
+	"path/filepath"
+	"strings"
 
 	"chromatic/internal/api/handlers"
 	"chromatic/internal/api/middleware"
@@ -17,12 +19,12 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	mux := http.NewServeMux()
 
 	// Create handlers
-	roomHandler := handlers.NewRoomHandler(db, cfg.AdminToken) // Use admin token as signing secret
+	roomHandler := handlers.NewRoomHandler(db, cfg, cfg.AdminToken) // Use admin token as signing secret
 	roomHandler.SetSFU(sfu)
 	roomHandler.SetHub(hub)
 
 	streamKeyHandler := handlers.NewStreamKeyHandler(db)
-	fileHandler := handlers.NewFileHandler(db, cfg)
+	fileHandler := handlers.NewFileHandler(db, cfg, cfg.AdminToken)
 	configHandler := handlers.NewConfigHandler(db, cfg)
 	wsHandler := handlers.NewWebSocketHandler(db, hub, sfu, cfg.AllowedOrigins, cfg.ProductionMode, cfg.AdminToken)
 	authHandler := handlers.NewAuthHandler(db, cfg.AdminToken, cfg.ProductionMode)
@@ -83,7 +85,6 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	adminMux.HandleFunc("GET /api/config", configHandler.Get)
 	adminMux.HandleFunc("PATCH /api/config", configHandler.Update)
 	adminMux.HandleFunc("POST /api/config/logo", configHandler.UploadLogo)
-	adminMux.HandleFunc("GET /api/config/logo", configHandler.GetLogo)
 	adminMux.HandleFunc("DELETE /api/config/logo", configHandler.DeleteLogo)
 	adminMux.HandleFunc("POST /api/config/test-turn", configHandler.TestTURN)
 
@@ -99,6 +100,8 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	mux.Handle("POST /api/rooms/{slug}/files", middleware.FileUploadRateLimiter(cfg.TrustedProxies)(http.HandlerFunc(fileHandler.Upload)))
 	mux.HandleFunc("GET /api/files/{id}", fileHandler.Download)
 	mux.HandleFunc("GET /api/files/{id}/thumbnail", fileHandler.Thumbnail)
+	// Public watermark logo (viewers need access)
+	mux.HandleFunc("GET /api/config/logo", configHandler.GetLogo)
 
 	// WebSocket endpoint
 	mux.HandleFunc("GET /ws/room/{slug}", wsHandler.HandleConnection)
@@ -109,9 +112,22 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	mux.HandleFunc("GET /api/rooms/{slug}/status/{id}", roomHandler.CheckParticipantStatus)
 	mux.HandleFunc("GET /api/rooms/{slug}/waiting/events/{id}", roomHandler.WaitingEvents)
 
-	// Static files (SvelteKit build)
-	staticHandler := http.FileServer(http.Dir("./static"))
-	mux.Handle("/", staticHandler)
+	// Static files (SvelteKit build) with SPA fallback
+	staticDir := http.Dir("./static")
+	fileServer := http.FileServer(staticDir)
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if path != "" {
+			if file, err := staticDir.Open(path); err == nil {
+				defer file.Close()
+				if info, err := file.Stat(); err == nil && !info.IsDir() {
+					fileServer.ServeHTTP(w, r)
+					return
+				}
+			}
+		}
+		http.ServeFile(w, r, filepath.Join("static", "index.html"))
+	}))
 
 	// Apply global middleware
 	var handler http.Handler = mux

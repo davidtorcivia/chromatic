@@ -2,19 +2,21 @@
 
 :root {
   /* Colors */
-  --color-bg: #0a0a0a;
-  --color-surface: #141414;
-  --color-surface-elevated: #1a1a1a;
-  --color-border: #2a2a2a;
-  --color-border-subtle: #1f1f1f;
-  --color-text: #fafafa;
-  --color-text-muted: #a0a0a0;
-  --color-text-subtle: #666666;
-  --color-primary: #3b82f6;
-  --color-primary-hover: #2563eb;
-  --color-success: #22c55e;
-  --color-warning: #f59e0b;
-  --color-error: #ef4444;
+  --color-bg: #0b0f12;
+  --color-surface: #12181d;
+  --color-surface-elevated: #162028;
+  --color-surface-hover: #1d2730;
+  --color-border: #26303a;
+  --color-border-subtle: #1a232b;
+  --color-text: #f4f7f9;
+  --color-text-muted: #a6b0b8;
+  --color-text-subtle: #6f7b86;
+  --color-primary: #48b6a6;
+  --color-primary-hover: #3ca394;
+  --color-success: #2fbf71;
+  --color-warning: #e6a23c;
+  --color-error: #ef5a5a;
+  --color-bg-hover: #1b232a;
 
   /* Spacing */
   --space-xs: 0.25rem;
@@ -25,7 +27,8 @@
   --space-2xl: 3rem;
 
   /* Typography */
-  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --font-sans: 'Work Sans', 'Segoe UI', Tahoma, sans-serif;
+  --font-display: 'Space Grotesk', 'Work Sans', sans-serif;
   --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
 
   /* Sizing */
@@ -60,7 +63,10 @@ html {
 
 body {
   font-family: var(--font-sans);
-  background: var(--color-bg);
+  background:
+    radial-gradient(1200px circle at 20% -10%, rgba(72, 182, 166, 0.18), transparent 60%),
+    radial-gradient(900px circle at 100% 10%, rgba(230, 162, 60, 0.16), transparent 55%),
+    var(--color-bg);
   color: var(--color-text);
   line-height: 1.5;
   min-height: 100vh;
@@ -68,6 +74,7 @@ body {
 
 /* Typography */
 h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-display);
   font-weight: 600;
   line-height: 1.2;
 }

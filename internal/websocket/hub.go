@@ -67,23 +67,25 @@ type Client struct {
 
 	// Rate limiting for chat messages (30 per minute)
 	chatRateLimiter *RateLimiter
+	// Rate limiting for cursor updates (20 per second)
+	cursorRateLimiter *RateLimiter
 }
 
 // RateLimiter tracks rate limits per client
 type RateLimiter struct {
-	mu           sync.Mutex
-	windowStart  time.Time
-	requests     int
-	maxRequests  int
+	mu             sync.Mutex
+	windowStart    time.Time
+	requests       int
+	maxRequests    int
 	windowDuration time.Duration
 }
 
 // NewRateLimiter creates a new rate limiter
 func NewRateLimiter(maxRequests int, windowDuration time.Duration) *RateLimiter {
 	return &RateLimiter{
-		windowStart:  time.Now(),
-		requests:     0,
-		maxRequests:  maxRequests,
+		windowStart:    time.Now(),
+		requests:       0,
+		maxRequests:    maxRequests,
 		windowDuration: windowDuration,
 	}
 }
@@ -123,6 +125,20 @@ func (c *Client) AllowChatMessage() bool {
 		c.InitChatRateLimiter()
 	}
 	return c.chatRateLimiter.Allow()
+}
+
+// InitCursorRateLimiter initializes the cursor update rate limiter
+// 20 updates per second per client
+func (c *Client) InitCursorRateLimiter() {
+	c.cursorRateLimiter = NewRateLimiter(20, time.Second)
+}
+
+// AllowCursor checks if the client can send another cursor update
+func (c *Client) AllowCursor() bool {
+	if c.cursorRateLimiter == nil {
+		c.InitCursorRateLimiter()
+	}
+	return c.cursorRateLimiter.Allow()
 }
 
 // RoomMessage is a message to be broadcast to a room

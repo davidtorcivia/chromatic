@@ -9,10 +9,13 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"chromatic/internal/config"
 	"chromatic/internal/database"
 )
+
+const testTokenSecret = "test-secret"
 
 func setupFileTest(t *testing.T) (*FileHandler, *RoomHandler, *database.DB, func()) {
 	db, dbCleanup := database.NewTestDB(t)
@@ -27,8 +30,8 @@ func setupFileTest(t *testing.T) (*FileHandler, *RoomHandler, *database.DB, func
 		UploadPath: uploadPath,
 	}
 
-	fileHandler := NewFileHandler(db, cfg)
-	roomHandler := NewRoomHandler(db, "test-secret")
+	fileHandler := NewFileHandler(db, cfg, testTokenSecret)
+	roomHandler := NewRoomHandler(db, cfg, testTokenSecret)
 
 	cleanup := func() {
 		dbCleanup()
@@ -36,6 +39,17 @@ func setupFileTest(t *testing.T) (*FileHandler, *RoomHandler, *database.DB, func
 	}
 
 	return fileHandler, roomHandler, db, cleanup
+}
+
+func createJoinToken(t *testing.T, participantID, roomSlug string) string {
+	t.Helper()
+
+	tokenManager := NewTokenManager(testTokenSecret)
+	token, err := tokenManager.GenerateToken(participantID, roomSlug, "Test User", time.Hour)
+	if err != nil {
+		t.Fatalf("failed to create join token: %v", err)
+	}
+	return token
 }
 
 // createTestRoom creates a room and returns its ID
@@ -97,12 +111,20 @@ func TestFileHandler_Upload(t *testing.T) {
 	createTestParticipant(t, db, roomID, "user-789")
 	createTestParticipant(t, db, roomID, "unknown") // For uploads without explicit participant ID
 
+	tokens := map[string]string{
+		"user-123": createJoinToken(t, "user-123", "upload-test"),
+		"user-456": createJoinToken(t, "user-456", "upload-test"),
+		"user-789": createJoinToken(t, "user-789", "upload-test"),
+		"unknown":  createJoinToken(t, "unknown", "upload-test"),
+	}
+
 	tests := []struct {
 		name           string
 		filename       string
 		content        []byte
 		contentType    string
 		participantID  string
+		token          string
 		expectedStatus int
 		checkResponse  func(t *testing.T, body []byte)
 	}{
@@ -112,6 +134,7 @@ func TestFileHandler_Upload(t *testing.T) {
 			content:        createTestPNG(),
 			contentType:    "image/png",
 			participantID:  "user-123",
+			token:          tokens["user-123"],
 			expectedStatus: http.StatusCreated,
 			checkResponse: func(t *testing.T, body []byte) {
 				var resp map[string]interface{}
@@ -136,6 +159,7 @@ func TestFileHandler_Upload(t *testing.T) {
 			content:        createTestJPEG(),
 			contentType:    "image/jpeg",
 			participantID:  "user-456",
+			token:          tokens["user-456"],
 			expectedStatus: http.StatusCreated,
 		},
 		{
@@ -144,6 +168,7 @@ func TestFileHandler_Upload(t *testing.T) {
 			content:        createTestPDF(),
 			contentType:    "application/pdf",
 			participantID:  "user-789",
+			token:          tokens["user-789"],
 			expectedStatus: http.StatusCreated,
 			checkResponse: func(t *testing.T, body []byte) {
 				var resp map[string]interface{}
@@ -160,6 +185,7 @@ func TestFileHandler_Upload(t *testing.T) {
 			content:        createTestPNG(),
 			contentType:    "image/png",
 			participantID:  "",
+			token:          tokens["unknown"],
 			expectedStatus: http.StatusCreated,
 		},
 	}
@@ -171,6 +197,7 @@ func TestFileHandler_Upload(t *testing.T) {
 			req := httptest.NewRequest("POST", "/api/rooms/upload-test/files", body)
 			req.SetPathValue("slug", "upload-test")
 			req.Header.Set("Content-Type", contentType)
+			req.Header.Set("X-Join-Token", tt.token)
 			if tt.participantID != "" {
 				req.Header.Set("X-Participant-ID", tt.participantID)
 			}
@@ -193,7 +220,9 @@ func TestFileHandler_Upload_InvalidMIME(t *testing.T) {
 	fileHandler, roomHandler, db, cleanup := setupFileTest(t)
 	defer cleanup()
 
-	createTestRoom(t, roomHandler, db, "mime-test")
+	roomID := createTestRoom(t, roomHandler, db, "mime-test")
+	createTestParticipant(t, db, roomID, "user-123")
+	token := createJoinToken(t, "user-123", "mime-test")
 
 	// Create a file with disallowed MIME type (executable)
 	content := []byte("MZ\x00\x00") // DOS executable header
@@ -202,6 +231,7 @@ func TestFileHandler_Upload_InvalidMIME(t *testing.T) {
 	req := httptest.NewRequest("POST", "/api/rooms/mime-test/files", body)
 	req.SetPathValue("slug", "mime-test")
 	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("X-Join-Token", token)
 
 	rr := httptest.NewRecorder()
 	fileHandler.Upload(rr, req)
@@ -219,7 +249,9 @@ func TestFileHandler_Upload_TooLarge(t *testing.T) {
 	fileHandler, roomHandler, db, cleanup := setupFileTest(t)
 	defer cleanup()
 
-	createTestRoom(t, roomHandler, db, "size-test")
+	roomID := createTestRoom(t, roomHandler, db, "size-test")
+	createTestParticipant(t, db, roomID, "user-123")
+	token := createJoinToken(t, "user-123", "size-test")
 
 	// Create a file larger than 5MB
 	content := make([]byte, 6*1024*1024)
@@ -228,6 +260,7 @@ func TestFileHandler_Upload_TooLarge(t *testing.T) {
 	req := httptest.NewRequest("POST", "/api/rooms/size-test/files", body)
 	req.SetPathValue("slug", "size-test")
 	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("X-Join-Token", token)
 
 	rr := httptest.NewRecorder()
 	fileHandler.Upload(rr, req)
@@ -237,7 +270,7 @@ func TestFileHandler_Upload_TooLarge(t *testing.T) {
 	}
 }
 
-func TestFileHandler_Upload_RoomNotFound(t *testing.T) {
+func TestFileHandler_Upload_Unauthorized(t *testing.T) {
 	fileHandler, _, _, cleanup := setupFileTest(t)
 	defer cleanup()
 
@@ -250,8 +283,8 @@ func TestFileHandler_Upload_RoomNotFound(t *testing.T) {
 	rr := httptest.NewRecorder()
 	fileHandler.Upload(rr, req)
 
-	if rr.Code != http.StatusNotFound {
-		t.Errorf("expected status %d for nonexistent room, got %d", http.StatusNotFound, rr.Code)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected status %d for missing token, got %d", http.StatusUnauthorized, rr.Code)
 	}
 }
 
@@ -261,12 +294,14 @@ func TestFileHandler_Download(t *testing.T) {
 
 	roomID := createTestRoom(t, roomHandler, db, "download-test")
 	createTestParticipant(t, db, roomID, "unknown") // For default uploader
+	token := createJoinToken(t, "unknown", "download-test")
 
 	// First upload a file
 	body, contentType := createMultipartRequest("download.png", createTestPNG(), "image/png")
 	uploadReq := httptest.NewRequest("POST", "/api/rooms/download-test/files", body)
 	uploadReq.SetPathValue("slug", "download-test")
 	uploadReq.Header.Set("Content-Type", contentType)
+	uploadReq.Header.Set("X-Join-Token", token)
 
 	uploadRR := httptest.NewRecorder()
 	fileHandler.Upload(uploadRR, uploadReq)
@@ -282,6 +317,7 @@ func TestFileHandler_Download(t *testing.T) {
 	t.Run("download existing file", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/files/"+fileID, nil)
 		req.SetPathValue("id", fileID)
+		req.Header.Set("X-Join-Token", token)
 
 		rr := httptest.NewRecorder()
 		fileHandler.Download(rr, req)
@@ -302,6 +338,7 @@ func TestFileHandler_Download(t *testing.T) {
 	t.Run("download nonexistent file", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/files/nonexistent", nil)
 		req.SetPathValue("id", "nonexistent")
+		req.Header.Set("X-Join-Token", token)
 
 		rr := httptest.NewRecorder()
 		fileHandler.Download(rr, req)
@@ -318,12 +355,14 @@ func TestFileHandler_Thumbnail(t *testing.T) {
 
 	roomID := createTestRoom(t, roomHandler, db, "thumb-test")
 	createTestParticipant(t, db, roomID, "unknown") // For default uploader
+	token := createJoinToken(t, "unknown", "thumb-test")
 
 	// Upload an image (which should generate a thumbnail)
 	body, contentType := createMultipartRequest("thumb.png", createTestPNG(), "image/png")
 	uploadReq := httptest.NewRequest("POST", "/api/rooms/thumb-test/files", body)
 	uploadReq.SetPathValue("slug", "thumb-test")
 	uploadReq.Header.Set("Content-Type", contentType)
+	uploadReq.Header.Set("X-Join-Token", token)
 
 	uploadRR := httptest.NewRecorder()
 	fileHandler.Upload(uploadRR, uploadReq)
@@ -339,6 +378,7 @@ func TestFileHandler_Thumbnail(t *testing.T) {
 	t.Run("get thumbnail for image", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/files/"+fileID+"/thumbnail", nil)
 		req.SetPathValue("id", fileID)
+		req.Header.Set("X-Join-Token", token)
 
 		rr := httptest.NewRecorder()
 		fileHandler.Thumbnail(rr, req)
@@ -351,6 +391,7 @@ func TestFileHandler_Thumbnail(t *testing.T) {
 	t.Run("thumbnail for nonexistent file", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/files/nonexistent/thumbnail", nil)
 		req.SetPathValue("id", "nonexistent")
+		req.Header.Set("X-Join-Token", token)
 
 		rr := httptest.NewRecorder()
 		fileHandler.Thumbnail(rr, req)

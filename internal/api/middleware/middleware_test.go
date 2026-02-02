@@ -89,8 +89,8 @@ func TestRequireAuthConstantTime(t *testing.T) {
 		"wrong-admin-token-12345", // Same length
 		"short",                   // Shorter
 		"a-very-long-token-that-is-much-longer-than-the-valid-one", // Longer
-		"",          // Empty
-		validToken,  // Valid (should succeed)
+		"",         // Empty
+		validToken, // Valid (should succeed)
 	}
 
 	for _, token := range testTokens {
@@ -115,11 +115,11 @@ func TestRequireAuthConstantTime(t *testing.T) {
 // TestCORS tests the CORS middleware
 func TestCORS(t *testing.T) {
 	tests := []struct {
-		name            string
-		allowedOrigins  []string
-		requestOrigin   string
-		expectedOrigin  string
-		shouldHaveACO   bool // Should have Access-Control-Allow-Origin
+		name           string
+		allowedOrigins []string
+		requestOrigin  string
+		expectedOrigin string
+		shouldHaveACO  bool // Should have Access-Control-Allow-Origin
 	}{
 		{
 			name:           "development mode allows any origin",
@@ -481,11 +481,11 @@ func TestGetClientIP(t *testing.T) {
 	// Test with no trusted proxies - should always use direct IP
 	t.Run("no trusted proxies", func(t *testing.T) {
 		tests := []struct {
-			name           string
-			remoteAddr     string
-			xForwardedFor  string
-			xRealIP        string
-			expectedIP     string
+			name          string
+			remoteAddr    string
+			xForwardedFor string
+			xRealIP       string
+			expectedIP    string
 		}{
 			{
 				name:       "remote addr only",
@@ -506,7 +506,7 @@ func TestGetClientIP(t *testing.T) {
 			},
 		}
 
-		emptyProxies := make(map[string]bool)
+		emptyProxies := buildTrustedProxySet(nil)
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				req := httptest.NewRequest("GET", "/", nil)
@@ -528,17 +528,14 @@ func TestGetClientIP(t *testing.T) {
 
 	// Test with trusted proxy - should trust forwarded headers from proxy
 	t.Run("with trusted proxy", func(t *testing.T) {
-		trustedProxies := map[string]bool{
-			"127.0.0.1": true,
-			"10.0.0.1":  true,
-		}
+		trustedProxies := buildTrustedProxySet([]string{"127.0.0.1", "10.0.0.1"})
 
 		tests := []struct {
-			name           string
-			remoteAddr     string
-			xForwardedFor  string
-			xRealIP        string
-			expectedIP     string
+			name          string
+			remoteAddr    string
+			xForwardedFor string
+			xRealIP       string
+			expectedIP    string
 		}{
 			{
 				name:          "x-forwarded-for from trusted proxy",

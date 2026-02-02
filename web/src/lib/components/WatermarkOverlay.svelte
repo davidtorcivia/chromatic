@@ -12,6 +12,7 @@
             | "bottom-right";
         opacity?: number;
         participantName: string;
+        roomName?: string;
         logoSize?: number; // Size in pixels (default 80)
         logoPadding?: number; // Padding from edges (default 20)
     }
@@ -23,6 +24,7 @@
         logoPosition = "bottom-right",
         opacity = 0.3,
         participantName,
+        roomName = "",
         logoSize = 80,
         logoPadding = 20,
     }: Props = $props();
@@ -48,10 +50,11 @@
     function processText(template: string): string {
         const now = new Date();
         return template
-            .replace(/\{\{name\}\}/g, participantName)
-            .replace(/\{\{date\}\}/g, now.toISOString().slice(0, 10))
+            .replace(/\{\{\s*name\s*\}\}/g, participantName)
+            .replace(/\{\{\s*room\s*\}\}/g, roomName)
+            .replace(/\{\{\s*date\s*\}\}/g, now.toISOString().slice(0, 10))
             .replace(
-                /\{\{time\}\}/g,
+                /\{\{\s*time\s*\}\}/g,
                 now.toLocaleTimeString([], {
                     hour: "2-digit",
                     minute: "2-digit",
@@ -116,7 +119,7 @@
         // Draw text watermark
         if ((mode === "text" || mode === "both") && text) {
             const processedText = processText(text);
-            ctx.font = "14px Inter, sans-serif";
+            ctx.font = "14px 'Work Sans', sans-serif";
             ctx.fillStyle = "white";
             ctx.textAlign = "center";
             ctx.textBaseline = "middle";

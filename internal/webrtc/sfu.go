@@ -59,6 +59,8 @@ type RoomTracks struct {
 type Subscriber struct {
 	ID             string
 	PeerConnection *webrtc.PeerConnection
+	VideoSender    *webrtc.RTPSender
+	AudioSender    *webrtc.RTPSender
 	done           chan struct{}
 	closeOnce      sync.Once // Ensures done channel is closed only once
 }
@@ -309,6 +311,18 @@ func (s *SFU) BindIngestToRoom(streamKeyToken, roomSlug string) error {
 	room.mu.Lock()
 	room.VideoTrack = ingest.VideoTrack
 	room.AudioTrack = ingest.AudioTrack
+	for _, sub := range room.Subscribers {
+		if sub.VideoSender != nil && ingest.VideoTrack != nil {
+			if err := sub.VideoSender.ReplaceTrack(ingest.VideoTrack); err != nil {
+				log.Printf("Failed to replace video track for subscriber %s: %v", sub.ID, err)
+			}
+		}
+		if sub.AudioSender != nil && ingest.AudioTrack != nil {
+			if err := sub.AudioSender.ReplaceTrack(ingest.AudioTrack); err != nil {
+				log.Printf("Failed to replace audio track for subscriber %s: %v", sub.ID, err)
+			}
+		}
+	}
 	room.mu.Unlock()
 
 	log.Printf("Bound ingest %s... to room %s", streamKeyToken[:8], roomSlug)
@@ -341,31 +355,33 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 		return nil, nil, fmt.Errorf("failed to create peer connection: %w", err)
 	}
 
-	// Add video track if available
-	if videoTrack != nil {
-		_, err = pc.AddTrack(videoTrack)
-		if err != nil {
-			pc.Close()
-			return nil, nil, fmt.Errorf("failed to add video track: %w", err)
-		}
-		log.Printf("Added video track to subscriber %s", subscriberID)
-	}
-
-	// Add audio track if available
-	if audioTrack != nil {
-		_, err = pc.AddTrack(audioTrack)
-		if err != nil {
-			pc.Close()
-			return nil, nil, fmt.Errorf("failed to add audio track: %w", err)
-		}
-		log.Printf("Added audio track to subscriber %s", subscriberID)
-	}
-
 	// Create subscriber record
 	sub := &Subscriber{
 		ID:             subscriberID,
 		PeerConnection: pc,
 		done:           make(chan struct{}),
+	}
+
+	// Add video track if available
+	if videoTrack != nil {
+		sender, err := pc.AddTrack(videoTrack)
+		if err != nil {
+			pc.Close()
+			return nil, nil, fmt.Errorf("failed to add video track: %w", err)
+		}
+		sub.VideoSender = sender
+		log.Printf("Added video track to subscriber %s", subscriberID)
+	}
+
+	// Add audio track if available
+	if audioTrack != nil {
+		sender, err := pc.AddTrack(audioTrack)
+		if err != nil {
+			pc.Close()
+			return nil, nil, fmt.Errorf("failed to add audio track: %w", err)
+		}
+		sub.AudioSender = sender
+		log.Printf("Added audio track to subscriber %s", subscriberID)
 	}
 
 	room.AddSubscriber(sub)
@@ -485,6 +501,48 @@ func (s *SFU) HandleIceRestart(roomSlug, subscriberID, sdpOffer string) (string,
 
 	log.Printf("ICE restart completed for subscriber %s", subscriberID)
 	return answer.SDP, nil
+}
+
+// HandleSubscriberOffer processes a client-initiated offer on an existing subscriber connection.
+// Used for renegotiation when a client adds a microphone track.
+func (s *SFU) HandleSubscriberOffer(roomSlug, subscriberID, sdpOffer string) (string, error) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return "", fmt.Errorf("room not found: %s", roomSlug)
+	}
+
+	room.mu.RLock()
+	sub, ok := room.Subscribers[subscriberID]
+	room.mu.RUnlock()
+
+	if !ok {
+		return "", fmt.Errorf("subscriber not found: %s", subscriberID)
+	}
+
+	offer := webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer,
+		SDP:  sdpOffer,
+	}
+
+	if err := sub.PeerConnection.SetRemoteDescription(offer); err != nil {
+		return "", fmt.Errorf("failed to set remote description: %w", err)
+	}
+
+	answer, err := sub.PeerConnection.CreateAnswer(nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create answer: %w", err)
+	}
+
+	if err := sub.PeerConnection.SetLocalDescription(answer); err != nil {
+		return "", fmt.Errorf("failed to set local description: %w", err)
+	}
+
+	// Wait for ICE gathering
+	gatherComplete := webrtc.GatheringCompletePromise(sub.PeerConnection)
+	<-gatherComplete
+
+	log.Printf("Renegotiation completed for subscriber %s", subscriberID)
+	return sub.PeerConnection.LocalDescription().SDP, nil
 }
 
 // GetIngestForRoom finds the ingest session bound to a room's stream key

@@ -3,6 +3,7 @@ package handlers
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -43,22 +44,86 @@ const maxFileSize = 5 * 1024 * 1024 // 5 MB
 
 // FileHandler handles file upload and download
 type FileHandler struct {
-	db  *database.DB
-	cfg *config.Config
+	db           *database.DB
+	cfg          *config.Config
+	tokenManager *TokenManager
 }
 
 // NewFileHandler creates a new FileHandler
-func NewFileHandler(db *database.DB, cfg *config.Config) *FileHandler {
-	return &FileHandler{db: db, cfg: cfg}
+func NewFileHandler(db *database.DB, cfg *config.Config, tokenSecret string) *FileHandler {
+	return &FileHandler{
+		db:           db,
+		cfg:          cfg,
+		tokenManager: NewTokenManager(tokenSecret),
+	}
+}
+
+// getJoinToken extracts a join token from headers or query params.
+func (h *FileHandler) getJoinToken(r *http.Request) string {
+	if token := r.Header.Get("X-Join-Token"); token != "" {
+		return token
+	}
+	if token := r.URL.Query().Get("token"); token != "" {
+		return token
+	}
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimPrefix(auth, "Bearer ")
+	}
+	return ""
+}
+
+// authorizeParticipant validates the join token and ensures the participant is admitted to the room.
+func (h *FileHandler) authorizeParticipant(r *http.Request, roomSlug string) (string, error) {
+	token := h.getJoinToken(r)
+	if token == "" {
+		return "", errors.New("missing join token")
+	}
+
+	payload, err := h.tokenManager.ValidateToken(token)
+	if err != nil {
+		return "", err
+	}
+
+	if payload.RoomSlug != roomSlug {
+		return "", errors.New("token room mismatch")
+	}
+
+	var isAdmitted bool
+	var roomStatus string
+	err = h.db.QueryRow(`
+		SELECT p.is_admitted, r.status
+		FROM participants p
+		JOIN rooms r ON r.id = p.room_id
+		WHERE p.id = ? AND r.slug = ?
+	`, payload.ParticipantID, roomSlug).Scan(&isAdmitted, &roomStatus)
+	if err != nil {
+		return "", err
+	}
+
+	if roomStatus == "ended" {
+		return "", errors.New("room ended")
+	}
+	if !isAdmitted {
+		return "", errors.New("participant not admitted")
+	}
+
+	return payload.ParticipantID, nil
 }
 
 // Upload handles file uploads
 func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 
+	uploaderID, err := h.authorizeParticipant(r, slug)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	// Get room ID
 	var roomID string
-	err := h.db.QueryRow("SELECT id FROM rooms WHERE slug = ?", slug).Scan(&roomID)
+	err = h.db.QueryRow("SELECT id FROM rooms WHERE slug = ?", slug).Scan(&roomID)
 	if err != nil {
 		http.Error(w, "Room not found", http.StatusNotFound)
 		return
@@ -104,7 +169,8 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 
 	// Generate file ID and path
 	fileID := generateFileID()
-	ext := filepath.Ext(header.Filename)
+	originalName := sanitizeFilename(header.Filename)
+	ext := filepath.Ext(originalName)
 	if ext == "" {
 		ext = getExtensionForMIME(mimeType)
 	}
@@ -131,17 +197,11 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get uploader ID from auth context (simplified for now)
-	uploaderID := r.Header.Get("X-Participant-ID")
-	if uploaderID == "" {
-		uploaderID = "unknown"
-	}
-
 	// Insert into database
 	_, err = h.db.Exec(`
 		INSERT INTO files (id, room_id, uploader_id, original_name, stored_path, mime_type, size_bytes)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, fileID, roomID, uploaderID, header.Filename, storedPath, mimeType, header.Size)
+	`, fileID, roomID, uploaderID, originalName, storedPath, mimeType, header.Size)
 
 	if err != nil {
 		os.Remove(storedPath)
@@ -164,7 +224,7 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 
 	response := map[string]interface{}{
 		"id":           fileID,
-		"originalName": header.Filename,
+		"originalName": originalName,
 		"mimeType":     mimeType,
 		"sizeBytes":    header.Size,
 		"url":          fmt.Sprintf("/api/files/%s", fileID),
@@ -185,13 +245,21 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 func (h *FileHandler) Download(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	var storedPath, mimeType, originalName string
+	var storedPath, mimeType, originalName, roomSlug string
 	err := h.db.QueryRow(`
-		SELECT stored_path, mime_type, original_name FROM files WHERE id = ?
-	`, id).Scan(&storedPath, &mimeType, &originalName)
+		SELECT f.stored_path, f.mime_type, f.original_name, r.slug
+		FROM files f
+		JOIN rooms r ON r.id = f.room_id
+		WHERE f.id = ?
+	`, id).Scan(&storedPath, &mimeType, &originalName, &roomSlug)
 
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	if _, err := h.authorizeParticipant(r, roomSlug); err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -202,7 +270,7 @@ func (h *FileHandler) Download(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", mimeType)
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, originalName))
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitizeFilename(originalName)))
 
 	http.ServeFile(w, r, storedPath)
 }
@@ -211,14 +279,22 @@ func (h *FileHandler) Download(w http.ResponseWriter, r *http.Request) {
 func (h *FileHandler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	var storedPath, mimeType string
+	var storedPath, mimeType, roomSlug string
 	var thumbnailPath *string
 	err := h.db.QueryRow(`
-		SELECT stored_path, mime_type, thumbnail_path FROM files WHERE id = ?
-	`, id).Scan(&storedPath, &mimeType, &thumbnailPath)
+		SELECT f.stored_path, f.mime_type, f.thumbnail_path, r.slug
+		FROM files f
+		JOIN rooms r ON r.id = f.room_id
+		WHERE f.id = ?
+	`, id).Scan(&storedPath, &mimeType, &thumbnailPath, &roomSlug)
 
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	if _, err := h.authorizeParticipant(r, roomSlug); err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 

@@ -8,10 +8,10 @@
         isOpen: boolean;
         onClose: () => void;
         roomSlug: string;
-        participantId: string;
+        joinToken: string;
     }
 
-    let { isOpen, onClose, roomSlug, participantId }: Props = $props();
+    let { isOpen, onClose, roomSlug, joinToken }: Props = $props();
 
     // Allowed file types (must match backend)
     const ALLOWED_TYPES = [
@@ -34,6 +34,17 @@
             return parsed.protocol === "http:" || parsed.protocol === "https:";
         } catch {
             return false;
+        }
+    }
+
+    function withJoinToken(url: string | undefined): string | undefined {
+        if (!url || !joinToken) return url;
+        try {
+            const parsed = new URL(url, window.location.origin);
+            parsed.searchParams.set("token", joinToken);
+            return parsed.toString();
+        } catch {
+            return url;
         }
     }
 
@@ -129,7 +140,7 @@
             const uploadedFile = await uploadFile(
                 roomSlug,
                 file,
-                participantId,
+                joinToken,
                 (progress) => {
                     uploadProgress = progress;
                 }
@@ -216,21 +227,21 @@
                     {:else if msg.file && isSafeUrl(msg.file.url)}
                         <div class="chat-message-file">
                             {#if msg.file.mimeType.startsWith("image/") && isSafeUrl(msg.file.thumbnailUrl || msg.file.url)}
-                                <a href={msg.file.url} target="_blank" rel="noopener noreferrer">
+                                <a href={withJoinToken(msg.file.url)} target="_blank" rel="noopener noreferrer">
                                     <img
-                                        src={msg.file.thumbnailUrl || msg.file.url}
+                                        src={withJoinToken(msg.file.thumbnailUrl || msg.file.url)}
                                         alt={msg.file.name}
                                     />
                                 </a>
                             {:else if msg.file.mimeType.startsWith("audio/")}
                                 <div class="audio-file">
                                     <span class="file-name">{msg.file.name}</span>
-                                    <audio controls src={msg.file.url} preload="metadata">
+                                    <audio controls src={withJoinToken(msg.file.url)} preload="metadata">
                                         <track kind="captions" />
                                     </audio>
                                 </div>
                             {:else}
-                                <a href={msg.file.url} target="_blank" rel="noopener noreferrer" class="file-link">
+                                <a href={withJoinToken(msg.file.url)} target="_blank" rel="noopener noreferrer" class="file-link">
                                     <span class="file-icon">📄</span>
                                     <span class="file-name">{msg.file.name}</span>
                                 </a>

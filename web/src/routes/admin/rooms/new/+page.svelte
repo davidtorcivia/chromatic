@@ -192,7 +192,7 @@
                         class="input"
                         bind:value={password}
                         placeholder="Leave empty for no password"
-                        minlength="4"
+                        minlength="8"
                     />
                 </div>
 

@@ -72,7 +72,7 @@
             eventSource.close();
         }
 
-        const url = `/api/rooms/${slug}/waiting/events/${sessionData.participantId}`;
+        const url = `/api/rooms/${slug}/waiting/events/${sessionData.participantId}?token=${encodeURIComponent(sessionData.token)}`;
         eventSource = new EventSource(url);
 
         eventSource.onopen = () => {
@@ -126,7 +126,7 @@
         if (!sessionData) return;
 
         try {
-            const result = await rooms.checkStatus(slug, sessionData.participantId);
+            const result = await rooms.checkStatus(slug, sessionData.participantId, sessionData.token);
 
             if (result.roomStatus === "ended") {
                 status = "ended";

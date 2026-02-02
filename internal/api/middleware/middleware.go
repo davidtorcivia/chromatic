@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -16,9 +17,9 @@ type SessionValidator func(sessionID string) bool
 
 // AuthConfig holds authentication configuration
 type AuthConfig struct {
-	AdminToken       string
-	SessionCookie    string           // Name of the session cookie
-	ValidateSession  SessionValidator // Function to validate session IDs
+	AdminToken      string
+	SessionCookie   string           // Name of the session cookie
+	ValidateSession SessionValidator // Function to validate session IDs
 }
 
 // RequireAuth returns middleware that validates authentication
@@ -132,7 +133,7 @@ func CORS(cfg CORSConfig) func(http.Handler) http.Handler {
 			}
 
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-CSRF-Token")
+			w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-CSRF-Token, X-Join-Token")
 			w.Header().Set("Access-Control-Max-Age", "86400")
 
 			// Handle preflight
@@ -160,6 +161,47 @@ type ipRateLimiter struct {
 	tokens      float64
 }
 
+type trustedProxySet struct {
+	exact map[string]bool
+	cidrs []*net.IPNet
+}
+
+func buildTrustedProxySet(trusted []string) trustedProxySet {
+	set := trustedProxySet{
+		exact: make(map[string]bool),
+	}
+	for _, proxy := range trusted {
+		proxy = strings.TrimSpace(proxy)
+		if proxy == "" {
+			continue
+		}
+		if strings.Contains(proxy, "/") {
+			if _, cidr, err := net.ParseCIDR(proxy); err == nil {
+				set.cidrs = append(set.cidrs, cidr)
+				continue
+			}
+		}
+		set.exact[proxy] = true
+	}
+	return set
+}
+
+func (t trustedProxySet) IsTrusted(ip string) bool {
+	if t.exact[ip] {
+		return true
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, cidr := range t.cidrs {
+		if cidr.Contains(parsed) {
+			return true
+		}
+	}
+	return false
+}
+
 // RateLimiter middleware limits requests per IP
 func RateLimiter(cfg RateLimiterConfig) func(http.Handler) http.Handler {
 	if cfg.RequestsPerSecond <= 0 {
@@ -172,11 +214,7 @@ func RateLimiter(cfg RateLimiterConfig) func(http.Handler) http.Handler {
 		cfg.CleanupInterval = 5 * time.Minute
 	}
 
-	// Build trusted proxy map for O(1) lookup
-	trustedProxyMap := make(map[string]bool)
-	for _, proxy := range cfg.TrustedProxies {
-		trustedProxyMap[proxy] = true
-	}
+	trustedProxySet := buildTrustedProxySet(cfg.TrustedProxies)
 
 	var mu sync.Mutex
 	limiters := make(map[string]*ipRateLimiter)
@@ -200,7 +238,7 @@ func RateLimiter(cfg RateLimiterConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Get client IP (only trust X-Forwarded-For from trusted proxies)
-			ip := getClientIP(r, trustedProxyMap)
+			ip := getClientIP(r, trustedProxySet)
 
 			mu.Lock()
 			limiter, exists := limiters[ip]
@@ -243,21 +281,19 @@ func RateLimiter(cfg RateLimiterConfig) func(http.Handler) http.Handler {
 // getClientIP extracts the client IP from the request
 // Only trusts X-Forwarded-For and X-Real-IP headers if the direct connection
 // comes from a trusted proxy. This prevents IP spoofing attacks.
-func getClientIP(r *http.Request, trustedProxies map[string]bool) string {
-	// Get the direct connection IP
-	directIP := r.RemoteAddr
-	// Remove port if present
-	if idx := strings.LastIndex(directIP, ":"); idx != -1 {
-		directIP = directIP[:idx]
+func getClientIP(r *http.Request, trustedProxies trustedProxySet) string {
+	directIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		directIP = r.RemoteAddr
 	}
 
 	// If no trusted proxies configured, always use direct IP (secure default)
-	if len(trustedProxies) == 0 {
+	if len(trustedProxies.exact) == 0 && len(trustedProxies.cidrs) == 0 {
 		return directIP
 	}
 
 	// Only trust forwarded headers if request came from a trusted proxy
-	if !trustedProxies[directIP] {
+	if !trustedProxies.IsTrusted(directIP) {
 		return directIP
 	}
 
@@ -332,15 +368,15 @@ func Recoverer(next http.Handler) http.Handler {
 
 // EndpointRateLimiterConfig holds configuration for endpoint-specific rate limiting
 type EndpointRateLimiterConfig struct {
-	RequestsPerWindow int           // Max requests per window
-	WindowDuration    time.Duration // Time window (e.g., 1 minute, 1 hour)
-	TrustedProxies    []string      // IP addresses of trusted reverse proxies
+	RequestsPerWindow int                          // Max requests per window
+	WindowDuration    time.Duration                // Time window (e.g., 1 minute, 1 hour)
+	TrustedProxies    []string                     // IP addresses of trusted reverse proxies
 	KeyExtractor      func(r *http.Request) string // Custom key extraction (e.g., include room slug)
 }
 
 // endpointRateLimiter tracks rate limiting state per key
 type endpointRateLimiter struct {
-	requests   int
+	requests    int
 	windowStart time.Time
 }
 
@@ -353,11 +389,7 @@ func EndpointRateLimiter(cfg EndpointRateLimiterConfig) func(http.Handler) http.
 		cfg.WindowDuration = time.Minute
 	}
 
-	// Build trusted proxy map for O(1) lookup
-	trustedProxyMap := make(map[string]bool)
-	for _, proxy := range cfg.TrustedProxies {
-		trustedProxyMap[proxy] = true
-	}
+	trustedProxySet := buildTrustedProxySet(cfg.TrustedProxies)
 
 	var mu sync.Mutex
 	limiters := make(map[string]*endpointRateLimiter)
@@ -385,7 +417,7 @@ func EndpointRateLimiter(cfg EndpointRateLimiterConfig) func(http.Handler) http.
 			if cfg.KeyExtractor != nil {
 				key = cfg.KeyExtractor(r)
 			} else {
-				key = getClientIP(r, trustedProxyMap)
+				key = getClientIP(r, trustedProxySet)
 			}
 
 			mu.Lock()
@@ -428,16 +460,12 @@ func EndpointRateLimiter(cfg EndpointRateLimiterConfig) func(http.Handler) http.
 // Keys by IP + room slug to limit password guessing per room
 func RoomJoinRateLimiter(trustedProxies []string) func(http.Handler) http.Handler {
 	return EndpointRateLimiter(EndpointRateLimiterConfig{
-		RequestsPerWindow: 5,            // 5 attempts
-		WindowDuration:    time.Minute,  // per minute
+		RequestsPerWindow: 5,           // 5 attempts
+		WindowDuration:    time.Minute, // per minute
 		TrustedProxies:    trustedProxies,
 		KeyExtractor: func(r *http.Request) string {
-			// Build trusted proxy map
-			trustedProxyMap := make(map[string]bool)
-			for _, proxy := range trustedProxies {
-				trustedProxyMap[proxy] = true
-			}
-			ip := getClientIP(r, trustedProxyMap)
+			trustedProxySet := buildTrustedProxySet(trustedProxies)
+			ip := getClientIP(r, trustedProxySet)
 			slug := r.PathValue("slug")
 			return fmt.Sprintf("%s:%s", ip, slug)
 		},
@@ -448,8 +476,8 @@ func RoomJoinRateLimiter(trustedProxies []string) func(http.Handler) http.Handle
 // 10 rooms per hour per IP
 func RoomCreationRateLimiter(trustedProxies []string) func(http.Handler) http.Handler {
 	return EndpointRateLimiter(EndpointRateLimiterConfig{
-		RequestsPerWindow: 10,          // 10 rooms
-		WindowDuration:    time.Hour,   // per hour
+		RequestsPerWindow: 10,        // 10 rooms
+		WindowDuration:    time.Hour, // per hour
 		TrustedProxies:    trustedProxies,
 	})
 }
@@ -458,8 +486,8 @@ func RoomCreationRateLimiter(trustedProxies []string) func(http.Handler) http.Ha
 // 10 uploads per minute per IP
 func FileUploadRateLimiter(trustedProxies []string) func(http.Handler) http.Handler {
 	return EndpointRateLimiter(EndpointRateLimiterConfig{
-		RequestsPerWindow: 10,           // 10 uploads
-		WindowDuration:    time.Minute,  // per minute
+		RequestsPerWindow: 10,          // 10 uploads
+		WindowDuration:    time.Minute, // per minute
 		TrustedProxies:    trustedProxies,
 	})
 }

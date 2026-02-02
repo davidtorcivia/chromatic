@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount } from "svelte";
+    import { onMount, onDestroy } from "svelte";
     import { page } from "$app/stores";
     import { rooms, type RoomInfo } from "$lib/api/client";
 
@@ -8,6 +8,10 @@
     let name = $state("");
     let password = $state("");
     let isLoading = $state(false);
+    let now = $state(Date.now());
+    let timer: ReturnType<typeof setInterval>;
+
+    const EARLY_ACCESS_WINDOW_MS = 10 * 60 * 1000;
 
     const slug = $page.params.slug!;
 
@@ -17,11 +21,31 @@
         } catch (e) {
             error = "Room not found";
         }
+
+        timer = setInterval(() => {
+            now = Date.now();
+        }, 30000);
     });
+
+    onDestroy(() => {
+        if (timer) {
+            clearInterval(timer);
+        }
+    });
+
+    let scheduledAt = $derived(roomInfo?.scheduledAt ? new Date(roomInfo.scheduledAt) : null);
+    let earlyAccessAt = $derived(
+        scheduledAt ? new Date(scheduledAt.getTime() - EARLY_ACCESS_WINDOW_MS) : null
+    );
+    let canJoin = $derived(!earlyAccessAt || now >= earlyAccessAt.getTime());
 
     async function handleJoin(e: SubmitEvent) {
         e.preventDefault();
         if (!name.trim()) return;
+        if (!canJoin) {
+            error = "This session is not open yet.";
+            return;
+        }
 
         isLoading = true;
         error = "";
@@ -33,8 +57,8 @@
                 password || undefined,
             );
 
-            // Store participant name for future sessions
-            localStorage.setItem('chromatic_name', name.trim());
+            // Store sanitized participant name for future sessions
+            localStorage.setItem('chromatic_name', result.name || name.trim());
 
             // Store session info
             sessionStorage.setItem(
@@ -82,6 +106,19 @@
             {#if roomInfo.status === "ended"}
                 <div class="card">
                     <p>This session has ended.</p>
+                </div>
+            {:else if !canJoin}
+                <div class="card">
+                    <p>
+                        This session opens at
+                        {earlyAccessAt?.toLocaleString(undefined, {
+                            month: "short",
+                            day: "numeric",
+                            hour: "2-digit",
+                            minute: "2-digit"
+                        })}
+                        .
+                    </p>
                 </div>
             {:else}
                 <form class="card join-form" onsubmit={handleJoin}>

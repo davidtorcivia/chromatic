@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -36,7 +37,7 @@ type ConfigResponse struct {
 	TurnExternalUsername     *string `json:"turnExternalUsername,omitempty"`
 	HasTurnCredential        bool    `json:"hasTurnCredential"`
 	// Informational fields (read-only)
-	PublicURL string `json:"publicUrl"`
+	PublicURL  string `json:"publicUrl"`
 	WHIPFormat string `json:"whipFormat"`
 }
 
@@ -203,9 +204,11 @@ func (h *ConfigHandler) UploadLogo(w http.ResponseWriter, r *http.Request) {
 	logoPath := filepath.Join(h.cfg.LogoPath, "default_watermark"+ext)
 
 	// Read all file content
-	file.Seek(0, 0)
-	fileContent := make([]byte, header.Size)
-	_, err = file.Read(fileContent)
+	if _, err := file.Seek(0, 0); err != nil {
+		http.Error(w, "Failed to read file", http.StatusInternalServerError)
+		return
+	}
+	fileContent, err := io.ReadAll(file)
 	if err != nil {
 		http.Error(w, "Failed to read file", http.StatusInternalServerError)
 		return
@@ -287,12 +290,12 @@ func (h *ConfigHandler) DeleteLogo(w http.ResponseWriter, r *http.Request) {
 
 // TURNTestResult represents the result of a TURN server test
 type TURNTestResult struct {
-	Server      string `json:"server"`
-	Reachable   bool   `json:"reachable"`
-	Latency     int64  `json:"latency,omitempty"` // milliseconds
-	Error       string `json:"error,omitempty"`
-	Protocol    string `json:"protocol,omitempty"`
-	TestType    string `json:"testType"` // "self-hosted" or "external"
+	Server    string `json:"server"`
+	Reachable bool   `json:"reachable"`
+	Latency   int64  `json:"latency,omitempty"` // milliseconds
+	Error     string `json:"error,omitempty"`
+	Protocol  string `json:"protocol,omitempty"`
+	TestType  string `json:"testType"` // "self-hosted" or "external"
 }
 
 // TURNTestResponse represents the full TURN test response

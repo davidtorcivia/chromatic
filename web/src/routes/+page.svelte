@@ -84,7 +84,10 @@
     align-items: center;
     justify-content: center;
     padding: var(--space-lg);
-    background: radial-gradient(ellipse at top, #1a1a2e 0%, var(--color-bg) 70%);
+    background:
+      radial-gradient(ellipse at top, rgba(72, 182, 166, 0.25) 0%, transparent 70%),
+      radial-gradient(ellipse at bottom, rgba(230, 162, 60, 0.15) 0%, transparent 65%),
+      var(--color-bg);
   }
 
   .landing-content {
@@ -100,7 +103,7 @@
   .logo h1 {
     font-size: 3rem;
     font-weight: 700;
-    background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+    background: linear-gradient(135deg, #48b6a6, #e6a23c);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;

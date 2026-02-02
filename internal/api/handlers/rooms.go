@@ -2,14 +2,17 @@ package handlers
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
+	"chromatic/internal/config"
 	"chromatic/internal/database"
 	"chromatic/internal/logger"
 	"chromatic/internal/metrics"
@@ -19,6 +22,8 @@ import (
 )
 
 var slugRegex = regexp.MustCompile(`^[a-z0-9-]{3,64}$`)
+
+const earlyAccessWindow = 10 * time.Minute
 
 // WaitingSubscription represents a waiting room participant's SSE connection
 type WaitingSubscription struct {
@@ -101,17 +106,22 @@ type RoomHandler struct {
 	hub interface {
 		BroadcastJSON(roomSlug string, msgType string, payload interface{}, excludeID string) error
 	}
-	onRoomLive     func(roomSlug string) // Called when room goes live
-	tokenManager   *TokenManager         // For generating signed WebSocket tokens
-	waitingManager *WaitingManager       // For waiting room SSE notifications
+	onRoomLive          func(roomSlug string) // Called when room goes live
+	tokenManager        *TokenManager         // For generating signed WebSocket tokens
+	waitingManager      *WaitingManager       // For waiting room SSE notifications
+	obsReconnectTimeout time.Duration
+	timerMu             sync.Mutex
+	streamEndTimers     map[string]*time.Timer
 }
 
 // NewRoomHandler creates a new RoomHandler
-func NewRoomHandler(db *database.DB, tokenSecret string) *RoomHandler {
+func NewRoomHandler(db *database.DB, cfg *config.Config, tokenSecret string) *RoomHandler {
 	return &RoomHandler{
-		db:             db,
-		tokenManager:   NewTokenManager(tokenSecret),
-		waitingManager: NewWaitingManager(),
+		db:                  db,
+		tokenManager:        NewTokenManager(tokenSecret),
+		waitingManager:      NewWaitingManager(),
+		obsReconnectTimeout: cfg.OBSReconnectTimeout,
+		streamEndTimers:     make(map[string]*time.Timer),
 	}
 }
 
@@ -132,6 +142,50 @@ func (h *RoomHandler) SetHub(hub interface {
 // SetOnRoomLive sets the callback for when a room goes live
 func (h *RoomHandler) SetOnRoomLive(callback func(roomSlug string)) {
 	h.onRoomLive = callback
+}
+
+func (h *RoomHandler) cancelStreamEndTimer(roomSlug string) {
+	h.timerMu.Lock()
+	defer h.timerMu.Unlock()
+
+	if timer, ok := h.streamEndTimers[roomSlug]; ok {
+		timer.Stop()
+		delete(h.streamEndTimers, roomSlug)
+	}
+}
+
+func (h *RoomHandler) scheduleStreamEnd(roomSlug string) {
+	if h.obsReconnectTimeout <= 0 {
+		return
+	}
+
+	h.timerMu.Lock()
+	if timer, ok := h.streamEndTimers[roomSlug]; ok {
+		timer.Stop()
+	}
+
+	h.streamEndTimers[roomSlug] = time.AfterFunc(h.obsReconnectTimeout, func() {
+		now := time.Now()
+		result, err := h.db.Exec(`
+			UPDATE rooms SET status = 'ended', ended_at = ?
+			WHERE slug = ? AND status = 'live'
+		`, now, roomSlug)
+		if err != nil {
+			logger.Error("Failed to end room after reconnect timeout", "room", roomSlug, "error", err)
+			return
+		}
+
+		affected, _ := result.RowsAffected()
+		if affected > 0 && h.hub != nil {
+			h.hub.BroadcastJSON(roomSlug, "room:ended", map[string]interface{}{}, "")
+		}
+
+		h.timerMu.Lock()
+		delete(h.streamEndTimers, roomSlug)
+		h.timerMu.Unlock()
+	})
+
+	h.timerMu.Unlock()
 }
 
 // List returns all rooms with optional status filter
@@ -186,15 +240,17 @@ func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 
 // CreateRoomRequest is the request body for creating a room
 type CreateRoomRequest struct {
-	Slug               string     `json:"slug"`
-	Name               string     `json:"name"`
-	ScheduledAt        *time.Time `json:"scheduledAt,omitempty"`
-	DurationMinutes    *int       `json:"durationMinutes,omitempty"`
-	Password           *string    `json:"password,omitempty"`
-	WaitingRoomEnabled bool       `json:"waitingRoomEnabled"`
-	StreamKeyID        *string    `json:"streamKeyId,omitempty"`
-	WatermarkMode      string     `json:"watermarkMode"`
-	WatermarkText      *string    `json:"watermarkText,omitempty"`
+	Slug                  string     `json:"slug"`
+	Name                  string     `json:"name"`
+	ScheduledAt           *time.Time `json:"scheduledAt,omitempty"`
+	DurationMinutes       *int       `json:"durationMinutes,omitempty"`
+	Password              *string    `json:"password,omitempty"`
+	WaitingRoomEnabled    bool       `json:"waitingRoomEnabled"`
+	StreamKeyID           *string    `json:"streamKeyId,omitempty"`
+	WatermarkMode         string     `json:"watermarkMode"`
+	WatermarkText         *string    `json:"watermarkText,omitempty"`
+	WatermarkLogoPosition string     `json:"watermarkLogoPosition,omitempty"`
+	WatermarkOpacity      *float64   `json:"watermarkOpacity,omitempty"`
 }
 
 // Create creates a new room
@@ -211,7 +267,8 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate name
+	// Validate and sanitize name
+	req.Name = sanitizeText(req.Name)
 	if len(req.Name) < 1 || len(req.Name) > 100 {
 		http.Error(w, "Name must be 1-100 characters", http.StatusBadRequest)
 		return
@@ -240,15 +297,45 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if req.WatermarkMode == "" {
 		req.WatermarkMode = "none"
 	}
+	if req.WatermarkMode != "none" && req.WatermarkMode != "text" && req.WatermarkMode != "logo" && req.WatermarkMode != "both" {
+		http.Error(w, "Invalid watermark mode", http.StatusBadRequest)
+		return
+	}
+
+	if req.WatermarkLogoPosition == "" {
+		req.WatermarkLogoPosition = "bottom-right"
+	}
+	switch req.WatermarkLogoPosition {
+	case "top-left", "top-right", "bottom-left", "bottom-right":
+	default:
+		http.Error(w, "Invalid watermark logo position", http.StatusBadRequest)
+		return
+	}
+
+	watermarkOpacity := 0.3
+	if req.WatermarkOpacity != nil {
+		if *req.WatermarkOpacity < 0 || *req.WatermarkOpacity > 1 {
+			http.Error(w, "Watermark opacity must be between 0 and 1", http.StatusBadRequest)
+			return
+		}
+		watermarkOpacity = *req.WatermarkOpacity
+	}
+
+	if req.WatermarkText != nil {
+		text := sanitizeText(*req.WatermarkText)
+		req.WatermarkText = &text
+	}
 
 	// Insert room
 	_, err := h.db.Exec(`
 		INSERT INTO rooms (
 			id, slug, name, scheduled_at, duration_minutes, password_hash,
-			waiting_room_enabled, stream_key_id, watermark_mode, watermark_text
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			waiting_room_enabled, stream_key_id, watermark_mode, watermark_text,
+			watermark_logo_position, watermark_opacity
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, id, req.Slug, req.Name, req.ScheduledAt, req.DurationMinutes, passwordHash,
-		req.WaitingRoomEnabled, req.StreamKeyID, req.WatermarkMode, req.WatermarkText)
+		req.WaitingRoomEnabled, req.StreamKeyID, req.WatermarkMode, req.WatermarkText,
+		req.WatermarkLogoPosition, watermarkOpacity)
 
 	if err != nil {
 		// Check for unique constraint violation
@@ -258,18 +345,20 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	// Fetch the created room
 	room := models.Room{
-		ID:                 id,
-		Slug:               req.Slug,
-		Name:               req.Name,
-		ScheduledAt:        req.ScheduledAt,
-		DurationMinutes:    req.DurationMinutes,
-		HasPassword:        passwordHash != nil,
-		WaitingRoomEnabled: req.WaitingRoomEnabled,
-		StreamKeyID:        req.StreamKeyID,
-		WatermarkMode:      req.WatermarkMode,
-		WatermarkText:      req.WatermarkText,
-		Status:             models.RoomStatusPending,
-		CreatedAt:          time.Now(),
+		ID:                    id,
+		Slug:                  req.Slug,
+		Name:                  req.Name,
+		ScheduledAt:           req.ScheduledAt,
+		DurationMinutes:       req.DurationMinutes,
+		HasPassword:           passwordHash != nil,
+		WaitingRoomEnabled:    req.WaitingRoomEnabled,
+		StreamKeyID:           req.StreamKeyID,
+		WatermarkMode:         req.WatermarkMode,
+		WatermarkText:         req.WatermarkText,
+		WatermarkLogoPosition: req.WatermarkLogoPosition,
+		WatermarkOpacity:      watermarkOpacity,
+		Status:                models.RoomStatusPending,
+		CreatedAt:             time.Now(),
 	}
 
 	// Track room creation
@@ -295,48 +384,174 @@ func (h *RoomHandler) Get(w http.ResponseWriter, r *http.Request) {
 func (h *RoomHandler) Update(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 
-	var updates map[string]interface{}
+	var updates map[string]json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	// Build update query dynamically
-	// Note: In production, use a proper query builder
-	allowed := map[string]string{
-		"name":                  "name",
-		"scheduledAt":           "scheduled_at",
-		"durationMinutes":       "duration_minutes",
-		"waitingRoomEnabled":    "waiting_room_enabled",
-		"streamKeyId":           "stream_key_id",
-		"watermarkMode":         "watermark_mode",
-		"watermarkText":         "watermark_text",
-		"watermarkLogoPath":     "watermark_logo_path",
-		"watermarkLogoPosition": "watermark_logo_position",
-		"watermarkOpacity":      "watermark_opacity",
-	}
-
-	query := "UPDATE rooms SET "
-	args := []interface{}{}
-	first := true
-
-	for key, col := range allowed {
-		if val, ok := updates[key]; ok {
-			if !first {
-				query += ", "
-			}
-			query += col + " = ?"
-			args = append(args, val)
-			first = false
-		}
-	}
-
-	if len(args) == 0 {
+	if len(updates) == 0 {
 		http.Error(w, "No valid fields to update", http.StatusBadRequest)
 		return
 	}
 
-	query += " WHERE slug = ?"
+	setClauses := make([]string, 0)
+	args := make([]interface{}, 0)
+
+	if raw, ok := updates["name"]; ok {
+		var name string
+		if err := json.Unmarshal(raw, &name); err != nil {
+			http.Error(w, "Invalid name", http.StatusBadRequest)
+			return
+		}
+		name = sanitizeText(name)
+		if len(name) < 1 || len(name) > 100 {
+			http.Error(w, "Name must be 1-100 characters", http.StatusBadRequest)
+			return
+		}
+		setClauses = append(setClauses, "name = ?")
+		args = append(args, name)
+	}
+
+	if raw, ok := updates["scheduledAt"]; ok {
+		if string(raw) == "null" {
+			setClauses = append(setClauses, "scheduled_at = NULL")
+		} else {
+			var scheduledAt time.Time
+			if err := json.Unmarshal(raw, &scheduledAt); err != nil {
+				http.Error(w, "Invalid scheduledAt", http.StatusBadRequest)
+				return
+			}
+			setClauses = append(setClauses, "scheduled_at = ?")
+			args = append(args, scheduledAt)
+		}
+	}
+
+	if raw, ok := updates["durationMinutes"]; ok {
+		var duration int
+		if err := json.Unmarshal(raw, &duration); err != nil {
+			http.Error(w, "Invalid durationMinutes", http.StatusBadRequest)
+			return
+		}
+		setClauses = append(setClauses, "duration_minutes = ?")
+		args = append(args, duration)
+	}
+
+	if raw, ok := updates["password"]; ok {
+		if string(raw) == "null" {
+			setClauses = append(setClauses, "password_hash = NULL")
+		} else {
+			var password string
+			if err := json.Unmarshal(raw, &password); err != nil {
+				http.Error(w, "Invalid password", http.StatusBadRequest)
+				return
+			}
+			if password == "" {
+				setClauses = append(setClauses, "password_hash = NULL")
+			} else if len(password) < 8 {
+				http.Error(w, "Password must be at least 8 characters", http.StatusBadRequest)
+				return
+			} else {
+				hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+				if err != nil {
+					http.Error(w, "Failed to process password", http.StatusInternalServerError)
+					return
+				}
+				setClauses = append(setClauses, "password_hash = ?")
+				args = append(args, string(hash))
+			}
+		}
+	}
+
+	if raw, ok := updates["waitingRoomEnabled"]; ok {
+		var waiting bool
+		if err := json.Unmarshal(raw, &waiting); err != nil {
+			http.Error(w, "Invalid waitingRoomEnabled", http.StatusBadRequest)
+			return
+		}
+		setClauses = append(setClauses, "waiting_room_enabled = ?")
+		args = append(args, waiting)
+	}
+
+	if raw, ok := updates["streamKeyId"]; ok {
+		if string(raw) == "null" {
+			setClauses = append(setClauses, "stream_key_id = NULL")
+		} else {
+			var streamKeyID string
+			if err := json.Unmarshal(raw, &streamKeyID); err != nil {
+				http.Error(w, "Invalid streamKeyId", http.StatusBadRequest)
+				return
+			}
+			setClauses = append(setClauses, "stream_key_id = ?")
+			args = append(args, streamKeyID)
+		}
+	}
+
+	if raw, ok := updates["watermarkMode"]; ok {
+		var mode string
+		if err := json.Unmarshal(raw, &mode); err != nil {
+			http.Error(w, "Invalid watermarkMode", http.StatusBadRequest)
+			return
+		}
+		if mode != "none" && mode != "text" && mode != "logo" && mode != "both" {
+			http.Error(w, "Invalid watermark mode", http.StatusBadRequest)
+			return
+		}
+		setClauses = append(setClauses, "watermark_mode = ?")
+		args = append(args, mode)
+	}
+
+	if raw, ok := updates["watermarkText"]; ok {
+		if string(raw) == "null" {
+			setClauses = append(setClauses, "watermark_text = NULL")
+		} else {
+			var text string
+			if err := json.Unmarshal(raw, &text); err != nil {
+				http.Error(w, "Invalid watermarkText", http.StatusBadRequest)
+				return
+			}
+			text = sanitizeText(text)
+			setClauses = append(setClauses, "watermark_text = ?")
+			args = append(args, text)
+		}
+	}
+
+	if raw, ok := updates["watermarkLogoPosition"]; ok {
+		var position string
+		if err := json.Unmarshal(raw, &position); err != nil {
+			http.Error(w, "Invalid watermarkLogoPosition", http.StatusBadRequest)
+			return
+		}
+		switch position {
+		case "top-left", "top-right", "bottom-left", "bottom-right":
+		default:
+			http.Error(w, "Invalid watermark logo position", http.StatusBadRequest)
+			return
+		}
+		setClauses = append(setClauses, "watermark_logo_position = ?")
+		args = append(args, position)
+	}
+
+	if raw, ok := updates["watermarkOpacity"]; ok {
+		var opacity float64
+		if err := json.Unmarshal(raw, &opacity); err != nil {
+			http.Error(w, "Invalid watermarkOpacity", http.StatusBadRequest)
+			return
+		}
+		if opacity < 0 || opacity > 1 {
+			http.Error(w, "Watermark opacity must be between 0 and 1", http.StatusBadRequest)
+			return
+		}
+		setClauses = append(setClauses, "watermark_opacity = ?")
+		args = append(args, opacity)
+	}
+
+	if len(setClauses) == 0 {
+		http.Error(w, "No valid fields to update", http.StatusBadRequest)
+		return
+	}
+
+	query := "UPDATE rooms SET " + strings.Join(setClauses, ", ") + " WHERE slug = ?"
 	args = append(args, slug)
 
 	result, err := h.db.Exec(query, args...)
@@ -394,6 +609,10 @@ func (h *RoomHandler) EndSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.hub != nil {
+		h.hub.BroadcastJSON(slug, "room:ended", map[string]interface{}{}, "")
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -438,6 +657,7 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	req.Name = sanitizeText(req.Name)
 	// Validate name
 	if len(req.Name) < 1 || len(req.Name) > 50 {
 		http.Error(w, "Name must be 1-50 characters", http.StatusBadRequest)
@@ -448,14 +668,25 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 	var roomID, passwordHash string
 	var waitingRoom bool
 	var roomStatus string
+	var scheduledAt *time.Time
 
 	err := h.db.QueryRow(`
-		SELECT id, COALESCE(password_hash, ''), waiting_room_enabled, status
+		SELECT id, COALESCE(password_hash, ''), waiting_room_enabled, status, scheduled_at
 		FROM rooms WHERE slug = ?
-	`, slug).Scan(&roomID, &passwordHash, &waitingRoom, &roomStatus)
+	`, slug).Scan(&roomID, &passwordHash, &waitingRoom, &roomStatus, &scheduledAt)
 
 	if err != nil {
 		http.Error(w, "Room not found", http.StatusNotFound)
+		return
+	}
+
+	if roomStatus == "ended" {
+		http.Error(w, "Room has ended", http.StatusGone)
+		return
+	}
+
+	if scheduledAt != nil && time.Now().Before(scheduledAt.Add(-earlyAccessWindow)) {
+		http.Error(w, "Session not open yet", http.StatusForbidden)
 		return
 	}
 
@@ -507,6 +738,7 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 		"isAdmitted":    isAdmitted,
 		"waitingRoom":   waitingRoom && !isAdmitted,
 		"color":         color,
+		"name":          req.Name,
 	}
 
 	respondJSON(w, response)
@@ -624,11 +856,23 @@ func (h *RoomHandler) AdmitAll(w http.ResponseWriter, r *http.Request) {
 func (h *RoomHandler) CheckParticipantStatus(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 	participantID := r.PathValue("id")
+	token := r.URL.Query().Get("token")
+
+	if token == "" {
+		http.Error(w, "Missing token", http.StatusUnauthorized)
+		return
+	}
+
+	payload, err := h.tokenManager.ValidateToken(token)
+	if err != nil || payload.ParticipantID != participantID || payload.RoomSlug != slug {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
 
 	var isAdmitted bool
 	var roomStatus string
 
-	err := h.db.QueryRow(`
+	err = h.db.QueryRow(`
 		SELECT p.is_admitted, r.status
 		FROM participants p
 		JOIN rooms r ON r.id = p.room_id
@@ -662,39 +906,48 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 		}
 	}()
 
-	// Find the room bound to this stream key
+	// Find the room bound to this stream key (prefer live room on reconnect)
 	var roomSlug string
+	var roomStatus string
 	err = tx.QueryRow(`
-		SELECT r.slug FROM rooms r
+		SELECT r.slug, r.status FROM rooms r
 		JOIN stream_keys sk ON sk.id = r.stream_key_id
-		WHERE sk.key_token = ? AND r.status = 'pending'
-		ORDER BY r.scheduled_at NULLS LAST, r.created_at
+		WHERE sk.key_token = ? AND r.status IN ('pending', 'live')
+		ORDER BY
+			CASE WHEN r.status = 'live' THEN 0 ELSE 1 END,
+			CASE WHEN r.scheduled_at IS NULL THEN 1 ELSE 0 END,
+			r.scheduled_at,
+			r.created_at
 		LIMIT 1
-	`, streamKeyToken).Scan(&roomSlug)
+	`, streamKeyToken).Scan(&roomSlug, &roomStatus)
 
 	if err != nil {
-		// No room bound to this stream key yet - that's okay
-		tx.Rollback()
-		tx = nil
-		return nil
+		if err == sql.ErrNoRows {
+			tx.Rollback()
+			tx = nil
+			return nil
+		}
+		return fmt.Errorf("failed to find room for stream key: %w", err)
 	}
 
-	// Update room status to live
-	result, err := tx.Exec(`
-		UPDATE rooms SET status = 'live', started_at = ?
-		WHERE slug = ? AND status = 'pending'
-	`, now, roomSlug)
-	if err != nil {
-		return fmt.Errorf("failed to update room status: %w", err)
-	}
+	// Update room status to live when transitioning from pending
+	if roomStatus == "pending" {
+		result, err := tx.Exec(`
+			UPDATE rooms SET status = 'live', started_at = ?
+			WHERE slug = ? AND status = 'pending'
+		`, now, roomSlug)
+		if err != nil {
+			return fmt.Errorf("failed to update room status: %w", err)
+		}
 
-	// Check if we actually updated a row (another transaction might have beaten us)
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		// Room was already taken by another stream, rollback
-		tx.Rollback()
-		tx = nil
-		return nil
+		// Check if we actually updated a row (another transaction might have beaten us)
+		rowsAffected, _ := result.RowsAffected()
+		if rowsAffected == 0 {
+			// Room was already taken by another stream, rollback
+			tx.Rollback()
+			tx = nil
+			return nil
+		}
 	}
 
 	// Commit the transaction
@@ -702,6 +955,9 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 	tx = nil // Prevent deferred rollback
+
+	// Cancel any pending stream end timer
+	h.cancelStreamEndTimer(roomSlug)
 
 	// Bind ingest tracks to room for distribution
 	if h.sfu != nil {
@@ -711,14 +967,18 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 		}
 	}
 
-	// Notify all connected clients that room is live
-	if h.hub != nil {
-		h.hub.BroadcastJSON(roomSlug, "room:live", map[string]interface{}{}, "")
-	}
+	if roomStatus == "pending" {
+		// Notify all connected clients that room is live
+		if h.hub != nil {
+			h.hub.BroadcastJSON(roomSlug, "room:live", map[string]interface{}{}, "")
+		}
 
-	// Initiate WebRTC subscriptions for all connected clients
-	if h.onRoomLive != nil {
-		h.onRoomLive(roomSlug)
+		// Initiate WebRTC subscriptions for all connected clients
+		if h.onRoomLive != nil {
+			h.onRoomLive(roomSlug)
+		}
+	} else if h.hub != nil {
+		h.hub.BroadcastJSON(roomSlug, "stream:resumed", map[string]interface{}{}, "")
 	}
 
 	logger.Info("Room is now live", "room", roomSlug)
@@ -747,6 +1007,9 @@ func (h *RoomHandler) OnStreamEnd(streamKeyToken string) {
 			"message": "Stream disconnected. Waiting for reconnection...",
 		}, "")
 	}
+
+	// Schedule room end if OBS does not reconnect in time
+	h.scheduleStreamEnd(roomSlug)
 
 	logger.Info("Stream paused (OBS disconnected)", "room", roomSlug)
 }
@@ -802,11 +1065,23 @@ func respondJSON(w http.ResponseWriter, data interface{}) {
 func (h *RoomHandler) WaitingEvents(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 	participantID := r.PathValue("id")
+	token := r.URL.Query().Get("token")
+
+	if token == "" {
+		http.Error(w, "Missing token", http.StatusUnauthorized)
+		return
+	}
+
+	payload, err := h.tokenManager.ValidateToken(token)
+	if err != nil || payload.ParticipantID != participantID || payload.RoomSlug != slug {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
 
 	// Verify participant exists and is in waiting state
 	var isAdmitted bool
 	var roomStatus string
-	err := h.db.QueryRow(`
+	err = h.db.QueryRow(`
 		SELECT p.is_admitted, r.status
 		FROM participants p
 		JOIN rooms r ON r.id = p.room_id

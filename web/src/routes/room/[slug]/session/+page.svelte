@@ -102,6 +102,21 @@
             // WebRTC offer will be sent by server
         });
 
+        // Handle stream paused/resumed events
+        session.onMessage("stream:paused", (payload: unknown) => {
+            const data = payload as { message?: string };
+            streamError = null;
+            hasStream = false;
+            if (data?.message) {
+                console.log(data.message);
+            }
+        });
+
+        session.onMessage("stream:resumed", () => {
+            streamError = null;
+            hasStream = true;
+        });
+
         // Handle room ending
         session.onMessage("room:ended", () => {
             alert("The session has ended.");
@@ -406,6 +421,7 @@
                     logoPosition={roomState.watermarkLogoPosition || 'bottom-right'}
                     opacity={roomState.watermarkOpacity ?? 0.3}
                     {participantName}
+                    roomName={roomState?.name || ""}
                 />
             {/if}
 
@@ -565,7 +581,7 @@
         isOpen={isChatOpen}
         onClose={() => (isChatOpen = false)}
         roomSlug={slug}
-        participantId={sessionData?.participantId || ""}
+        joinToken={sessionData?.token || ""}
     />
     <BrowserToast />
 </main>

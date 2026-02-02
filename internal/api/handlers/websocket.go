@@ -3,10 +3,11 @@ package handlers
 import (
 	"crypto/subtle"
 	"encoding/json"
-	"html"
+	"fmt"
+	"math"
 	"net/http"
-	"regexp"
 	"strings"
+	"time"
 
 	"chromatic/internal/api/middleware"
 	"chromatic/internal/database"
@@ -57,21 +58,6 @@ func NewWebSocketHandler(db *database.DB, hub *websocket.Hub, sfu *webrtc.SFU, a
 	}
 
 	return h
-}
-
-// htmlTagsRegex matches HTML tags for stripping
-var htmlTagsRegex = regexp.MustCompile(`<[^>]*>`)
-
-// sanitizeText removes HTML tags and escapes any remaining special characters
-// to prevent XSS attacks in chat messages and participant names
-func sanitizeText(input string) string {
-	// Strip HTML tags
-	stripped := htmlTagsRegex.ReplaceAllString(input, "")
-	// Trim whitespace and limit consecutive whitespace
-	stripped = strings.TrimSpace(stripped)
-	// Escape HTML entities for any remaining special chars
-	escaped := html.EscapeString(stripped)
-	return escaped
 }
 
 // HandleConnection handles WebSocket connection upgrades
@@ -175,6 +161,8 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	}
 	// Initialize chat rate limiter: 30 messages per minute
 	client.InitChatRateLimiter()
+	// Initialize cursor rate limiter: 20 updates per second
+	client.InitCursorRateLimiter()
 
 	// Assign color if not set
 	if color == "" {
@@ -226,11 +214,19 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 // initiateSubscription starts the WebRTC subscription for a client
 func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSlug string) {
 	// Create subscriber connection and get offer
-	_, offer, err := h.sfu.CreateSubscriberConnection(roomSlug, client.ID)
+	pc, offer, err := h.sfu.CreateSubscriberConnection(roomSlug, client.ID)
 	if err != nil {
 		logger.Error("Failed to create subscriber connection", "participant_id", client.ID, "room", roomSlug, "error", err)
 		return
 	}
+
+	// Listen for inbound audio (voice) tracks from this participant
+	pc.OnTrack(func(track *pionwebrtc.TrackRemote, receiver *pionwebrtc.RTPReceiver) {
+		if track.Kind() != pionwebrtc.RTPCodecTypeAudio {
+			return
+		}
+		h.forwardVoiceTrack(roomSlug, client.ID, track)
+	})
 
 	// Send offer to client
 	client.SendJSON("signal:offer", map[string]interface{}{
@@ -324,6 +320,9 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 	case "chat:send":
 		metrics.Get().TotalMessagesChat.Add(1)
 		h.handleChatSend(client, msg.Payload)
+	case "chat:file":
+		metrics.Get().TotalMessagesChat.Add(1)
+		h.handleChatFile(client, msg.Payload)
 	case "cursor":
 		metrics.Get().TotalMessagesCursor.Add(1)
 		h.handleCursor(client, msg.Payload)
@@ -383,7 +382,69 @@ func (h *WebSocketHandler) handleChatSend(client *websocket.Client, payload json
 	}, "")
 }
 
+func (h *WebSocketHandler) handleChatFile(client *websocket.Client, payload json.RawMessage) {
+	// Apply the same rate limit as chat messages
+	if !client.AllowChatMessage() {
+		logger.Debug("Chat rate limit exceeded", "participant_id", client.ID, "room", client.RoomSlug)
+		return
+	}
+
+	var data struct {
+		FileID string `json:"fileId"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return
+	}
+	if data.FileID == "" {
+		return
+	}
+
+	var (
+		fileID       string
+		originalName string
+		mimeType     string
+		roomSlug     string
+	)
+
+	err := h.db.QueryRow(`
+		SELECT f.id, f.original_name, f.mime_type, r.slug
+		FROM files f
+		JOIN rooms r ON r.id = f.room_id
+		WHERE f.id = ?
+	`, data.FileID).Scan(&fileID, &originalName, &mimeType, &roomSlug)
+	if err != nil {
+		return
+	}
+
+	if roomSlug != client.RoomSlug {
+		return
+	}
+
+	filePayload := map[string]interface{}{
+		"id":       fileID,
+		"name":     originalName,
+		"mimeType": mimeType,
+		"url":      fmt.Sprintf("/api/files/%s", fileID),
+	}
+
+	if strings.HasPrefix(mimeType, "image/") {
+		filePayload["thumbnailUrl"] = fmt.Sprintf("/api/files/%s/thumbnail", fileID)
+	}
+
+	h.hub.BroadcastJSON(client.RoomSlug, "chat:message", map[string]interface{}{
+		"participantId":   client.ID,
+		"participantName": sanitizeText(client.Name),
+		"type":            "file",
+		"content":         "",
+		"file":            filePayload,
+	}, "")
+}
+
 func (h *WebSocketHandler) handleCursor(client *websocket.Client, payload json.RawMessage) {
+	if !client.AllowCursor() {
+		return
+	}
+
 	var data struct {
 		X      float64 `json:"x"`
 		Y      float64 `json:"y"`
@@ -391,6 +452,21 @@ func (h *WebSocketHandler) handleCursor(client *websocket.Client, payload json.R
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return
+	}
+
+	if math.IsNaN(data.X) || math.IsNaN(data.Y) || math.IsInf(data.X, 0) || math.IsInf(data.Y, 0) {
+		return
+	}
+
+	if data.X < 0 {
+		data.X = 0
+	} else if data.X > 1 {
+		data.X = 1
+	}
+	if data.Y < 0 {
+		data.Y = 0
+	} else if data.Y > 1 {
+		data.Y = 1
 	}
 
 	// Broadcast cursor to all (including sender for latency feedback)
@@ -442,12 +518,8 @@ func (h *WebSocketHandler) handleSignalOffer(client *websocket.Client, payload j
 
 	logger.Debug("Received voice offer", "participant_id", client.ID, "room", client.RoomSlug)
 
-	// Create a peer connection to receive the client's voice audio
-	// and create an answer
-	answer, err := h.sfu.HandleVoiceOffer(client.RoomSlug, client.ID, data.SDP, func(participantID string, track *pionwebrtc.TrackRemote) {
-		// When we receive the audio track from this client, forward it to others
-		h.forwardVoiceTrack(client.RoomSlug, participantID, track)
-	})
+	// Apply the offer to the existing subscriber connection and create an answer.
+	answer, err := h.sfu.HandleSubscriberOffer(client.RoomSlug, client.ID, data.SDP)
 
 	if err != nil {
 		logger.Error("Failed to handle voice offer", "participant_id", client.ID, "error", err)
@@ -621,6 +693,11 @@ func (h *WebSocketHandler) handleAdminKick(client *websocket.Client, payload jso
 		"reason": data.Reason,
 	})
 
+	// Force disconnect if the client is connected
+	if target := h.hub.GetClient(client.RoomSlug, data.ParticipantID); target != nil {
+		target.Conn.Close()
+	}
+
 	// Notify others
 	h.hub.BroadcastJSON(client.RoomSlug, "participant:left", map[string]interface{}{
 		"participantId": data.ParticipantID,
@@ -630,6 +707,15 @@ func (h *WebSocketHandler) handleAdminKick(client *websocket.Client, payload jso
 func (h *WebSocketHandler) handleAdminEndSession(client *websocket.Client) {
 	if !client.IsAdmin {
 		return
+	}
+
+	// Mark room as ended in the database
+	_, err := h.db.Exec(`
+		UPDATE rooms SET status = 'ended', ended_at = ?
+		WHERE slug = ? AND status != 'ended'
+	`, time.Now(), client.RoomSlug)
+	if err != nil {
+		logger.Error("Failed to end session", "room", client.RoomSlug, "error", err)
 	}
 
 	// Broadcast session end to all
