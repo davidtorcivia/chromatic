@@ -4,6 +4,9 @@
 dev:
 	go run ./cmd/chromatic
 
+setup:
+	go run ./cmd/chromatic setup
+
 dev-frontend:
 	cd web && npm run dev
 

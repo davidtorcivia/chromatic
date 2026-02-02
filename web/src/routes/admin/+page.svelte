@@ -1,5 +1,6 @@
 <script lang="ts">
     import { onMount } from "svelte";
+    import { goto } from "$app/navigation";
     import {
         rooms,
         streamKeys,
@@ -10,6 +11,7 @@
     let recentRooms = $state<Room[]>([]);
     let keys = $state<StreamKey[]>([]);
     let isLoading = $state(true);
+    let showSetupBanner = $state(false);
 
     onMount(async () => {
         try {
@@ -19,12 +21,31 @@
             ]);
             recentRooms = roomsData.slice(0, 5);
             keys = keysData;
+            if (typeof localStorage !== "undefined") {
+                const setupComplete =
+                    localStorage.getItem("chromatic-setup-complete") === "true";
+                const setupDismissed =
+                    localStorage.getItem("chromatic-setup-dismissed") === "true";
+                const isFirstRun =
+                    roomsData.length === 0 && keysData.length === 0;
+                showSetupBanner = !setupComplete && isFirstRun;
+                if (!setupComplete && !setupDismissed && isFirstRun) {
+                    goto("/admin/setup");
+                }
+            }
         } catch (e) {
             console.error("Failed to load dashboard data", e);
         } finally {
             isLoading = false;
         }
     });
+
+    function dismissSetup() {
+        if (typeof localStorage !== "undefined") {
+            localStorage.setItem("chromatic-setup-dismissed", "true");
+        }
+        showSetupBanner = false;
+    }
 
     function formatDate(dateStr: string): string {
         return new Date(dateStr).toLocaleDateString(undefined, {
@@ -45,6 +66,26 @@
         <h1>Dashboard</h1>
         <a href="/admin/rooms/new" class="btn btn-primary">Create Room</a>
     </header>
+
+    {#if showSetupBanner}
+        <section class="setup-banner card">
+            <div class="setup-banner-content">
+                <h2>First-run setup</h2>
+                <p>
+                    Finish the setup wizard to configure TURN, branding, stream
+                    keys, and your first room.
+                </p>
+            </div>
+            <div class="setup-banner-actions">
+                <a href="/admin/setup" class="btn btn-primary"
+                    >Launch Wizard</a
+                >
+                <button class="btn btn-ghost" onclick={dismissSetup}>
+                    Dismiss
+                </button>
+            </div>
+        </section>
+    {/if}
 
     {#if isLoading}
         <div class="loading">
@@ -177,6 +218,36 @@
         margin: 0;
     }
 
+    .setup-banner {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: var(--space-lg);
+        margin-bottom: var(--space-xl);
+        background: linear-gradient(
+            135deg,
+            rgba(72, 182, 166, 0.12),
+            rgba(230, 162, 60, 0.08)
+        );
+    }
+
+    .setup-banner-content h2 {
+        margin: 0 0 var(--space-xs);
+        font-size: 1.25rem;
+    }
+
+    .setup-banner-content p {
+        margin: 0;
+        color: var(--color-text-muted);
+        font-size: 0.875rem;
+    }
+
+    .setup-banner-actions {
+        display: flex;
+        gap: var(--space-sm);
+        flex-wrap: wrap;
+    }
+
     .dashboard-grid {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -305,5 +376,12 @@
     .btn-sm {
         padding: var(--space-xs) var(--space-sm);
         font-size: 0.75rem;
+    }
+
+    @media (max-width: 768px) {
+        .setup-banner {
+            flex-direction: column;
+            align-items: flex-start;
+        }
     }
 </style>

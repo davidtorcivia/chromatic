@@ -65,9 +65,11 @@ Access at `http://localhost:5173`
 ### Production Deployment
 
 ```bash
-cd deployments
+# Configure (interactive)
+make setup
 
-# Configure
+# Or configure manually
+cd deployments
 cp .env.example .env
 nano .env  # Set ADMIN_TOKEN, TURN_SECRET, PUBLIC_URL, etc.
 
@@ -79,6 +81,8 @@ curl https://stream.yourdomain.com/health
 ```
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for complete instructions.
+After login, open Admin → Setup Wizard to finish TURN, branding, stream keys, and
+first-room setup. The wizard does not edit your `.env` file.
 
 ## OBS Configuration
 

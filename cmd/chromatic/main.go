@@ -18,6 +18,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "setup" {
+		os.Exit(runSetup())
+	}
+
 	// Load configuration first (we need production mode for logger)
 	cfg, err := config.Load()
 	if err != nil {

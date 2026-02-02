@@ -32,6 +32,7 @@
 
         <nav class="sidebar-nav">
             <a href="/admin" class="nav-item">Dashboard</a>
+            <a href="/admin/setup" class="nav-item">Setup Wizard</a>
             <a href="/admin/rooms" class="nav-item">Rooms</a>
             <a href="/admin/stream-keys" class="nav-item">Stream Keys</a>
             <a href="/admin/settings" class="nav-item">Settings</a>
