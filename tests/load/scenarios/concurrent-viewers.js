@@ -11,7 +11,7 @@
  *   k6 run tests/load/scenarios/concurrent-viewers.js
  *
  * With environment variables:
- *   k6 run -e BASE_URL=http://localhost:8080 -e ADMIN_TOKEN=secret tests/load/scenarios/concurrent-viewers.js
+ *   k6 run -e BASE_URL=http://localhost:3000 -e ADMIN_TOKEN=secret tests/load/scenarios/concurrent-viewers.js
  */
 
 import http from 'k6/http';
@@ -21,7 +21,7 @@ import { Counter, Trend, Rate } from 'k6/metrics';
 import { LOAD_TEST, PERFORMANCE_TARGETS } from '../k6-config.js';
 
 // Environment configuration
-const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:3000';
 const ADMIN_TOKEN = __ENV.ADMIN_TOKEN || 'test-admin-token';
 const WS_URL = BASE_URL.replace('http', 'ws');
 

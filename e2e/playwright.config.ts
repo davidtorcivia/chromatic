@@ -33,7 +33,7 @@ export default defineConfig({
   // Shared settings for all the projects below
   use: {
     // Base URL for the application under test
-    baseURL: process.env.TEST_BASE_URL || 'http://localhost:8080',
+    baseURL: process.env.TEST_BASE_URL || 'http://localhost:3000',
 
     // Collect trace when retrying the failed test
     trace: 'on-first-retry',
@@ -76,8 +76,8 @@ export default defineConfig({
 
   // Run your local dev server before starting the tests
   // webServer: {
-  //   command: 'cd .. && make run',
-  //   url: 'http://localhost:8080',
+  //   command: 'cd .. && make dev',
+  //   url: 'http://localhost:3000',
   //   reuseExistingServer: !process.env.CI,
   //   timeout: 120 * 1000,
   // },

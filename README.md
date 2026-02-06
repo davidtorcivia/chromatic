@@ -26,7 +26,7 @@ Chromatic enables real-time color-critical streaming from DaVinci Resolve via OB
 
 ### Operations
 - **Self-hosted**: Full control over your data
-- **Docker deployment**: One-command deployment with Caddy + Coturn
+- **Docker deployment**: Pull-based deployment with Caddy + Coturn
 - **Third-party TURN**: Support for Twilio, Xirsys, Metered, and others
 - **Prometheus metrics**: Built-in monitoring endpoint
 
@@ -34,16 +34,15 @@ Chromatic enables real-time color-critical streaming from DaVinci Resolve via OB
 
 ### Prerequisites
 
-- Go 1.24+
-- Node.js 20+
-- Docker and Docker Compose (for deployment)
+- Production deployment: Docker Engine + Docker Compose plugin
+- Development only: Go 1.24+ and Node.js 20+
 - OBS Studio 30+ (for streaming)
 
 ### Development
 
 ```bash
 # Clone and enter directory
-git clone https://github.com/yourorg/chromatic.git
+git clone https://github.com/davidtorcivia/chromatic.git
 cd chromatic
 
 # Install dependencies
@@ -62,23 +61,23 @@ make dev-frontend
 
 Access at `http://localhost:5173`
 
-### Production Deployment
+### Production Deployment (Pull-Based)
 
 ```bash
-# Configure (interactive)
-make setup
+# Clone and enter deployment directory
+git clone https://github.com/davidtorcivia/chromatic.git
+cd chromatic/deployments
 
-# Or configure manually
-cd deployments
+# Configure environment
 cp .env.example .env
-nano .env  # Set ADMIN_TOKEN, TURN_SECRET, PUBLIC_URL, CHROMATIC_IMAGE, etc.
+nano .env  # Set ADMIN_TOKEN, TURN_SECRET, PUBLIC_URL, TURN_REALM, PUBLIC_IP, CHROMATIC_IMAGE
 
-# Deploy
+# Pull prebuilt image and start
 docker compose pull
 docker compose up -d
 
 # Verify
-curl https://stream.yourdomain.com/health
+curl -fsS https://stream.yourdomain.com/health
 ```
 
 Set `CHROMATIC_IMAGE` to an immutable release tag (for example `sha-<commit>`) or
@@ -228,7 +227,7 @@ A pre-built Grafana dashboard is included:
 ```bash
 # Start monitoring stack with Chromatic
 cd deployments
-docker-compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
 ```
 
 Access Grafana at `http://localhost:3001` (admin/admin)

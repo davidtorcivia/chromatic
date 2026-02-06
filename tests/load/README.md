@@ -60,7 +60,7 @@ k6 run tests/load/scenarios/chat-load.js
 
 ```bash
 k6 run \
-  -e BASE_URL=http://localhost:8080 \
+  -e BASE_URL=http://localhost:3000 \
   -e ADMIN_TOKEN=your-admin-token \
   -e ROOM_SLUG=my-test-room \
   tests/load/scenarios/concurrent-viewers.js
@@ -194,7 +194,7 @@ Threshold Results:
 Ensure Chromatic is running:
 
 ```bash
-make run
+make dev
 # or
 go run ./cmd/chromatic
 ```
@@ -213,7 +213,7 @@ Check that WebSocket upgrade is working:
 
 ```bash
 curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" \
-  http://localhost:8080/ws/test-room
+  http://localhost:3000/ws/test-room
 ```
 
 ### High Latency

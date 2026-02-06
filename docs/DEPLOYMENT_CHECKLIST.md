@@ -48,8 +48,8 @@ nc -zvu your.server.ip 3478
 
 - [ ] Clone repository to server
   ```bash
-  git clone https://github.com/yourorg/chromatic.git
-  cd chromatic/deployments
+  git clone https://github.com/davidtorcivia/chromatic.git /opt/chromatic
+  cd /opt/chromatic/deployments
   ```
 
 ### 2. Generate Secrets
@@ -89,12 +89,12 @@ nc -zvu your.server.ip 3478
   }
   ```
 
-### 5. Create Data Directories
+### 5. Create Backup Directory
 
-- [ ] Ensure data directories exist
+- [ ] Create a backup directory on the host
   ```bash
-  mkdir -p data/{files,logos,caddy}
-  chmod 755 data
+  mkdir -p /opt/chromatic/backups
+  chmod 700 /opt/chromatic/backups
   ```
 
 ### 6. Deploy
@@ -144,7 +144,7 @@ nc -zvu your.server.ip 3478
 
 - [ ] **Coturn container running**
   ```bash
-  docker-compose logs coturn | tail -20
+  docker compose logs coturn | tail -20
   # Should not show errors
   ```
 
@@ -233,8 +233,17 @@ nc -zvu your.server.ip 3478
 
 - [ ] **Backup script created**
   ```bash
-  cp scripts/backup.sh.example scripts/backup.sh
-  chmod +x scripts/backup.sh
+  cd /opt/chromatic
+  chmod +x scripts/backup.sh scripts/restore.sh scripts/verify-backup.sh
+  ./scripts/backup.sh /opt/chromatic/backups
+  TIMESTAMP=20260206_231500
+  ./scripts/verify-backup.sh "$TIMESTAMP" /opt/chromatic/backups
+  # Replace with timestamp from the backup output.
+  # Optional cleanup:
+  # rm -f /opt/chromatic/backups/chromatic-20260206_231500.db
+  # rm -f /opt/chromatic/backups/files-20260206_231500.tar.gz
+  # rm -f /opt/chromatic/backups/logos-20260206_231500.tar.gz
+  # rm -f /opt/chromatic/backups/manifest-20260206_231500.txt
   ```
 
 - [ ] **Cron job scheduled**
@@ -277,12 +286,12 @@ Before considering deployment complete:
 
 ### Container won't start
 ```bash
-docker-compose logs <service-name>
+docker compose logs <service-name>
 ```
 
 ### SSL certificate error
 ```bash
-docker-compose logs caddy
+docker compose logs caddy
 # Check for rate limit or DNS issues
 ```
 
@@ -306,7 +315,7 @@ When updating Chromatic:
 
 1. [ ] Backup database
    ```bash
-   docker-compose exec chromatic sqlite3 /data/chromatic.db ".backup /data/backup-before-update.db"
+   docker compose exec chromatic sqlite3 /data/chromatic.db ".backup /data/backup-before-update.db"
    ```
 
 2. [ ] Pull new images
@@ -334,12 +343,12 @@ If update causes issues:
 
 1. [ ] Stop services
    ```bash
-   docker-compose down
+   docker compose down
    ```
 
 2. [ ] Restore database backup
    ```bash
-   cp data/backup-before-update.db data/chromatic.db
+   docker compose run --rm --no-deps chromatic sh -ec "cp /data/backup-before-update.db /data/chromatic.db && rm -f /data/chromatic.db-wal /data/chromatic.db-shm"
    ```
 
 3. [ ] Use previous image version

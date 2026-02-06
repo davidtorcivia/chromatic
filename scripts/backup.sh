@@ -1,114 +1,104 @@
 #!/bin/bash
 #
 # Chromatic Backup Script
-# Creates a timestamped backup of the database and uploaded files
+# Creates timestamped backups from the Docker volume used by Compose.
 #
 # Usage: ./scripts/backup.sh [backup_dir]
 #
-# Default backup directory: ./backups
+# Defaults:
+#   backup_dir: ./backups
+#   compose file: ./deployments/docker-compose.yml
 
-set -e
+set -euo pipefail
 
-# Configuration
-BACKUP_DIR="${1:-./backups}"
-DATA_DIR="${DATA_DIR:-./data}"
-DATABASE_PATH="${DATABASE_PATH:-$DATA_DIR/chromatic.db}"
-UPLOAD_PATH="${UPLOAD_PATH:-$DATA_DIR/files}"
-LOGO_PATH="${LOGO_PATH:-$DATA_DIR/logos}"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+COMPOSE_FILE="${COMPOSE_FILE:-$REPO_ROOT/deployments/docker-compose.yml}"
+BACKUP_DIR="${1:-$REPO_ROOT/backups}"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-7}"
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+require_cmd() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        log_error "Required command not found: $1"
+        exit 1
+    fi
 }
 
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
+require_cmd docker
 
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
+if [ ! -f "$COMPOSE_FILE" ]; then
+    log_error "Compose file not found: $COMPOSE_FILE"
+    exit 1
+fi
 
-# Create backup directory if it doesn't exist
 mkdir -p "$BACKUP_DIR"
+BACKUP_DIR_ABS="$(cd "$BACKUP_DIR" && pwd)"
 
-log_info "Starting Chromatic backup..."
+COMPOSE_CMD=(docker compose -f "$COMPOSE_FILE")
+
+log_info "Starting Chromatic backup"
 log_info "Timestamp: $TIMESTAMP"
-log_info "Backup directory: $BACKUP_DIR"
+log_info "Backup directory: $BACKUP_DIR_ABS"
 
-# Check if database exists
-if [ ! -f "$DATABASE_PATH" ]; then
-    log_error "Database not found at $DATABASE_PATH"
-    exit 1
-fi
+# Database hot backup using sqlite CLI inside the Chromatic image.
+"${COMPOSE_CMD[@]}" run --rm --no-deps \
+    -v "$BACKUP_DIR_ABS:/backup" \
+    chromatic sh -ec "sqlite3 /data/chromatic.db \".backup '/backup/chromatic-$TIMESTAMP.db'\""
 
-# Create database backup using SQLite's .backup command (hot backup)
-DB_BACKUP="$BACKUP_DIR/chromatic-$TIMESTAMP.db"
-log_info "Backing up database to $DB_BACKUP..."
+log_info "Database backup created: chromatic-$TIMESTAMP.db"
 
-# Use SQLite's online backup for consistency
-sqlite3 "$DATABASE_PATH" ".backup '$DB_BACKUP'"
+# Backup uploaded files if present.
+"${COMPOSE_CMD[@]}" run --rm --no-deps \
+    -v "$BACKUP_DIR_ABS:/backup" \
+    chromatic sh -ec "if [ -d /data/files ] && [ \"\$(ls -A /data/files 2>/dev/null)\" ]; then tar -czf '/backup/files-$TIMESTAMP.tar.gz' -C /data files; fi"
 
-if [ $? -eq 0 ]; then
-    log_info "Database backup completed successfully"
-else
-    log_error "Database backup failed"
-    exit 1
-fi
-
-# Backup uploaded files if they exist
-if [ -d "$UPLOAD_PATH" ] && [ "$(ls -A $UPLOAD_PATH 2>/dev/null)" ]; then
-    FILES_BACKUP="$BACKUP_DIR/files-$TIMESTAMP.tar.gz"
-    log_info "Backing up uploaded files to $FILES_BACKUP..."
-    tar -czf "$FILES_BACKUP" -C "$(dirname $UPLOAD_PATH)" "$(basename $UPLOAD_PATH)"
-    log_info "Files backup completed"
+if [ -f "$BACKUP_DIR_ABS/files-$TIMESTAMP.tar.gz" ]; then
+    log_info "Files backup created: files-$TIMESTAMP.tar.gz"
 else
     log_warn "No uploaded files found to backup"
 fi
 
-# Backup logos if they exist
-if [ -d "$LOGO_PATH" ] && [ "$(ls -A $LOGO_PATH 2>/dev/null)" ]; then
-    LOGOS_BACKUP="$BACKUP_DIR/logos-$TIMESTAMP.tar.gz"
-    log_info "Backing up logos to $LOGOS_BACKUP..."
-    tar -czf "$LOGOS_BACKUP" -C "$(dirname $LOGO_PATH)" "$(basename $LOGO_PATH)"
-    log_info "Logos backup completed"
+# Backup logos if present.
+"${COMPOSE_CMD[@]}" run --rm --no-deps \
+    -v "$BACKUP_DIR_ABS:/backup" \
+    chromatic sh -ec "if [ -d /data/logos ] && [ \"\$(ls -A /data/logos 2>/dev/null)\" ]; then tar -czf '/backup/logos-$TIMESTAMP.tar.gz' -C /data logos; fi"
+
+if [ -f "$BACKUP_DIR_ABS/logos-$TIMESTAMP.tar.gz" ]; then
+    log_info "Logos backup created: logos-$TIMESTAMP.tar.gz"
 else
     log_warn "No logos found to backup"
 fi
 
-# Create a manifest file
-MANIFEST="$BACKUP_DIR/manifest-$TIMESTAMP.txt"
-echo "Chromatic Backup Manifest" > "$MANIFEST"
-echo "=========================" >> "$MANIFEST"
-echo "Timestamp: $TIMESTAMP" >> "$MANIFEST"
-echo "Date: $(date)" >> "$MANIFEST"
-echo "" >> "$MANIFEST"
-echo "Files:" >> "$MANIFEST"
-echo "  Database: $(basename $DB_BACKUP)" >> "$MANIFEST"
-[ -f "$FILES_BACKUP" ] && echo "  Files: $(basename $FILES_BACKUP)" >> "$MANIFEST"
-[ -f "$LOGOS_BACKUP" ] && echo "  Logos: $(basename $LOGOS_BACKUP)" >> "$MANIFEST"
-echo "" >> "$MANIFEST"
-echo "Database size: $(du -h $DB_BACKUP | cut -f1)" >> "$MANIFEST"
-[ -f "$FILES_BACKUP" ] && echo "Files archive size: $(du -h $FILES_BACKUP | cut -f1)" >> "$MANIFEST"
-[ -f "$LOGOS_BACKUP" ] && echo "Logos archive size: $(du -h $LOGOS_BACKUP | cut -f1)" >> "$MANIFEST"
+MANIFEST="$BACKUP_DIR_ABS/manifest-$TIMESTAMP.txt"
+{
+    echo "Chromatic Backup Manifest"
+    echo "========================="
+    echo "Timestamp: $TIMESTAMP"
+    echo "Date: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    echo "Compose file: $COMPOSE_FILE"
+    echo ""
+    echo "Artifacts:"
+    ls -1 "$BACKUP_DIR_ABS"/*"$TIMESTAMP"* 2>/dev/null | xargs -n1 basename || true
+} > "$MANIFEST"
 
-log_info "Manifest created: $MANIFEST"
+log_info "Manifest created: $(basename "$MANIFEST")"
 
-# Cleanup old backups (keep last 7 days by default)
-RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-7}"
-log_info "Cleaning up backups older than $RETENTION_DAYS days..."
-find "$BACKUP_DIR" -name "chromatic-*.db" -mtime +$RETENTION_DAYS -delete 2>/dev/null || true
-find "$BACKUP_DIR" -name "files-*.tar.gz" -mtime +$RETENTION_DAYS -delete 2>/dev/null || true
-find "$BACKUP_DIR" -name "logos-*.tar.gz" -mtime +$RETENTION_DAYS -delete 2>/dev/null || true
-find "$BACKUP_DIR" -name "manifest-*.txt" -mtime +$RETENTION_DAYS -delete 2>/dev/null || true
+log_info "Cleaning up backups older than $RETENTION_DAYS day(s)"
+find "$BACKUP_DIR_ABS" -name "chromatic-*.db" -mtime +"$RETENTION_DAYS" -delete 2>/dev/null || true
+find "$BACKUP_DIR_ABS" -name "files-*.tar.gz" -mtime +"$RETENTION_DAYS" -delete 2>/dev/null || true
+find "$BACKUP_DIR_ABS" -name "logos-*.tar.gz" -mtime +"$RETENTION_DAYS" -delete 2>/dev/null || true
+find "$BACKUP_DIR_ABS" -name "manifest-*.txt" -mtime +"$RETENTION_DAYS" -delete 2>/dev/null || true
 
-log_info "Backup completed successfully!"
-log_info ""
-log_info "Backup files:"
-ls -lh "$BACKUP_DIR"/*-$TIMESTAMP* 2>/dev/null || true
+log_info "Backup completed successfully"
+log_info "Generated files:"
+ls -lh "$BACKUP_DIR_ABS"/*"$TIMESTAMP"* 2>/dev/null || true

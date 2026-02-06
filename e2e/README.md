@@ -5,7 +5,7 @@ End-to-end tests for the Chromatic streaming platform using [Playwright](https:/
 ## Prerequisites
 
 1. Node.js 18+ installed
-2. Chromatic backend running on `localhost:8080`
+2. Chromatic backend running on `localhost:3000`
 
 ## Setup
 
@@ -46,7 +46,7 @@ npx playwright test --project=webkit
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `TEST_BASE_URL` | Base URL for the application | `http://localhost:8080` |
+| `TEST_BASE_URL` | Base URL for the application | `http://localhost:3000` |
 | `ADMIN_TOKEN` | Admin authentication token | `test-admin-token` |
 
 Example:
@@ -155,7 +155,7 @@ Example GitHub Actions workflow:
     npx playwright install --with-deps
     npm test
   env:
-    TEST_BASE_URL: http://localhost:8080
+    TEST_BASE_URL: http://localhost:3000
     ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
 ```
 
@@ -164,7 +164,7 @@ Example GitHub Actions workflow:
 ### Tests fail with "Connection refused"
 Ensure the Chromatic backend is running:
 ```bash
-make run
+make dev
 # or
 go run ./cmd/chromatic
 ```

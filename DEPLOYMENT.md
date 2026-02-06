@@ -11,7 +11,7 @@ This guide covers deploying Chromatic to a production server using Docker.
 - **Network**: Public IP address required for WebRTC
 
 ### Software
-- Docker and Docker Compose
+- Docker Engine + Docker Compose plugin (`docker compose`)
 - Domain name with DNS configured
 - SSL certificate (handled by Caddy)
 
@@ -31,9 +31,9 @@ Open the following ports:
 ### 1. Clone and Configure
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourorg/chromatic.git
-cd chromatic/deployments
+# Clone the repository on your server
+git clone https://github.com/davidtorcivia/chromatic.git /opt/chromatic
+cd /opt/chromatic/deployments
 
 # Copy and edit environment variables
 cp .env.example .env
@@ -81,7 +81,6 @@ stream.yourdomain.com {
 ### 5. Deploy
 
 ```bash
-cd deployments
 docker compose pull
 docker compose up -d
 ```
@@ -174,33 +173,33 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
 ## Data Volumes
 
-```bash
-./data/
-├── chromatic.db    # SQLite database
-├── files/          # Uploaded files
-├── logos/          # Watermark logos
-└── caddy/          # SSL certificates
-```
+Production deploys use Docker named volumes (Compose keys shown below):
+
+- `chromatic_data` - Application data (`/data/chromatic.db`, `/data/files`, `/data/logos`)
+- `caddy_data` - Caddy TLS assets and certificates
+- `caddy_config` - Caddy runtime config
+
+Compose typically prefixes the actual Docker volume names with the project name
+(for example `deployments_chromatic_data`).
 
 ## Backup
 
 ### Database Backup
 
 ```bash
-# Stop the service first for consistency
-docker-compose stop chromatic
+# Default backup location: /opt/chromatic/backups
+/opt/chromatic/scripts/backup.sh /opt/chromatic/backups
 
-# Copy the database
-cp data/chromatic.db backup/chromatic-$(date +%Y%m%d).db
-
-# Restart
-docker-compose start chromatic
+# Verify backup integrity
+TIMESTAMP=20260206_231500  # Replace with timestamp from backup output
+/opt/chromatic/scripts/verify-backup.sh "$TIMESTAMP" /opt/chromatic/backups
 ```
 
 ### Full Backup
 
 ```bash
-tar -czvf chromatic-backup-$(date +%Y%m%d).tar.gz data/
+# Includes DB + uploaded files + logos
+/opt/chromatic/scripts/backup.sh /opt/chromatic/backups
 ```
 
 ## Updating
@@ -227,7 +226,7 @@ docker compose logs -f chromatic
 
 1. **Check TURN server**:
    ```bash
-   docker-compose logs coturn
+   docker compose logs coturn
    ```
 
 2. **Verify ports are open**:
@@ -248,7 +247,7 @@ docker compose logs -f chromatic
 
 2. **Check server logs**:
    ```bash
-   docker-compose logs -f chromatic
+   docker compose logs -f chromatic
    ```
 
 3. **Common errors**:
@@ -271,12 +270,12 @@ SQLite may report "database locked" under heavy load:
 
 1. Check for stuck processes:
    ```bash
-   docker-compose exec chromatic ls -la /data/chromatic.db*
+   docker compose exec chromatic ls -la /data/chromatic.db*
    ```
 
 2. Restart the service:
    ```bash
-   docker-compose restart chromatic
+   docker compose restart chromatic
    ```
 
 ## Security Considerations
@@ -310,7 +309,7 @@ curl -s https://stream.yourdomain.com/health | jq
 ### Container Status
 
 ```bash
-docker-compose ps
+docker compose ps
 docker stats
 ```
 
@@ -318,10 +317,10 @@ docker stats
 
 ```bash
 # All services
-docker-compose logs -f
+docker compose logs -f
 
 # Specific service
-docker-compose logs -f chromatic
+docker compose logs -f chromatic
 ```
 
 ## Third-Party TURN Servers
@@ -527,10 +526,10 @@ turnutils_uclient -u <username> -w <password> <turn-server>:3478
 **Self-hosted Coturn**:
 ```bash
 # View Coturn logs
-docker-compose logs -f coturn
+docker compose logs -f coturn
 
 # Check active sessions (if redis enabled)
-docker-compose exec coturn turnadmin -l
+docker compose exec coturn turnadmin -l
 ```
 
 **Third-party providers**: Check their respective dashboards for:

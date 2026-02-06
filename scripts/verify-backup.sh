@@ -1,156 +1,121 @@
 #!/bin/bash
 #
 # Chromatic Backup Verification Script
-# Verifies the integrity of a backup without restoring it
+# Verifies backup artifacts without modifying running services.
 #
 # Usage: ./scripts/verify-backup.sh <backup_timestamp> [backup_dir]
 
-set -e
+set -euo pipefail
 
-# Check arguments
-if [ -z "$1" ]; then
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+COMPOSE_FILE="${COMPOSE_FILE:-$REPO_ROOT/deployments/docker-compose.yml}"
+
+if [ -z "${1:-}" ]; then
     echo "Usage: $0 <backup_timestamp> [backup_dir]"
     echo "Example: $0 20250115_143000 ./backups"
     echo ""
     echo "Available backups:"
-    ls -la "${2:-./backups}"/chromatic-*.db 2>/dev/null | sed 's/.*chromatic-/  /' | sed 's/.db//' || echo "  No backups found"
+    ls -la "${2:-$REPO_ROOT/backups}"/chromatic-*.db 2>/dev/null | sed 's/.*chromatic-/  /' | sed 's/.db//' || echo "  No backups found"
     exit 1
 fi
 
 TIMESTAMP="$1"
-BACKUP_DIR="${2:-./backups}"
+BACKUP_DIR="${2:-$REPO_ROOT/backups}"
+BACKUP_DIR_ABS="$(cd "$BACKUP_DIR" && pwd)"
+DB_BACKUP="$BACKUP_DIR_ABS/chromatic-$TIMESTAMP.db"
+FILES_BACKUP="$BACKUP_DIR_ABS/files-$TIMESTAMP.tar.gz"
+LOGOS_BACKUP="$BACKUP_DIR_ABS/logos-$TIMESTAMP.tar.gz"
+MANIFEST="$BACKUP_DIR_ABS/manifest-$TIMESTAMP.txt"
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_pass() { echo -e "${GREEN}[PASS]${NC} $1"; }
+log_fail() { echo -e "${RED}[FAIL]${NC} $1"; }
 
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
+if [ ! -f "$COMPOSE_FILE" ]; then
+    log_error "Compose file not found: $COMPOSE_FILE"
+    exit 1
+fi
 
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
+if [ ! -f "$DB_BACKUP" ]; then
+    log_error "Database backup not found: $DB_BACKUP"
+    exit 1
+fi
 
-log_pass() {
-    echo -e "${GREEN}[PASS]${NC} $1"
-}
-
-log_fail() {
-    echo -e "${RED}[FAIL]${NC} $1"
-}
-
-# Define backup files
-DB_BACKUP="$BACKUP_DIR/chromatic-$TIMESTAMP.db"
-FILES_BACKUP="$BACKUP_DIR/files-$TIMESTAMP.tar.gz"
-LOGOS_BACKUP="$BACKUP_DIR/logos-$TIMESTAMP.tar.gz"
-MANIFEST="$BACKUP_DIR/manifest-$TIMESTAMP.txt"
-
+COMPOSE_CMD=(docker compose -f "$COMPOSE_FILE")
 ERRORS=0
 
-log_info "Verifying Chromatic backup: $TIMESTAMP"
-log_info "Backup directory: $BACKUP_DIR"
+log_info "Verifying backup timestamp: $TIMESTAMP"
+log_info "Backup directory: $BACKUP_DIR_ABS"
 echo ""
 
-# Check manifest
 echo "Checking manifest..."
 if [ -f "$MANIFEST" ]; then
     log_pass "Manifest found"
-    echo "  Contents:"
-    cat "$MANIFEST" | sed 's/^/    /'
-    echo ""
 else
-    log_warn "Manifest not found (optional)"
+    log_warn "Manifest not found"
 fi
 
-# Verify database backup
+echo ""
 echo "Checking database backup..."
-if [ -f "$DB_BACKUP" ]; then
-    log_pass "Database backup exists: $(du -h $DB_BACKUP | cut -f1)"
+DB_SIZE="$(du -h "$DB_BACKUP" | cut -f1)"
+log_pass "Database artifact exists: $(basename "$DB_BACKUP") ($DB_SIZE)"
 
-    # Verify SQLite integrity
-    echo "  Running SQLite integrity check..."
-    INTEGRITY=$(sqlite3 "$DB_BACKUP" "PRAGMA integrity_check;" 2>&1)
-    if [ "$INTEGRITY" == "ok" ]; then
-        log_pass "Database integrity check passed"
-    else
-        log_fail "Database integrity check failed: $INTEGRITY"
-        ERRORS=$((ERRORS + 1))
-    fi
-
-    # Check schema
-    echo "  Verifying schema..."
-    TABLES=$(sqlite3 "$DB_BACKUP" ".tables" 2>&1)
-    if echo "$TABLES" | grep -q "rooms"; then
-        log_pass "Schema verified (rooms table exists)"
-    else
-        log_fail "Schema verification failed (rooms table missing)"
-        ERRORS=$((ERRORS + 1))
-    fi
-
-    # Show table counts
-    echo "  Table record counts:"
-    for table in stream_keys rooms participants messages files config sessions; do
-        COUNT=$(sqlite3 "$DB_BACKUP" "SELECT COUNT(*) FROM $table;" 2>/dev/null || echo "N/A")
-        echo "    $table: $COUNT"
-    done
+INTEGRITY="$("${COMPOSE_CMD[@]}" run --rm --no-deps -v "$BACKUP_DIR_ABS:/backup:ro" chromatic sh -ec "sqlite3 '/backup/chromatic-$TIMESTAMP.db' 'PRAGMA integrity_check;'" 2>&1 || true)"
+if [ "$INTEGRITY" = "ok" ]; then
+    log_pass "SQLite integrity check passed"
 else
-    log_fail "Database backup not found: $DB_BACKUP"
+    log_fail "SQLite integrity check failed: $INTEGRITY"
     ERRORS=$((ERRORS + 1))
 fi
 
-echo ""
-
-# Verify files backup
-echo "Checking files backup..."
-if [ -f "$FILES_BACKUP" ]; then
-    log_pass "Files backup exists: $(du -h $FILES_BACKUP | cut -f1)"
-
-    # Verify tar integrity
-    echo "  Verifying archive integrity..."
-    if tar -tzf "$FILES_BACKUP" > /dev/null 2>&1; then
-        FILE_COUNT=$(tar -tzf "$FILES_BACKUP" | wc -l)
-        log_pass "Archive integrity check passed ($FILE_COUNT files)"
+TABLES="$("${COMPOSE_CMD[@]}" run --rm --no-deps -v "$BACKUP_DIR_ABS:/backup:ro" chromatic sh -ec "sqlite3 '/backup/chromatic-$TIMESTAMP.db' '.tables'" 2>&1 || true)"
+for table in stream_keys rooms participants messages files config sessions; do
+    if echo "$TABLES" | grep -q "\b$table\b"; then
+        log_pass "Table exists: $table"
     else
-        log_fail "Archive integrity check failed"
+        log_fail "Table missing: $table"
+        ERRORS=$((ERRORS + 1))
+    fi
+done
+
+echo ""
+echo "Checking media archives..."
+if [ -f "$FILES_BACKUP" ]; then
+    if tar -tzf "$FILES_BACKUP" >/dev/null 2>&1; then
+        log_pass "Files archive valid: $(basename "$FILES_BACKUP")"
+    else
+        log_fail "Files archive is corrupted: $(basename "$FILES_BACKUP")"
         ERRORS=$((ERRORS + 1))
     fi
 else
-    log_warn "Files backup not found (may be expected if no files uploaded)"
+    log_warn "Files archive not found for timestamp (may be expected)"
 fi
 
-echo ""
-
-# Verify logos backup
-echo "Checking logos backup..."
 if [ -f "$LOGOS_BACKUP" ]; then
-    log_pass "Logos backup exists: $(du -h $LOGOS_BACKUP | cut -f1)"
-
-    # Verify tar integrity
-    echo "  Verifying archive integrity..."
-    if tar -tzf "$LOGOS_BACKUP" > /dev/null 2>&1; then
-        LOGO_COUNT=$(tar -tzf "$LOGOS_BACKUP" | wc -l)
-        log_pass "Archive integrity check passed ($LOGO_COUNT files)"
+    if tar -tzf "$LOGOS_BACKUP" >/dev/null 2>&1; then
+        log_pass "Logos archive valid: $(basename "$LOGOS_BACKUP")"
     else
-        log_fail "Archive integrity check failed"
+        log_fail "Logos archive is corrupted: $(basename "$LOGOS_BACKUP")"
         ERRORS=$((ERRORS + 1))
     fi
 else
-    log_warn "Logos backup not found (may be expected if no logo uploaded)"
+    log_warn "Logos archive not found for timestamp (may be expected)"
 fi
 
 echo ""
 echo "========================================"
-if [ $ERRORS -eq 0 ]; then
-    log_info "Backup verification completed successfully!"
+if [ "$ERRORS" -eq 0 ]; then
+    log_info "Backup verification passed"
     exit 0
-else
-    log_error "Backup verification found $ERRORS error(s)"
-    exit 1
 fi
+
+log_error "Backup verification failed with $ERRORS error(s)"
+exit 1

@@ -1,458 +1,144 @@
-# Chromatic Backup Guide
+# Chromatic Backup and Restore
 
-This guide covers backup and restore procedures for Chromatic installations.
+This guide covers backup, verification, and restore for production deployments using:
 
-## What to Backup
+- `deployments/docker-compose.yml`
+- Docker named volume `chromatic_data`
+- Scripts in `scripts/`
 
-Chromatic stores data in three locations:
+Run all commands from the repository root (for example `/opt/chromatic`).
 
-| Data Type | Location | Priority |
-|-----------|----------|----------|
-| SQLite Database | `./data/chromatic.db` | **Critical** |
-| Uploaded Files | `./data/files/` | High |
-| Watermark Logos | `./data/logos/` | Medium |
-| SSL Certificates | `./data/caddy/` | Low (auto-regenerated) |
+## What Gets Backed Up
+
+`./scripts/backup.sh` creates timestamped artifacts in your backup directory:
+
+- `chromatic-YYYYMMDD_HHMMSS.db` - SQLite database backup
+- `files-YYYYMMDD_HHMMSS.tar.gz` - Uploaded files (if present)
+- `logos-YYYYMMDD_HHMMSS.tar.gz` - Watermark logos (if present)
+- `manifest-YYYYMMDD_HHMMSS.txt` - Backup manifest
 
 ## Quick Backup
 
-### Manual Backup
-
 ```bash
-cd deployments
-
-# Stop the service for consistency (recommended for database)
-docker-compose stop chromatic
-
-# Create timestamped backup
-tar -czvf chromatic-backup-$(date +%Y%m%d-%H%M%S).tar.gz data/
-
-# Restart service
-docker-compose start chromatic
-```
-
-### Hot Backup (No Downtime)
-
-SQLite with WAL mode supports hot backups:
-
-```bash
-cd deployments
-
-# Backup database while running (SQLite will handle consistency)
-sqlite3 data/chromatic.db ".backup 'backup/chromatic-$(date +%Y%m%d).db'"
-
-# Backup files (may miss files being written)
-rsync -av data/files/ backup/files/
-rsync -av data/logos/ backup/logos/
-```
-
-## Database Backup
-
-### SQLite Backup Methods
-
-**Method 1: .backup command (recommended)**
-```bash
-sqlite3 data/chromatic.db ".backup 'chromatic-backup.db'"
-```
-
-**Method 2: File copy (requires stopping service)**
-```bash
-docker-compose stop chromatic
-cp data/chromatic.db backup/chromatic-$(date +%Y%m%d).db
-cp data/chromatic.db-wal backup/chromatic-$(date +%Y%m%d).db-wal 2>/dev/null
-cp data/chromatic.db-shm backup/chromatic-$(date +%Y%m%d).db-shm 2>/dev/null
-docker-compose start chromatic
-```
-
-**Method 3: SQL dump (portable)**
-```bash
-sqlite3 data/chromatic.db ".dump" > backup/chromatic-$(date +%Y%m%d).sql
-```
-
-### Verifying Database Backup
-
-```bash
-# Check integrity
-sqlite3 backup/chromatic-backup.db "PRAGMA integrity_check;"
-
-# Expected output: ok
-
-# Quick content check
-sqlite3 backup/chromatic-backup.db "SELECT COUNT(*) FROM rooms;"
-```
-
-## Automated Backups
-
-### Using Cron
-
-Create `/etc/cron.d/chromatic-backup`:
-
-```cron
-# Daily database backup at 2 AM
-0 2 * * * root /opt/chromatic/scripts/backup.sh
-
-# Weekly full backup on Sunday at 3 AM
-0 3 * * 0 root /opt/chromatic/scripts/full-backup.sh
-```
-
-### Backup Script
-
-Create `scripts/backup.sh`:
-
-```bash
-#!/bin/bash
-set -e
-
-# Configuration
-CHROMATIC_DIR="/opt/chromatic/deployments"
-BACKUP_DIR="/backups/chromatic"
-RETENTION_DAYS=30
-
-# Create backup directory
-mkdir -p "$BACKUP_DIR"
-
-# Timestamp
-TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-
-# Database backup (hot)
-sqlite3 "$CHROMATIC_DIR/data/chromatic.db" ".backup '$BACKUP_DIR/chromatic-$TIMESTAMP.db'"
-
-# Compress
-gzip "$BACKUP_DIR/chromatic-$TIMESTAMP.db"
-
-# Clean old backups
-find "$BACKUP_DIR" -name "chromatic-*.db.gz" -mtime +$RETENTION_DAYS -delete
-
-# Log
-echo "$(date): Backup completed: chromatic-$TIMESTAMP.db.gz" >> "$BACKUP_DIR/backup.log"
-```
-
-Make executable:
-```bash
-chmod +x scripts/backup.sh
-```
-
-### Full Backup Script
-
-Create `scripts/full-backup.sh`:
-
-```bash
-#!/bin/bash
-set -e
-
-# Configuration
-CHROMATIC_DIR="/opt/chromatic/deployments"
-BACKUP_DIR="/backups/chromatic"
-RETENTION_WEEKS=8
-
-# Create backup directory
-mkdir -p "$BACKUP_DIR"
-
-# Timestamp
-TIMESTAMP=$(date +%Y%m%d)
-
-# Stop service for consistent backup
-cd "$CHROMATIC_DIR"
-docker-compose stop chromatic
-
-# Full backup
-tar -czvf "$BACKUP_DIR/chromatic-full-$TIMESTAMP.tar.gz" data/
-
-# Restart service
-docker-compose start chromatic
-
-# Clean old backups
-find "$BACKUP_DIR" -name "chromatic-full-*.tar.gz" -mtime +$((RETENTION_WEEKS * 7)) -delete
-
-# Log
-echo "$(date): Full backup completed: chromatic-full-$TIMESTAMP.tar.gz" >> "$BACKUP_DIR/backup.log"
-```
-
-## Cloud Backup
-
-### AWS S3
-
-```bash
-#!/bin/bash
-# Requires: aws-cli configured
-
-BACKUP_FILE="chromatic-$(date +%Y%m%d).db"
-S3_BUCKET="your-backup-bucket"
+# Recommended location
+mkdir -p /opt/chromatic/backups
+chmod 700 /opt/chromatic/backups
 
 # Create backup
-sqlite3 data/chromatic.db ".backup '$BACKUP_FILE'"
-gzip "$BACKUP_FILE"
-
-# Upload to S3
-aws s3 cp "${BACKUP_FILE}.gz" "s3://${S3_BUCKET}/chromatic/"
-
-# Clean local
-rm "${BACKUP_FILE}.gz"
+./scripts/backup.sh /opt/chromatic/backups
 ```
 
-### Google Cloud Storage
+By default, backups older than 7 days are removed.
+Set retention with `BACKUP_RETENTION_DAYS`:
 
 ```bash
-#!/bin/bash
-# Requires: gcloud configured
-
-BACKUP_FILE="chromatic-$(date +%Y%m%d).db"
-GCS_BUCKET="your-backup-bucket"
-
-sqlite3 data/chromatic.db ".backup '$BACKUP_FILE'"
-gzip "$BACKUP_FILE"
-gsutil cp "${BACKUP_FILE}.gz" "gs://${GCS_BUCKET}/chromatic/"
-rm "${BACKUP_FILE}.gz"
+BACKUP_RETENTION_DAYS=30 ./scripts/backup.sh /opt/chromatic/backups
 ```
 
-### Backblaze B2
+## Verify a Backup
+
+After backup, run verification before updates or maintenance:
 
 ```bash
-#!/bin/bash
-# Requires: b2 CLI configured
-
-BACKUP_FILE="chromatic-$(date +%Y%m%d).db"
-B2_BUCKET="your-backup-bucket"
-
-sqlite3 data/chromatic.db ".backup '$BACKUP_FILE'"
-gzip "$BACKUP_FILE"
-b2 upload-file "$B2_BUCKET" "${BACKUP_FILE}.gz" "chromatic/${BACKUP_FILE}.gz"
-rm "${BACKUP_FILE}.gz"
+./scripts/verify-backup.sh 20260206_231500 /opt/chromatic/backups
 ```
 
-## Restore Procedures
+Replace `20260206_231500` with your backup timestamp.
 
-### Full Restore
+## Quick Restore
+
+1. Pick the backup timestamp you want to restore.
+2. Run restore:
 
 ```bash
-cd deployments
-
-# Stop service
-docker-compose down
-
-# Clear existing data (be careful!)
-rm -rf data/*
-
-# Extract backup
-tar -xzvf chromatic-full-YYYYMMDD.tar.gz
-
-# Start service
-docker-compose up -d
+./scripts/restore.sh 20260206_231500 /opt/chromatic/backups
 ```
 
-### Database Only Restore
+Restore behavior:
+
+- Creates a pre-restore DB snapshot (`chromatic-pre-restore-*.db`)
+- Stops `chromatic`
+- Restores DB and media artifacts from the selected timestamp
+- Starts `chromatic` again
+
+## Update Safety Pattern (Recommended)
+
+Before upgrading to a new image tag:
 
 ```bash
-cd deployments
+./scripts/backup.sh /opt/chromatic/backups
+TIMESTAMP=20260206_231500  # Replace with your backup timestamp
+./scripts/verify-backup.sh "$TIMESTAMP" /opt/chromatic/backups
 
-# Stop service
-docker-compose stop chromatic
-
-# Backup current (just in case)
-mv data/chromatic.db data/chromatic.db.old
-rm -f data/chromatic.db-wal data/chromatic.db-shm
-
-# Restore from backup
-cp /backups/chromatic/chromatic-YYYYMMDD.db data/chromatic.db
-
-# Or from gzip:
-gunzip -c /backups/chromatic/chromatic-YYYYMMDD.db.gz > data/chromatic.db
-
-# Start service
-docker-compose start chromatic
-
-# Verify
-docker-compose logs -f chromatic
+docker compose -f deployments/docker-compose.yml pull
+docker compose -f deployments/docker-compose.yml up -d
 ```
 
-### Restore from SQL Dump
+If the upgrade fails, restore the last known-good backup:
 
 ```bash
-cd deployments
-docker-compose stop chromatic
-
-# Remove old database
-rm -f data/chromatic.db*
-
-# Restore from SQL
-sqlite3 data/chromatic.db < /backups/chromatic/chromatic-YYYYMMDD.sql
-
-docker-compose start chromatic
+TIMESTAMP=20260206_231500  # Replace with your backup timestamp
+./scripts/restore.sh "$TIMESTAMP" /opt/chromatic/backups
 ```
 
-### Selective File Restore
+## Automation with Cron
+
+Run nightly backups at 2 AM:
+
+```cron
+0 2 * * * cd /opt/chromatic && /opt/chromatic/scripts/backup.sh /opt/chromatic/backups >> /var/log/chromatic-backup.log 2>&1
+```
+
+Run weekly verification at 2:15 AM on Sundays:
+
+```cron
+15 2 * * 0 cd /opt/chromatic && /opt/chromatic/scripts/verify-backup.sh $(ls -1 /opt/chromatic/backups/chromatic-*.db | sed 's/.*chromatic-//' | sed 's/.db$//' | tail -n1) /opt/chromatic/backups >> /var/log/chromatic-backup-verify.log 2>&1
+```
+
+## Manual Backup Commands (Without Scripts)
+
+If needed, run manual commands against Compose:
 
 ```bash
-# Restore specific room's files
-tar -xzvf chromatic-full-YYYYMMDD.tar.gz data/files/room-id/
+mkdir -p /opt/chromatic/backups
+
+# Database hot backup
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+docker compose -f deployments/docker-compose.yml run --rm --no-deps \
+  -v /opt/chromatic/backups:/backup \
+  chromatic sh -ec "sqlite3 /data/chromatic.db \".backup '/backup/chromatic-${TIMESTAMP}.db'\""
+
+# Files and logos archives (optional)
+docker compose -f deployments/docker-compose.yml run --rm --no-deps \
+  -v /opt/chromatic/backups:/backup \
+  chromatic sh -ec "[ -d /data/files ] && [ \"\$(ls -A /data/files 2>/dev/null)\" ] && tar -czf '/backup/files-${TIMESTAMP}.tar.gz' -C /data files || true"
+
+docker compose -f deployments/docker-compose.yml run --rm --no-deps \
+  -v /opt/chromatic/backups:/backup \
+  chromatic sh -ec "[ -d /data/logos ] && [ \"\$(ls -A /data/logos 2>/dev/null)\" ] && tar -czf '/backup/logos-${TIMESTAMP}.tar.gz' -C /data logos || true"
 ```
 
-## Backup Verification
+## Restore Validation Checklist
 
-### Automated Verification Script
+After restore:
 
 ```bash
-#!/bin/bash
-# verify-backup.sh
-
-BACKUP_FILE=$1
-
-if [ -z "$BACKUP_FILE" ]; then
-    echo "Usage: verify-backup.sh <backup-file>"
-    exit 1
-fi
-
-# Decompress if needed
-if [[ "$BACKUP_FILE" == *.gz ]]; then
-    gunzip -c "$BACKUP_FILE" > /tmp/verify-backup.db
-    DB_FILE="/tmp/verify-backup.db"
-else
-    DB_FILE="$BACKUP_FILE"
-fi
-
-# Check integrity
-INTEGRITY=$(sqlite3 "$DB_FILE" "PRAGMA integrity_check;")
-if [ "$INTEGRITY" != "ok" ]; then
-    echo "FAILED: Integrity check"
-    exit 1
-fi
-
-# Check tables exist
-TABLES=$(sqlite3 "$DB_FILE" ".tables")
-REQUIRED_TABLES="rooms participants files sessions stream_keys"
-for table in $REQUIRED_TABLES; do
-    if [[ ! "$TABLES" == *"$table"* ]]; then
-        echo "FAILED: Missing table $table"
-        exit 1
-    fi
-done
-
-# Check record counts
-ROOMS=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM rooms;")
-echo "Rooms: $ROOMS"
-
-PARTICIPANTS=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM participants;")
-echo "Participants: $PARTICIPANTS"
-
-# Clean up
-rm -f /tmp/verify-backup.db
-
-echo "PASSED: Backup verification successful"
+docker compose -f deployments/docker-compose.yml ps
+docker compose -f deployments/docker-compose.yml logs -f chromatic
+curl -fsS https://stream.yourdomain.com/health
 ```
 
-## Disaster Recovery
+Confirm in Admin UI:
 
-### Recovery Time Objectives
-
-| Scenario | RTO | Procedure |
-|----------|-----|-----------|
-| Database corruption | 15 min | Restore from latest backup |
-| Server failure | 30 min | Deploy new server, restore backup |
-| Accidental deletion | 5 min | Restore specific files |
-
-### Recovery Checklist
-
-1. **Assess the situation**
-   - What data is affected?
-   - When did the issue start?
-   - Is there a recent backup?
-
-2. **Stop the service**
-   ```bash
-   docker-compose down
-   ```
-
-3. **Identify the correct backup**
-   ```bash
-   ls -la /backups/chromatic/
-   ```
-
-4. **Test backup before restoring** (on different machine if possible)
-   ```bash
-   ./scripts/verify-backup.sh /backups/chromatic/chromatic-YYYYMMDD.db.gz
-   ```
-
-5. **Perform restore**
-   - Follow appropriate restore procedure above
-
-6. **Verify restoration**
-   ```bash
-   docker-compose up -d
-   curl https://stream.yourdomain.com/health
-   ```
-
-7. **Document the incident**
-   - What happened
-   - What was restored
-   - Any data loss
-
-## Backup Monitoring
-
-### Health Check Script
-
-```bash
-#!/bin/bash
-# backup-health.sh
-
-BACKUP_DIR="/backups/chromatic"
-MAX_AGE_HOURS=25  # Alert if no backup in 25 hours
-
-# Check latest backup age
-LATEST=$(ls -t "$BACKUP_DIR"/chromatic-*.db.gz 2>/dev/null | head -1)
-
-if [ -z "$LATEST" ]; then
-    echo "CRITICAL: No backups found!"
-    exit 2
-fi
-
-# Get age in hours
-AGE_SECONDS=$(($(date +%s) - $(stat -c %Y "$LATEST")))
-AGE_HOURS=$((AGE_SECONDS / 3600))
-
-if [ $AGE_HOURS -gt $MAX_AGE_HOURS ]; then
-    echo "WARNING: Latest backup is $AGE_HOURS hours old"
-    exit 1
-fi
-
-# Check backup size (should be > 0)
-SIZE=$(stat -c %s "$LATEST")
-if [ $SIZE -lt 1000 ]; then
-    echo "WARNING: Backup file suspiciously small: $SIZE bytes"
-    exit 1
-fi
-
-echo "OK: Latest backup is $AGE_HOURS hours old, size: $SIZE bytes"
-exit 0
-```
-
-### Prometheus Metrics
-
-Add to your monitoring:
-
-```yaml
-# prometheus.yml
-scrape_configs:
-  - job_name: 'chromatic-backup'
-    static_configs:
-      - targets: ['localhost:9100']
-    metric_relabel_configs:
-      - source_labels: [__name__]
-        regex: 'node_textfile_scrape_error'
-        action: keep
-```
-
-Create metric file at `/var/lib/node_exporter/chromatic_backup.prom`:
-```
-# HELP chromatic_backup_age_seconds Age of latest backup in seconds
-# TYPE chromatic_backup_age_seconds gauge
-chromatic_backup_age_seconds 3600
-```
+- rooms exist
+- stream keys exist
+- logos/watermarks are present
+- test room can stream and play back
 
 ## Best Practices
 
-1. **Test restores regularly**: Monthly test restores to verify backup integrity
-2. **Multiple backup locations**: Keep backups in at least 2 physical locations
-3. **Encrypt sensitive backups**: Database may contain session tokens
-4. **Monitor backup jobs**: Alert on failure
-5. **Document procedures**: Keep this guide updated
-6. **Retention policy**: Balance storage costs vs recovery needs
-7. **Version backups**: Don't overwrite; keep historical versions
+1. Keep backups on a separate disk or object storage.
+2. Keep at least one off-server copy.
+3. Verify backups regularly, not only when incidents happen.
+4. Run a test restore monthly.
+5. Keep immutable release tags (`sha-<commit>` or digest) in `.env` for safe rollback.

@@ -3,7 +3,7 @@
 # Includes Prometheus + Grafana for metrics visualization.
 #
 # Usage:
-#   docker-compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+#   docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
 #
 # Access:
 #   - Grafana: http://localhost:3001 (admin/admin)

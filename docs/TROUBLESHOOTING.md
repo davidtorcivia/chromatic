@@ -38,7 +38,7 @@ This guide covers common issues and their solutions when running Chromatic.
 
 4. **Server logs**:
    ```bash
-   docker-compose logs chromatic | grep -i "stream key"
+   docker compose logs chromatic | grep -i "stream key"
    ```
 
 ### OBS connects but no video appears
@@ -60,7 +60,7 @@ This guide covers common issues and their solutions when running Chromatic.
 
 3. **Check server logs for track info**:
    ```bash
-   docker-compose logs chromatic | grep "Received track"
+   docker compose logs chromatic | grep "Received track"
    ```
 
 ### OBS shows "Could not connect to server"
@@ -76,7 +76,7 @@ This guide covers common issues and their solutions when running Chromatic.
 
 3. **Check Caddy status**:
    ```bash
-   docker-compose logs caddy
+   docker compose logs caddy
    ```
 
 ### Stream key already in use
@@ -87,7 +87,7 @@ This guide covers common issues and their solutions when running Chromatic.
 
 1. **Previous stream didn't close cleanly**:
    ```bash
-   docker-compose restart chromatic
+   docker compose restart chromatic
    ```
 
 2. **Check for active ingests**:
@@ -133,7 +133,7 @@ This guide covers common issues and their solutions when running Chromatic.
 
 3. **Check TURN server health**:
    ```bash
-   docker-compose logs coturn | tail -100
+   docker compose logs coturn | tail -100
    ```
 
 4. **Increase reconnection timeout**:
@@ -163,7 +163,7 @@ This guide covers common issues and their solutions when running Chromatic.
 
 1. **Check logs**:
    ```bash
-   docker-compose logs coturn
+   docker compose logs coturn
    ```
 
 2. **Common errors**:
@@ -172,7 +172,7 @@ This guide covers common issues and their solutions when running Chromatic.
 
 3. **Verify configuration**:
    ```bash
-   docker-compose exec coturn cat /etc/coturn/turnserver.conf
+   docker compose exec coturn cat /etc/coturn/turnserver.conf
    ```
 
 ### TURN relay not working
@@ -202,10 +202,10 @@ This guide covers common issues and their solutions when running Chromatic.
 1. **Verify TURN_SECRET matches**:
    ```bash
    # Check Chromatic config
-   docker-compose exec chromatic env | grep TURN
+   docker compose exec chromatic env | grep TURN
 
    # Check Coturn config
-   docker-compose exec coturn cat /etc/coturn/turnserver.conf | grep static-auth-secret
+   docker compose exec coturn cat /etc/coturn/turnserver.conf | grep static-auth-secret
    ```
 
 2. **Check credential format**:
@@ -244,7 +244,7 @@ This guide covers common issues and their solutions when running Chromatic.
 
 3. **Check for audio track**:
    ```bash
-   docker-compose logs chromatic | grep "audio track"
+   docker compose logs chromatic | grep "audio track"
    ```
 
 ### Video stuttering/freezing
@@ -288,7 +288,7 @@ This guide covers common issues and their solutions when running Chromatic.
 
 1. **Check file permissions**:
    ```bash
-   docker-compose exec chromatic ls -la /data/logos/
+   docker compose exec chromatic ls -la /data/logos/
    ```
 
 2. **Supported formats**: PNG, JPEG, WebP
@@ -369,17 +369,17 @@ This guide covers common issues and their solutions when running Chromatic.
 
 1. **Check for stuck processes**:
    ```bash
-   docker-compose exec chromatic ls -la /data/chromatic.db*
+   docker compose exec chromatic ls -la /data/chromatic.db*
    ```
 
 2. **Restart the service**:
    ```bash
-   docker-compose restart chromatic
+   docker compose restart chromatic
    ```
 
 3. **Enable WAL mode** (should be on by default):
    ```bash
-   docker-compose exec chromatic sqlite3 /data/chromatic.db "PRAGMA journal_mode;"
+   docker compose exec chromatic sqlite3 /data/chromatic.db "PRAGMA journal_mode;"
    # Should return: wal
    ```
 
@@ -391,19 +391,18 @@ This guide covers common issues and their solutions when running Chromatic.
 
 1. **Check integrity**:
    ```bash
-   docker-compose exec chromatic sqlite3 /data/chromatic.db "PRAGMA integrity_check;"
+   docker compose exec chromatic sqlite3 /data/chromatic.db "PRAGMA integrity_check;"
    ```
 
 2. **Restore from backup**:
    ```bash
-   docker-compose stop chromatic
-   cp backup/chromatic-latest.db data/chromatic.db
-   docker-compose start chromatic
+   TIMESTAMP=20260206_231500  # Replace with your backup timestamp
+   ./scripts/restore.sh "$TIMESTAMP" /opt/chromatic/backups
    ```
 
 3. **Attempt repair**:
    ```bash
-   sqlite3 data/chromatic.db ".recover" | sqlite3 data/chromatic-recovered.db
+   docker compose run --rm --no-deps chromatic sh -ec "sqlite3 /data/chromatic.db '.recover' | sqlite3 /data/chromatic-recovered.db"
    ```
 
 ---
@@ -416,7 +415,7 @@ This guide covers common issues and their solutions when running Chromatic.
 
 1. **Verify ADMIN_TOKEN**:
    ```bash
-   docker-compose exec chromatic env | grep ADMIN_TOKEN
+   docker compose exec chromatic env | grep ADMIN_TOKEN
    ```
 
 2. **Check cookies**: Clear browser cookies and try again
@@ -454,34 +453,34 @@ This guide covers common issues and their solutions when running Chromatic.
 
 2. **Restart service**:
    ```bash
-   docker-compose restart chromatic
+   docker compose restart chromatic
    ```
 
 3. **View logs**:
    ```bash
-   docker-compose logs -f chromatic
+   docker compose logs -f chromatic
    ```
 
 ### Specific log areas
 
 **WebSocket messages**:
 ```bash
-docker-compose logs chromatic | grep "WS message"
+docker compose logs chromatic | grep "WS message"
 ```
 
 **WebRTC signaling**:
 ```bash
-docker-compose logs chromatic | grep -E "(offer|answer|candidate)"
+docker compose logs chromatic | grep -E "(offer|answer|candidate)"
 ```
 
 **WHIP/Stream**:
 ```bash
-docker-compose logs chromatic | grep -i whip
+docker compose logs chromatic | grep -i whip
 ```
 
 **TURN server**:
 ```bash
-docker-compose logs coturn
+docker compose logs coturn
 ```
 
 ### Client-side debugging
@@ -494,17 +493,17 @@ docker-compose logs coturn
 
 ```bash
 # System info
-docker-compose version
+docker compose version
 docker version
 
 # Container logs
-docker-compose logs --tail=500 > debug-logs.txt
+docker compose logs --tail=500 > debug-logs.txt
 
 # Metrics
 curl -s https://stream.yourdomain.com/metrics >> debug-logs.txt
 
 # Configuration (sanitize secrets!)
-docker-compose exec chromatic env | grep -v TOKEN | grep -v SECRET >> debug-logs.txt
+docker compose exec chromatic env | grep -v TOKEN | grep -v SECRET >> debug-logs.txt
 ```
 
 ---

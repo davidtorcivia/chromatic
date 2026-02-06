@@ -21,7 +21,7 @@ RUN CGO_ENABLED=1 go build -o chromatic ./cmd/chromatic
 FROM alpine:3.19
 WORKDIR /app
 
-RUN apk add --no-cache ca-certificates curl
+RUN apk add --no-cache ca-certificates curl sqlite
 
 # Create non-root user for security
 RUN addgroup -g 1001 chromatic && \
