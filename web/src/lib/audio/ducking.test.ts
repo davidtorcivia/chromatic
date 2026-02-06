@@ -12,7 +12,13 @@ vi.mock('./context', () => ({
             frequencyBinCount: 128,
             connect: vi.fn(),
             getByteFrequencyData: vi.fn()
-        })
+        }),
+        createGain: vi.fn().mockReturnValue({
+            gain: { value: 1 },
+            connect: vi.fn(),
+            disconnect: vi.fn()
+        }),
+        destination: {}
     })
 }));
 

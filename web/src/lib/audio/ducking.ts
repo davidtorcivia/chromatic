@@ -65,9 +65,15 @@ export class AudioDuckingManager {
     }
 
     async addVoiceTrack(participantId: string, track: MediaStreamTrack): Promise<void> {
+        const MediaStreamCtor = globalThis.MediaStream;
+        if (typeof MediaStreamCtor !== 'function') {
+            // Non-browser test/runtime environments may not expose MediaStream.
+            return;
+        }
+
         const ctx = await getAudioContext();
 
-        const stream = new MediaStream([track]);
+        const stream = new MediaStreamCtor([track]);
         const source = ctx.createMediaStreamSource(stream);
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 256;

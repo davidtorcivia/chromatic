@@ -143,7 +143,7 @@
                             class="input slug-input"
                             bind:value={slug}
                             placeholder="my-color-session"
-                            pattern="[a-z0-9-]{3,64}"
+                            pattern={"[a-z0-9-]{3,64}"}
                             minlength="3"
                             maxlength="64"
                             required
@@ -214,11 +214,12 @@
                 <h3>Watermark</h3>
 
                 <div class="form-group">
-                    <label>Watermark Mode</label>
+                    <label for="watermarkMode-none">Watermark Mode</label>
                     <div class="radio-group">
                         <label class="radio-label">
                             <input
                                 type="radio"
+                                id="watermarkMode-none"
                                 name="watermarkMode"
                                 value="none"
                                 bind:group={watermarkMode}

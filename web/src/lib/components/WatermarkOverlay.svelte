@@ -29,7 +29,7 @@
         logoPadding = 20,
     }: Props = $props();
 
-    let canvasEl: HTMLCanvasElement;
+    let canvasEl = $state<HTMLCanvasElement | null>(null);
     let observer: MutationObserver;
     let animationFrame: number;
     let logoImage: HTMLImageElement | null = null;
@@ -170,6 +170,7 @@
 
     function setupTamperDetection() {
         if (!canvasEl) return;
+        const canvas = canvasEl;
 
         observer = new MutationObserver((mutations) => {
             for (const mutation of mutations) {
@@ -177,7 +178,7 @@
                     const attr = mutation.attributeName;
                     if (attr === "style" || attr === "class") {
                         // Check for visibility/opacity tampering
-                        const style = window.getComputedStyle(canvasEl);
+                        const style = window.getComputedStyle(canvas);
                         if (
                             style.display === "none" ||
                             style.visibility === "hidden" ||
@@ -188,7 +189,7 @@
                     }
                 } else if (mutation.type === "childList") {
                     // Check if canvas was removed
-                    if (!document.contains(canvasEl)) {
+                    if (!document.contains(canvas)) {
                         handleTampering();
                     }
                 }
@@ -196,14 +197,14 @@
         });
 
         // Watch the canvas and its parent
-        observer.observe(canvasEl.parentElement!, {
+        observer.observe(canvas.parentElement!, {
             childList: true,
             subtree: true,
             attributes: true,
             attributeFilter: ["style", "class"],
         });
 
-        observer.observe(canvasEl, {
+        observer.observe(canvas, {
             attributes: true,
             attributeFilter: ["style", "class"],
         });

@@ -163,7 +163,7 @@
                     </div>
 
                     <div class="key-url">
-                        <label>WHIP URL</label>
+                        <span class="field-label">WHIP URL</span>
                         <div class="copy-row">
                             <code>{window.location.origin}/whip/{key.keyToken}</code>
                             <button
@@ -264,7 +264,7 @@
         margin-bottom: var(--space-md);
     }
 
-    .key-url label {
+    .key-url .field-label {
         display: block;
         font-size: 0.75rem;
         color: var(--color-text-muted);

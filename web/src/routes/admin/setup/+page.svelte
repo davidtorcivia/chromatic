@@ -958,7 +958,7 @@
                                             id="watermarkText"
                                             class="input"
                                             bind:value={watermarkText}
-                                            placeholder="{{name}} - {{date}}"
+                                            placeholder={"{{name}} - {{date}}"}
                                         />
                                         <p class="hint">
                                             Variables:
@@ -1095,7 +1095,7 @@
 
                                 {#if selectedKeyId}
                                     <div class="whip-block">
-                                        <label>WHIP URL</label>
+                                        <span class="field-label">WHIP URL</span>
                                         <div class="copy-row">
                                             <code>
                                                 {baseUrl}/whip/{keys.find((k) => k.id === selectedKeyId)?.keyToken}
@@ -1198,7 +1198,7 @@
                                                 class="input slug-input"
                                                 bind:value={roomSlug}
                                                 placeholder="color-review"
-                                                pattern="[a-z0-9-]{3,64}"
+                                                pattern={"[a-z0-9-]{3,64}"}
                                                 minlength="3"
                                                 maxlength="64"
                                                 required
@@ -1255,7 +1255,7 @@
                                             : "Room created successfully."}
                                     </p>
                                     <div class="whip-block">
-                                        <label>Viewer URL</label>
+                                        <span class="field-label">Viewer URL</span>
                                         <div class="copy-row">
                                             <code>{roomUrl()}</code>
                                             <button
@@ -1741,7 +1741,7 @@
         color: var(--color-text-muted);
     }
 
-    .whip-block label {
+    .whip-block .field-label {
         display: block;
         font-size: 0.75rem;
         color: var(--color-text-muted);

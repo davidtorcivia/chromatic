@@ -16,14 +16,14 @@ Object.defineProperty(window, 'matchMedia', {
 });
 
 // Mock ResizeObserver
-global.ResizeObserver = class ResizeObserver {
+globalThis.ResizeObserver = class ResizeObserver {
     observe() {}
     unobserve() {}
     disconnect() {}
-};
+} as unknown as typeof ResizeObserver;
 
 // Mock IntersectionObserver
-global.IntersectionObserver = class IntersectionObserver {
+globalThis.IntersectionObserver = class IntersectionObserver {
     root = null;
     rootMargin = '';
     thresholds = [];
@@ -42,7 +42,7 @@ Object.defineProperty(navigator, 'mediaDevices', {
 });
 
 // Mock AudioContext
-global.AudioContext = class AudioContext {
+globalThis.AudioContext = class AudioContext {
     state = 'running';
     createGain() {
         return {
@@ -59,6 +59,17 @@ global.AudioContext = class AudioContext {
     }
     createMediaStreamSource() {
         return { connect: () => {} };
+    }
+    resume() { return Promise.resolve(); }
+    createBuffer() {
+        return {} as AudioBuffer;
+    }
+    createBufferSource() {
+        return {
+            buffer: null,
+            connect: () => {},
+            start: () => {}
+        };
     }
     close() { return Promise.resolve(); }
 } as unknown as typeof AudioContext;

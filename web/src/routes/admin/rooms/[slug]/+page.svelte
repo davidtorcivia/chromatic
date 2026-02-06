@@ -275,7 +275,7 @@
                     {#if room.streamKeyId}
                         <div class="stream-info">
                             <div class="stream-field">
-                                <label>WHIP URL (for OBS)</label>
+                                <span class="field-label">WHIP URL (for OBS)</span>
                                 <div class="copy-field">
                                     <code>{getWhipUrl()}</code>
                                     <button
@@ -352,10 +352,10 @@
                 </div>
 
                 <div class="form-group">
-                    <label>Watermark Mode</label>
+                    <label for="watermarkMode-none">Watermark Mode</label>
                     <div class="radio-group">
                         <label class="radio-label">
-                            <input type="radio" name="watermarkMode" value="none" bind:group={watermarkMode} />
+                            <input id="watermarkMode-none" type="radio" name="watermarkMode" value="none" bind:group={watermarkMode} />
                             <span>None</span>
                         </label>
                         <label class="radio-label">
@@ -381,7 +381,7 @@
                             id="watermarkText"
                             class="input"
                             bind:value={watermarkText}
-                            placeholder="{{{{name}}}} - {{{{date}}}}"
+                            placeholder={"{{name}} - {{date}}"}
                         />
                         <p class="hint">Variables: {"{{name}}"}, {"{{room}}"}, {"{{date}}"}, {"{{time}}"}</p>
                     </div>
@@ -579,7 +579,7 @@
         margin-bottom: var(--space-md);
     }
 
-    .stream-field label {
+    .stream-field .field-label {
         display: block;
         font-size: 0.875rem;
         color: var(--color-text-muted);
@@ -733,12 +733,6 @@
         font-size: 0.75rem;
         color: var(--color-text-subtle);
         margin-top: var(--space-xs);
-    }
-
-    .hint code {
-        background: var(--color-surface-elevated);
-        padding: 0.1em 0.3em;
-        border-radius: var(--radius-sm);
     }
 
     .range-input {

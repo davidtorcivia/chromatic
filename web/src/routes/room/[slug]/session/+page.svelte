@@ -12,7 +12,7 @@
 
     const slug = $page.params.slug!;
 
-    let videoElement: HTMLVideoElement;
+    let videoElement = $state<HTMLVideoElement | null>(null);
     let isChatOpen = $state(false);
     let isControlsVisible = $state(true);
     let controlsTimer: ReturnType<typeof setTimeout>;
@@ -34,12 +34,12 @@
     let streamError = $state<string | null>(null);
 
     // Get session data from storage
-    let sessionData: {
+    let sessionData = $state<{
         participantId: string;
         token: string;
         color: string;
         name?: string;
-    } | null = null;
+    } | null>(null);
 
     onMount(async () => {
         // Get session data

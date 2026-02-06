@@ -459,12 +459,13 @@ func EndpointRateLimiter(cfg EndpointRateLimiterConfig) func(http.Handler) http.
 // RoomJoinRateLimiter creates a rate limiter for room join attempts (password protection)
 // Keys by IP + room slug to limit password guessing per room
 func RoomJoinRateLimiter(trustedProxies []string) func(http.Handler) http.Handler {
+	trustedProxySet := buildTrustedProxySet(trustedProxies)
+
 	return EndpointRateLimiter(EndpointRateLimiterConfig{
 		RequestsPerWindow: 5,           // 5 attempts
 		WindowDuration:    time.Minute, // per minute
 		TrustedProxies:    trustedProxies,
 		KeyExtractor: func(r *http.Request) string {
-			trustedProxySet := buildTrustedProxySet(trustedProxies)
 			ip := getClientIP(r, trustedProxySet)
 			slug := r.PathValue("slug")
 			return fmt.Sprintf("%s:%s", ip, slug)

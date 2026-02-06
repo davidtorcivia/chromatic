@@ -187,11 +187,11 @@
         <section class="card settings-section">
             <h2>Server Information</h2>
             <div class="info-row">
-                <label>Public URL</label>
+                <span class="field-label">Public URL</span>
                 <code>{config?.publicUrl || "Not configured"}</code>
             </div>
             <div class="info-row">
-                <label>WHIP URL Format</label>
+                <span class="field-label">WHIP URL Format</span>
                 <div class="copy-row">
                     <code>{config?.whipFormat || "Not configured"}</code>
                     <button
@@ -224,7 +224,7 @@
                         id="watermarkText"
                         class="input"
                         bind:value={watermarkText}
-                        placeholder="{{name}} - {{date}}"
+                        placeholder={"{{name}} - {{date}}"}
                     />
                     <p class="hint">
                         Available variables: <code>{"{{name}}"}</code>,
@@ -245,7 +245,7 @@
             <hr />
 
             <div class="form-group">
-                <label>Default Watermark Logo</label>
+                <span class="field-label">Default Watermark Logo</span>
                 {#if config?.defaultWatermarkLogoUrl}
                     <div class="logo-preview">
                         <img
@@ -451,6 +451,13 @@
         margin-bottom: var(--space-xs);
     }
 
+    .form-group .field-label {
+        display: block;
+        font-size: 0.875rem;
+        font-weight: 500;
+        margin-bottom: var(--space-xs);
+    }
+
     .hint {
         font-size: 0.75rem;
         color: var(--color-text-subtle);
@@ -467,7 +474,7 @@
         margin-bottom: var(--space-md);
     }
 
-    .info-row label {
+    .info-row .field-label {
         display: block;
         font-size: 0.75rem;
         color: var(--color-text-muted);

@@ -49,8 +49,8 @@
     }
 
     let messageInput = $state("");
-    let messagesContainer: HTMLDivElement;
-    let fileInput: HTMLInputElement;
+    let messagesContainer = $state<HTMLDivElement | null>(null);
+    let fileInput = $state<HTMLInputElement | null>(null);
     let uploadProgress = $state<number | null>(null);
     let uploadError = $state<string | null>(null);
     let isDragOver = $state(false);
@@ -77,11 +77,11 @@
     });
 
     function scrollToBottom() {
-        if (messagesContainer) {
-            requestAnimationFrame(() => {
-                messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            });
-        }
+        if (!messagesContainer) return;
+        const container = messagesContainer;
+        requestAnimationFrame(() => {
+            container.scrollTop = container.scrollHeight;
+        });
     }
 
     function handleSubmit(e: SubmitEvent) {
