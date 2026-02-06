@@ -16,7 +16,6 @@
     let turnUrl = $state("");
     let turnUsername = $state("");
     let turnCredential = $state("");
-    let logoFile: File | null = null;
 
     onMount(async () => {
         await loadConfig();
@@ -62,11 +61,19 @@
         successMessage = "";
 
         try {
+            const normalizedTurnURL = turnUrl
+                .split(",")
+                .map((entry) => entry.trim())
+                .filter(Boolean)
+                .join(",");
+
             config = await appConfig.update({
-                turnExternalUrl: turnUrl || undefined,
-                turnExternalUsername: turnUsername || undefined,
+                turnExternalUrl: normalizedTurnURL,
+                turnExternalUsername: turnUsername.trim(),
                 turnExternalCredential: turnCredential || undefined,
             });
+            turnUrl = config.turnExternalUrl || "";
+            turnUsername = config.turnExternalUsername || "";
             turnCredential = ""; // Clear credential field after save
             successMessage = "TURN settings saved";
             setTimeout(() => (successMessage = ""), 3000);
@@ -156,6 +163,19 @@
             isTesting = false;
         }
     }
+
+    function turnModeLabel(mode?: string) {
+        switch (mode) {
+            case "external":
+                return "External TURN only";
+            case "hybrid":
+                return "Hybrid (self-hosted + external)";
+            case "self-hosted":
+                return "Self-hosted TURN only";
+            default:
+                return "Not configured";
+        }
+    }
 </script>
 
 <svelte:head>
@@ -189,6 +209,18 @@
             <div class="info-row">
                 <span class="field-label">Public URL</span>
                 <code>{config?.publicUrl || "Not configured"}</code>
+            </div>
+            <div class="info-row">
+                <span class="field-label">TURN mode</span>
+                <code>{turnModeLabel(config?.turnMode)}</code>
+            </div>
+            <div class="info-row">
+                <span class="field-label">Cloudflare TURN</span>
+                <code
+                    >{config?.turnCloudflareConfigured
+                        ? "Configured via environment"
+                        : "Not configured"}</code
+                >
             </div>
             <div class="info-row">
                 <span class="field-label">WHIP URL Format</span>
@@ -277,24 +309,37 @@
             </div>
         </section>
 
-        <!-- External TURN Server -->
+        <!-- TURN Connectivity -->
         <section class="card settings-section">
-            <h2>External TURN Server</h2>
+            <h2>TURN Connectivity</h2>
             <p class="section-description">
-                Configure a fallback TURN server (e.g., Twilio) for better NAT
-                traversal. Leave empty to use only the built-in Coturn server.
+                Cloudflare TURN is the recommended non-self-hosted option and
+                is configured with environment variables. Use this form to add
+                static external TURN URLs and credentials as fallback or for
+                other providers.
             </p>
+
+            {#if config?.turnCloudflareConfigured}
+                <p class="hint">
+                    Cloudflare TURN credentials are generated dynamically
+                    server-side. Leave username/credential empty unless you are
+                    adding a non-Cloudflare provider.
+                </p>
+            {/if}
 
             <form onsubmit={handleSaveTurn}>
                 <div class="form-group">
-                    <label for="turnUrl">TURN Server URL</label>
+                    <label for="turnUrl">TURN URL(s)</label>
                     <input
                         type="text"
                         id="turnUrl"
                         class="input"
                         bind:value={turnUrl}
-                        placeholder="turn:global.turn.twilio.com:3478?transport=udp"
+                        placeholder="turn:turn.cloudflare.com:3478?transport=udp,turns:turn.cloudflare.com:443?transport=tcp"
                     />
+                    <p class="hint">
+                        Comma-separated URLs are supported.
+                    </p>
                 </div>
 
                 <div class="form-group">

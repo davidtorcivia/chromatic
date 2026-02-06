@@ -25,7 +25,7 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 
 	streamKeyHandler := handlers.NewStreamKeyHandler(db)
 	fileHandler := handlers.NewFileHandler(db, cfg, cfg.AdminToken)
-	configHandler := handlers.NewConfigHandler(db, cfg)
+	configHandler := handlers.NewConfigHandler(db, cfg, sfu)
 	wsHandler := handlers.NewWebSocketHandler(db, hub, sfu, cfg.AllowedOrigins, cfg.ProductionMode, cfg.AdminToken)
 	authHandler := handlers.NewAuthHandler(db, cfg.AdminToken, cfg.ProductionMode)
 

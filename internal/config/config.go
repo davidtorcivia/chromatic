@@ -4,8 +4,21 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
+
+const (
+	TurnModeSelfHosted = "self-hosted"
+	TurnModeExternal   = "external"
+	TurnModeHybrid     = "hybrid"
+)
+
+var defaultCloudflareTurnURLs = []string{
+	"turn:turn.cloudflare.com:3478?transport=udp",
+	"turn:turn.cloudflare.com:3478?transport=tcp",
+	"turns:turn.cloudflare.com:443?transport=tcp",
+}
 
 // Config holds all application configuration
 type Config struct {
@@ -29,11 +42,17 @@ type Config struct {
 	ProductionMode bool     // When true, enforces strict security (requires ALLOWED_ORIGINS)
 
 	// TURN
-	TurnSecret       string
-	TurnRealm        string
-	TurnExternalURL  string
-	TurnExternalUser string
-	TurnExternalPass string
+	TurnMode                     string
+	TurnSecret                   string
+	TurnRealm                    string
+	TurnExternalURL              string // Legacy single-URL field (backwards compatibility)
+	TurnExternalURLs             []string
+	TurnExternalUser             string
+	TurnExternalPass             string
+	TurnCloudflareKeyID          string
+	TurnCloudflareAPIToken       string
+	TurnCloudflareCredentialTTL  int
+	TurnCloudflareCredentialSkew int
 
 	// Timeouts
 	OBSReconnectTimeout time.Duration
@@ -52,13 +71,36 @@ func Load() (*Config, error) {
 		AllowedOrigins:      getEnvList("ALLOWED_ORIGINS", nil),
 		TrustedProxies:      getEnvList("TRUSTED_PROXIES", nil),
 		ProductionMode:      getEnvBool("PRODUCTION_MODE", false),
+		TurnMode:            normalizeTurnMode(getEnv("TURN_MODE", TurnModeHybrid)),
 		TurnSecret:          getEnvRequired("TURN_SECRET"),
 		TurnRealm:           getEnvRequired("TURN_REALM"),
 		TurnExternalURL:     getEnv("TURN_EXTERNAL_URL", ""),
+		TurnExternalURLs:    getEnvList("TURN_EXTERNAL_URLS", nil),
 		TurnExternalUser:    getEnv("TURN_EXTERNAL_USER", ""),
 		TurnExternalPass:    getEnv("TURN_EXTERNAL_PASS", ""),
-		OBSReconnectTimeout: getEnvDuration("OBS_RECONNECT_TIMEOUT", 5*time.Minute),
-		ClientPingInterval:  getEnvDuration("CLIENT_PING_INTERVAL", 60*time.Second),
+		TurnCloudflareKeyID: getEnv("TURN_CLOUDFLARE_KEY_ID", ""),
+		TurnCloudflareAPIToken: getEnv("TURN_CLOUDFLARE_API_TOKEN",
+			"",
+		),
+		TurnCloudflareCredentialTTL:  getEnvInt("TURN_CLOUDFLARE_CREDENTIAL_TTL", 3600),
+		TurnCloudflareCredentialSkew: getEnvInt("TURN_CLOUDFLARE_CREDENTIAL_SKEW", 60),
+		OBSReconnectTimeout:          getEnvDuration("OBS_RECONNECT_TIMEOUT", 5*time.Minute),
+		ClientPingInterval:           getEnvDuration("CLIENT_PING_INTERVAL", 60*time.Second),
+	}
+
+	// Support legacy TURN_EXTERNAL_URL when TURN_EXTERNAL_URLS is not set.
+	if len(cfg.TurnExternalURLs) == 0 && cfg.TurnExternalURL != "" {
+		cfg.TurnExternalURLs = []string{cfg.TurnExternalURL}
+	}
+
+	// If Cloudflare is configured and external URLs are omitted, use sane defaults.
+	if cfg.HasCloudflareTURN() && len(cfg.TurnExternalURLs) == 0 {
+		cfg.TurnExternalURLs = append([]string(nil), defaultCloudflareTurnURLs...)
+	}
+
+	// Keep legacy field populated from the first URL for compatibility with older code paths.
+	if cfg.TurnExternalURL == "" && len(cfg.TurnExternalURLs) > 0 {
+		cfg.TurnExternalURL = cfg.TurnExternalURLs[0]
 	}
 
 	// Validate required fields
@@ -68,24 +110,66 @@ func Load() (*Config, error) {
 	if cfg.AdminToken == "" {
 		return nil, fmt.Errorf("ADMIN_TOKEN is required")
 	}
-	if cfg.TurnSecret == "" {
-		return nil, fmt.Errorf("TURN_SECRET is required")
-	}
-	if cfg.TurnRealm == "" {
-		return nil, fmt.Errorf("TURN_REALM is required")
-	}
 
 	// In production mode, ALLOWED_ORIGINS is required
 	if cfg.ProductionMode && len(cfg.AllowedOrigins) == 0 {
 		return nil, fmt.Errorf("ALLOWED_ORIGINS is required in production mode")
 	}
 
+	if cfg.TurnMode != TurnModeSelfHosted && cfg.TurnMode != TurnModeExternal && cfg.TurnMode != TurnModeHybrid {
+		return nil, fmt.Errorf("TURN_MODE must be one of: %s, %s, %s", TurnModeSelfHosted, TurnModeExternal, TurnModeHybrid)
+	}
+
+	if cfg.TurnMode != TurnModeExternal {
+		if cfg.TurnSecret == "" {
+			return nil, fmt.Errorf("TURN_SECRET is required unless TURN_MODE=external")
+		}
+		if cfg.TurnRealm == "" {
+			return nil, fmt.Errorf("TURN_REALM is required unless TURN_MODE=external")
+		}
+	}
+
+	if cfg.TurnMode == TurnModeExternal {
+		hasExternalStatic := len(cfg.TurnExternalURLs) > 0 && cfg.TurnExternalUser != "" && cfg.TurnExternalPass != ""
+		if !hasExternalStatic && !cfg.HasCloudflareTURN() {
+			return nil, fmt.Errorf("TURN_MODE=external requires either Cloudflare TURN credentials or TURN_EXTERNAL_URLS + TURN_EXTERNAL_USER/PASS")
+		}
+	}
+
+	if cfg.TurnCloudflareCredentialTTL < 60 {
+		return nil, fmt.Errorf("TURN_CLOUDFLARE_CREDENTIAL_TTL must be >= 60 seconds")
+	}
+	if cfg.TurnCloudflareCredentialSkew < 0 {
+		return nil, fmt.Errorf("TURN_CLOUDFLARE_CREDENTIAL_SKEW must be >= 0 seconds")
+	}
+	if cfg.TurnCloudflareCredentialSkew >= cfg.TurnCloudflareCredentialTTL {
+		return nil, fmt.Errorf("TURN_CLOUDFLARE_CREDENTIAL_SKEW must be smaller than TURN_CLOUDFLARE_CREDENTIAL_TTL")
+	}
+
 	return cfg, nil
+}
+
+func (c *Config) HasCloudflareTURN() bool {
+	return c.TurnCloudflareKeyID != "" && c.TurnCloudflareAPIToken != ""
 }
 
 // ListenAddr returns the address to listen on
 func (c *Config) ListenAddr() string {
 	return fmt.Sprintf(":%d", c.Port)
+}
+
+func normalizeTurnMode(mode string) string {
+	normalized := strings.ToLower(trimSpace(mode))
+	switch normalized {
+	case "", TurnModeHybrid:
+		return TurnModeHybrid
+	case TurnModeSelfHosted, "selfhosted", "self_hosted":
+		return TurnModeSelfHosted
+	case TurnModeExternal:
+		return TurnModeExternal
+	default:
+		return normalized
+	}
 }
 
 // getEnv gets an environment variable with a default value

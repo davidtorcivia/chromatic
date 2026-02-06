@@ -18,13 +18,15 @@ const (
 	defaultLogoPath         = "/data/logos"
 	defaultOBSReconnect     = "5m"
 	defaultClientPing       = "60s"
+	defaultChromaticImage   = "ghcr.io/davidtorcivia/chromatic:latest"
 	defaultPublicURLProd    = "https://stream.yourdomain.com"
 	defaultPublicURLDev     = "http://localhost:3000"
 	defaultTurnRealmProd    = "stream.yourdomain.com"
 	defaultTurnRealmDev     = "localhost"
 	defaultEnvRelativePath  = "deployments/.env"
 	defaultAllowedOrigins   = "https://stream.yourdomain.com"
-	defaultExternalTurnURL  = ""
+	defaultTurnMode         = "external"
+	defaultExternalTurnURLs = "turn:turn.cloudflare.com:3478?transport=udp,turn:turn.cloudflare.com:3478?transport=tcp,turns:turn.cloudflare.com:443?transport=tcp"
 	defaultExternalTurnUser = ""
 	defaultExternalTurnPass = ""
 )
@@ -61,17 +63,25 @@ func runSetup() int {
 	}
 	publicURL := requireValue(reader, "PUBLIC_URL", publicURLDefault)
 
-	turnRealmDefault := defaultTurnRealmProd
-	if !productionMode {
-		turnRealmDefault = defaultTurnRealmDev
-	}
-	if host := hostFromURL(publicURL); host != "" {
-		turnRealmDefault = host
-	}
-	turnRealm := requireValue(reader, "TURN_REALM", turnRealmDefault)
-
 	adminToken := promptSecret(reader, "ADMIN_TOKEN", true)
-	turnSecret := promptSecret(reader, "TURN_SECRET", true)
+
+	turnMode := promptChoice(reader, "TURN_MODE", []string{"external", "hybrid", "self-hosted"}, defaultTurnMode)
+
+	turnRealm := ""
+	turnSecret := ""
+	publicIP := ""
+	if turnMode != "external" {
+		turnRealmDefault := defaultTurnRealmProd
+		if !productionMode {
+			turnRealmDefault = defaultTurnRealmDev
+		}
+		if host := hostFromURL(publicURL); host != "" {
+			turnRealmDefault = host
+		}
+		turnRealm = requireValue(reader, "TURN_REALM", turnRealmDefault)
+		turnSecret = promptSecret(reader, "TURN_SECRET", true)
+		publicIP = prompt(reader, "PUBLIC_IP (required for self-hosted TURN)", "")
+	}
 
 	allowedOrigins := ""
 	if productionMode {
@@ -83,33 +93,53 @@ func runSetup() int {
 	}
 
 	trustedProxies := prompt(reader, "TRUSTED_PROXIES (optional)", "")
-	publicIP := prompt(reader, "PUBLIC_IP (optional, recommended for TURN)", "")
+	chromaticImage := prompt(reader, "CHROMATIC_IMAGE", defaultChromaticImage)
 
-	externalTurnURL := defaultExternalTurnURL
+	turnCloudflareKeyID := ""
+	turnCloudflareAPIToken := ""
+	externalTurnURLs := ""
 	externalTurnUser := defaultExternalTurnUser
 	externalTurnPass := defaultExternalTurnPass
-	if promptYesNo(reader, "Configure external TURN provider", false) {
-		externalTurnURL = requireValue(reader, "TURN_EXTERNAL_URL", "")
-		externalTurnUser = requireValue(reader, "TURN_EXTERNAL_USER", "")
-		externalTurnPass = requireValue(reader, "TURN_EXTERNAL_PASS", "")
+
+	if turnMode != "self-hosted" {
+		if promptYesNo(reader, "Use Cloudflare TURN credentials (recommended)", true) {
+			turnCloudflareKeyID = requireValue(reader, "TURN_CLOUDFLARE_KEY_ID", "")
+			turnCloudflareAPIToken = requireValue(reader, "TURN_CLOUDFLARE_API_TOKEN", "")
+			externalTurnURLs = defaultExternalTurnURLs
+		}
+
+		configureStatic := promptYesNo(reader, "Configure static external TURN credentials", false)
+		if turnMode == "external" && turnCloudflareKeyID == "" && turnCloudflareAPIToken == "" {
+			configureStatic = true
+		}
+
+		if configureStatic {
+			externalTurnURLs = requireValue(reader, "TURN_EXTERNAL_URLS (comma-separated)", externalTurnURLs)
+			externalTurnUser = requireValue(reader, "TURN_EXTERNAL_USER", "")
+			externalTurnPass = requireValue(reader, "TURN_EXTERNAL_PASS", "")
+		}
 	}
 
 	content := buildEnvFile(envFileParams{
 		adminToken:          adminToken,
 		publicURL:           publicURL,
+		turnMode:            turnMode,
 		turnSecret:          turnSecret,
 		turnRealm:           turnRealm,
 		productionMode:      productionMode,
 		allowedOrigins:      allowedOrigins,
 		trustedProxies:      trustedProxies,
+		chromaticImage:      chromaticImage,
 		databasePath:        defaultDatabasePath,
 		uploadPath:          defaultUploadPath,
 		logoPath:            defaultLogoPath,
 		port:                defaultPort,
 		publicIP:            publicIP,
-		turnExternalURL:     externalTurnURL,
+		turnExternalURLs:    externalTurnURLs,
 		turnExternalUser:    externalTurnUser,
 		turnExternalPass:    externalTurnPass,
+		turnCloudflareKeyID: turnCloudflareKeyID,
+		turnCloudflareToken: turnCloudflareAPIToken,
 		obsReconnectTimeout: defaultOBSReconnect,
 		clientPingInterval:  defaultClientPing,
 	})
@@ -133,19 +163,23 @@ func runSetup() int {
 type envFileParams struct {
 	adminToken          string
 	publicURL           string
+	turnMode            string
 	turnSecret          string
 	turnRealm           string
 	productionMode      bool
 	allowedOrigins      string
 	trustedProxies      string
+	chromaticImage      string
 	databasePath        string
 	uploadPath          string
 	logoPath            string
 	port                string
 	publicIP            string
-	turnExternalURL     string
+	turnExternalURLs    string
 	turnExternalUser    string
 	turnExternalPass    string
+	turnCloudflareKeyID string
+	turnCloudflareToken string
 	obsReconnectTimeout string
 	clientPingInterval  string
 }
@@ -165,6 +199,7 @@ func buildEnvFile(p envFileParams) string {
 	writeLine("# =============================================================================")
 	writeLine(fmt.Sprintf("ADMIN_TOKEN=%s", p.adminToken))
 	writeLine(fmt.Sprintf("PUBLIC_URL=%s", p.publicURL))
+	writeLine(fmt.Sprintf("TURN_MODE=%s", p.turnMode))
 	writeLine(fmt.Sprintf("TURN_SECRET=%s", p.turnSecret))
 	writeLine(fmt.Sprintf("TURN_REALM=%s", p.turnRealm))
 	writeLine("")
@@ -178,6 +213,7 @@ func buildEnvFile(p envFileParams) string {
 		writeLine("ALLOWED_ORIGINS=")
 	}
 	writeLine(fmt.Sprintf("TRUSTED_PROXIES=%s", p.trustedProxies))
+	writeLine(fmt.Sprintf("CHROMATIC_IMAGE=%s", p.chromaticImage))
 	writeLine("")
 	writeLine("# =============================================================================")
 	writeLine("# STORAGE PATHS (Docker volume mounts)")
@@ -190,12 +226,18 @@ func buildEnvFile(p envFileParams) string {
 	writeLine("# SERVER SETTINGS")
 	writeLine("# =============================================================================")
 	writeLine(fmt.Sprintf("PORT=%s", p.port))
+	writeLine("# Required only when TURN_MODE=self-hosted or TURN_MODE=hybrid")
 	writeLine(fmt.Sprintf("PUBLIC_IP=%s", p.publicIP))
 	writeLine("")
 	writeLine("# =============================================================================")
-	writeLine("# EXTERNAL TURN SERVER (Optional)")
+	writeLine("# EXTERNAL TURN PROVIDERS")
 	writeLine("# =============================================================================")
-	writeLine(fmt.Sprintf("TURN_EXTERNAL_URL=%s", p.turnExternalURL))
+	writeLine("# Cloudflare TURN (recommended for TURN_MODE=external)")
+	writeLine(fmt.Sprintf("TURN_CLOUDFLARE_KEY_ID=%s", p.turnCloudflareKeyID))
+	writeLine(fmt.Sprintf("TURN_CLOUDFLARE_API_TOKEN=%s", p.turnCloudflareToken))
+	writeLine("# Optional static external TURN credentials")
+	writeLine(fmt.Sprintf("TURN_EXTERNAL_URLS=%s", p.turnExternalURLs))
+	writeLine(fmt.Sprintf("TURN_EXTERNAL_URL=%s", firstCSVValue(p.turnExternalURLs)))
 	writeLine(fmt.Sprintf("TURN_EXTERNAL_USER=%s", p.turnExternalUser))
 	writeLine(fmt.Sprintf("TURN_EXTERNAL_PASS=%s", p.turnExternalPass))
 	writeLine("")
@@ -253,6 +295,28 @@ func promptYesNo(reader *bufio.Reader, label string, defaultYes bool) bool {
 	}
 }
 
+func promptChoice(reader *bufio.Reader, label string, choices []string, defaultChoice string) string {
+	if len(choices) == 0 {
+		return defaultChoice
+	}
+
+	display := strings.Join(choices, "/")
+	for {
+		fmt.Printf("%s (%s) [%s]: ", label, display, defaultChoice)
+		text, _ := reader.ReadString('\n')
+		text = strings.TrimSpace(strings.ToLower(text))
+		if text == "" {
+			return defaultChoice
+		}
+		for _, choice := range choices {
+			if text == strings.ToLower(choice) {
+				return choice
+			}
+		}
+		fmt.Printf("Please enter one of: %s\n", display)
+	}
+}
+
 func promptSecret(reader *bufio.Reader, label string, allowGenerate bool) string {
 	if allowGenerate && promptYesNo(reader, fmt.Sprintf("Generate %s", label), true) {
 		token, err := generateHex(32)
@@ -286,4 +350,14 @@ func hostFromURL(raw string) string {
 		return ""
 	}
 	return parsed.Hostname()
+}
+
+func firstCSVValue(values string) string {
+	for _, candidate := range strings.Split(values, ",") {
+		trimmed := strings.TrimSpace(candidate)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }

@@ -10,12 +10,19 @@ import (
 func TestLoad(t *testing.T) {
 	// Save original env and restore after tests
 	originalEnv := map[string]string{
-		"PUBLIC_URL":   os.Getenv("PUBLIC_URL"),
-		"ADMIN_TOKEN":  os.Getenv("ADMIN_TOKEN"),
-		"TURN_SECRET":  os.Getenv("TURN_SECRET"),
-		"TURN_REALM":   os.Getenv("TURN_REALM"),
-		"PORT":         os.Getenv("PORT"),
-		"DATABASE_PATH": os.Getenv("DATABASE_PATH"),
+		"PUBLIC_URL":                os.Getenv("PUBLIC_URL"),
+		"ADMIN_TOKEN":               os.Getenv("ADMIN_TOKEN"),
+		"TURN_SECRET":               os.Getenv("TURN_SECRET"),
+		"TURN_REALM":                os.Getenv("TURN_REALM"),
+		"TURN_MODE":                 os.Getenv("TURN_MODE"),
+		"TURN_EXTERNAL_URL":         os.Getenv("TURN_EXTERNAL_URL"),
+		"TURN_EXTERNAL_URLS":        os.Getenv("TURN_EXTERNAL_URLS"),
+		"TURN_EXTERNAL_USER":        os.Getenv("TURN_EXTERNAL_USER"),
+		"TURN_EXTERNAL_PASS":        os.Getenv("TURN_EXTERNAL_PASS"),
+		"TURN_CLOUDFLARE_KEY_ID":    os.Getenv("TURN_CLOUDFLARE_KEY_ID"),
+		"TURN_CLOUDFLARE_API_TOKEN": os.Getenv("TURN_CLOUDFLARE_API_TOKEN"),
+		"PORT":                      os.Getenv("PORT"),
+		"DATABASE_PATH":             os.Getenv("DATABASE_PATH"),
 	}
 	defer func() {
 		for k, v := range originalEnv {
@@ -92,6 +99,64 @@ func TestLoad(t *testing.T) {
 		}
 		if cfg.DatabasePath != "/data/chromatic.db" {
 			t.Errorf("expected default DatabasePath, got %q", cfg.DatabasePath)
+		}
+	})
+
+	t.Run("external mode with cloudflare does not require self-hosted TURN vars", func(t *testing.T) {
+		os.Setenv("PUBLIC_URL", "https://example.com")
+		os.Setenv("ADMIN_TOKEN", "test-token")
+		os.Setenv("TURN_MODE", "external")
+		os.Unsetenv("TURN_SECRET")
+		os.Unsetenv("TURN_REALM")
+		os.Unsetenv("TURN_EXTERNAL_URL")
+		os.Unsetenv("TURN_EXTERNAL_URLS")
+		os.Unsetenv("TURN_EXTERNAL_USER")
+		os.Unsetenv("TURN_EXTERNAL_PASS")
+		os.Setenv("TURN_CLOUDFLARE_KEY_ID", "cf-key-id")
+		os.Setenv("TURN_CLOUDFLARE_API_TOKEN", "cf-api-token")
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if cfg.TurnMode != TurnModeExternal {
+			t.Fatalf("expected %q mode, got %q", TurnModeExternal, cfg.TurnMode)
+		}
+		if len(cfg.TurnExternalURLs) == 0 {
+			t.Fatal("expected default Cloudflare TURN URL list")
+		}
+	})
+
+	t.Run("external mode requires external credentials or cloudflare", func(t *testing.T) {
+		os.Setenv("PUBLIC_URL", "https://example.com")
+		os.Setenv("ADMIN_TOKEN", "test-token")
+		os.Setenv("TURN_MODE", "external")
+		os.Unsetenv("TURN_SECRET")
+		os.Unsetenv("TURN_REALM")
+		os.Unsetenv("TURN_EXTERNAL_URL")
+		os.Unsetenv("TURN_EXTERNAL_URLS")
+		os.Unsetenv("TURN_EXTERNAL_USER")
+		os.Unsetenv("TURN_EXTERNAL_PASS")
+		os.Unsetenv("TURN_CLOUDFLARE_KEY_ID")
+		os.Unsetenv("TURN_CLOUDFLARE_API_TOKEN")
+
+		_, err := Load()
+		if err == nil {
+			t.Fatal("expected validation error in external mode without TURN provider")
+		}
+	})
+
+	t.Run("invalid turn mode", func(t *testing.T) {
+		os.Setenv("PUBLIC_URL", "https://example.com")
+		os.Setenv("ADMIN_TOKEN", "test-token")
+		os.Setenv("TURN_MODE", "unsupported")
+		os.Setenv("TURN_SECRET", "turn-secret")
+		os.Setenv("TURN_REALM", "turn.example.com")
+
+		_, err := Load()
+		if err == nil {
+			t.Fatal("expected error for invalid TURN_MODE")
 		}
 	})
 }

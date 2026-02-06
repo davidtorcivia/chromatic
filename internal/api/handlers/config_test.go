@@ -43,7 +43,7 @@ func setupConfigTest(t *testing.T) (*ConfigHandler, func()) {
 		LogoPath:  tempDir,
 	}
 
-	handler := NewConfigHandler(db, cfg)
+	handler := NewConfigHandler(db, cfg, nil)
 
 	cleanup := func() {
 		dbCleanup()
@@ -75,6 +75,38 @@ func TestConfigHandler_Get_Empty(t *testing.T) {
 
 	if resp.WHIPFormat != "http://localhost:3000/whip/{stream_key_token}" {
 		t.Errorf("unexpected WHIP format: %s", resp.WHIPFormat)
+	}
+}
+
+func TestConfigHandler_Get_UsesEnvTURNFallback(t *testing.T) {
+	handler, cleanup := setupConfigTest(t)
+	defer cleanup()
+
+	handler.cfg.TurnExternalURL = "turn:external.example.com:3478?transport=udp"
+	handler.cfg.TurnExternalUser = "fallback-user"
+	handler.cfg.TurnExternalPass = "fallback-pass"
+
+	req := httptest.NewRequest("GET", "/api/config", nil)
+	rr := httptest.NewRecorder()
+	handler.Get(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+
+	var resp ConfigResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp.TurnExternalURL == nil || *resp.TurnExternalURL != handler.cfg.TurnExternalURL {
+		t.Fatalf("expected fallback TURN URL %q, got %v", handler.cfg.TurnExternalURL, resp.TurnExternalURL)
+	}
+	if resp.TurnExternalUsername == nil || *resp.TurnExternalUsername != handler.cfg.TurnExternalUser {
+		t.Fatalf("expected fallback TURN username %q, got %v", handler.cfg.TurnExternalUser, resp.TurnExternalUsername)
+	}
+	if !resp.HasTurnCredential {
+		t.Fatal("expected fallback TURN credential flag to be true")
 	}
 }
 
@@ -444,6 +476,20 @@ func TestConfigHandler_GetLogo_FileNotFound(t *testing.T) {
 
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("expected status %d for missing file, got %d", http.StatusNotFound, rr.Code)
+	}
+}
+
+func TestParseTURNURL_TURNSSchemeDefaultsToTCP443(t *testing.T) {
+	host, protocol, err := parseTURNURL("turns:turn.cloudflare.com")
+	if err != nil {
+		t.Fatalf("parseTURNURL returned error: %v", err)
+	}
+
+	if protocol != "tcp" {
+		t.Fatalf("expected protocol tcp, got %s", protocol)
+	}
+	if host != "turn.cloudflare.com:443" {
+		t.Fatalf("expected host turn.cloudflare.com:443, got %s", host)
 	}
 }
 

@@ -151,6 +151,8 @@ export interface AppConfig {
     turnExternalUrl?: string;
     turnExternalUsername?: string;
     hasTurnCredential: boolean;
+    turnMode: "self-hosted" | "external" | "hybrid";
+    turnCloudflareConfigured: boolean;
     publicUrl: string;
     whipFormat: string;
 }

@@ -26,8 +26,9 @@ Chromatic enables real-time color-critical streaming from DaVinci Resolve via OB
 
 ### Operations
 - **Self-hosted**: Full control over your data
-- **Docker deployment**: Pull-based deployment with Caddy + Coturn
-- **Third-party TURN**: Support for Twilio, Xirsys, Metered, and others
+- **Docker deployment**: Pull prebuilt images from GHCR (no local build required)
+- **Cloudflare TURN default**: Recommended non-self-hosted TURN path
+- **Flexible TURN modes**: External-only, hybrid, or fully self-hosted Coturn
 - **Prometheus metrics**: Built-in monitoring endpoint
 
 ## Quick Start
@@ -64,13 +65,13 @@ Access at `http://localhost:5173`
 ### Production Deployment (Pull-Based)
 
 ```bash
-# Clone and enter deployment directory
+# Clone once to get Docker Compose/Caddy config (no local build needed)
 git clone https://github.com/davidtorcivia/chromatic.git
 cd chromatic/deployments
 
 # Configure environment
 cp .env.example .env
-nano .env  # Set ADMIN_TOKEN, TURN_SECRET, PUBLIC_URL, TURN_REALM, PUBLIC_IP, CHROMATIC_IMAGE
+nano .env  # Set ADMIN_TOKEN, PUBLIC_URL, DOMAIN, CHROMATIC_IMAGE, TURN_MODE, and TURN provider vars
 
 # Pull prebuilt image and start
 docker compose pull
@@ -80,8 +81,15 @@ docker compose up -d
 curl -fsS https://stream.yourdomain.com/health
 ```
 
+Coturn is optional when `TURN_MODE=external` (Cloudflare TURN recommended).
+
 Set `CHROMATIC_IMAGE` to an immutable release tag (for example `sha-<commit>`) or
 digest (`@sha256:...`) for reproducible deploys and safe rollback.
+
+Recommended TURN path for most deployments:
+- `TURN_MODE=external`
+- `TURN_CLOUDFLARE_KEY_ID=<key id>`
+- `TURN_CLOUDFLARE_API_TOKEN=<api token>`
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for complete instructions.
 After login, open Admin → Setup Wizard to finish TURN, branding, stream keys, and
@@ -152,7 +160,7 @@ If anonymous pulls fail, set the GHCR package visibility to public.
 | Frontend | SvelteKit 2, Svelte 5 |
 | Database | SQLite with WAL mode |
 | Reverse Proxy | Caddy (auto SSL) |
-| TURN Server | Coturn |
+| TURN Server | Cloudflare TURN (default external) or Coturn |
 | Container | Docker Compose |
 
 ## Project Structure
@@ -191,16 +199,15 @@ chromatic/
 | [e2e/README.md](e2e/README.md) | End-to-end testing guide |
 | [tests/load/README.md](tests/load/README.md) | Load testing guide |
 
-## Third-Party TURN Support
+## TURN Modes
 
-Chromatic supports external TURN providers for better global connectivity:
+Chromatic supports three TURN deployment modes:
 
-- **Twilio**: Enterprise-grade, pay-per-GB
-- **Xirsys**: Free tier available
-- **Metered**: Generous free tier, low cost
-- **Cloudflare Calls**: Beta
+- **`external` (recommended)**: Cloudflare TURN or another hosted TURN provider
+- **`hybrid`**: Self-hosted Coturn plus external provider fallback
+- **`self-hosted`**: Coturn only
 
-See [DEPLOYMENT.md#third-party-turn-servers](DEPLOYMENT.md#third-party-turn-servers) for setup instructions.
+See [DEPLOYMENT.md#turn-modes](DEPLOYMENT.md#turn-modes) for exact configuration.
 
 ## Monitoring
 
@@ -320,7 +327,7 @@ Please ensure:
 - Set tune to **zerolatency**
 
 ### Viewers stuck on "Connecting..."
-- Check TURN server is running
+- Check TURN provider configuration (`TURN_MODE`, Cloudflare creds, or Coturn if self-hosted)
 - Verify firewall allows UDP ports 49152-65535
 - Try third-party TURN if behind corporate firewall
 

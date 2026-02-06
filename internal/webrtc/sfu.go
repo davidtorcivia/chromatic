@@ -1,9 +1,12 @@
 package webrtc
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
+	"time"
 
 	"chromatic/internal/config"
 	"chromatic/internal/metrics"
@@ -18,6 +21,12 @@ type SFU struct {
 	mu     sync.RWMutex
 	config *config.Config
 	api    *webrtc.API
+
+	turnMode         string
+	externalTurnURLs []string
+	externalTurnUser string
+	externalTurnPass string
+	cloudflareTURN   *cloudflareTURNProvider
 
 	// Active ingest sessions keyed by stream key token
 	ingests map[string]*IngestSession
@@ -116,10 +125,28 @@ func NewSFU(cfg *config.Config) (*SFU, error) {
 	)
 
 	sfu := &SFU{
-		config:  cfg,
-		api:     api,
-		ingests: make(map[string]*IngestSession),
-		rooms:   make(map[string]*RoomTracks),
+		config:           cfg,
+		api:              api,
+		turnMode:         cfg.TurnMode,
+		externalTurnURLs: append([]string(nil), cfg.TurnExternalURLs...),
+		externalTurnUser: cfg.TurnExternalUser,
+		externalTurnPass: cfg.TurnExternalPass,
+		ingests:          make(map[string]*IngestSession),
+		rooms:            make(map[string]*RoomTracks),
+	}
+
+	// Backward compatibility for callers that set the legacy single URL field.
+	if len(sfu.externalTurnURLs) == 0 {
+		sfu.externalTurnURLs = splitAndSanitizeTURNURLs(cfg.TurnExternalURL)
+	}
+
+	if cfg.HasCloudflareTURN() {
+		sfu.cloudflareTURN = newCloudflareTURNProvider(cloudflareTURNProviderConfig{
+			KeyID:      cfg.TurnCloudflareKeyID,
+			APIToken:   cfg.TurnCloudflareAPIToken,
+			TTLSeconds: cfg.TurnCloudflareCredentialTTL,
+			Skew:       time.Duration(cfg.TurnCloudflareCredentialSkew) * time.Second,
+		})
 	}
 
 	log.Println("SFU initialized with H.264 and Opus codecs")
@@ -135,8 +162,19 @@ func (s *SFU) GetICEServers() []webrtc.ICEServer {
 		},
 	}
 
-	// Add configured TURN server if available
-	if s.config.TurnRealm != "" {
+	s.mu.RLock()
+	turnMode := s.turnMode
+	externalTurnURLs := append([]string(nil), s.externalTurnURLs...)
+	externalTurnUser := s.externalTurnUser
+	externalTurnPass := s.externalTurnPass
+	cloudflareProvider := s.cloudflareTURN
+	s.mu.RUnlock()
+
+	includeSelfHosted := turnMode != config.TurnModeExternal
+	includeExternal := turnMode != config.TurnModeSelfHosted
+
+	// Add built-in/self-hosted TURN if enabled.
+	if includeSelfHosted && s.config.TurnRealm != "" && s.config.TurnSecret != "" {
 		// Generate time-limited TURN credentials
 		username, credential := generateTURNCredentials(s.config.TurnSecret, s.config.TurnRealm)
 		servers = append(servers, webrtc.ICEServer{
@@ -146,16 +184,59 @@ func (s *SFU) GetICEServers() []webrtc.ICEServer {
 		})
 	}
 
-	// Add external TURN if configured
-	if s.config.TurnExternalURL != "" {
+	// Add Cloudflare-managed TURN if enabled (credentials are generated/cached server-side).
+	if includeExternal && cloudflareProvider != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		server, err := cloudflareProvider.GetICEServer(ctx, externalTurnURLs)
+		if err != nil {
+			log.Printf("Failed to fetch Cloudflare TURN credentials: %v", err)
+		} else if len(server.URLs) > 0 && server.Username != "" && server.Credential != "" {
+			servers = append(servers, server)
+		}
+	}
+
+	// Add static external TURN server if configured.
+	if includeExternal && len(externalTurnURLs) > 0 && externalTurnUser != "" && externalTurnPass != "" {
 		servers = append(servers, webrtc.ICEServer{
-			URLs:       []string{s.config.TurnExternalURL},
-			Username:   s.config.TurnExternalUser,
-			Credential: s.config.TurnExternalPass,
+			URLs:       externalTurnURLs,
+			Username:   externalTurnUser,
+			Credential: externalTurnPass,
 		})
 	}
 
 	return servers
+}
+
+// SetExternalTURNConfig updates external TURN settings at runtime.
+// This enables admin/setup changes to apply without restarting the process.
+func (s *SFU) SetExternalTURNConfig(urlCSV, username, credential string) {
+	urls := splitAndSanitizeTURNURLs(urlCSV)
+
+	s.mu.Lock()
+	s.externalTurnURLs = urls
+	s.externalTurnUser = strings.TrimSpace(username)
+	s.externalTurnPass = strings.TrimSpace(credential)
+	s.mu.Unlock()
+}
+
+func splitAndSanitizeTURNURLs(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		value := strings.TrimSpace(p)
+		if value == "" {
+			continue
+		}
+		result = append(result, value)
+	}
+
+	return result
 }
 
 // CreatePeerConnection creates a new peer connection with standard configuration

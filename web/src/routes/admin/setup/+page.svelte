@@ -311,15 +311,23 @@
         turnSuccess = "";
 
         try {
+            const normalizedTurnURL = turnUrl
+                .split(",")
+                .map((entry) => entry.trim())
+                .filter(Boolean)
+                .join(",");
+
             config = await appConfig.update({
-                turnExternalUrl: turnUrl || undefined,
-                turnExternalUsername: turnUsername || undefined,
+                turnExternalUrl: normalizedTurnURL,
+                turnExternalUsername: turnUsername.trim(),
                 turnExternalCredential: turnCredential || undefined,
             });
             baseUrl =
                 config?.publicUrl ||
                 (typeof window !== "undefined" ? window.location.origin : "");
             updatePublicUrlStatus(config?.publicUrl);
+            turnUrl = config?.turnExternalUrl || "";
+            turnUsername = config?.turnExternalUsername || "";
             turnCredential = "";
             turnSuccess = "TURN settings saved";
             turnConfirmed = true;
@@ -531,6 +539,19 @@
         copiedRoom = true;
         setTimeout(() => (copiedRoom = false), 2000);
     }
+
+    function turnModeLabel(mode?: string) {
+        switch (mode) {
+            case "external":
+                return "External TURN only";
+            case "hybrid":
+                return "Hybrid (self-hosted + external)";
+            case "self-hosted":
+                return "Self-hosted TURN only";
+            default:
+                return "Not configured";
+        }
+    }
 </script>
 
 <svelte:head>
@@ -687,7 +708,8 @@
                                     />
                                     <span>
                                         Environment vars set (PUBLIC_URL,
-                                        ADMIN_TOKEN, TURN_SECRET, TURN_REALM)
+                                        ADMIN_TOKEN, TURN_MODE + TURN provider
+                                        credentials)
                                     </span>
                                 </label>
                                 <label class="check-item">
@@ -710,8 +732,8 @@
                                         bind:checked={preflightChecks.ports}
                                     />
                                     <span>
-                                        Firewall open: 80, 443, 3478,
-                                        49152-65535
+                                        Firewall open: 80, 443 (plus TURN ports
+                                        only when self-hosting TURN)
                                     </span>
                                 </label>
                                 <label class="check-item">
@@ -738,18 +760,43 @@
                         <div class="panel-header">
                             <h2>Connectivity and TURN</h2>
                             <p>
-                                Use the built-in Coturn server or configure an
-                                external provider for global reliability.
+                                Cloudflare TURN is the recommended default for
+                                non-self-hosted deployments. Add static TURN
+                                fallback only when needed.
                             </p>
                         </div>
 
                         <div class="split-grid">
                             <section class="card">
-                                <h3>External TURN (optional)</h3>
+                                <h3>TURN provider</h3>
                                 <p class="section-description">
-                                    Leave blank to rely on the bundled TURN
-                                    server.
+                                    Current runtime mode:
+                                    <strong>{turnModeLabel(config?.turnMode)}</strong
+                                    >.
                                 </p>
+
+                                <div class="status-grid">
+                                    <div class="status-card">
+                                        <div class="status-header">
+                                            <span class="status-label"
+                                                >Cloudflare TURN</span
+                                            >
+                                            <span
+                                                class="status-pill {config?.turnCloudflareConfigured
+                                                    ? 'good'
+                                                    : 'warn'}"
+                                                >{config?.turnCloudflareConfigured
+                                                    ? "Configured"
+                                                    : "Not configured"}</span
+                                            >
+                                        </div>
+                                        <p class="status-detail">
+                                            {config?.turnCloudflareConfigured
+                                                ? "Credentials are generated on-demand; no static username/password needed."
+                                                : "Set TURN_CLOUDFLARE_KEY_ID and TURN_CLOUDFLARE_API_TOKEN in .env for the recommended setup."}
+                                        </p>
+                                    </div>
+                                </div>
 
                                 {#if turnError}
                                     <div class="error-message">{turnError}</div>
@@ -763,14 +810,20 @@
 
                                 <form onsubmit={handleSaveTurn}>
                                     <div class="form-group">
-                                        <label for="turnUrl">TURN URL</label>
+                                        <label for="turnUrl"
+                                            >Static TURN URL(s)</label
+                                        >
                                         <input
                                             type="text"
                                             id="turnUrl"
                                             class="input"
                                             bind:value={turnUrl}
-                                            placeholder="turn:global.turn.twilio.com:3478?transport=udp"
+                                            placeholder="turn:turn.cloudflare.com:3478?transport=udp,turns:turn.cloudflare.com:443?transport=tcp"
                                         />
+                                        <p class="hint">
+                                            Optional. Comma-separated URLs are
+                                            supported.
+                                        </p>
                                     </div>
 
                                     <div class="form-group">
@@ -834,8 +887,8 @@
                                         bind:checked={turnConfirmed}
                                     />
                                     <span>
-                                        Use the built-in TURN only (no external
-                                        provider)
+                                        TURN configuration validated for this
+                                        deployment
                                     </span>
                                 </label>
                             </section>

@@ -29,8 +29,17 @@ services:
       - LOGO_PATH=/data/logos
       - ADMIN_TOKEN=${ADMIN_TOKEN}
       - PUBLIC_URL=${PUBLIC_URL}
+      - TURN_MODE=${TURN_MODE:-external}
       - TURN_SECRET=${TURN_SECRET}
       - TURN_REALM=${TURN_REALM}
+      - TURN_EXTERNAL_URLS=${TURN_EXTERNAL_URLS}
+      - TURN_EXTERNAL_URL=${TURN_EXTERNAL_URL}
+      - TURN_EXTERNAL_USER=${TURN_EXTERNAL_USER}
+      - TURN_EXTERNAL_PASS=${TURN_EXTERNAL_PASS}
+      - TURN_CLOUDFLARE_KEY_ID=${TURN_CLOUDFLARE_KEY_ID}
+      - TURN_CLOUDFLARE_API_TOKEN=${TURN_CLOUDFLARE_API_TOKEN}
+      - TURN_CLOUDFLARE_CREDENTIAL_TTL=${TURN_CLOUDFLARE_CREDENTIAL_TTL:-3600}
+      - TURN_CLOUDFLARE_CREDENTIAL_SKEW=${TURN_CLOUDFLARE_CREDENTIAL_SKEW:-60}
       - PORT=3000
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
       - PRODUCTION_MODE=${PRODUCTION_MODE:-false}
@@ -46,6 +55,8 @@ services:
     image: coturn/coturn:latest
     container_name: chromatic_turn
     restart: unless-stopped
+    profiles:
+      - self-hosted-turn
     network_mode: host
     volumes:
       - ./turnserver.conf:/etc/coturn/turnserver.conf:ro

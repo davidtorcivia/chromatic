@@ -110,7 +110,7 @@ This guide covers common issues and their solutions when running Chromatic.
    - Find the `room:state` message
    - Verify `iceServers` array is present and populated
 
-2. **Verify TURN server is working** (see [TURN Server Issues](#turn-server-issues))
+2. **Verify TURN provider is working** (see [TURN Server Issues](#turn-server-issues))
 
 3. **Check WebSocket connection**:
    ```javascript
@@ -131,10 +131,12 @@ This guide covers common issues and their solutions when running Chromatic.
 2. **Enable ICE restart** (automatic in Chromatic 1.0+):
    - Check browser console for "ICE restart" messages
 
-3. **Check TURN server health**:
-   ```bash
-   docker compose logs coturn | tail -100
-   ```
+3. **Check TURN provider health**:
+   - `TURN_MODE=external`: verify Cloudflare/static provider credentials in `.env`
+   - `TURN_MODE=hybrid` or `TURN_MODE=self-hosted`: check Coturn logs:
+     ```bash
+     docker compose --profile self-hosted-turn logs coturn | tail -100
+     ```
 
 4. **Increase reconnection timeout**:
    - Default: 10 attempts with exponential backoff
@@ -147,15 +149,16 @@ This guide covers common issues and their solutions when running Chromatic.
 1. **All ICE candidates failed**: Usually a TURN server issue
 
 2. **Check firewall rules**:
-   - Ports 3478 (TURN), 5349 (TURN/TLS), 49152-65535 (media relay)
+   - Always: 80/443 for HTTPS
+   - Self-hosted TURN only: 3478, 5349, and 49152-65535/udp
 
-3. **Try third-party TURN**: See [Third-Party TURN](DEPLOYMENT.md#third-party-turn-servers)
+3. **Try external TURN mode**: See [TURN Modes](../DEPLOYMENT.md#turn-modes)
 
 ---
 
 ## TURN Server Issues
 
-### Coturn not starting
+### Coturn not starting (self-hosted/hybrid only)
 
 **Symptoms**: Container exits immediately or shows errors
 
@@ -163,7 +166,7 @@ This guide covers common issues and their solutions when running Chromatic.
 
 1. **Check logs**:
    ```bash
-   docker compose logs coturn
+   docker compose --profile self-hosted-turn logs coturn
    ```
 
 2. **Common errors**:
@@ -172,7 +175,7 @@ This guide covers common issues and their solutions when running Chromatic.
 
 3. **Verify configuration**:
    ```bash
-   docker compose exec coturn cat /etc/coturn/turnserver.conf
+   docker compose --profile self-hosted-turn exec coturn cat /etc/coturn/turnserver.conf
    ```
 
 ### TURN relay not working
@@ -204,8 +207,8 @@ This guide covers common issues and their solutions when running Chromatic.
    # Check Chromatic config
    docker compose exec chromatic env | grep TURN
 
-   # Check Coturn config
-   docker compose exec coturn cat /etc/coturn/turnserver.conf | grep static-auth-secret
+   # Check Coturn config (self-hosted/hybrid only)
+   docker compose --profile self-hosted-turn exec coturn cat /etc/coturn/turnserver.conf | grep static-auth-secret
    ```
 
 2. **Check credential format**:
@@ -480,7 +483,7 @@ docker compose logs chromatic | grep -i whip
 
 **TURN server**:
 ```bash
-docker compose logs coturn
+docker compose --profile self-hosted-turn logs coturn
 ```
 
 ### Client-side debugging
