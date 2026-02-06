@@ -1,4 +1,4 @@
-.PHONY: dev build test clean docker-build docker-up docker-down
+.PHONY: dev build test clean docker-build docker-pull docker-up docker-down
 
 # Development
 dev:
@@ -28,9 +28,13 @@ test-frontend:
 
 # Docker
 docker-build:
-	docker compose -f deployments/docker-compose.yml build
+	docker build -f deployments/Dockerfile -t chromatic:local .
+
+docker-pull:
+	docker compose -f deployments/docker-compose.yml pull
 
 docker-up:
+	docker compose -f deployments/docker-compose.yml pull
 	docker compose -f deployments/docker-compose.yml up -d
 
 docker-down:

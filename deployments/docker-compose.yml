@@ -19,9 +19,8 @@ services:
       - chromatic_net
 
   chromatic:
-    build:
-      context: ..
-      dockerfile: deployments/Dockerfile
+    image: ${CHROMATIC_IMAGE:-ghcr.io/davidtorcivia/chromatic:latest}
+    pull_policy: always
     container_name: chromatic
     restart: unless-stopped
     environment:
@@ -35,7 +34,7 @@ services:
       - PORT=3000
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
       - PRODUCTION_MODE=${PRODUCTION_MODE:-false}
-      - TRUSTED_PROXIES=172.16.0.0/12,10.0.0.0/8
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-172.16.0.0/12,10.0.0.0/8}
     volumes:
       - chromatic_data:/data
     networks:

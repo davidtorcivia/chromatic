@@ -34,7 +34,7 @@ Chromatic enables real-time color-critical streaming from DaVinci Resolve via OB
 
 ### Prerequisites
 
-- Go 1.22+
+- Go 1.24+
 - Node.js 20+
 - Docker and Docker Compose (for deployment)
 - OBS Studio 30+ (for streaming)
@@ -71,18 +71,33 @@ make setup
 # Or configure manually
 cd deployments
 cp .env.example .env
-nano .env  # Set ADMIN_TOKEN, TURN_SECRET, PUBLIC_URL, etc.
+nano .env  # Set ADMIN_TOKEN, TURN_SECRET, PUBLIC_URL, CHROMATIC_IMAGE, etc.
 
 # Deploy
-docker-compose up -d
+docker compose pull
+docker compose up -d
 
 # Verify
 curl https://stream.yourdomain.com/health
 ```
 
+Set `CHROMATIC_IMAGE` to an immutable release tag (for example `sha-<commit>`) or
+digest (`@sha256:...`) for reproducible deploys and safe rollback.
+
 See [DEPLOYMENT.md](DEPLOYMENT.md) for complete instructions.
 After login, open Admin → Setup Wizard to finish TURN, branding, stream keys, and
 first-room setup. The wizard does not edit your `.env` file.
+
+### Published Images
+
+Production images are automatically published to GitHub Container Registry (GHCR):
+
+- `ghcr.io/davidtorcivia/chromatic`
+- Tags include branch, semver (`vX.Y.Z`), and immutable `sha-<commit>`
+- Default branch also publishes `latest` (use only for non-critical environments)
+
+For production, deploy using a pinned immutable tag or digest.
+If anonymous pulls fail, set the GHCR package visibility to public.
 
 ## OBS Configuration
 
@@ -134,7 +149,7 @@ first-room setup. The wizard does not edit your `.env` file.
 
 | Component | Technology |
 |-----------|------------|
-| Backend | Go 1.22+, Pion WebRTC v4 |
+| Backend | Go 1.24+, Pion WebRTC v4 |
 | Frontend | SvelteKit 2, Svelte 5 |
 | Database | SQLite with WAL mode |
 | Reverse Proxy | Caddy (auto SSL) |
@@ -269,7 +284,7 @@ k6 run tests/load/scenarios/concurrent-viewers.js
 make build
 
 # Build Docker image
-make docker-build
+make docker-build  # Produces local image: chromatic:local
 
 # Build frontend only
 make build-frontend

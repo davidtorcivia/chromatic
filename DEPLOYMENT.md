@@ -61,6 +61,7 @@ PUBLIC_URL=https://stream.yourdomain.com
 TURN_SECRET=your-generated-turn-secret
 TURN_REALM=stream.yourdomain.com
 PUBLIC_IP=your.server.ip.address
+CHROMATIC_IMAGE=ghcr.io/davidtorcivia/chromatic:sha-<release-commit>
 
 # Production mode (recommended)
 PRODUCTION_MODE=true
@@ -81,7 +82,22 @@ stream.yourdomain.com {
 
 ```bash
 cd deployments
-docker-compose up -d
+docker compose pull
+docker compose up -d
+```
+
+Use immutable image references for production:
+
+- Tag pin: `ghcr.io/davidtorcivia/chromatic:sha-<commit>`
+- Digest pin: `ghcr.io/davidtorcivia/chromatic@sha256:<digest>`
+
+Image repository: `ghcr.io/davidtorcivia/chromatic`
+If anonymous pulls fail, set package visibility to **public** in GHCR package settings.
+
+If the GHCR package is private, authenticate before pulling:
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 ```
 
 ### 6. Verify
@@ -192,14 +208,17 @@ tar -czvf chromatic-backup-$(date +%Y%m%d).tar.gz data/
 ```bash
 cd deployments
 
-# Pull latest images
-docker-compose pull
+# Optional: switch to a specific release before pulling
+# sed -i 's|^CHROMATIC_IMAGE=.*|CHROMATIC_IMAGE=ghcr.io/davidtorcivia/chromatic:sha-<commit>|' .env
+
+# Pull configured image versions
+docker compose pull
 
 # Restart with new images
-docker-compose up -d
+docker compose up -d
 
 # Check logs
-docker-compose logs -f chromatic
+docker compose logs -f chromatic
 ```
 
 ## Troubleshooting

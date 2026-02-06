@@ -14,7 +14,7 @@ Use this checklist when deploying Chromatic to a new server or updating an exist
 - [ ] **Docker**: Docker and Docker Compose installed
   ```bash
   docker --version  # Should be 20.10+
-  docker-compose --version  # Should be 1.29+
+  docker compose version  # Compose plugin should be installed
   ```
 
 ### Domain & DNS
@@ -76,6 +76,7 @@ nc -zvu your.server.ip 3478
   - [ ] `TURN_SECRET` - Generated TURN secret
   - [ ] `TURN_REALM` - Your domain (stream.yourdomain.com)
   - [ ] `PUBLIC_IP` - Server's public IP address
+  - [ ] `CHROMATIC_IMAGE` - Pinned image tag/digest from `ghcr.io/davidtorcivia/chromatic`
   - [ ] `PRODUCTION_MODE=true`
   - [ ] `ALLOWED_ORIGINS` - Your domain
 
@@ -98,17 +99,21 @@ nc -zvu your.server.ip 3478
 
 ### 6. Deploy
 
+- [ ] (If GHCR package is private) Login to GHCR
+  ```bash
+  echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+  ```
 - [ ] Pull Docker images
   ```bash
-  docker-compose pull
+  docker compose pull
   ```
 - [ ] Start services
   ```bash
-  docker-compose up -d
+  docker compose up -d
   ```
 - [ ] Check all containers running
   ```bash
-  docker-compose ps
+  docker compose ps
   # All should show "Up"
   ```
 
@@ -306,17 +311,17 @@ When updating Chromatic:
 
 2. [ ] Pull new images
    ```bash
-   docker-compose pull
+   docker compose pull
    ```
 
 3. [ ] Restart services
    ```bash
-   docker-compose up -d
+   docker compose up -d
    ```
 
 4. [ ] Verify update
    ```bash
-   docker-compose logs -f chromatic
+   docker compose logs -f chromatic
    ```
 
 5. [ ] Run health checks (see above)
@@ -339,6 +344,7 @@ If update causes issues:
 
 3. [ ] Use previous image version
    ```bash
-   # Edit docker-compose.yml to specify version
-   docker-compose up -d
+   # Set CHROMATIC_IMAGE in .env to the previous pinned tag/digest, then:
+   docker compose pull
+   docker compose up -d
    ```
