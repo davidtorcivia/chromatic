@@ -73,6 +73,7 @@
     let turnUrl = $state("");
     let turnUsername = $state("");
     let turnCredential = $state("");
+    let clearTurnCredential = $state(false);
     let turnTestResults = $state<TURNTestResponse | null>(null);
     let isSavingTurn = $state(false);
     let isTestingTurn = $state(false);
@@ -316,11 +317,14 @@
                 .map((entry) => entry.trim())
                 .filter(Boolean)
                 .join(",");
+            const turnCredentialPayload = clearTurnCredential
+                ? ""
+                : turnCredential || undefined;
 
             config = await appConfig.update({
                 turnExternalUrl: normalizedTurnURL,
                 turnExternalUsername: turnUsername.trim(),
-                turnExternalCredential: turnCredential || undefined,
+                turnExternalCredential: turnCredentialPayload,
             });
             baseUrl =
                 config?.publicUrl ||
@@ -329,6 +333,7 @@
             turnUrl = config?.turnExternalUrl || "";
             turnUsername = config?.turnExternalUsername || "";
             turnCredential = "";
+            clearTurnCredential = false;
             turnSuccess = "TURN settings saved";
             turnConfirmed = true;
             setTimeout(() => (turnSuccess = ""), 3000);
@@ -846,15 +851,39 @@
                                             id="turnCredential"
                                             class="input"
                                             bind:value={turnCredential}
+                                            oninput={() =>
+                                                (clearTurnCredential = false)}
                                             placeholder={config?.hasTurnCredential
-                                                ? "********"
+                                                ? clearTurnCredential
+                                                    ? "Will be cleared on save"
+                                                    : "********"
                                                 : "TURN credential"}
                                         />
                                         {#if config?.hasTurnCredential}
                                             <p class="hint">
                                                 A credential is already set.
-                                                Enter a new value to change it.
+                                                Enter a new value to rotate it
+                                                or clear it explicitly.
                                             </p>
+                                            <div class="button-row">
+                                                <button
+                                                    type="button"
+                                                    class="btn btn-secondary btn-sm"
+                                                    onclick={() => {
+                                                        clearTurnCredential =
+                                                            !clearTurnCredential;
+                                                        if (
+                                                            clearTurnCredential
+                                                        ) {
+                                                            turnCredential = "";
+                                                        }
+                                                    }}
+                                                >
+                                                    {clearTurnCredential
+                                                        ? "Credential Will Be Cleared"
+                                                        : "Clear Saved Credential"}
+                                                </button>
+                                            </div>
                                         {/if}
                                     </div>
 

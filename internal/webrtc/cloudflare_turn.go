@@ -19,10 +19,11 @@ const (
 )
 
 type cloudflareTURNProviderConfig struct {
-	KeyID      string
-	APIToken   string
-	TTLSeconds int
-	Skew       time.Duration
+	KeyID            string
+	APIToken         string
+	TTLSeconds       int
+	Skew             time.Duration
+	EndpointTemplate string
 }
 
 type cloudflareTURNProvider struct {
@@ -60,6 +61,12 @@ type cloudflareTURNWrappedResponse struct {
 }
 
 func newCloudflareTURNProvider(cfg cloudflareTURNProviderConfig) *cloudflareTURNProvider {
+	if cfg.TTLSeconds <= 0 {
+		cfg.TTLSeconds = 3600
+	}
+	if cfg.EndpointTemplate == "" {
+		cfg.EndpointTemplate = cloudflareTURNEndpoint
+	}
 	return &cloudflareTURNProvider{
 		cfg: cfg,
 		client: &http.Client{
@@ -107,7 +114,7 @@ func (p *cloudflareTURNProvider) getCredentials(ctx context.Context) (string, st
 		return "", "", fmt.Errorf("failed to marshal Cloudflare TURN request: %w", err)
 	}
 
-	url := fmt.Sprintf(cloudflareTURNEndpoint, p.cfg.KeyID)
+	url := fmt.Sprintf(p.cfg.EndpointTemplate, p.cfg.KeyID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create Cloudflare TURN request: %w", err)

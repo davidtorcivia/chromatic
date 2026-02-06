@@ -16,6 +16,7 @@
     let turnUrl = $state("");
     let turnUsername = $state("");
     let turnCredential = $state("");
+    let clearTurnCredential = $state(false);
 
     onMount(async () => {
         await loadConfig();
@@ -66,15 +67,19 @@
                 .map((entry) => entry.trim())
                 .filter(Boolean)
                 .join(",");
+            const turnCredentialPayload = clearTurnCredential
+                ? ""
+                : turnCredential || undefined;
 
             config = await appConfig.update({
                 turnExternalUrl: normalizedTurnURL,
                 turnExternalUsername: turnUsername.trim(),
-                turnExternalCredential: turnCredential || undefined,
+                turnExternalCredential: turnCredentialPayload,
             });
             turnUrl = config.turnExternalUrl || "";
             turnUsername = config.turnExternalUsername || "";
             turnCredential = ""; // Clear credential field after save
+            clearTurnCredential = false;
             successMessage = "TURN settings saved";
             setTimeout(() => (successMessage = ""), 3000);
         } catch (e: any) {
@@ -360,15 +365,34 @@
                         id="turnCredential"
                         class="input"
                         bind:value={turnCredential}
+                        oninput={() => (clearTurnCredential = false)}
                         placeholder={config?.hasTurnCredential
-                            ? "••••••••"
+                            ? clearTurnCredential
+                                ? "Will be cleared on save"
+                                : "••••••••"
                             : "TURN credential"}
                     />
                     {#if config?.hasTurnCredential}
                         <p class="hint">
                             Credential is already set. Enter a new value to
-                            change it.
+                            rotate it or clear it explicitly.
                         </p>
+                        <div class="button-row">
+                            <button
+                                type="button"
+                                class="btn btn-secondary btn-sm"
+                                onclick={() => {
+                                    clearTurnCredential = !clearTurnCredential;
+                                    if (clearTurnCredential) {
+                                        turnCredential = "";
+                                    }
+                                }}
+                            >
+                                {clearTurnCredential
+                                    ? "Credential Will Be Cleared"
+                                    : "Clear Saved Credential"}
+                            </button>
+                        </div>
                     {/if}
                 </div>
 
