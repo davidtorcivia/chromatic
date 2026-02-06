@@ -7,7 +7,7 @@ COPY web/ .
 RUN npm run build
 
 # Build stage for Go
-FROM golang:1.22-alpine AS backend
+FROM golang:1.24-alpine AS backend
 WORKDIR /build
 RUN apk add --no-cache gcc musl-dev
 
