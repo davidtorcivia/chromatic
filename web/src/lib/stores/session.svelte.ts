@@ -195,6 +195,11 @@ export function createSessionStore() {
                 }
                 break;
 
+            case 'chat:history':
+                // Forward to registered handlers (ChatPanel will handle)
+                messageHandlers.get('chat:history')?.(msg.payload);
+                break;
+
             default:
                 // Forward to registered handlers
                 messageHandlers.get(msg.type)?.(msg.payload);

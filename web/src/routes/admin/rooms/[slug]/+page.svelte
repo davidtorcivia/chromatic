@@ -66,7 +66,7 @@
 
     async function loadWaitingRoom() {
         try {
-            waitingParticipants = await rooms.listWaiting(slug);
+            waitingParticipants = (await rooms.listWaiting(slug)) ?? [];
         } catch (e) {
             console.error("Failed to load waiting room", e);
         }
@@ -275,7 +275,7 @@
                     {#if room.streamKeyId}
                         <div class="stream-info">
                             <div class="stream-field">
-                                <span class="field-label">WHIP URL (for OBS)</span>
+                                <span class="field-label">WHIP URL</span>
                                 <div class="copy-field">
                                     <code>{getWhipUrl()}</code>
                                     <button
@@ -287,7 +287,8 @@
                                 </div>
                             </div>
                             <p class="stream-hint">
-                                In OBS: Settings &rarr; Stream &rarr; Service: WHIP &rarr; paste URL above
+                                In OBS: Settings &rarr; Stream &rarr; Service: WHIP &rarr;
+                                paste the URL above into <strong>Server</strong> and leave <strong>Bearer Token empty</strong>.
                             </p>
                         </div>
                     {:else}

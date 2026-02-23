@@ -20,7 +20,7 @@
 
     onMount(async () => {
         try {
-            keys = await streamKeys.list();
+            keys = (await streamKeys.list()) ?? [];
             if (keys.length > 0) {
                 streamKeyId = keys[0].id;
             }

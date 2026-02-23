@@ -13,6 +13,7 @@ import (
 
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/intervalpli"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -56,12 +57,14 @@ type IngestSession struct {
 
 // RoomTracks holds the tracks being distributed to a room
 type RoomTracks struct {
-	mu            sync.RWMutex
-	RoomSlug      string
-	VideoTrack    *webrtc.TrackLocalStaticRTP
-	AudioTrack    *webrtc.TrackLocalStaticRTP
-	Subscribers   map[string]*Subscriber
-	VoiceSessions map[string]*VoiceSession // Participant voice connections
+	mu               sync.RWMutex
+	RoomSlug         string
+	VideoTrack       *webrtc.TrackLocalStaticRTP
+	AudioTrack       *webrtc.TrackLocalStaticRTP
+	Subscribers      map[string]*Subscriber
+	VoiceSessions    map[string]*VoiceSession                // Participant voice connections
+	VoiceRemoteTracks map[string]*webrtc.TrackRemote          // Active voice remote tracks keyed by participant ID
+	IngestPC         *webrtc.PeerConnection                  // Reference to ingest PC for PLI requests
 }
 
 // Subscriber represents a client receiving the stream
@@ -76,29 +79,41 @@ type Subscriber struct {
 
 // NewSFU creates a new SFU instance
 func NewSFU(cfg *config.Config) (*SFU, error) {
-	// Create a MediaEngine with default codecs
+	// Create a MediaEngine with specific codecs for our SFU.
+	// OBS sends H.264 Baseline with packetization-mode=1. We MUST only register
+	// H.264 with PM=1 to prevent browsers (Firefox) from negotiating PM=0 which
+	// would cause a black screen since the RTP payload format wouldn't match.
 	m := &webrtc.MediaEngine{}
 
-	// Register H.264 codec for video (primary for color work)
-	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeH264,
-			ClockRate:   90000,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
-		},
-		PayloadType: 96,
-	}, webrtc.RTPCodecTypeVideo); err != nil {
-		return nil, fmt.Errorf("failed to register H264 codec: %w", err)
+	videoRTCPFeedback := []webrtc.RTCPFeedback{
+		{Type: "goog-remb", Parameter: ""},
+		{Type: "ccm", Parameter: "fir"},
+		{Type: "nack", Parameter: ""},
+		{Type: "nack", Parameter: "pli"},
 	}
 
-	// Register Opus codec for audio
+	// H.264 Constrained Baseline, packetization-mode=1 (matches OBS output)
+	for _, profile := range []string{"42001f", "42e01f"} {
+		if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:     webrtc.MimeTypeH264,
+				ClockRate:    90000,
+				SDPFmtpLine:  fmt.Sprintf("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=%s", profile),
+				RTCPFeedback: videoRTCPFeedback,
+			},
+		}, webrtc.RTPCodecTypeVideo); err != nil {
+			return nil, fmt.Errorf("failed to register H.264 codec: %w", err)
+		}
+	}
+
+	// Opus audio (for both stream audio and voice chat)
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypeOpus,
-			ClockRate: 48000,
-			Channels:  2,
+			MimeType:    webrtc.MimeTypeOpus,
+			ClockRate:   48000,
+			Channels:    2,
+			SDPFmtpLine: "minptime=10;useinbandfec=1",
 		},
-		PayloadType: 111,
 	}, webrtc.RTPCodecTypeAudio); err != nil {
 		return nil, fmt.Errorf("failed to register Opus codec: %w", err)
 	}
@@ -107,7 +122,10 @@ func NewSFU(cfg *config.Config) (*SFU, error) {
 	i := &interceptor.Registry{}
 
 	// Add PLI (Picture Loss Indication) generator for better video quality
-	intervalPliFactory, err := intervalpli.NewReceiverInterceptor()
+	// Use 1-second interval to ensure frequent keyframes for late-joining subscribers
+	intervalPliFactory, err := intervalpli.NewReceiverInterceptor(
+		intervalpli.GeneratorInterval(time.Second),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create PLI interceptor: %w", err)
 	}
@@ -370,14 +388,15 @@ func (rt *RoomTracks) BroadcastTrack(track *webrtc.TrackLocalStaticRTP, data []b
 	return err
 }
 
-// BindIngestToRoom binds an ingest session's tracks to a room for distribution
-func (s *SFU) BindIngestToRoom(streamKeyToken, roomSlug string) error {
+// BindIngestToRoom binds an ingest session's tracks to a room for distribution.
+// Returns a list of subscriber IDs that need renegotiation (new tracks were added, not just replaced).
+func (s *SFU) BindIngestToRoom(streamKeyToken, roomSlug string) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	ingest, ok := s.ingests[streamKeyToken]
 	if !ok {
-		return fmt.Errorf("ingest session not found for token")
+		return nil, fmt.Errorf("ingest session not found for token")
 	}
 
 	room, ok := s.rooms[roomSlug]
@@ -389,25 +408,88 @@ func (s *SFU) BindIngestToRoom(streamKeyToken, roomSlug string) error {
 		s.rooms[roomSlug] = room
 	}
 
+	var needsRenegotiation []string
+
 	room.mu.Lock()
 	room.VideoTrack = ingest.VideoTrack
 	room.AudioTrack = ingest.AudioTrack
+	room.IngestPC = ingest.PeerConnection
 	for _, sub := range room.Subscribers {
+		subNeedsReneg := false
+
+		// Video track
 		if sub.VideoSender != nil && ingest.VideoTrack != nil {
 			if err := sub.VideoSender.ReplaceTrack(ingest.VideoTrack); err != nil {
 				log.Printf("Failed to replace video track for subscriber %s: %v", sub.ID, err)
 			}
+		} else if sub.VideoSender == nil && ingest.VideoTrack != nil {
+			// Subscriber joined before ingest — add the track now
+			sender, err := sub.PeerConnection.AddTrack(ingest.VideoTrack)
+			if err != nil {
+				log.Printf("Failed to add video track to subscriber %s: %v", sub.ID, err)
+			} else {
+				sub.VideoSender = sender
+				subNeedsReneg = true
+			}
 		}
+
+		// Audio track
 		if sub.AudioSender != nil && ingest.AudioTrack != nil {
 			if err := sub.AudioSender.ReplaceTrack(ingest.AudioTrack); err != nil {
 				log.Printf("Failed to replace audio track for subscriber %s: %v", sub.ID, err)
 			}
+		} else if sub.AudioSender == nil && ingest.AudioTrack != nil {
+			sender, err := sub.PeerConnection.AddTrack(ingest.AudioTrack)
+			if err != nil {
+				log.Printf("Failed to add audio track to subscriber %s: %v", sub.ID, err)
+			} else {
+				sub.AudioSender = sender
+				subNeedsReneg = true
+			}
+		}
+
+		if subNeedsReneg {
+			needsRenegotiation = append(needsRenegotiation, sub.ID)
 		}
 	}
 	room.mu.Unlock()
 
 	log.Printf("Bound ingest %s... to room %s", streamKeyToken[:8], roomSlug)
-	return nil
+	return needsRenegotiation, nil
+}
+
+// RequestKeyframe sends a PLI to the ingest to force a keyframe for all subscribers.
+// Called when new subscribers join or when a client requests a stream resync.
+func (s *SFU) RequestKeyframe(roomSlug string) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return
+	}
+
+	room.mu.RLock()
+	ingestPC := room.IngestPC
+	room.mu.RUnlock()
+
+	if ingestPC == nil {
+		return
+	}
+
+	// Find video receivers and send PLI for each
+	for _, receiver := range ingestPC.GetReceivers() {
+		track := receiver.Track()
+		if track != nil && track.Kind() == webrtc.RTPCodecTypeVideo {
+			if err := ingestPC.WriteRTCP([]rtcp.Packet{
+				&rtcp.PictureLossIndication{
+					MediaSSRC: uint32(track.SSRC()),
+				},
+			}); err != nil {
+				log.Printf("Failed to send PLI for room %s: %v", roomSlug, err)
+			} else {
+				log.Printf("Sent PLI keyframe request for room %s", roomSlug)
+			}
+			break
+		}
+	}
 }
 
 // GetRoomTracksForSlug returns the room tracks if they exist
@@ -467,12 +549,15 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 
 	room.AddSubscriber(sub)
 
-	// Handle connection state
+	// Request a keyframe from the ingest so the new subscriber can decode immediately
+	go s.RequestKeyframe(roomSlug)
+
+	// Handle connection state — only remove on terminal states.
+	// "disconnected" is transient and can recover via ICE restart from the client.
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("Subscriber %s connection state: %s", subscriberID, state)
 		switch state {
-		case webrtc.PeerConnectionStateDisconnected,
-			webrtc.PeerConnectionStateFailed,
+		case webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed:
 			room.RemoveSubscriber(subscriberID)
 		}
@@ -664,6 +749,70 @@ type VoiceSession struct {
 	AudioTrack     *webrtc.TrackLocalStaticRTP
 	done           chan struct{}
 	closeOnce      sync.Once
+}
+
+// StoreVoiceRemoteTrack stores the remote track reference for forwarding to late joiners
+func (s *SFU) StoreVoiceRemoteTrack(roomSlug, participantID string, track *webrtc.TrackRemote) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return
+	}
+
+	room.mu.Lock()
+	defer room.mu.Unlock()
+
+	if room.VoiceRemoteTracks == nil {
+		room.VoiceRemoteTracks = make(map[string]*webrtc.TrackRemote)
+	}
+	room.VoiceRemoteTracks[participantID] = track
+}
+
+// RemoveVoiceRemoteTrack removes a stored voice remote track
+func (s *SFU) RemoveVoiceRemoteTrack(roomSlug, participantID string) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return
+	}
+
+	room.mu.Lock()
+	defer room.mu.Unlock()
+
+	delete(room.VoiceRemoteTracks, participantID)
+}
+
+// RLockVoiceTracks acquires a read lock for accessing voice tracks
+func (rt *RoomTracks) RLockVoiceTracks() {
+	rt.mu.RLock()
+}
+
+// RUnlockVoiceTracks releases the read lock for voice tracks
+func (rt *RoomTracks) RUnlockVoiceTracks() {
+	rt.mu.RUnlock()
+}
+
+// GetVoiceRemoteTrackLocked returns a voice remote track (caller must hold RLock)
+func (rt *RoomTracks) GetVoiceRemoteTrackLocked(participantID string) *webrtc.TrackRemote {
+	if rt.VoiceRemoteTracks == nil {
+		return nil
+	}
+	return rt.VoiceRemoteTracks[participantID]
+}
+
+// GetActiveVoiceSessions returns the participant IDs that have active voice remote tracks in a room
+func (s *SFU) GetActiveVoiceSessions(roomSlug string) []string {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return nil
+	}
+
+	room.mu.RLock()
+	defer room.mu.RUnlock()
+
+	ids := make([]string, 0, len(room.VoiceRemoteTracks))
+	for id := range room.VoiceRemoteTracks {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // HandleVoiceOffer processes an offer from a client wanting to send voice audio

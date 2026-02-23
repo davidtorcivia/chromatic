@@ -1,5 +1,6 @@
 <script lang="ts">
     import { onMount, onDestroy } from "svelte";
+    import { goto } from "$app/navigation";
     import { page } from "$app/stores";
     import { rooms, type RoomInfo } from "$lib/api/client";
 
@@ -66,11 +67,11 @@
                 JSON.stringify(result),
             );
 
-            // Redirect based on waiting room status
+            // Navigate based on waiting room status
             if (result.waitingRoom) {
-                window.location.href = `/room/${slug}/waiting`;
+                goto(`/room/${slug}/waiting`);
             } else {
-                window.location.href = `/room/${slug}/session`;
+                goto(`/room/${slug}/session`);
             }
         } catch (e: any) {
             error = e.message || "Failed to join room";

@@ -52,6 +52,12 @@ export class WebRTCManager {
         this.options.sendSignal('signal:answer', {
             sdp: answer.sdp
         });
+
+        // If we have a pending mic stream (from autoRequestMic), add it now
+        if (this.localStream && !this.audioSender) {
+            console.log('Adding pending audio track after offer');
+            await this.addLocalAudioTrack();
+        }
     }
 
     // Handle ICE candidate from server (if server sends any)
@@ -174,6 +180,12 @@ export class WebRTCManager {
         }
     }
 
+    // Request a stream resync (forces keyframe from publisher)
+    requestResync(): void {
+        console.log('Requesting stream resync (keyframe)');
+        this.options.sendSignal('signal:resync', {});
+    }
+
     // Get current connection state
     getConnectionState(): RTCPeerConnectionState | null {
         return this.pc?.connectionState ?? null;
@@ -209,11 +221,7 @@ export class WebRTCManager {
                 video: false
             });
 
-            // Start muted by default
-            this.localStream.getAudioTracks().forEach(track => {
-                track.enabled = false;
-            });
-
+            // Tracks start enabled (mic on by default) - caller controls mute state via setMicEnabled
             console.log('Microphone access granted');
             return true;
         } catch (err) {

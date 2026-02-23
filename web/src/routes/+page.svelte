@@ -59,21 +59,6 @@
         {isLoading ? 'Verifying...' : 'Login'}
       </button>
     </form>
-
-    <div class="features">
-      <div class="feature">
-        <h3>🎨 Color Fidelity</h3>
-        <p>High-bitrate streaming optimized for XDR displays</p>
-      </div>
-      <div class="feature">
-        <h3>⚡ Sub-second Latency</h3>
-        <p>Real-time WebRTC streaming from DaVinci Resolve</p>
-      </div>
-      <div class="feature">
-        <h3>👆 Interactive Review</h3>
-        <p>Laser pointer annotations visible to all participants</p>
-      </div>
-    </div>
   </div>
 </main>
 
@@ -150,26 +135,4 @@
     margin-bottom: var(--space-lg);
   }
 
-  .features {
-    display: grid;
-    gap: var(--space-lg);
-    text-align: left;
-  }
-
-  .feature {
-    padding: var(--space-md);
-    background: var(--color-surface);
-    border-radius: var(--radius-md);
-    border: 1px solid var(--color-border);
-  }
-
-  .feature h3 {
-    font-size: 1rem;
-    margin-bottom: var(--space-xs);
-  }
-
-  .feature p {
-    font-size: 0.875rem;
-    color: var(--color-text-muted);
-  }
 </style>

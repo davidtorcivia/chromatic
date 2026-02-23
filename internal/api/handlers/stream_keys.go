@@ -38,7 +38,7 @@ func (h *StreamKeyHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	var keys []StreamKey
+	keys := []StreamKey{}
 	for rows.Next() {
 		var key StreamKey
 		if err := rows.Scan(&key.ID, &key.Name, &key.KeyToken, &key.CreatedAt); err != nil {

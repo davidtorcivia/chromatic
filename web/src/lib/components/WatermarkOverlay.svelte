@@ -116,21 +116,20 @@
         ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
         ctx.globalAlpha = opacity;
 
-        // Draw text watermark
+        // Draw text watermark (bottom-right corner)
         if ((mode === "text" || mode === "both") && text) {
             const processedText = processText(text);
             ctx.font = "14px 'Work Sans', sans-serif";
             ctx.fillStyle = "white";
-            ctx.textAlign = "center";
-            ctx.textBaseline = "middle";
+            ctx.textAlign = "right";
+            ctx.textBaseline = "bottom";
             ctx.shadowColor = "rgba(0, 0, 0, 0.8)";
             ctx.shadowBlur = 2;
 
-            // Center position
             ctx.fillText(
                 processedText,
-                canvasEl.width / 2,
-                canvasEl.height / 2,
+                canvasEl.width - logoPadding,
+                canvasEl.height - logoPadding,
             );
         }
 

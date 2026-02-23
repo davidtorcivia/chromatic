@@ -303,7 +303,7 @@ func TestSFU_BindIngestToRoom_NotFound(t *testing.T) {
 	}
 	defer sfu.Shutdown()
 
-	err = sfu.BindIngestToRoom("nonexistent-token", "test-room")
+	_, err = sfu.BindIngestToRoom("nonexistent-token", "test-room")
 	if err == nil {
 		t.Error("expected error for nonexistent ingest")
 	}
@@ -328,7 +328,7 @@ func TestSFU_BindIngestToRoom_Success(t *testing.T) {
 	sfu.SetIngest(token, session)
 
 	// Bind to room
-	err = sfu.BindIngestToRoom(token, roomSlug)
+	_, err = sfu.BindIngestToRoom(token, roomSlug)
 	if err != nil {
 		t.Fatalf("failed to bind ingest to room: %v", err)
 	}

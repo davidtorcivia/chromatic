@@ -1,28 +1,11 @@
 services:
-  caddy:
-    image: caddy:2-alpine
-    container_name: chromatic_caddy
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"  # HTTP/3 support
-    environment:
-      - DOMAIN=${DOMAIN:-localhost}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      - chromatic
-    networks:
-      - chromatic_net
-
   chromatic:
-    image: ${CHROMATIC_IMAGE:-ghcr.io/davidtorcivia/chromatic:latest}
-    pull_policy: always
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
     container_name: chromatic
     restart: unless-stopped
+    network_mode: host
     environment:
       - DATABASE_PATH=/data/chromatic.db
       - UPLOAD_PATH=/data/files
@@ -40,33 +23,12 @@ services:
       - TURN_CLOUDFLARE_API_TOKEN=${TURN_CLOUDFLARE_API_TOKEN}
       - TURN_CLOUDFLARE_CREDENTIAL_TTL=${TURN_CLOUDFLARE_CREDENTIAL_TTL:-3600}
       - TURN_CLOUDFLARE_CREDENTIAL_SKEW=${TURN_CLOUDFLARE_CREDENTIAL_SKEW:-60}
-      - PORT=3000
+      - PORT=3020
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
       - PRODUCTION_MODE=${PRODUCTION_MODE:-false}
       - TRUSTED_PROXIES=${TRUSTED_PROXIES:-172.16.0.0/12,10.0.0.0/8}
     volumes:
       - chromatic_data:/data
-    networks:
-      - chromatic_net
-    expose:
-      - "3000"
-
-  coturn:
-    image: coturn/coturn:latest
-    container_name: chromatic_turn
-    restart: unless-stopped
-    profiles:
-      - self-hosted-turn
-    network_mode: host
-    volumes:
-      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
-    command: [ "-c", "/etc/coturn/turnserver.conf" ]
-
-networks:
-  chromatic_net:
-    driver: bridge
 
 volumes:
   chromatic_data:
-  caddy_data:
-  caddy_config:

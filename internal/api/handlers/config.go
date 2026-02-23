@@ -334,7 +334,7 @@ type TURNTestResponse struct {
 
 // TestTURN tests connectivity to configured TURN servers
 func (h *ConfigHandler) TestTURN(w http.ResponseWriter, r *http.Request) {
-	var results []TURNTestResult
+	results := []TURNTestResult{}
 
 	// Test self-hosted TURN server (Coturn)
 	if h.cfg.TurnMode != config.TurnModeExternal && h.cfg.TurnRealm != "" {

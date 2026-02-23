@@ -173,8 +173,9 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	// Register with hub
 	h.hub.Register(client)
 
-	// Send initial room state
+	// Send initial room state and chat history
 	h.sendRoomState(client, slug)
+	h.sendChatHistory(client, slug)
 
 	// Notify others of new participant
 	h.hub.BroadcastJSON(slug, "participant:joined", map[string]interface{}{
@@ -234,6 +235,30 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 	})
 
 	logger.Debug("Sent WebRTC offer to client", "participant_id", client.ID, "room", roomSlug)
+
+	// Forward any existing voice tracks from other participants to this new subscriber.
+	// This ensures late joiners can hear people who are already speaking.
+	go func() {
+		voiceParticipants := h.sfu.GetActiveVoiceSessions(roomSlug)
+		room := h.sfu.GetRoomTracksForSlug(roomSlug)
+		if room == nil {
+			return
+		}
+
+		room.RLockVoiceTracks()
+		defer room.RUnlockVoiceTracks()
+
+		for _, voiceOwnerID := range voiceParticipants {
+			if voiceOwnerID == client.ID {
+				continue
+			}
+			track := room.GetVoiceRemoteTrackLocked(voiceOwnerID)
+			if track == nil {
+				continue
+			}
+			h.forwardVoiceTrackToClients(roomSlug, voiceOwnerID, track, client.ID)
+		}
+	}()
 }
 
 // InitiateSubscriptionsForRoom sends WebRTC offers to all clients in a room
@@ -314,6 +339,58 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 	})
 }
 
+// sendChatHistory sends persisted chat messages to a newly connected client
+func (h *WebSocketHandler) sendChatHistory(client *websocket.Client, slug string) {
+	rows, err := h.db.Query(`
+		SELECT m.id, m.participant_id, p.name, m.type, m.content, m.created_at
+		FROM messages m
+		JOIN participants p ON p.id = m.participant_id
+		WHERE m.room_id = (SELECT id FROM rooms WHERE slug = ?)
+		ORDER BY m.created_at ASC
+		LIMIT 200
+	`, slug)
+	if err != nil {
+		logger.Warn("Failed to load chat history", "room", slug, "error", err)
+		return
+	}
+	defer rows.Close()
+
+	messages := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		var id, participantID, participantName, msgType, content string
+		var createdAt time.Time
+		if err := rows.Scan(&id, &participantID, &participantName, &msgType, &content, &createdAt); err != nil {
+			continue
+		}
+
+		msg := map[string]interface{}{
+			"id":              id,
+			"participantId":   participantID,
+			"participantName": sanitizeText(participantName),
+			"type":            msgType,
+			"content":         content,
+			"timestamp":       createdAt.UnixMilli(),
+		}
+
+		// For file messages, parse the stored JSON content back into a file object
+		if msgType == "file" {
+			var fileData map[string]interface{}
+			if json.Unmarshal([]byte(content), &fileData) == nil {
+				msg["file"] = fileData
+				msg["content"] = ""
+			}
+		}
+
+		messages = append(messages, msg)
+	}
+
+	if len(messages) > 0 {
+		client.SendJSON("chat:history", map[string]interface{}{
+			"messages": messages,
+		})
+	}
+}
+
 // handleMessage handles incoming WebSocket messages
 func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket.Message) {
 	switch msg.Type {
@@ -339,6 +416,8 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 		h.handleIceRestart(client, msg.Payload)
 	case "signal:renegotiate-answer":
 		h.handleRenegotiateAnswer(client, msg.Payload)
+	case "signal:resync":
+		h.handleResync(client)
 	// Admin commands
 	case "admin:mute":
 		h.handleAdminMute(client, msg.Payload)
@@ -355,7 +434,6 @@ func (h *WebSocketHandler) handleChatSend(client *websocket.Client, payload json
 	// Check chat rate limit: 30 messages per minute
 	if !client.AllowChatMessage() {
 		logger.Debug("Chat rate limit exceeded", "participant_id", client.ID, "room", client.RoomSlug)
-		// Silently drop the message - don't spam the client with errors
 		return
 	}
 
@@ -366,19 +444,27 @@ func (h *WebSocketHandler) handleChatSend(client *websocket.Client, payload json
 		return
 	}
 
-	// Sanitize content to prevent XSS
 	sanitizedContent := sanitizeText(data.Content)
-
 	if len(sanitizedContent) == 0 || len(data.Content) > 2000 {
 		return
 	}
 
+	now := time.Now()
+	msgID := generateID()
+
+	// Persist to database
+	h.db.Exec(`INSERT INTO messages (id, room_id, participant_id, type, content, created_at)
+		SELECT ?, r.id, ?, 'text', ?, ? FROM rooms r WHERE r.slug = ?`,
+		msgID, client.ID, sanitizedContent, now, client.RoomSlug)
+
 	// Broadcast to all in room
 	h.hub.BroadcastJSON(client.RoomSlug, "chat:message", map[string]interface{}{
+		"id":              msgID,
 		"participantId":   client.ID,
 		"participantName": sanitizeText(client.Name),
 		"type":            "text",
 		"content":         sanitizedContent,
+		"timestamp":       now.UnixMilli(),
 	}, "")
 }
 
@@ -431,12 +517,23 @@ func (h *WebSocketHandler) handleChatFile(client *websocket.Client, payload json
 		filePayload["thumbnailUrl"] = fmt.Sprintf("/api/files/%s/thumbnail", fileID)
 	}
 
+	now := time.Now()
+	msgID := generateID()
+
+	// Persist to database (store file reference as JSON content)
+	fileJSON, _ := json.Marshal(filePayload)
+	h.db.Exec(`INSERT INTO messages (id, room_id, participant_id, type, content, created_at)
+		SELECT ?, r.id, ?, 'file', ?, ? FROM rooms r WHERE r.slug = ?`,
+		msgID, client.ID, string(fileJSON), now, client.RoomSlug)
+
 	h.hub.BroadcastJSON(client.RoomSlug, "chat:message", map[string]interface{}{
+		"id":              msgID,
 		"participantId":   client.ID,
 		"participantName": sanitizeText(client.Name),
 		"type":            "file",
 		"content":         "",
 		"file":            filePayload,
+		"timestamp":       now.UnixMilli(),
 	}, "")
 }
 
@@ -538,28 +635,37 @@ func (h *WebSocketHandler) handleSignalOffer(client *websocket.Client, payload j
 func (h *WebSocketHandler) forwardVoiceTrack(roomSlug, participantID string, track *pionwebrtc.TrackRemote) {
 	logger.Debug("Forwarding voice track", "participant_id", participantID, "room", roomSlug)
 
+	// Store the remote track so we can forward to late joiners
+	h.sfu.StoreVoiceRemoteTrack(roomSlug, participantID, track)
+
 	// Get all clients in the room except the sender
+	h.forwardVoiceTrackToClients(roomSlug, participantID, track, "")
+}
+
+// forwardVoiceTrackToClients forwards a voice track to clients in the room.
+// If targetClientID is non-empty, only that specific client receives the track.
+func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID string, track *pionwebrtc.TrackRemote, targetClientID string) {
 	clients := h.hub.GetRoomClients(roomSlug)
 	for _, client := range clients {
-		if client.ID == participantID {
+		if client.ID == voiceOwnerID {
 			continue // Don't send to self
 		}
+		if targetClientID != "" && client.ID != targetClientID {
+			continue // Only send to specific target
+		}
 
-		// Add the voice track to this client's subscriber connection
-		// This returns a renegotiation offer that must be sent to the client
-		offerSDP, err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, client.ID, participantID, track)
+		offerSDP, err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, client.ID, voiceOwnerID, track)
 		if err != nil {
-			logger.Warn("Failed to add voice track to subscriber", "subscriber_id", client.ID, "source_id", participantID, "error", err)
+			logger.Warn("Failed to add voice track to subscriber", "subscriber_id", client.ID, "source_id", voiceOwnerID, "error", err)
 			continue
 		}
 
-		// Send renegotiation offer to client so it can receive the new voice track
 		client.SendJSON("signal:renegotiate", map[string]interface{}{
 			"sdp":           offerSDP,
-			"participantId": participantID, // Who the voice track belongs to
+			"participantId": voiceOwnerID,
 		})
 
-		logger.Debug("Sent renegotiation offer for voice track", "subscriber_id", client.ID, "source_id", participantID)
+		logger.Debug("Sent renegotiation offer for voice track", "subscriber_id", client.ID, "source_id", voiceOwnerID)
 	}
 }
 
@@ -656,6 +762,11 @@ func (h *WebSocketHandler) handleRenegotiateAnswer(client *websocket.Client, pay
 	}
 
 	logger.Debug("Renegotiation completed", "participant_id", client.ID)
+}
+
+func (h *WebSocketHandler) handleResync(client *websocket.Client) {
+	logger.Debug("Processing resync/keyframe request", "participant_id", client.ID, "room", client.RoomSlug)
+	h.sfu.RequestKeyframe(client.RoomSlug)
 }
 
 func (h *WebSocketHandler) handleAdminMute(client *websocket.Client, payload json.RawMessage) {

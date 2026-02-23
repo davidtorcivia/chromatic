@@ -101,10 +101,12 @@ func (m *WaitingManager) NotifyAllAdmitted(participantIDs []string) {
 type RoomHandler struct {
 	db  *database.DB
 	sfu interface {
-		BindIngestToRoom(streamKeyToken, roomSlug string) error
+		BindIngestToRoom(streamKeyToken, roomSlug string) ([]string, error)
+		RenegotiateSubscriber(roomSlug, subscriberID string) (string, error)
 	}
 	hub interface {
 		BroadcastJSON(roomSlug string, msgType string, payload interface{}, excludeID string) error
+		SendToJSON(roomSlug, clientID, msgType string, payload interface{}) error
 	}
 	onRoomLive          func(roomSlug string) // Called when room goes live
 	tokenManager        *TokenManager         // For generating signed WebSocket tokens
@@ -127,7 +129,8 @@ func NewRoomHandler(db *database.DB, cfg *config.Config, tokenSecret string) *Ro
 
 // SetSFU sets the SFU reference (for stream binding)
 func (h *RoomHandler) SetSFU(sfu interface {
-	BindIngestToRoom(streamKeyToken, roomSlug string) error
+	BindIngestToRoom(streamKeyToken, roomSlug string) ([]string, error)
+	RenegotiateSubscriber(roomSlug, subscriberID string) (string, error)
 }) {
 	h.sfu = sfu
 }
@@ -135,6 +138,7 @@ func (h *RoomHandler) SetSFU(sfu interface {
 // SetHub sets the WebSocket hub reference (for notifications)
 func (h *RoomHandler) SetHub(hub interface {
 	BroadcastJSON(roomSlug string, msgType string, payload interface{}, excludeID string) error
+	SendToJSON(roomSlug, clientID, msgType string, payload interface{}) error
 }) {
 	h.hub = hub
 }
@@ -217,7 +221,7 @@ func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	var rooms []models.Room
+	rooms := []models.Room{}
 	for rows.Next() {
 		var room models.Room
 		err := rows.Scan(
@@ -761,7 +765,7 @@ func (h *RoomHandler) ListWaiting(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	var participants []map[string]interface{}
+	participants := []map[string]interface{}{}
 	for rows.Next() {
 		var id, name string
 		var joinedAt time.Time
@@ -960,8 +964,11 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 	h.cancelStreamEndTimer(roomSlug)
 
 	// Bind ingest tracks to room for distribution
+	var subsNeedingReneg []string
 	if h.sfu != nil {
-		if err := h.sfu.BindIngestToRoom(streamKeyToken, roomSlug); err != nil {
+		var err error
+		subsNeedingReneg, err = h.sfu.BindIngestToRoom(streamKeyToken, roomSlug)
+		if err != nil {
 			// Log but don't fail - room is already marked live
 			logger.Warn("Failed to bind ingest to room", "room", roomSlug, "error", err)
 		}
@@ -977,8 +984,26 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 		if h.onRoomLive != nil {
 			h.onRoomLive(roomSlug)
 		}
-	} else if h.hub != nil {
-		h.hub.BroadcastJSON(roomSlug, "stream:resumed", map[string]interface{}{}, "")
+	} else {
+		if h.hub != nil {
+			h.hub.BroadcastJSON(roomSlug, "stream:resumed", map[string]interface{}{}, "")
+		}
+
+		// Renegotiate with subscribers that joined before the ingest started
+		// (they had no tracks and now need the new ones)
+		if h.sfu != nil && h.hub != nil {
+			for _, subID := range subsNeedingReneg {
+				offerSDP, err := h.sfu.RenegotiateSubscriber(roomSlug, subID)
+				if err != nil {
+					logger.Warn("Failed to renegotiate subscriber after ingest bind", "subscriber", subID, "error", err)
+					continue
+				}
+				h.hub.SendToJSON(roomSlug, subID, "signal:renegotiate", map[string]interface{}{
+					"sdp": offerSDP,
+				})
+				logger.Debug("Sent renegotiation offer to subscriber", "subscriber", subID, "room", roomSlug)
+			}
+		}
 	}
 
 	logger.Info("Room is now live", "room", roomSlug)
@@ -1000,16 +1025,13 @@ func (h *RoomHandler) OnStreamEnd(streamKeyToken string) {
 		return
 	}
 
-	// Notify connected clients that the stream has paused
-	// The admin may reconnect, so we don't end the room
+	// Notify connected clients that the stream has paused.
+	// Rooms never auto-end — only an admin can end the session.
 	if h.hub != nil {
 		h.hub.BroadcastJSON(roomSlug, "stream:paused", map[string]interface{}{
 			"message": "Stream disconnected. Waiting for reconnection...",
 		}, "")
 	}
-
-	// Schedule room end if OBS does not reconnect in time
-	h.scheduleStreamEnd(roomSlug)
 
 	logger.Info("Stream paused (OBS disconnected)", "room", roomSlug)
 }

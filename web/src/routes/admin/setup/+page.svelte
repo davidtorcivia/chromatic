@@ -128,8 +128,8 @@
 
             updatePublicUrlStatus(configData.publicUrl);
 
-            keys = keysData;
-            roomsList = roomsData;
+            keys = keysData ?? [];
+            roomsList = roomsData ?? [];
 
             if (!selectedKeyId && keysData.length > 0) {
                 selectedKeyId = keysData[0].id;
@@ -1191,6 +1191,9 @@
                                                     : "Copy"}
                                             </button>
                                         </div>
+                                        <p class="hint">
+                                            In OBS, paste this into <strong>Server</strong> and leave <strong>Bearer Token empty</strong>.
+                                        </p>
                                     </div>
                                 {/if}
                             </section>
@@ -1767,6 +1770,7 @@
         width: 100%;
         border-collapse: collapse;
         font-size: 0.875rem;
+        table-layout: fixed;
     }
 
     .test-results-table th,
@@ -1774,6 +1778,19 @@
         padding: var(--space-sm);
         text-align: left;
         border-bottom: 1px solid var(--color-border);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .test-results-table td:first-child {
+        overflow: hidden;
+    }
+
+    .test-results-table td:first-child code {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
     }
 
     .test-results-table th {

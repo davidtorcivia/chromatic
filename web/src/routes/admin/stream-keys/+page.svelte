@@ -16,7 +16,7 @@
 
     async function loadKeys() {
         try {
-            keys = await streamKeys.list();
+            keys = (await streamKeys.list()) ?? [];
         } catch (e) {
             console.error("Failed to load stream keys", e);
         } finally {
@@ -178,7 +178,9 @@
                     <div class="key-instructions">
                         <p>
                             <strong>OBS Setup:</strong> Settings &rarr; Stream &rarr;
-                            Service: WHIP &rarr; Paste URL above
+                            Service: WHIP &rarr; paste the URL above into
+                            <strong>Server</strong> and leave
+                            <strong>Bearer Token empty</strong>.
                         </p>
                     </div>
                 </div>

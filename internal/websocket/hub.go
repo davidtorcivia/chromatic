@@ -32,10 +32,6 @@ type Hub struct {
 	// Rooms contain clients organized by room slug
 	rooms map[string]*Room
 
-	// Client registration/unregistration
-	register   chan *Client
-	unregister chan *Client
-
 	// Broadcast to all clients in a room
 	broadcast chan *RoomMessage
 
@@ -157,24 +153,16 @@ type Message struct {
 // NewHub creates a new Hub
 func NewHub() *Hub {
 	return &Hub{
-		rooms:      make(map[string]*Room),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		broadcast:  make(chan *RoomMessage, 256),
-		done:       make(chan struct{}),
+		rooms:     make(map[string]*Room),
+		broadcast: make(chan *RoomMessage, 256),
+		done:      make(chan struct{}),
 	}
 }
 
-// Run starts the Hub's main event loop
+// Run starts the Hub's main event loop (processes broadcasts)
 func (h *Hub) Run() {
 	for {
 		select {
-		case client := <-h.register:
-			h.registerClient(client)
-
-		case client := <-h.unregister:
-			h.unregisterClient(client)
-
 		case message := <-h.broadcast:
 			h.broadcastToRoom(message)
 
@@ -256,14 +244,14 @@ func (h *Hub) broadcastToRoom(msg *RoomMessage) {
 	}
 }
 
-// Register adds a client to the hub
+// Register adds a client to the hub (synchronous so the client is visible immediately)
 func (h *Hub) Register(client *Client) {
-	h.register <- client
+	h.registerClient(client)
 }
 
 // Unregister removes a client from the hub
 func (h *Hub) Unregister(client *Client) {
-	h.unregister <- client
+	h.unregisterClient(client)
 }
 
 // Broadcast sends a message to all clients in a room

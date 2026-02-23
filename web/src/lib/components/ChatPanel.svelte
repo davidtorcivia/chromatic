@@ -56,13 +56,38 @@
     let isDragOver = $state(false);
 
     onMount(() => {
-        // Subscribe to chat messages
+        // Load chat history from server
+        session.onMessage("chat:history", (payload) => {
+            const data = payload as {
+                messages: Array<{
+                    id: string;
+                    participantId: string;
+                    participantName: string;
+                    type: "text" | "file";
+                    content: string;
+                    timestamp: number;
+                    file?: {
+                        id: string;
+                        name: string;
+                        mimeType: string;
+                        url: string;
+                        thumbnailUrl?: string;
+                    };
+                }>;
+            };
+            chatStore.loadHistory(data.messages);
+            scrollToBottom();
+        });
+
+        // Subscribe to new chat messages
         session.onMessage("chat:message", (payload) => {
             const msg = payload as {
+                id?: string;
                 participantId: string;
                 participantName: string;
                 type: "text" | "file";
                 content: string;
+                timestamp?: number;
                 file?: {
                     id: string;
                     name: string;

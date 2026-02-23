@@ -14,7 +14,7 @@
 
     onMount(async () => {
         try {
-            allRooms = await rooms.list();
+            allRooms = (await rooms.list()) ?? [];
         } catch (e) {
             console.error("Failed to load rooms", e);
         } finally {

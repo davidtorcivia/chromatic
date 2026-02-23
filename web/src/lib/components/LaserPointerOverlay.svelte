@@ -94,13 +94,12 @@
 <!-- Overlay positioned to match video content area -->
 <div
     bind:this={overlayEl}
-    class="overlay interactive"
+    class="laser-overlay"
     style="
     left: {videoRect.x}px;
     top: {videoRect.y}px;
     width: {videoRect.width}px;
     height: {videoRect.height}px;
-    cursor: crosshair;
   "
     onpointerdown={handlePointerDown}
     onpointermove={handlePointerMove}
@@ -130,3 +129,38 @@
         </div>
     {/each}
 </div>
+
+<style>
+    .laser-overlay {
+        position: absolute;
+        cursor: crosshair;
+        pointer-events: auto;
+        z-index: 5;
+    }
+
+    .cursor-pointer {
+        position: absolute;
+        pointer-events: none;
+        transform: translate(-50%, -50%);
+    }
+
+    .cursor-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        border: 2px solid white;
+    }
+
+    .cursor-label {
+        position: absolute;
+        top: 16px;
+        left: 50%;
+        transform: translateX(-50%);
+        font-size: 0.625rem;
+        font-weight: 600;
+        color: white;
+        padding: 2px 6px;
+        border-radius: 4px;
+        white-space: nowrap;
+    }
+</style>

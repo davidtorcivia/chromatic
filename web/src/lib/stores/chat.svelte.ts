@@ -21,11 +21,11 @@ export function createChatStore() {
     let unreadCount = $state(0);
     let isVisible = $state(false);
 
-    function addMessage(msg: Omit<ChatMessage, 'id' | 'timestamp'>) {
+    function addMessage(msg: Omit<ChatMessage, 'id' | 'timestamp'> & { id?: string; timestamp?: number }) {
         const message: ChatMessage = {
             ...msg,
-            id: crypto.randomUUID(),
-            timestamp: Date.now()
+            id: msg.id || crypto.randomUUID(),
+            timestamp: msg.timestamp || Date.now()
         };
 
         messages = [...messages, message];
@@ -33,6 +33,12 @@ export function createChatStore() {
         if (!isVisible) {
             unreadCount++;
         }
+    }
+
+    function loadHistory(msgs: ChatMessage[]) {
+        // Only load if we have no messages yet (avoid duplicates on reconnect)
+        if (messages.length > 0) return;
+        messages = msgs;
     }
 
     function setVisible(visible: boolean) {
@@ -52,6 +58,7 @@ export function createChatStore() {
         get unreadCount() { return unreadCount; },
         get isVisible() { return isVisible; },
         addMessage,
+        loadHistory,
         setVisible,
         clear
     };
