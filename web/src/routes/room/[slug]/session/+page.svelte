@@ -72,9 +72,6 @@
 
         await unlockAudio();
 
-        // Connect WebSocket
-        session.connect(slug, sessionData!.token, participantName);
-
         // Handle ICE servers from room state
         session.onMessage("iceServers", (servers: unknown) => {
             iceServers = servers as RTCIceServer[];
@@ -170,6 +167,9 @@
             const data = payload as { sdp: string };
             if (webrtcManager) await webrtcManager.handleVoiceAnswer(data.sdp);
         });
+
+        // Connect only after handlers are registered so early messages aren't dropped.
+        session.connect(slug, sessionData!.token, participantName);
 
         window.addEventListener("chromatic:tampering", handleTampering);
         startControlsTimer();
@@ -800,6 +800,7 @@
         position: absolute;
         inset: 0;
         z-index: 15;
+        pointer-events: auto;
         display: flex;
         flex-direction: column;
         align-items: center;
