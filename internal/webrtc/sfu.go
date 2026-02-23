@@ -92,15 +92,26 @@ func NewSFU(cfg *config.Config) (*SFU, error) {
 		{Type: "nack", Parameter: "pli"},
 	}
 
-	// H.264 Constrained Baseline, packetization-mode=1 (matches OBS output)
-	for _, profile := range []string{"42001f", "42e01f"} {
+	// H.264 packetization-mode=1 ONLY — PM=0 causes Firefox black screen.
+	// Register with explicit PayloadType values matching pion defaults so
+	// SDP negotiation produces correct payload type mappings.
+	h264Codecs := []struct {
+		PayloadType webrtc.PayloadType
+		Profile     string
+	}{
+		{102, "42001f"}, // Constrained Baseline
+		{106, "42e01f"}, // Constrained Baseline (alt constraint flags)
+		{127, "4d001f"}, // Main Profile (Chrome may prefer this)
+	}
+	for _, c := range h264Codecs {
 		if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 			RTPCodecCapability: webrtc.RTPCodecCapability{
 				MimeType:     webrtc.MimeTypeH264,
 				ClockRate:    90000,
-				SDPFmtpLine:  fmt.Sprintf("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=%s", profile),
+				SDPFmtpLine:  fmt.Sprintf("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=%s", c.Profile),
 				RTCPFeedback: videoRTCPFeedback,
 			},
+			PayloadType: c.PayloadType,
 		}, webrtc.RTPCodecTypeVideo); err != nil {
 			return nil, fmt.Errorf("failed to register H.264 codec: %w", err)
 		}
@@ -114,6 +125,7 @@ func NewSFU(cfg *config.Config) (*SFU, error) {
 			Channels:    2,
 			SDPFmtpLine: "minptime=10;useinbandfec=1",
 		},
+		PayloadType: 111,
 	}, webrtc.RTPCodecTypeAudio); err != nil {
 		return nil, fmt.Errorf("failed to register Opus codec: %w", err)
 	}
