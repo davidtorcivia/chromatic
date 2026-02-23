@@ -17,6 +17,8 @@
     let videoRect = $state({ x: 0, y: 0, width: 0, height: 0 });
     let sendThrottle: ReturnType<typeof setTimeout> | null = null;
     let activePointerId: number | null = null;
+    let showUsageHint = $state(true);
+    let hintTimer: ReturnType<typeof setTimeout> | null = null;
     const THROTTLE_MS = 50;
 
     function updateVideoRect() {
@@ -34,6 +36,7 @@
         // Laser activation is explicit (Shift + Left Click on video) to avoid hijacking normal UI clicks.
         const handleVideoPointerDown = (e: PointerEvent) => {
             if (e.pointerType === "touch" || e.button !== 0 || !e.shiftKey || isPointing) return;
+            showUsageHint = false;
             activePointerId = e.pointerId;
             isPointing = true;
             sendCursor(e, true);
@@ -63,6 +66,10 @@
         window.addEventListener("pointerup", handleGlobalPointerUp);
         window.addEventListener("pointercancel", handleGlobalPointerUp);
         window.addEventListener("blur", handleWindowBlur);
+        hintTimer = setTimeout(() => {
+            showUsageHint = false;
+            hintTimer = null;
+        }, 8000);
 
         // Subscribe to cursor updates from WebSocket
         session.onMessage("cursor", (payload) => {
@@ -87,6 +94,10 @@
             window.removeEventListener("pointerup", handleGlobalPointerUp);
             window.removeEventListener("pointercancel", handleGlobalPointerUp);
             window.removeEventListener("blur", handleWindowBlur);
+            if (hintTimer) {
+                clearTimeout(hintTimer);
+                hintTimer = null;
+            }
             if (sendThrottle) {
                 clearTimeout(sendThrottle);
                 sendThrottle = null;
@@ -126,6 +137,9 @@
     height: {videoRect.height}px;
   "
 >
+    {#if showUsageHint}
+        <div class="laser-hint">Laser pointer: hold Shift + left click and drag on video</div>
+    {/if}
     {#each cursors as cursor (cursor.participantId)}
         <div
             class="cursor-pointer"
@@ -162,6 +176,22 @@
         position: absolute;
         pointer-events: none;
         transform: translate(-50%, -50%);
+    }
+
+    .laser-hint {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        background: rgba(0, 0, 0, 0.72);
+        color: rgba(255, 255, 255, 0.92);
+        border: 1px solid rgba(255, 255, 255, 0.22);
+        border-radius: 999px;
+        padding: 6px 10px;
+        font-size: 0.72rem;
+        font-weight: 500;
+        letter-spacing: 0.01em;
+        pointer-events: none;
+        white-space: nowrap;
     }
 
     .cursor-dot {
