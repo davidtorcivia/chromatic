@@ -42,6 +42,7 @@
     let streamError = $state<string | null>(null);
     let needsPlayClick = $state(false); // Autoplay fallback
     let streamPaused = $state(false); // Stream temporarily disconnected
+    let isLaserEnabled = $state(false);
     let showParticipantList = $state(false);
     let speakingParticipants = $state<Set<string>>(new Set());
     let voiceAnalysers = new Map<string, { analyser: AnalyserNode; ctx: AudioContext }>();
@@ -416,6 +417,10 @@
         webrtcManager?.requestResync();
     }
 
+    function toggleLaser() {
+        isLaserEnabled = !isLaserEnabled;
+    }
+
     function toggleFullscreen() {
         if (document.fullscreenElement) {
             document.exitFullscreen();
@@ -523,7 +528,7 @@
             </video>
 
             {#if videoElement && hasStream && !needsPlayClick}
-                <LaserPointerOverlay {videoElement} />
+                <LaserPointerOverlay {videoElement} enabled={isLaserEnabled} />
             {/if}
 
             {#if roomState?.watermarkMode && roomState.watermarkMode !== 'none'}
@@ -703,6 +708,18 @@
                             <path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>
                         </svg>
                         <span class="control-label">Resync</span>
+                    </button>
+
+                    <button
+                        class="control-btn"
+                        class:active={isLaserEnabled}
+                        onclick={toggleLaser}
+                        title="Toggle laser pointer mode"
+                    >
+                        <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
+                            <path d="M4 20h2l6-6-2-2-6 6v2zm7.4-7.4 2 2L18 10.01a1.41 1.41 0 0 0 0-2l-2.01-2.01a1.41 1.41 0 0 0-2 0L11.4 8.6zM19 14l-4 4 1 1a2.83 2.83 0 0 0 4 0 2.83 2.83 0 0 0 0-4l-1-1z"/>
+                        </svg>
+                        <span class="control-label">{isLaserEnabled ? "Laser On" : "Laser Off"}</span>
                     </button>
 
                     <button

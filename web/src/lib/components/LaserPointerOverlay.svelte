@@ -9,15 +9,16 @@
 
     interface Props {
         videoElement: HTMLVideoElement;
+        enabled: boolean;
     }
 
-    let { videoElement }: Props = $props();
+    let { videoElement, enabled = false }: Props = $props();
 
     let isPointing = $state(false);
     let videoRect = $state({ x: 0, y: 0, width: 0, height: 0 });
     let sendThrottle: ReturnType<typeof setTimeout> | null = null;
     let activePointerId: number | null = null;
-    let showUsageHint = $state(true);
+    let showUsageHint = $state(false);
     let hintTimer: ReturnType<typeof setTimeout> | null = null;
     const THROTTLE_MS = 50;
 
@@ -27,15 +28,48 @@
         }
     }
 
+    function clearHintTimer() {
+        if (hintTimer) {
+            clearTimeout(hintTimer);
+            hintTimer = null;
+        }
+    }
+
+    function showHintForDuration() {
+        clearHintTimer();
+        showUsageHint = true;
+        hintTimer = setTimeout(() => {
+            showUsageHint = false;
+            hintTimer = null;
+        }, 5000);
+    }
+
+    $effect(() => {
+        videoElement.style.cursor = enabled ? "crosshair" : "";
+
+        if (enabled) {
+            showHintForDuration();
+            return;
+        }
+
+        showUsageHint = false;
+        clearHintTimer();
+        if (isPointing) {
+            activePointerId = null;
+            isPointing = false;
+            sendCursorEnd();
+        }
+    });
+
     onMount(() => {
         updateVideoRect();
 
         videoElement.addEventListener("loadedmetadata", updateVideoRect);
         window.addEventListener("resize", updateVideoRect);
 
-        // Laser activation is explicit (Shift + Left Click on video) to avoid hijacking normal UI clicks.
+        // Laser pointer only activates when explicitly enabled from the session controls.
         const handleVideoPointerDown = (e: PointerEvent) => {
-            if (e.pointerType === "touch" || e.button !== 0 || !e.shiftKey || isPointing) return;
+            if (!enabled || e.pointerType === "touch" || e.button !== 0 || isPointing) return;
             showUsageHint = false;
             activePointerId = e.pointerId;
             isPointing = true;
@@ -66,10 +100,6 @@
         window.addEventListener("pointerup", handleGlobalPointerUp);
         window.addEventListener("pointercancel", handleGlobalPointerUp);
         window.addEventListener("blur", handleWindowBlur);
-        hintTimer = setTimeout(() => {
-            showUsageHint = false;
-            hintTimer = null;
-        }, 8000);
 
         // Subscribe to cursor updates from WebSocket
         session.onMessage("cursor", (payload) => {
@@ -94,10 +124,7 @@
             window.removeEventListener("pointerup", handleGlobalPointerUp);
             window.removeEventListener("pointercancel", handleGlobalPointerUp);
             window.removeEventListener("blur", handleWindowBlur);
-            if (hintTimer) {
-                clearTimeout(hintTimer);
-                hintTimer = null;
-            }
+            clearHintTimer();
             if (sendThrottle) {
                 clearTimeout(sendThrottle);
                 sendThrottle = null;
@@ -138,7 +165,7 @@
   "
 >
     {#if showUsageHint}
-        <div class="laser-hint">Laser pointer: hold Shift + left click and drag on video</div>
+        <div class="laser-hint">Laser enabled: click and drag on video to point</div>
     {/if}
     {#each cursors as cursor (cursor.participantId)}
         <div
