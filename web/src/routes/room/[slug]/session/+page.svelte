@@ -24,9 +24,14 @@
     let iceServers: RTCIceServer[] = [];
     let hasStream = $state(false);
     let isMuted = $state(true); // Start muted for autoplay compliance
-    let isMicEnabled = $state(true); // Mic ON by default
+    let isMicEnabled = $state(false);
     let hasMicPermission = $state(false);
-    let micRequested = false; // Track whether we've tried auto-requesting
+    type MicPromptState = "hidden" | "requesting" | "granted" | "denied";
+    let micPromptState = $state<MicPromptState>("hidden");
+    let micAutoRequestStarted = false;
+    let micAutoEnablePending = false;
+    let initialOfferHandled = false;
+    let micPromptTimer: ReturnType<typeof setTimeout> | null = null;
     let selectedParticipant = $state<{ id: string; name: string; role: string } | null>(null);
     let adminMenuPosition = $state({ x: 0, y: 0 });
     let currentRtt = $state<number | null>(null);
@@ -88,6 +93,8 @@
 
             if (webrtcManager) {
                 await webrtcManager.handleOffer(data.sdp);
+                initialOfferHandled = true;
+                tryEnablePendingAutoMic();
             }
         });
 
@@ -136,7 +143,9 @@
             const data = payload as { participantId: string };
             if (data.participantId === sessionData?.participantId) {
                 isMicEnabled = false;
+                micAutoEnablePending = false;
                 webrtcManager?.setMicEnabled(false);
+                session.send("media:toggle", { audio: false });
             }
         });
 
@@ -174,6 +183,7 @@
         }
         session.disconnect();
         window.removeEventListener("chromatic:tampering", handleTampering);
+        clearMicPromptTimer();
     });
 
     function initializeWebRTC() {
@@ -187,28 +197,63 @@
         });
 
         console.log('WebRTC manager initialized');
-
-        // Auto-request microphone (mic on by default)
-        autoRequestMic();
+        session.send("media:toggle", { audio: false });
+        void startAutoMicConnection();
     }
 
-    async function autoRequestMic() {
-        if (micRequested || !webrtcManager) return;
-        micRequested = true;
-
-        try {
-            const granted = await webrtcManager.requestMicrophone();
-            if (granted) {
-                hasMicPermission = true;
-                isMicEnabled = true;
-                webrtcManager.setMicEnabled(true);
-                session.send("media:toggle", { audio: true });
-            } else {
-                isMicEnabled = false;
-            }
-        } catch {
-            isMicEnabled = false;
+    function clearMicPromptTimer() {
+        if (micPromptTimer) {
+            clearTimeout(micPromptTimer);
+            micPromptTimer = null;
         }
+    }
+
+    function hideMicPromptLater(delayMs = 1400) {
+        clearMicPromptTimer();
+        micPromptTimer = setTimeout(() => {
+            micPromptState = "hidden";
+            micPromptTimer = null;
+        }, delayMs);
+    }
+
+    async function startAutoMicConnection() {
+        if (!webrtcManager || micAutoRequestStarted || hasMicPermission) return;
+        micAutoRequestStarted = true;
+        micPromptState = "requesting";
+
+        const granted = await webrtcManager.requestMicrophone();
+        if (!granted) {
+            micPromptState = "denied";
+            micAutoEnablePending = false;
+            isMicEnabled = false;
+            session.send("media:toggle", { audio: false });
+            return;
+        }
+
+        hasMicPermission = true;
+        micAutoEnablePending = true;
+        tryEnablePendingAutoMic();
+    }
+
+    function tryEnablePendingAutoMic() {
+        if (!webrtcManager || !hasMicPermission || !micAutoEnablePending || !initialOfferHandled) return;
+
+        micAutoEnablePending = false;
+        isMicEnabled = true;
+        webrtcManager.setMicEnabled(true);
+        session.send("media:toggle", { audio: true });
+        micPromptState = "granted";
+        hideMicPromptLater();
+    }
+
+    async function retryMicConnection() {
+        micAutoRequestStarted = false;
+        micAutoEnablePending = false;
+        await startAutoMicConnection();
+    }
+
+    function dismissMicPrompt() {
+        micPromptState = "hidden";
     }
 
     function handleTrack(event: RTCTrackEvent) {
@@ -333,6 +378,10 @@
         }
         hasStream = false;
         currentRtt = null;
+        initialOfferHandled = false;
+        micAutoEnablePending = false;
+        clearMicPromptTimer();
+        micPromptState = "hidden";
     }
 
     function handleTampering() {
@@ -399,23 +448,32 @@
     }
 
     async function toggleMic() {
+        if (!webrtcManager) return;
+
         if (!hasMicPermission) {
-            if (webrtcManager) {
-                const granted = await webrtcManager.requestMicrophone();
-                if (granted) {
-                    hasMicPermission = true;
-                    isMicEnabled = true;
-                    webrtcManager.setMicEnabled(true);
-                } else {
-                    alert("Microphone access is required for voice chat.");
-                    return;
-                }
+            const granted = await webrtcManager.requestMicrophone();
+            if (granted) {
+                hasMicPermission = true;
+                micAutoEnablePending = false;
+                isMicEnabled = true;
+                webrtcManager.setMicEnabled(true);
+                session.send("media:toggle", { audio: true });
+                micPromptState = "granted";
+                hideMicPromptLater();
+                return;
+            } else {
+                micPromptState = "denied";
+                return;
             }
-        } else {
-            isMicEnabled = !isMicEnabled;
-            webrtcManager?.setMicEnabled(isMicEnabled);
         }
+
+        isMicEnabled = !isMicEnabled;
+        webrtcManager.setMicEnabled(isMicEnabled);
         session.send("media:toggle", { audio: isMicEnabled });
+        if (isMicEnabled) {
+            micPromptState = "granted";
+            hideMicPromptLater();
+        }
     }
 
     function handleParticipantClick(event: MouseEvent, participant: { id: string; name: string; role: string }) {
@@ -484,7 +542,7 @@
         <!-- Status overlays - OUTSIDE video-container so they stack above controls -->
         {#if needsPlayClick}
             <div class="stream-status-overlay">
-                <button class="play-btn" onclick={handlePlayClick}>
+                <button class="play-btn" aria-label="Play stream" onclick={handlePlayClick}>
                     <svg viewBox="0 0 24 24" fill="currentColor" width="48" height="48"><path d="M8 5v14l11-7z"/></svg>
                 </button>
                 <p>Tap to play stream</p>
@@ -509,6 +567,31 @@
             <div class="stream-status-overlay">
                 <div class="waiting-spinner"></div>
                 <p>{isLive ? "Connecting to stream..." : "Waiting for stream..."}</p>
+            </div>
+        {/if}
+
+        {#if micPromptState !== "hidden"}
+            <div class="mic-prompt" class:success={micPromptState === "granted"} class:error={micPromptState === "denied"} role="status" aria-live="polite">
+                {#if micPromptState === "requesting"}
+                    <div class="mic-spinner" aria-hidden="true"></div>
+                    <div class="mic-prompt-copy">
+                        <p class="mic-prompt-title">Connecting your microphone...</p>
+                        <p class="mic-prompt-text">Allow browser mic access so you can talk right away.</p>
+                    </div>
+                {:else if micPromptState === "granted"}
+                    <div class="mic-prompt-copy">
+                        <p class="mic-prompt-title">Microphone connected</p>
+                    </div>
+                {:else}
+                    <div class="mic-prompt-copy">
+                        <p class="mic-prompt-title">Microphone access is blocked</p>
+                        <p class="mic-prompt-text">Enable your mic to join voice chat.</p>
+                    </div>
+                    <div class="mic-prompt-actions">
+                        <button class="mic-prompt-btn primary" onclick={retryMicConnection}>Enable Mic</button>
+                        <button class="mic-prompt-btn" onclick={dismissMicPrompt}>Continue Muted</button>
+                    </div>
+                {/if}
             </div>
         {/if}
 
@@ -751,6 +834,82 @@
         transition: transform 0.2s ease, background 0.2s ease;
     }
     .play-btn:hover { transform: scale(1.1); background: var(--color-primary-hover); }
+
+    .mic-prompt {
+        position: absolute;
+        top: 18px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 16;
+        width: min(92vw, 460px);
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-sm);
+        padding: var(--space-sm) var(--space-md);
+        border-radius: var(--radius-md);
+        background: rgba(6, 18, 32, 0.92);
+        border: 1px solid rgba(72, 182, 166, 0.35);
+        color: var(--color-text);
+        box-shadow: var(--shadow-lg);
+        pointer-events: auto;
+    }
+    .mic-prompt.success {
+        border-color: rgba(16, 185, 129, 0.5);
+        background: rgba(7, 36, 28, 0.92);
+    }
+    .mic-prompt.error {
+        border-color: rgba(239, 68, 68, 0.55);
+        background: rgba(44, 9, 9, 0.95);
+    }
+    .mic-prompt-copy {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+    .mic-prompt-title {
+        margin: 0;
+        font-size: 0.95rem;
+        font-weight: 600;
+        color: #fff;
+    }
+    .mic-prompt-text {
+        margin: 0;
+        font-size: 0.8125rem;
+        color: var(--color-text-muted);
+    }
+    .mic-spinner {
+        width: 16px;
+        height: 16px;
+        border: 2px solid rgba(255, 255, 255, 0.2);
+        border-top-color: var(--color-primary);
+        border-radius: 50%;
+        animation: mic-spin 0.8s linear infinite;
+    }
+    .mic-prompt-actions {
+        display: flex;
+        gap: var(--space-xs);
+    }
+    .mic-prompt-btn {
+        border: 1px solid rgba(255, 255, 255, 0.22);
+        background: rgba(255, 255, 255, 0.08);
+        color: #fff;
+        border-radius: var(--radius-sm);
+        padding: 6px 10px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    .mic-prompt-btn.primary {
+        background: var(--color-primary);
+        border-color: var(--color-primary);
+        color: #041014;
+    }
+    .mic-prompt-btn:hover {
+        filter: brightness(1.08);
+    }
+    @keyframes mic-spin {
+        to { transform: rotate(360deg); }
+    }
 
     /* Controls overlay */
     .controls-overlay {

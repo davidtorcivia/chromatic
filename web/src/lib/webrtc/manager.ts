@@ -53,8 +53,8 @@ export class WebRTCManager {
             sdp: answer.sdp
         });
 
-        // If we have a pending mic stream (from autoRequestMic), add it now
-        if (this.localStream && !this.audioSender) {
+        // If we have a pending mic stream and mic is enabled, add it now
+        if (this.localStream && !this.audioSender && !this.isMicMuted) {
             console.log('Adding pending audio track after offer');
             await this.addLocalAudioTrack();
         }
@@ -221,7 +221,12 @@ export class WebRTCManager {
                 video: false
             });
 
-            // Tracks start enabled (mic on by default) - caller controls mute state via setMicEnabled
+            // Respect current mic mute state so permission can be requested
+            // before we begin sending audio.
+            this.localStream.getAudioTracks().forEach(track => {
+                track.enabled = !this.isMicMuted;
+            });
+
             console.log('Microphone access granted');
             return true;
         } catch (err) {

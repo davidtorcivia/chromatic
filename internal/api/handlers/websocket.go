@@ -156,7 +156,7 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 		Conn:         conn,
 		Send:         make(chan []byte, 256),
 		IsAdmin:      isAdmin,
-		AudioEnabled: true,
+		AudioEnabled: false,
 		VideoEnabled: true,
 	}
 	// Initialize chat rate limiter: 30 messages per minute

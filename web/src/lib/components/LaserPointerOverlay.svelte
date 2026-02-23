@@ -13,10 +13,10 @@
 
     let { videoElement }: Props = $props();
 
-    let overlayEl: HTMLDivElement;
     let isPointing = $state(false);
     let videoRect = $state({ x: 0, y: 0, width: 0, height: 0 });
     let sendThrottle: ReturnType<typeof setTimeout> | null = null;
+    let activePointerId: number | null = null;
     const THROTTLE_MS = 50;
 
     function updateVideoRect() {
@@ -30,6 +30,56 @@
 
         videoElement.addEventListener("loadedmetadata", updateVideoRect);
         window.addEventListener("resize", updateVideoRect);
+
+        const handleGlobalPointerDown = (e: PointerEvent) => {
+            if (e.pointerType === "touch" || e.button !== 0 || isPointing) return;
+
+            const target = e.target instanceof Element ? e.target : null;
+            if (
+                target?.closest(
+                    "button, a, input, textarea, select, [role='button'], .controls-overlay, .stream-status-overlay"
+                )
+            ) {
+                return;
+            }
+
+            updateVideoRect();
+            const withinVideo =
+                e.clientX >= videoRect.x &&
+                e.clientX <= videoRect.x + videoRect.width &&
+                e.clientY >= videoRect.y &&
+                e.clientY <= videoRect.y + videoRect.height;
+            if (!withinVideo) return;
+
+            activePointerId = e.pointerId;
+            isPointing = true;
+            sendCursor(e, true);
+        };
+
+        const handleGlobalPointerMove = (e: PointerEvent) => {
+            if (!isPointing || activePointerId !== e.pointerId) return;
+            sendCursor(e, true);
+        };
+
+        const handleGlobalPointerUp = (e: PointerEvent) => {
+            if (!isPointing || activePointerId !== e.pointerId) return;
+            activePointerId = null;
+            isPointing = false;
+            sendCursorEnd();
+        };
+
+        const handleWindowBlur = () => {
+            if (!isPointing) return;
+            activePointerId = null;
+            isPointing = false;
+            sendCursorEnd();
+        };
+
+        window.addEventListener("pointerdown", handleGlobalPointerDown);
+        window.addEventListener("pointermove", handleGlobalPointerMove);
+        window.addEventListener("pointerup", handleGlobalPointerUp);
+        window.addEventListener("pointercancel", handleGlobalPointerUp);
+        window.addEventListener("blur", handleWindowBlur);
 
         // Subscribe to cursor updates from WebSocket
         session.onMessage("cursor", (payload) => {
@@ -49,26 +99,18 @@
         return () => {
             videoElement.removeEventListener("loadedmetadata", updateVideoRect);
             window.removeEventListener("resize", updateVideoRect);
+            window.removeEventListener("pointerdown", handleGlobalPointerDown);
+            window.removeEventListener("pointermove", handleGlobalPointerMove);
+            window.removeEventListener("pointerup", handleGlobalPointerUp);
+            window.removeEventListener("pointercancel", handleGlobalPointerUp);
+            window.removeEventListener("blur", handleWindowBlur);
+            if (sendThrottle) {
+                clearTimeout(sendThrottle);
+                sendThrottle = null;
+            }
             cursorStore.stopCleanup();
         };
     });
-
-    function handlePointerDown(e: PointerEvent) {
-        isPointing = true;
-        overlayEl.setPointerCapture(e.pointerId);
-        sendCursor(e, true);
-    }
-
-    function handlePointerMove(e: PointerEvent) {
-        if (!isPointing) return;
-        sendCursor(e, true);
-    }
-
-    function handlePointerUp(e: PointerEvent) {
-        isPointing = false;
-        overlayEl.releasePointerCapture(e.pointerId);
-        sendCursorEnd();
-    }
 
     function sendCursor(e: PointerEvent, active: boolean) {
         const coords = clientToVideoCoords(e.clientX, e.clientY, videoElement);
@@ -93,7 +135,6 @@
 
 <!-- Overlay positioned to match video content area -->
 <div
-    bind:this={overlayEl}
     class="laser-overlay"
     style="
     left: {videoRect.x}px;
@@ -101,10 +142,6 @@
     width: {videoRect.width}px;
     height: {videoRect.height}px;
   "
-    onpointerdown={handlePointerDown}
-    onpointermove={handlePointerMove}
-    onpointerup={handlePointerUp}
-    onpointerleave={handlePointerUp}
 >
     {#each cursors as cursor (cursor.participantId)}
         <div
@@ -134,7 +171,7 @@
     .laser-overlay {
         position: absolute;
         cursor: crosshair;
-        pointer-events: auto;
+        pointer-events: none;
         z-index: 5;
     }
 
