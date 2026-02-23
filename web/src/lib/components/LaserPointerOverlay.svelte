@@ -31,26 +31,9 @@
         videoElement.addEventListener("loadedmetadata", updateVideoRect);
         window.addEventListener("resize", updateVideoRect);
 
-        const handleGlobalPointerDown = (e: PointerEvent) => {
-            if (e.pointerType === "touch" || e.button !== 0 || isPointing) return;
-
-            const target = e.target instanceof Element ? e.target : null;
-            if (
-                target?.closest(
-                    "button, a, input, textarea, select, [role='button'], .controls-overlay, .stream-status-overlay"
-                )
-            ) {
-                return;
-            }
-
-            updateVideoRect();
-            const withinVideo =
-                e.clientX >= videoRect.x &&
-                e.clientX <= videoRect.x + videoRect.width &&
-                e.clientY >= videoRect.y &&
-                e.clientY <= videoRect.y + videoRect.height;
-            if (!withinVideo) return;
-
+        // Laser activation is explicit (Shift + Left Click on video) to avoid hijacking normal UI clicks.
+        const handleVideoPointerDown = (e: PointerEvent) => {
+            if (e.pointerType === "touch" || e.button !== 0 || !e.shiftKey || isPointing) return;
             activePointerId = e.pointerId;
             isPointing = true;
             sendCursor(e, true);
@@ -75,7 +58,7 @@
             sendCursorEnd();
         };
 
-        window.addEventListener("pointerdown", handleGlobalPointerDown);
+        videoElement.addEventListener("pointerdown", handleVideoPointerDown);
         window.addEventListener("pointermove", handleGlobalPointerMove);
         window.addEventListener("pointerup", handleGlobalPointerUp);
         window.addEventListener("pointercancel", handleGlobalPointerUp);
@@ -99,7 +82,7 @@
         return () => {
             videoElement.removeEventListener("loadedmetadata", updateVideoRect);
             window.removeEventListener("resize", updateVideoRect);
-            window.removeEventListener("pointerdown", handleGlobalPointerDown);
+            videoElement.removeEventListener("pointerdown", handleVideoPointerDown);
             window.removeEventListener("pointermove", handleGlobalPointerMove);
             window.removeEventListener("pointerup", handleGlobalPointerUp);
             window.removeEventListener("pointercancel", handleGlobalPointerUp);
@@ -170,7 +153,7 @@
 <style>
     .laser-overlay {
         position: absolute;
-        cursor: crosshair;
+        cursor: default;
         pointer-events: none;
         z-index: 5;
     }
