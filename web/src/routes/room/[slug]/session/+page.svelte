@@ -4,7 +4,7 @@
     import { page } from "$app/stores";
     import { session } from "$lib/stores/session.svelte";
     import { chatStore } from "$lib/stores/chat.svelte";
-    import { unlockAudio } from "$lib/audio/context";
+    import { unlockAudio, getAudioContext } from "$lib/audio/context";
     import { WebRTCManager } from "$lib/webrtc/manager";
     import { AudioDuckingManager } from "$lib/audio/ducking";
     import LaserPointerOverlay from "$lib/components/LaserPointerOverlay.svelte";
@@ -45,7 +45,7 @@
     let isLaserEnabled = $state(false);
     let showParticipantList = $state(false);
     let speakingParticipants = $state<Set<string>>(new Set());
-    let voiceAnalysers = new Map<string, { analyser: AnalyserNode; ctx: AudioContext }>();
+    let voiceAnalysers = new Map<string, AnalyserNode>();
     let vadFrame: ReturnType<typeof requestAnimationFrame> | null = null;
     // Buffer voice tracks that arrive before audioDuckingManager is created
     // (can happen when voice relay tracks are in the initial offer and ontrack
@@ -354,27 +354,30 @@
             pendingVoiceTracks.set(participantId, track);
         }
 
-        // Set up voice activity detection for speaking indicator
-        try {
-            const ctx = new AudioContext();
+        // Set up voice activity detection for speaking indicator.
+        // Reuse the shared AudioContext (already resumed) rather than
+        // creating new ones — Firefox keeps new AudioContexts suspended
+        // when created outside a user-gesture handler, so the AnalyserNode
+        // would return silence and the VAD would never trigger.
+        getAudioContext().then(ctx => {
             const stream = new MediaStream([track]);
             const source = ctx.createMediaStreamSource(stream);
             const analyser = ctx.createAnalyser();
             analyser.fftSize = 256;
             source.connect(analyser);
-            voiceAnalysers.set(participantId, { analyser, ctx });
+            voiceAnalysers.set(participantId, analyser);
 
             // Start VAD monitoring if not running
             if (!vadFrame) startVADMonitoring();
-        } catch (err) {
+        }).catch(err => {
             console.warn('Failed to set up VAD for participant', participantId, err);
-        }
+        });
     }
 
     function startVADMonitoring() {
         const check = () => {
             const newSpeaking = new Set<string>();
-            for (const [pid, { analyser }] of voiceAnalysers) {
+            for (const [pid, analyser] of voiceAnalysers) {
                 const data = new Uint8Array(analyser.frequencyBinCount);
                 analyser.getByteFrequencyData(data);
                 const avg = data.reduce((sum, val) => sum + val, 0) / data.length;
@@ -394,9 +397,6 @@
         if (vadFrame) {
             cancelAnimationFrame(vadFrame);
             vadFrame = null;
-        }
-        for (const { ctx } of voiceAnalysers.values()) {
-            ctx.close();
         }
         voiceAnalysers.clear();
         if (webrtcManager) {
@@ -539,6 +539,9 @@
         roomState?.participants?.find(
             (p: { id: string }) => p.id === sessionData?.participantId
         )?.role === 'admin'
+    );
+    let activeSpeakers = $derived(
+        participants.filter((p: { id: string }) => speakingParticipants.has(p.id))
     );
 </script>
 
@@ -760,6 +763,21 @@
                 </div>
             </div>
         </div>
+
+        <!-- Active speaker indicator (always visible when someone is speaking) -->
+        {#if activeSpeakers.length > 0}
+            <div class="active-speaker-indicator">
+                {#each activeSpeakers as speaker (speaker.id)}
+                    <div class="active-speaker-chip">
+                        <span class="active-speaker-avatar" style="background-color: {speaker.color}">
+                            {speaker.name.charAt(0).toUpperCase()}
+                        </span>
+                        <span class="active-speaker-name">{speaker.name}</span>
+                        <span class="active-speaker-pulse"></span>
+                    </div>
+                {/each}
+            </div>
+        {/if}
 
         <!-- Participant list (outside controls overlay so it doesn't auto-hide) -->
         {#if showParticipantList}
@@ -1226,6 +1244,60 @@
         border: 2px solid #000;
     }
 
+    /* Active speaker indicator */
+    .active-speaker-indicator {
+        position: absolute;
+        bottom: 100px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 12;
+        display: flex;
+        gap: var(--space-xs);
+        pointer-events: none;
+    }
+    .active-speaker-chip {
+        display: flex;
+        align-items: center;
+        gap: var(--space-xs);
+        background: rgba(0, 0, 0, 0.75);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        padding: 6px 12px 6px 6px;
+        border-radius: 999px;
+        border: 1px solid rgba(72, 182, 166, 0.4);
+        animation: speaker-fade-in 0.2s ease-out;
+    }
+    .active-speaker-avatar {
+        width: 1.5rem;
+        height: 1.5rem;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 0.6875rem;
+        font-weight: 600;
+        color: white;
+        flex-shrink: 0;
+    }
+    .active-speaker-name {
+        font-size: 0.8125rem;
+        font-weight: 500;
+        color: #fff;
+        white-space: nowrap;
+    }
+    .active-speaker-pulse {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--color-success);
+        animation: pulse-speaking 1s infinite;
+        flex-shrink: 0;
+    }
+    @keyframes speaker-fade-in {
+        from { opacity: 0; transform: translateY(6px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+
     @media (max-width: 768px) {
         .session-page { flex-direction: column; }
         .video-wrapper { flex: none; height: 60vh; }
@@ -1233,5 +1305,6 @@
         .control-btn { padding: 8px 10px; min-width: 52px; }
         .control-btn svg { width: 20px; height: 20px; }
         .control-label { font-size: 0.5625rem; }
+        .active-speaker-indicator { bottom: 80px; }
     }
 </style>
