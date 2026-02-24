@@ -19,57 +19,73 @@ export class WebRTCManager {
     private isMicMuted: boolean = true;
     private iceRestartPending: boolean = false;
     private connectionLostTimeout: ReturnType<typeof setTimeout> | null = null;
+    // Serialize all SDP operations to prevent concurrent modifications
+    // to the PeerConnection's signaling state (e.g. handleOffer + handleRenegotiation
+    // firing from separate WebSocket messages while awaiting).
+    private signalingQueue: Promise<void> = Promise.resolve();
 
     constructor(options: WebRTCManagerOptions) {
         this.options = options;
     }
 
+    // Enqueue an async signaling operation so SDP changes are serialized.
+    private enqueueSignaling<T>(fn: () => Promise<T>): Promise<T> {
+        const task = this.signalingQueue.then(fn, fn);
+        // Keep the queue moving regardless of success/failure
+        this.signalingQueue = task.then(() => {}, () => {});
+        return task;
+    }
+
     // Handle incoming SDP offer from server
     async handleOffer(sdp: string): Promise<void> {
-        console.log('Handling WebRTC offer');
+        return this.enqueueSignaling(async () => {
+            console.log('Handling WebRTC offer');
 
-        // Create peer connection if not exists
-        if (!this.pc) {
-            this.createPeerConnection();
-        }
+            // Create peer connection if not exists
+            if (!this.pc) {
+                this.createPeerConnection();
+            }
 
-        const pc = this.pc!;
+            const pc = this.pc!;
 
-        // Set remote description (the offer from server)
-        const offer: RTCSessionDescriptionInit = {
-            type: 'offer',
-            sdp: sdp
-        };
+            // Set remote description (the offer from server)
+            const offer: RTCSessionDescriptionInit = {
+                type: 'offer',
+                sdp: sdp
+            };
 
-        await pc.setRemoteDescription(offer);
-        console.log('Set remote description');
+            await pc.setRemoteDescription(offer);
+            console.log('Set remote description');
 
-        // Create answer
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        console.log('Created and set local description (answer)');
+            // Create answer
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            console.log('Created and set local description (answer)');
 
-        // Send answer back to server
-        this.options.sendSignal('signal:answer', {
-            sdp: answer.sdp
+            // Send answer back to server
+            this.options.sendSignal('signal:answer', {
+                sdp: answer.sdp
+            });
+
+            // If we have a pending mic stream and mic is enabled, add it now
+            if (this.localStream && !this.audioSender && !this.isMicMuted) {
+                console.log('Adding pending audio track after offer');
+                await this.addLocalAudioTrack();
+            }
         });
-
-        // If we have a pending mic stream and mic is enabled, add it now
-        if (this.localStream && !this.audioSender && !this.isMicMuted) {
-            console.log('Adding pending audio track after offer');
-            await this.addLocalAudioTrack();
-        }
     }
 
     // Handle ICE candidate from server (if server sends any)
     async handleCandidate(candidate: RTCIceCandidateInit): Promise<void> {
-        if (!this.pc) {
-            console.warn('Received ICE candidate but no peer connection');
-            return;
-        }
+        return this.enqueueSignaling(async () => {
+            if (!this.pc) {
+                console.warn('Received ICE candidate but no peer connection');
+                return;
+            }
 
-        await this.pc.addIceCandidate(candidate);
-        console.log('Added ICE candidate from server');
+            await this.pc.addIceCandidate(candidate);
+            console.log('Added ICE candidate from server');
+        });
     }
 
     private createPeerConnection(): void {
@@ -81,18 +97,28 @@ export class WebRTCManager {
 
         // Handle incoming tracks
         this.pc.ontrack = (event) => {
-            console.log('Received track:', event.track.kind, 'id:', event.track.id, 'streams:', event.streams.length);
-
-            // Check if this is a voice track from another participant
-            // Server creates voice tracks with ID format: "voice-{participantId}"
+            const streamId = event.streams[0]?.id ?? '';
             const trackId = event.track.id;
-            if (trackId.startsWith('voice-')) {
-                const participantId = trackId.substring(6); // Remove "voice-" prefix
-                console.log('Identified voice track from participant:', participantId);
+            console.log('Received track:', event.track.kind, 'trackId:', trackId, 'streamId:', streamId, 'streams:', event.streams.length);
 
-                // Call the voice track callback if provided
+            // Identify voice tracks by stream/track ID.
+            // Server creates voice relay tracks with:
+            //   track ID:  "voice-{participantId}"
+            //   stream ID: "voice-stream-{participantId}"
+            // Some browsers (Firefox) replace track.id with a generated UUID,
+            // so we check stream ID first (preserved per WebRTC spec via a=msid).
+            let voiceParticipantId: string | null = null;
+
+            if (streamId.startsWith('voice-stream-')) {
+                voiceParticipantId = streamId.substring('voice-stream-'.length);
+            } else if (trackId.startsWith('voice-')) {
+                voiceParticipantId = trackId.substring('voice-'.length);
+            }
+
+            if (voiceParticipantId) {
+                console.log('Identified voice track from participant:', voiceParticipantId);
                 if (this.options.onVoiceTrack) {
-                    this.options.onVoiceTrack(participantId, event.track);
+                    this.options.onVoiceTrack(voiceParticipantId, event.track);
                 }
                 return;
             }
@@ -172,20 +198,22 @@ export class WebRTCManager {
         console.log('Performing ICE restart...');
         this.options.onIceRestart?.();
 
-        try {
-            const offer = await this.pc.createOffer({ iceRestart: true });
-            await this.pc.setLocalDescription(offer);
+        return this.enqueueSignaling(async () => {
+            try {
+                const offer = await this.pc!.createOffer({ iceRestart: true });
+                await this.pc!.setLocalDescription(offer);
 
-            // Send offer to server for ICE restart
-            this.options.sendSignal('signal:ice-restart', {
-                sdp: offer.sdp
-            });
+                // Send offer to server for ICE restart
+                this.options.sendSignal('signal:ice-restart', {
+                    sdp: offer.sdp
+                });
 
-            console.log('Sent ICE restart offer');
-        } catch (err) {
-            console.error('Failed to perform ICE restart:', err);
-            this.iceRestartPending = false;
-        }
+                console.log('Sent ICE restart offer');
+            } catch (err) {
+                console.error('Failed to perform ICE restart:', err);
+                this.iceRestartPending = false;
+            }
+        });
     }
 
     // Request a stream resync (forces keyframe from publisher)
@@ -288,67 +316,91 @@ export class WebRTCManager {
 
     // Renegotiate the connection after adding tracks
     private async renegotiate(): Promise<void> {
-        if (!this.pc) return;
+        return this.enqueueSignaling(async () => {
+            if (!this.pc) return;
 
-        try {
-            const offer = await this.pc.createOffer();
-            await this.pc.setLocalDescription(offer);
+            try {
+                const offer = await this.pc.createOffer();
+                await this.pc.setLocalDescription(offer);
 
-            // Send offer to server
-            this.options.sendSignal('signal:offer', {
-                sdp: offer.sdp
-            });
+                // Send offer to server
+                this.options.sendSignal('signal:offer', {
+                    sdp: offer.sdp
+                });
 
-            console.log('Sent renegotiation offer for voice');
-        } catch (err) {
-            console.error('Failed to renegotiate:', err);
-        }
+                console.log('Sent renegotiation offer for voice');
+            } catch (err) {
+                console.error('Failed to renegotiate:', err);
+            }
+        });
     }
 
     // Handle answer for voice renegotiation
     async handleVoiceAnswer(sdp: string): Promise<void> {
-        if (!this.pc) return;
+        return this.enqueueSignaling(async () => {
+            if (!this.pc) return;
 
-        const answer: RTCSessionDescriptionInit = {
-            type: 'answer',
-            sdp: sdp
-        };
+            const answer: RTCSessionDescriptionInit = {
+                type: 'answer',
+                sdp: sdp
+            };
 
-        await this.pc.setRemoteDescription(answer);
-        console.log('Set remote description for voice answer');
+            await this.pc.setRemoteDescription(answer);
+            console.log('Set remote description for voice answer');
+        });
     }
 
     // Handle server-initiated renegotiation (e.g., when voice tracks are added)
     async handleRenegotiation(sdp: string, participantId?: string): Promise<void> {
-        if (!this.pc) {
-            console.warn('Received renegotiation but no peer connection');
-            return;
-        }
+        return this.enqueueSignaling(async () => {
+            if (!this.pc) {
+                console.warn('Received renegotiation but no peer connection');
+                return;
+            }
 
-        console.log('Handling server-initiated renegotiation', participantId ? `for voice from ${participantId}` : '');
-        this.options.onRenegotiation?.();
+            console.log('Handling server-initiated renegotiation', participantId ? `for voice from ${participantId}` : '');
+            this.options.onRenegotiation?.();
 
-        try {
-            // Set the new offer from server
-            const offer: RTCSessionDescriptionInit = {
-                type: 'offer',
-                sdp: sdp
-            };
-            await this.pc.setRemoteDescription(offer);
+            try {
+                // If we have a pending local offer (client-initiated renegotiation),
+                // rollback to accept the server's offer instead. The server is the
+                // "impolite" peer in our signaling model.
+                if (this.pc.signalingState === 'have-local-offer') {
+                    console.log('Rolling back local offer to accept server renegotiation');
+                    await this.pc.setLocalDescription({ type: 'rollback' });
+                }
 
-            // Create answer
-            const answer = await this.pc.createAnswer();
-            await this.pc.setLocalDescription(answer);
+                // Set the new offer from server
+                const offer: RTCSessionDescriptionInit = {
+                    type: 'offer',
+                    sdp: sdp
+                };
+                await this.pc.setRemoteDescription(offer);
 
-            // Send answer back to server
-            this.options.sendSignal('signal:renegotiate-answer', {
-                sdp: answer.sdp
-            });
+                // If we have a pending mic stream, add the track before creating
+                // the answer so the answer includes the mic media section.
+                if (this.localStream && !this.audioSender && !this.isMicMuted) {
+                    const audioTrack = this.localStream.getAudioTracks()[0];
+                    if (audioTrack) {
+                        this.audioSender = this.pc.addTrack(audioTrack, this.localStream);
+                        console.log('Added mic track during renegotiation answer');
+                    }
+                }
 
-            console.log('Sent renegotiation answer');
-        } catch (err) {
-            console.error('Failed to handle renegotiation:', err);
-        }
+                // Create answer
+                const answer = await this.pc.createAnswer();
+                await this.pc.setLocalDescription(answer);
+
+                // Send answer back to server
+                this.options.sendSignal('signal:renegotiate-answer', {
+                    sdp: answer.sdp
+                });
+
+                console.log('Sent renegotiation answer');
+            } catch (err) {
+                console.error('Failed to handle renegotiation:', err);
+            }
+        });
     }
 
     // Clean up

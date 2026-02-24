@@ -236,29 +236,10 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 
 	logger.Debug("Sent WebRTC offer to client", "participant_id", client.ID, "room", roomSlug)
 
-	// Forward any existing voice tracks from other participants to this new subscriber.
-	// This ensures late joiners can hear people who are already speaking.
-	go func() {
-		voiceParticipants := h.sfu.GetActiveVoiceSessions(roomSlug)
-		room := h.sfu.GetRoomTracksForSlug(roomSlug)
-		if room == nil {
-			return
-		}
-
-		room.RLockVoiceTracks()
-		defer room.RUnlockVoiceTracks()
-
-		for _, voiceOwnerID := range voiceParticipants {
-			if voiceOwnerID == client.ID {
-				continue
-			}
-			track := room.GetVoiceRemoteTrackLocked(voiceOwnerID)
-			if track == nil {
-				continue
-			}
-			h.forwardVoiceTrackToClients(roomSlug, voiceOwnerID, track, client.ID)
-		}
-	}()
+	// Note: existing voice relay tracks are already included in the initial
+	// offer by CreateSubscriberConnection. No separate renegotiation needed
+	// for late joiners — this avoids the signaling state race that occurs
+	// when creating offers before the initial answer has been received.
 }
 
 // InitiateSubscriptionsForRoom sends WebRTC offers to all clients in a room
@@ -616,7 +597,7 @@ func (h *WebSocketHandler) handleSignalOffer(client *websocket.Client, payload j
 	logger.Debug("Received voice offer", "participant_id", client.ID, "room", client.RoomSlug)
 
 	// Apply the offer to the existing subscriber connection and create an answer.
-	answer, err := h.sfu.HandleSubscriberOffer(client.RoomSlug, client.ID, data.SDP)
+	answer, rolledBack, err := h.sfu.HandleSubscriberOffer(client.RoomSlug, client.ID, data.SDP)
 
 	if err != nil {
 		logger.Error("Failed to handle voice offer", "participant_id", client.ID, "error", err)
@@ -629,22 +610,54 @@ func (h *WebSocketHandler) handleSignalOffer(client *websocket.Client, payload j
 	})
 
 	logger.Debug("Sent voice answer", "participant_id", client.ID)
+
+	// If we rolled back a server-initiated offer (voice renegotiation that collided
+	// with this client offer), re-trigger a renegotiation so the voice tracks that
+	// were already AddTrack'd are included in a new offer.
+	if rolledBack {
+		go func() {
+			offerSDP, err := h.sfu.RenegotiateSubscriber(client.RoomSlug, client.ID)
+			if err != nil {
+				logger.Warn("Failed to re-renegotiate after rollback", "participant_id", client.ID, "error", err)
+				return
+			}
+			client.SendJSON("signal:renegotiate", map[string]interface{}{
+				"sdp": offerSDP,
+			})
+			logger.Debug("Sent follow-up renegotiation after rollback", "participant_id", client.ID)
+		}()
+	}
 }
 
-// forwardVoiceTrack forwards a participant's voice track to all other participants in the room
+// forwardVoiceTrack forwards a participant's voice track to all other participants in the room.
+// It creates a single relay local track that reads from the remote track once and fans out
+// writes to all subscriber PCs, preventing the multi-reader bug.
 func (h *WebSocketHandler) forwardVoiceTrack(roomSlug, participantID string, track *pionwebrtc.TrackRemote) {
 	logger.Debug("Forwarding voice track", "participant_id", participantID, "room", roomSlug)
 
-	// Store the remote track so we can forward to late joiners
+	// Store the remote track reference
 	h.sfu.StoreVoiceRemoteTrack(roomSlug, participantID, track)
 
-	// Get all clients in the room except the sender
-	h.forwardVoiceTrackToClients(roomSlug, participantID, track, "")
+	// Create a single relay track that reads from the remote track once
+	// and fans out writes to all subscriber PCs via Pion's internal binding.
+	relayTrack, err := h.sfu.CreateVoiceRelayTrack(roomSlug, participantID, track)
+	if err != nil {
+		logger.Error("Failed to create voice relay track", "participant_id", participantID, "error", err)
+		return
+	}
+
+	// Add the relay track to all other subscribers
+	h.forwardVoiceTrackToClients(roomSlug, participantID, relayTrack, "")
+
+	// Request a keyframe after voice renegotiation. The SDP renegotiation
+	// can cause some browsers (Firefox) to briefly reset the video decoder,
+	// and a fresh IDR frame helps them recover immediately.
+	h.sfu.RequestKeyframe(roomSlug)
 }
 
-// forwardVoiceTrackToClients forwards a voice track to clients in the room.
+// forwardVoiceTrackToClients adds a shared voice relay track to clients in the room.
 // If targetClientID is non-empty, only that specific client receives the track.
-func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID string, track *pionwebrtc.TrackRemote, targetClientID string) {
+func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID string, localTrack *pionwebrtc.TrackLocalStaticRTP, targetClientID string) {
 	clients := h.hub.GetRoomClients(roomSlug)
 	for _, client := range clients {
 		if client.ID == voiceOwnerID {
@@ -654,7 +667,7 @@ func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID str
 			continue // Only send to specific target
 		}
 
-		offerSDP, err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, client.ID, voiceOwnerID, track)
+		offerSDP, err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, client.ID, voiceOwnerID, localTrack)
 		if err != nil {
 			logger.Warn("Failed to add voice track to subscriber", "subscriber_id", client.ID, "source_id", voiceOwnerID, "error", err)
 			continue

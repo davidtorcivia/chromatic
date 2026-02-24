@@ -5,7 +5,16 @@
         clientToVideoCoords,
         getVideoContentRect,
     } from "$lib/video/coordinates";
-    import { cursorStore, type Cursor } from "$lib/stores/cursors.svelte";
+
+    interface Cursor {
+        participantId: string;
+        participantName: string;
+        color: string;
+        x: number;
+        y: number;
+        active: boolean;
+        lastUpdate: number;
+    }
 
     interface Props {
         videoElement: HTMLVideoElement;
@@ -21,6 +30,16 @@
     let showUsageHint = $state(false);
     let hintTimer: ReturnType<typeof setTimeout> | null = null;
     const THROTTLE_MS = 50;
+
+    // Keep cursor state local to this component for reliable Svelte 5 reactivity.
+    // Using a plain object + reassignment (instead of a cross-module $state Map)
+    // guarantees $derived invalidation on every update.
+    let cursorMap: Record<string, Cursor> = {};
+    let cursorList = $state<Cursor[]>([]);
+
+    function updateCursorList() {
+        cursorList = Object.values(cursorMap);
+    }
 
     function updateVideoRect() {
         if (videoElement) {
@@ -111,10 +130,25 @@
                 y: number;
                 active: boolean;
             };
-            cursorStore.update(data);
+            cursorMap[data.participantId] = {
+                ...data,
+                lastUpdate: Date.now()
+            };
+            updateCursorList();
         });
 
-        cursorStore.startCleanup();
+        // Clean up stale cursors every 500ms
+        const cleanupInterval = setInterval(() => {
+            const now = Date.now();
+            let changed = false;
+            for (const id of Object.keys(cursorMap)) {
+                if (now - cursorMap[id].lastUpdate > 3000) {
+                    delete cursorMap[id];
+                    changed = true;
+                }
+            }
+            if (changed) updateCursorList();
+        }, 500);
 
         return () => {
             videoElement.removeEventListener("loadedmetadata", updateVideoRect);
@@ -129,7 +163,7 @@
                 clearTimeout(sendThrottle);
                 sendThrottle = null;
             }
-            cursorStore.stopCleanup();
+            clearInterval(cleanupInterval);
         };
     });
 
@@ -149,9 +183,6 @@
     function sendCursorEnd() {
         session.send("cursor", { x: 0, y: 0, active: false });
     }
-
-    // Get current cursors (access the reactive state directly for proper tracking)
-    let cursors: Cursor[] = $derived(Array.from(cursorStore.cursors.values()));
 </script>
 
 <!-- Overlay positioned to match video content area -->
@@ -167,7 +198,7 @@
     {#if showUsageHint}
         <div class="laser-hint">Laser enabled: click and drag on video to point</div>
     {/if}
-    {#each cursors as cursor (cursor.participantId)}
+    {#each cursorList as cursor (cursor.participantId)}
         <div
             class="cursor-pointer"
             style="
@@ -197,6 +228,9 @@
         cursor: default;
         pointer-events: none;
         z-index: 5;
+        /* Force own compositing layer so the overlay renders above
+           the video element's hardware compositor in all browsers */
+        transform: translateZ(0);
     }
 
     .cursor-pointer {

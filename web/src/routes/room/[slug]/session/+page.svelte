@@ -47,6 +47,10 @@
     let speakingParticipants = $state<Set<string>>(new Set());
     let voiceAnalysers = new Map<string, { analyser: AnalyserNode; ctx: AudioContext }>();
     let vadFrame: ReturnType<typeof requestAnimationFrame> | null = null;
+    // Buffer voice tracks that arrive before audioDuckingManager is created
+    // (can happen when voice relay tracks are in the initial offer and ontrack
+    // fires for them before the main video/audio track triggers handleTrack).
+    let pendingVoiceTracks = new Map<string, MediaStreamTrack>();
 
     // Get session data from storage
     let sessionData = $state<{
@@ -275,6 +279,13 @@
         }
 
         try {
+            // Only set srcObject if it's a new stream. During renegotiation the
+            // browser may fire ontrack again for existing tracks; resetting
+            // srcObject causes Firefox to briefly go black.
+            if (videoElement.srcObject === event.streams[0]) {
+                return;
+            }
+
             videoElement.srcObject = event.streams[0];
 
             // Attempt autoplay (muted for browser compliance)
@@ -292,10 +303,17 @@
                 hasStream = true;
             }
 
-            const isUserAdmin = roomState?.participants?.find(
-                (p: { id: string }) => p.id === sessionData?.participantId
-            )?.role === 'admin';
-            audioDuckingManager = new AudioDuckingManager(videoElement, isUserAdmin ?? false);
+            if (!audioDuckingManager) {
+                const isUserAdmin = roomState?.participants?.find(
+                    (p: { id: string }) => p.id === sessionData?.participantId
+                )?.role === 'admin';
+                audioDuckingManager = new AudioDuckingManager(videoElement, isUserAdmin ?? false);
+                // Flush any voice tracks that arrived before we were created
+                for (const [pid, vTrack] of pendingVoiceTracks) {
+                    audioDuckingManager.addVoiceTrack(pid, vTrack);
+                }
+                pendingVoiceTracks.clear();
+            }
             startStatsPolling();
         } catch (err) {
             console.error('Failed to attach stream:', err);
@@ -329,7 +347,12 @@
     }
 
     function handleVoiceTrack(participantId: string, track: MediaStreamTrack) {
-        if (audioDuckingManager) audioDuckingManager.addVoiceTrack(participantId, track);
+        if (audioDuckingManager) {
+            audioDuckingManager.addVoiceTrack(participantId, track);
+        } else {
+            // Buffer track for when audioDuckingManager is created
+            pendingVoiceTracks.set(participantId, track);
+        }
 
         // Set up voice activity detection for speaking indicator
         try {
@@ -814,6 +837,10 @@
         height: 100%;
         object-fit: contain;
         background: #000;
+        /* Establish stacking context so overlays render above the video
+           compositor layer in Firefox and other browsers */
+        position: relative;
+        z-index: 0;
     }
 
     .stream-status-overlay {

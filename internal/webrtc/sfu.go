@@ -64,6 +64,7 @@ type RoomTracks struct {
 	Subscribers      map[string]*Subscriber
 	VoiceSessions    map[string]*VoiceSession                // Participant voice connections
 	VoiceRemoteTracks map[string]*webrtc.TrackRemote          // Active voice remote tracks keyed by participant ID
+	VoiceLocalTracks  map[string]*webrtc.TrackLocalStaticRTP  // Relay local tracks for voice fan-out
 	IngestPC         *webrtc.PeerConnection                  // Reference to ingest PC for PLI requests
 }
 
@@ -74,7 +75,8 @@ type Subscriber struct {
 	VideoSender    *webrtc.RTPSender
 	AudioSender    *webrtc.RTPSender
 	done           chan struct{}
-	closeOnce      sync.Once // Ensures done channel is closed only once
+	closeOnce      sync.Once  // Ensures done channel is closed only once
+	SignalingMu    sync.Mutex // Serializes SDP operations to prevent concurrent signaling state changes
 }
 
 // NewSFU creates a new SFU instance
@@ -387,6 +389,10 @@ func (rt *RoomTracks) RemoveSubscriber(id string) {
 		// Track subscriber removal
 		metrics.Get().ActiveSubscribers.Add(-1)
 	}
+	// Clean up any voice state owned by this participant.
+	// The relay goroutine will exit on its own when Read() returns EOF.
+	delete(rt.VoiceRemoteTracks, id)
+	delete(rt.VoiceLocalTracks, id)
 }
 
 // BroadcastTrack sends track data to all subscribers
@@ -522,6 +528,15 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 	room.mu.RLock()
 	videoTrack := room.VideoTrack
 	audioTrack := room.AudioTrack
+	// Collect existing voice relay tracks so they are included in the initial
+	// offer. This avoids a separate renegotiation that would race with the
+	// initial offer-answer exchange and corrupt the signaling state.
+	var voiceRelayTracks []*webrtc.TrackLocalStaticRTP
+	for pid, track := range room.VoiceLocalTracks {
+		if pid != subscriberID {
+			voiceRelayTracks = append(voiceRelayTracks, track)
+		}
+	}
 	room.mu.RUnlock()
 
 	// Create peer connection
@@ -557,6 +572,15 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 		}
 		sub.AudioSender = sender
 		log.Printf("Added audio track to subscriber %s", subscriberID)
+	}
+
+	// Add existing voice relay tracks so subscriber can hear them immediately
+	for _, voiceTrack := range voiceRelayTracks {
+		if _, err := pc.AddTrack(voiceTrack); err != nil {
+			log.Printf("Failed to add voice relay track to subscriber %s: %v", subscriberID, err)
+		} else {
+			log.Printf("Added existing voice relay track to subscriber %s", subscriberID)
+		}
 	}
 
 	room.AddSubscriber(sub)
@@ -612,6 +636,9 @@ func (s *SFU) SetSubscriberAnswer(roomSlug, subscriberID string, answer webrtc.S
 		return fmt.Errorf("subscriber not found: %s", subscriberID)
 	}
 
+	sub.SignalingMu.Lock()
+	defer sub.SignalingMu.Unlock()
+
 	if err := sub.PeerConnection.SetRemoteDescription(answer); err != nil {
 		return fmt.Errorf("failed to set remote description: %w", err)
 	}
@@ -657,6 +684,9 @@ func (s *SFU) HandleIceRestart(roomSlug, subscriberID, sdpOffer string) (string,
 		return "", fmt.Errorf("subscriber not found: %s", subscriberID)
 	}
 
+	sub.SignalingMu.Lock()
+	defer sub.SignalingMu.Unlock()
+
 	// Set the new offer from the client
 	offer := webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
@@ -687,10 +717,11 @@ func (s *SFU) HandleIceRestart(roomSlug, subscriberID, sdpOffer string) (string,
 
 // HandleSubscriberOffer processes a client-initiated offer on an existing subscriber connection.
 // Used for renegotiation when a client adds a microphone track.
-func (s *SFU) HandleSubscriberOffer(roomSlug, subscriberID, sdpOffer string) (string, error) {
+// Returns (answer SDP, whether a server-side offer was rolled back, error).
+func (s *SFU) HandleSubscriberOffer(roomSlug, subscriberID, sdpOffer string) (string, bool, error) {
 	room := s.GetRoomTracksForSlug(roomSlug)
 	if room == nil {
-		return "", fmt.Errorf("room not found: %s", roomSlug)
+		return "", false, fmt.Errorf("room not found: %s", roomSlug)
 	}
 
 	room.mu.RLock()
@@ -698,7 +729,24 @@ func (s *SFU) HandleSubscriberOffer(roomSlug, subscriberID, sdpOffer string) (st
 	room.mu.RUnlock()
 
 	if !ok {
-		return "", fmt.Errorf("subscriber not found: %s", subscriberID)
+		return "", false, fmt.Errorf("subscriber not found: %s", subscriberID)
+	}
+
+	sub.SignalingMu.Lock()
+	defer sub.SignalingMu.Unlock()
+
+	rolledBack := false
+
+	// Handle "glare": if the server has a pending offer (have-local-offer) when
+	// the client sends its own offer, rollback the server's offer to accept the
+	// client's. Tracks added by the rolled-back offer are still on the PC and
+	// will be included in a follow-up renegotiation.
+	if sub.PeerConnection.SignalingState() == webrtc.SignalingStateHaveLocalOffer {
+		log.Printf("Rolling back server offer for subscriber %s to handle client offer (glare)", subscriberID)
+		if err := sub.PeerConnection.SetLocalDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}); err != nil {
+			return "", false, fmt.Errorf("failed to rollback: %w", err)
+		}
+		rolledBack = true
 	}
 
 	offer := webrtc.SessionDescription{
@@ -707,24 +755,24 @@ func (s *SFU) HandleSubscriberOffer(roomSlug, subscriberID, sdpOffer string) (st
 	}
 
 	if err := sub.PeerConnection.SetRemoteDescription(offer); err != nil {
-		return "", fmt.Errorf("failed to set remote description: %w", err)
+		return "", false, fmt.Errorf("failed to set remote description: %w", err)
 	}
 
 	answer, err := sub.PeerConnection.CreateAnswer(nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to create answer: %w", err)
+		return "", false, fmt.Errorf("failed to create answer: %w", err)
 	}
 
 	if err := sub.PeerConnection.SetLocalDescription(answer); err != nil {
-		return "", fmt.Errorf("failed to set local description: %w", err)
+		return "", false, fmt.Errorf("failed to set local description: %w", err)
 	}
 
 	// Wait for ICE gathering
 	gatherComplete := webrtc.GatheringCompletePromise(sub.PeerConnection)
 	<-gatherComplete
 
-	log.Printf("Renegotiation completed for subscriber %s", subscriberID)
-	return sub.PeerConnection.LocalDescription().SDP, nil
+	log.Printf("Renegotiation completed for subscriber %s (rolledBack=%v)", subscriberID, rolledBack)
+	return sub.PeerConnection.LocalDescription().SDP, rolledBack, nil
 }
 
 // GetIngestForRoom finds the ingest session bound to a room's stream key
@@ -920,13 +968,79 @@ func (s *SFU) RemoveVoiceSession(roomSlug, participantID string) {
 			session.PeerConnection.Close()
 		}
 		delete(room.VoiceSessions, participantID)
+		delete(room.VoiceRemoteTracks, participantID)
+		delete(room.VoiceLocalTracks, participantID)
 		log.Printf("Removed voice session for %s from room %s", participantID, roomSlug)
 	}
 }
 
-// AddVoiceTrackToSubscriber adds a voice track from one participant to another's subscriber connection
-// Returns the renegotiation offer SDP that needs to be sent to the subscriber
-func (s *SFU) AddVoiceTrackToSubscriber(roomSlug, subscriberID, voiceOwnerID string, remoteTrack *webrtc.TrackRemote) (string, error) {
+// CreateVoiceRelayTrack creates a single local relay track for a voice source and
+// starts one goroutine to forward RTP packets from the remote track. Writing to
+// a TrackLocalStaticRTP fans out to all PeerConnections it has been added to,
+// so we only need one reader per remote track.
+func (s *SFU) CreateVoiceRelayTrack(roomSlug, participantID string, remoteTrack *webrtc.TrackRemote) (*webrtc.TrackLocalStaticRTP, error) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return nil, fmt.Errorf("room not found: %s", roomSlug)
+	}
+
+	localTrack, err := webrtc.NewTrackLocalStaticRTP(
+		remoteTrack.Codec().RTPCodecCapability,
+		fmt.Sprintf("voice-%s", participantID),
+		fmt.Sprintf("voice-stream-%s", participantID),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create relay track: %w", err)
+	}
+
+	room.mu.Lock()
+	if room.VoiceLocalTracks == nil {
+		room.VoiceLocalTracks = make(map[string]*webrtc.TrackLocalStaticRTP)
+	}
+	room.VoiceLocalTracks[participantID] = localTrack
+	room.mu.Unlock()
+
+	// Single forwarding goroutine — reads from the remote track once
+	// and writes to the local track, which fans out to all bound PCs.
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, _, err := remoteTrack.Read(buf)
+			if err != nil {
+				log.Printf("Voice relay read ended for %s: %v", participantID, err)
+				return
+			}
+			if _, err := localTrack.Write(buf[:n]); err != nil {
+				log.Printf("Voice relay write error for %s: %v", participantID, err)
+				return
+			}
+		}
+	}()
+
+	log.Printf("Created voice relay track for %s in room %s", participantID, roomSlug)
+	return localTrack, nil
+}
+
+// GetVoiceRelayTrack returns the relay local track for a voice source (if one exists)
+func (s *SFU) GetVoiceRelayTrack(roomSlug, participantID string) *webrtc.TrackLocalStaticRTP {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return nil
+	}
+
+	room.mu.RLock()
+	defer room.mu.RUnlock()
+
+	if room.VoiceLocalTracks == nil {
+		return nil
+	}
+	return room.VoiceLocalTracks[participantID]
+}
+
+// AddVoiceTrackToSubscriber adds a shared voice relay track to a subscriber's
+// peer connection and creates a renegotiation offer.
+// Returns the renegotiation offer SDP that needs to be sent to the subscriber.
+func (s *SFU) AddVoiceTrackToSubscriber(roomSlug, subscriberID, voiceOwnerID string, localTrack *webrtc.TrackLocalStaticRTP) (string, error) {
 	room := s.GetRoomTracksForSlug(roomSlug)
 	if room == nil {
 		return "", fmt.Errorf("room not found: %s", roomSlug)
@@ -940,37 +1054,44 @@ func (s *SFU) AddVoiceTrackToSubscriber(roomSlug, subscriberID, voiceOwnerID str
 		return "", fmt.Errorf("subscriber not found: %s", subscriberID)
 	}
 
-	// Create a local track to forward the remote track
-	localTrack, err := webrtc.NewTrackLocalStaticRTP(
-		remoteTrack.Codec().RTPCodecCapability,
-		fmt.Sprintf("voice-%s", voiceOwnerID),
-		fmt.Sprintf("voice-stream-%s", voiceOwnerID),
-	)
-	if err != nil {
-		return "", fmt.Errorf("failed to create local track: %w", err)
+	// Guard: don't touch a PC that is already closed/failed
+	connState := sub.PeerConnection.ConnectionState()
+	if connState == webrtc.PeerConnectionStateClosed || connState == webrtc.PeerConnectionStateFailed {
+		return "", fmt.Errorf("subscriber %s connection in terminal state: %s", subscriberID, connState)
 	}
 
-	// Add the track to the subscriber's peer connection
-	_, err = sub.PeerConnection.AddTrack(localTrack)
+	// Wait for the signaling mutex with a timeout. Another goroutine
+	// (e.g. HandleSubscriberOffer processing a client mic offer) may hold
+	// the lock, so we poll rather than block indefinitely.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if sub.SignalingMu.TryLock() {
+			break
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("timed out waiting for signaling lock for subscriber %s", subscriberID)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	defer sub.SignalingMu.Unlock()
+
+	// After acquiring the lock, re-check connection state
+	connState = sub.PeerConnection.ConnectionState()
+	if connState == webrtc.PeerConnectionStateClosed || connState == webrtc.PeerConnectionStateFailed {
+		return "", fmt.Errorf("subscriber %s connection in terminal state: %s", subscriberID, connState)
+	}
+
+	// With the mutex held, the signaling state should be stable.
+	if sub.PeerConnection.SignalingState() != webrtc.SignalingStateStable {
+		return "", fmt.Errorf("signaling state not stable for subscriber %s: %s", subscriberID, sub.PeerConnection.SignalingState())
+	}
+
+	// Add the shared relay track to the subscriber's peer connection.
+	// Pion fans out writes to all PCs that have added this track.
+	_, err := sub.PeerConnection.AddTrack(localTrack)
 	if err != nil {
 		return "", fmt.Errorf("failed to add track: %w", err)
 	}
-
-	// Start forwarding RTP packets from remote to local track
-	go func() {
-		buf := make([]byte, 1500)
-		for {
-			n, _, err := remoteTrack.Read(buf)
-			if err != nil {
-				log.Printf("Voice track read error for %s: %v", voiceOwnerID, err)
-				return
-			}
-			if _, err := localTrack.Write(buf[:n]); err != nil {
-				log.Printf("Voice track write error to %s: %v", subscriberID, err)
-				return
-			}
-		}
-	}()
 
 	log.Printf("Added voice track from %s to subscriber %s", voiceOwnerID, subscriberID)
 
@@ -1007,6 +1128,14 @@ func (s *SFU) RenegotiateSubscriber(roomSlug, subscriberID string) (string, erro
 		return "", fmt.Errorf("subscriber not found: %s", subscriberID)
 	}
 
+	sub.SignalingMu.Lock()
+	defer sub.SignalingMu.Unlock()
+
+	// Only renegotiate if in stable state
+	if sub.PeerConnection.SignalingState() != webrtc.SignalingStateStable {
+		return "", fmt.Errorf("cannot renegotiate subscriber %s: signaling state is %s", subscriberID, sub.PeerConnection.SignalingState())
+	}
+
 	// Create new offer
 	offer, err := sub.PeerConnection.CreateOffer(nil)
 	if err != nil {
@@ -1038,6 +1167,17 @@ func (s *SFU) HandleRenegotiationAnswer(roomSlug, subscriberID, sdpAnswer string
 
 	if !ok {
 		return fmt.Errorf("subscriber not found: %s", subscriberID)
+	}
+
+	sub.SignalingMu.Lock()
+	defer sub.SignalingMu.Unlock()
+
+	// Ignore stale answers: if the PC is not in have-local-offer (e.g. because
+	// the offer was rolled back to accept a client-initiated offer), there is
+	// nothing to apply this answer to.
+	if sub.PeerConnection.SignalingState() != webrtc.SignalingStateHaveLocalOffer {
+		log.Printf("Ignoring stale renegotiation answer for subscriber %s (state: %s)", subscriberID, sub.PeerConnection.SignalingState())
+		return nil
 	}
 
 	answer := webrtc.SessionDescription{
