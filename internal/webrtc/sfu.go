@@ -677,8 +677,12 @@ func (s *SFU) HandleIceRestart(roomSlug, subscriberID, sdpOffer string) (string,
 		return "", fmt.Errorf("failed to set local description: %w", err)
 	}
 
+	// Wait for ICE gathering so the answer includes candidates
+	gatherComplete := webrtc.GatheringCompletePromise(sub.PeerConnection)
+	<-gatherComplete
+
 	log.Printf("ICE restart completed for subscriber %s", subscriberID)
-	return answer.SDP, nil
+	return sub.PeerConnection.LocalDescription().SDP, nil
 }
 
 // HandleSubscriberOffer processes a client-initiated offer on an existing subscriber connection.

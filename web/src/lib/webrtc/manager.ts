@@ -7,6 +7,7 @@ export interface WebRTCManagerOptions {
     sendSignal: (type: string, payload: unknown) => void;
     onConnectionStateChange?: (state: RTCPeerConnectionState) => void;
     onIceRestart?: () => void;
+    onIceRestartFailed?: () => void;
     onRenegotiation?: () => void;
 }
 
@@ -132,9 +133,16 @@ export class WebRTCManager {
                     }
                 }, 5000);
             } else if (state === 'failed') {
-                // Immediate ICE restart on failure
-                console.log('Connection failed, attempting ICE restart');
-                this.performIceRestart();
+                if (this.iceRestartPending) {
+                    // ICE restart was already attempted but failed
+                    console.log('ICE restart failed, connection unrecoverable');
+                    this.iceRestartPending = false;
+                    this.options.onIceRestartFailed?.();
+                } else {
+                    // First failure - attempt ICE restart
+                    console.log('Connection failed, attempting ICE restart');
+                    this.performIceRestart();
+                }
             } else if (state === 'connected') {
                 // Clear timeout if reconnected
                 if (this.connectionLostTimeout) {

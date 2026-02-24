@@ -194,7 +194,10 @@
             iceServers,
             onTrack: handleTrack,
             onVoiceTrack: handleVoiceTrack,
-            sendSignal: (type, payload) => session.send(type, payload)
+            sendSignal: (type, payload) => session.send(type, payload),
+            onIceRestartFailed: () => {
+                streamError = "Connection failed. The stream could not be reached. Please try refreshing the page.";
+            }
         });
 
         console.log('WebRTC manager initialized');
@@ -940,10 +943,11 @@
         padding: var(--space-md) var(--space-lg);
         pointer-events: none;
         opacity: 0;
-        transition: opacity var(--transition-normal);
+        visibility: hidden;
+        transition: opacity var(--transition-normal), visibility var(--transition-normal);
     }
-    .controls-overlay.visible { opacity: 1; }
-    .controls-overlay > * { pointer-events: auto; }
+    .controls-overlay.visible { opacity: 1; visibility: visible; }
+    .controls-overlay.visible > * { pointer-events: auto; }
 
     .top-bar {
         display: flex;
