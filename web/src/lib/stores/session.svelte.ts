@@ -184,6 +184,9 @@ export function createSessionStore() {
                         p => p.id !== leftData.participantId
                     );
                 }
+                // Forward so consumers (e.g. session page's VAD tracker) can
+                // release per-participant resources.
+                messageHandlers.get('participant:left')?.(msg.payload);
                 break;
 
             case 'participant:updated':
@@ -212,8 +215,17 @@ export function createSessionStore() {
         }
     }
 
-    function onMessage(type: string, handler: (payload: unknown) => void) {
+    // onMessage registers a handler for a server-pushed message type and
+    // returns a dispose function that unregisters it. Components should call
+    // the returned dispose in onDestroy — otherwise handlers accumulate across
+    // navigations and fire with stale closures.
+    function onMessage(type: string, handler: (payload: unknown) => void): () => void {
         messageHandlers.set(type, handler);
+        return () => {
+            if (messageHandlers.get(type) === handler) {
+                messageHandlers.delete(type);
+            }
+        };
     }
 
     function disconnect() {
@@ -226,6 +238,10 @@ export function createSessionStore() {
             ws.close(1000);
             ws = null;
         }
+        // Purge any handlers captured from the previous lifecycle so a fresh
+        // connect() starts with a clean slate. Callers that want their handlers
+        // to survive reconnect can re-register on the WebSocket's onopen.
+        messageHandlers.clear();
         state = {
             connected: false,
             room: null,

@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount } from "svelte";
+    import { onMount, onDestroy } from "svelte";
     import { session } from "$lib/stores/session.svelte";
     import { chatStore } from "$lib/stores/chat.svelte";
     import { uploadFile, type UploadedFile } from "$lib/api/client";
@@ -55,17 +55,44 @@
     let uploadError = $state<string | null>(null);
     let isDragOver = $state(false);
 
+    let disposeHandlers: Array<() => void> = [];
+
     onMount(() => {
         // Load chat history from server
-        session.onMessage("chat:history", (payload) => {
-            const data = payload as {
-                messages: Array<{
-                    id: string;
+        disposeHandlers.push(
+            session.onMessage("chat:history", (payload) => {
+                const data = payload as {
+                    messages: Array<{
+                        id: string;
+                        participantId: string;
+                        participantName: string;
+                        type: "text" | "file";
+                        content: string;
+                        timestamp: number;
+                        file?: {
+                            id: string;
+                            name: string;
+                            mimeType: string;
+                            url: string;
+                            thumbnailUrl?: string;
+                        };
+                    }>;
+                };
+                chatStore.loadHistory(data.messages);
+                scrollToBottom();
+            })
+        );
+
+        // Subscribe to new chat messages
+        disposeHandlers.push(
+            session.onMessage("chat:message", (payload) => {
+                const msg = payload as {
+                    id?: string;
                     participantId: string;
                     participantName: string;
                     type: "text" | "file";
                     content: string;
-                    timestamp: number;
+                    timestamp?: number;
                     file?: {
                         id: string;
                         name: string;
@@ -73,32 +100,16 @@
                         url: string;
                         thumbnailUrl?: string;
                     };
-                }>;
-            };
-            chatStore.loadHistory(data.messages);
-            scrollToBottom();
-        });
-
-        // Subscribe to new chat messages
-        session.onMessage("chat:message", (payload) => {
-            const msg = payload as {
-                id?: string;
-                participantId: string;
-                participantName: string;
-                type: "text" | "file";
-                content: string;
-                timestamp?: number;
-                file?: {
-                    id: string;
-                    name: string;
-                    mimeType: string;
-                    url: string;
-                    thumbnailUrl?: string;
                 };
-            };
-            chatStore.addMessage(msg);
-            scrollToBottom();
-        });
+                chatStore.addMessage(msg);
+                scrollToBottom();
+            })
+        );
+    });
+
+    onDestroy(() => {
+        for (const dispose of disposeHandlers) dispose();
+        disposeHandlers = [];
     });
 
     function scrollToBottom() {

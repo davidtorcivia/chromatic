@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -20,19 +19,32 @@ import (
 	pionwebrtc "github.com/pion/webrtc/v4"
 )
 
+// SessionValidator validates an admin session ID and returns true if still active.
+type SessionValidator func(sessionID string) bool
+
 // WebSocketHandler handles WebSocket connections
 type WebSocketHandler struct {
 	db              *database.DB
 	hub             *websocket.Hub
 	sfu             *webrtc.SFU
 	originValidator *middleware.OriginValidator
-	adminToken      string
 	tokenManager    *TokenManager
+	validateSession SessionValidator
 	upgrader        gorillaws.Upgrader
 }
 
-// NewWebSocketHandler creates a new WebSocketHandler
-func NewWebSocketHandler(db *database.DB, hub *websocket.Hub, sfu *webrtc.SFU, allowedOrigins []string, productionMode bool, adminToken string) *WebSocketHandler {
+// NewWebSocketHandler creates a new WebSocketHandler.
+// validateSession is used to check the admin session cookie on upgrade and again
+// on each privileged action so that a mid-session logout drops privileges.
+func NewWebSocketHandler(
+	db *database.DB,
+	hub *websocket.Hub,
+	sfu *webrtc.SFU,
+	allowedOrigins []string,
+	productionMode bool,
+	adminToken string,
+	validateSession SessionValidator,
+) *WebSocketHandler {
 	validator := middleware.NewOriginValidator(allowedOrigins, productionMode)
 
 	h := &WebSocketHandler{
@@ -40,8 +52,8 @@ func NewWebSocketHandler(db *database.DB, hub *websocket.Hub, sfu *webrtc.SFU, a
 		hub:             hub,
 		sfu:             sfu,
 		originValidator: validator,
-		adminToken:      adminToken,
 		tokenManager:    NewTokenManager(adminToken), // Use adminToken as HMAC secret
+		validateSession: validateSession,
 	}
 
 	h.upgrader = gorillaws.Upgrader{
@@ -65,15 +77,21 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	slug := r.PathValue("slug")
 	token := r.URL.Query().Get("token")
 	name := r.URL.Query().Get("name")
-	adminAuth := r.URL.Query().Get("admin") // Optional admin token for admin access
 
 	if token == "" || name == "" {
 		http.Error(w, "Missing token or name", http.StatusBadRequest)
 		return
 	}
 
-	// Check if this is an admin connection (using constant-time comparison)
-	isAdminAuth := adminAuth != "" && subtle.ConstantTimeCompare([]byte(adminAuth), []byte(h.adminToken)) == 1
+	// Admin status comes from the httpOnly session cookie set by POST /api/auth/login.
+	// Never accept a long-lived credential in the URL (logs / browser history / referrer).
+	var adminSessionID string
+	if h.validateSession != nil {
+		if c, err := r.Cookie(SessionCookieName); err == nil && c.Value != "" && h.validateSession(c.Value) {
+			adminSessionID = c.Value
+		}
+	}
+	isAdminAuth := adminSessionID != ""
 
 	// Validate the signed token
 	tokenPayload, err := h.tokenManager.ValidateToken(token)
@@ -148,16 +166,17 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 		role = "admin" // Set role to admin for authenticated admin
 	}
 	client := &websocket.Client{
-		ID:           participantID,
-		Name:         name,
-		Role:         role,
-		RoomSlug:     slug,
-		Hub:          h.hub,
-		Conn:         conn,
-		Send:         make(chan []byte, 256),
-		IsAdmin:      isAdmin,
-		AudioEnabled: false,
-		VideoEnabled: true,
+		ID:             participantID,
+		Name:           name,
+		Role:           role,
+		RoomSlug:       slug,
+		Hub:            h.hub,
+		Conn:           conn,
+		Send:           make(chan []byte, 256),
+		IsAdmin:        isAdmin,
+		AdminSessionID: adminSessionID,
+		AudioEnabled:   false,
+		VideoEnabled:   true,
 	}
 	// Initialize chat rate limiter: 30 messages per minute
 	client.InitChatRateLimiter()
@@ -320,16 +339,21 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 	})
 }
 
-// sendChatHistory sends persisted chat messages to a newly connected client
+// sendChatHistory sends the most recent persisted chat messages to a newly
+// connected client. We fetch the tail via DESC+LIMIT and reverse in memory so
+// the client sees oldest-first; older messages beyond chatHistoryLimit are
+// considered archive-only. A large room with 10k messages would otherwise
+// block each new joiner on a full scan.
 func (h *WebSocketHandler) sendChatHistory(client *websocket.Client, slug string) {
+	const chatHistoryLimit = 50
 	rows, err := h.db.Query(`
 		SELECT m.id, m.participant_id, p.name, m.type, m.content, m.created_at
 		FROM messages m
 		JOIN participants p ON p.id = m.participant_id
 		WHERE m.room_id = (SELECT id FROM rooms WHERE slug = ?)
-		ORDER BY m.created_at ASC
-		LIMIT 200
-	`, slug)
+		ORDER BY m.created_at DESC
+		LIMIT ?
+	`, slug, chatHistoryLimit)
 	if err != nil {
 		logger.Warn("Failed to load chat history", "room", slug, "error", err)
 		return
@@ -363,6 +387,11 @@ func (h *WebSocketHandler) sendChatHistory(client *websocket.Client, slug string
 		}
 
 		messages = append(messages, msg)
+	}
+
+	// Rows came back newest-first so the client receives oldest-first.
+	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
+		messages[i], messages[j] = messages[j], messages[i]
 	}
 
 	if len(messages) > 0 {
@@ -782,8 +811,25 @@ func (h *WebSocketHandler) handleResync(client *websocket.Client) {
 	h.sfu.RequestKeyframe(client.RoomSlug)
 }
 
-func (h *WebSocketHandler) handleAdminMute(client *websocket.Client, payload json.RawMessage) {
+// requireAdmin returns true if the client is still a valid admin right now.
+// It re-checks the session cookie captured at upgrade time so a mid-session
+// logout immediately revokes admin powers. Callers should log & return on false.
+func (h *WebSocketHandler) requireAdmin(client *websocket.Client, action string) bool {
 	if !client.IsAdmin {
+		return false
+	}
+	if client.AdminSessionID != "" && h.validateSession != nil && !h.validateSession(client.AdminSessionID) {
+		logger.Warn("Admin session revoked mid-connection; denying action",
+			"action", action, "participant_id", client.ID, "room", client.RoomSlug)
+		client.IsAdmin = false
+		client.AdminSessionID = ""
+		return false
+	}
+	return true
+}
+
+func (h *WebSocketHandler) handleAdminMute(client *websocket.Client, payload json.RawMessage) {
+	if !h.requireAdmin(client, "mute") {
 		return
 	}
 
@@ -797,10 +843,11 @@ func (h *WebSocketHandler) handleAdminMute(client *websocket.Client, payload jso
 	h.hub.BroadcastJSON(client.RoomSlug, "admin:muted", map[string]interface{}{
 		"participantId": data.ParticipantID,
 	}, "")
+	logger.Info("Admin mute", "by", client.ID, "target", data.ParticipantID, "room", client.RoomSlug)
 }
 
 func (h *WebSocketHandler) handleAdminKick(client *websocket.Client, payload json.RawMessage) {
-	if !client.IsAdmin {
+	if !h.requireAdmin(client, "kick") {
 		return
 	}
 
@@ -826,10 +873,11 @@ func (h *WebSocketHandler) handleAdminKick(client *websocket.Client, payload jso
 	h.hub.BroadcastJSON(client.RoomSlug, "participant:left", map[string]interface{}{
 		"participantId": data.ParticipantID,
 	}, "")
+	logger.Info("Admin kick", "by", client.ID, "target", data.ParticipantID, "room", client.RoomSlug)
 }
 
 func (h *WebSocketHandler) handleAdminEndSession(client *websocket.Client) {
-	if !client.IsAdmin {
+	if !h.requireAdmin(client, "end-session") {
 		return
 	}
 

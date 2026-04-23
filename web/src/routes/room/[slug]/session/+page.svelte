@@ -17,7 +17,7 @@
     let videoElement = $state<HTMLVideoElement | null>(null);
     let isChatOpen = $state(false);
     let isControlsVisible = $state(true);
-    let controlsTimer: ReturnType<typeof setTimeout>;
+    let controlsTimer: ReturnType<typeof setTimeout> | null = null;
     let participantName = $state("Viewer");
     let webrtcManager: WebRTCManager | null = null;
     let audioDuckingManager: AudioDuckingManager | null = null;
@@ -45,6 +45,8 @@
     let isLaserEnabled = $state(false);
     let showParticipantList = $state(false);
     let speakingParticipants = $state<Set<string>>(new Set());
+    // VAD analysers share the page's AudioContext; only the analyser node is
+    // per-track. The context is torn down in cleanupWebRTC, not per-track.
     let voiceAnalysers = new Map<string, AnalyserNode>();
     let vadFrame: ReturnType<typeof requestAnimationFrame> | null = null;
     // Buffer voice tracks that arrive before audioDuckingManager is created
@@ -171,6 +173,17 @@
         session.onMessage("signal:answer", async (payload: unknown) => {
             const data = payload as { sdp: string };
             if (webrtcManager) await webrtcManager.handleVoiceAnswer(data.sdp);
+        });
+
+        // Release per-participant audio graph (VAD + ducking) when someone
+        // leaves the room — otherwise their AnalyserNode and GainNode stay
+        // connected to the shared AudioContext and the graph grows with churn.
+        session.onMessage("participant:left", (payload: unknown) => {
+            const data = payload as { participantId: string };
+            if (data?.participantId) {
+                removeVoiceAnalyser(data.participantId);
+                audioDuckingManager?.removeVoiceTrack(data.participantId);
+            }
         });
 
         // Connect only after handlers are registered so early messages aren't dropped.
@@ -331,10 +344,15 @@
 
     function startStatsPolling() {
         if (statsInterval) return;
+        let inFlight = false;
         statsInterval = setInterval(async () => {
-            if (webrtcManager) {
+            if (!webrtcManager || inFlight) return;
+            inFlight = true;
+            try {
                 const stats = await webrtcManager.getStats();
                 currentRtt = stats.rtt ?? null;
+            } finally {
+                inFlight = false;
             }
         }, 2000);
     }
@@ -350,7 +368,11 @@
         if (audioDuckingManager) {
             audioDuckingManager.addVoiceTrack(participantId, track);
         } else {
-            // Buffer track for when audioDuckingManager is created
+            // Buffer track for when audioDuckingManager is created — voice
+            // relay tracks can arrive in the initial offer before the main
+            // video/audio track has triggered handleTrack (which creates
+            // audioDuckingManager). Without this buffer, early joiners miss
+            // voice until the next renegotiation.
             pendingVoiceTracks.set(participantId, track);
         }
 
@@ -372,6 +394,26 @@
         }).catch(err => {
             console.warn('Failed to set up VAD for participant', participantId, err);
         });
+    }
+
+    function removeVoiceAnalyser(participantId: string) {
+        const analyser = voiceAnalysers.get(participantId);
+        if (!analyser) return;
+        try {
+            analyser.disconnect();
+        } catch {
+            // Already disconnected or destroyed.
+        }
+        voiceAnalysers.delete(participantId);
+        if (voiceAnalysers.size === 0 && vadFrame) {
+            cancelAnimationFrame(vadFrame);
+            vadFrame = null;
+        }
+        if (speakingParticipants.has(participantId)) {
+            const next = new Set(speakingParticipants);
+            next.delete(participantId);
+            speakingParticipants = next;
+        }
     }
 
     function startVADMonitoring() {
@@ -398,7 +440,18 @@
             cancelAnimationFrame(vadFrame);
             vadFrame = null;
         }
+        // Disconnect analysers explicitly so they release their MediaStream
+        // source and let the browser GC the tracks; otherwise the graph stays
+        // wired until the shared AudioContext is closed.
+        for (const analyser of voiceAnalysers.values()) {
+            try {
+                analyser.disconnect();
+            } catch {
+                // Already disconnected.
+            }
+        }
         voiceAnalysers.clear();
+        speakingParticipants = new Set();
         if (webrtcManager) {
             webrtcManager.close();
             webrtcManager = null;
@@ -409,6 +462,10 @@
         micAutoEnablePending = false;
         clearMicPromptTimer();
         micPromptState = "hidden";
+        if (controlsTimer) {
+            clearTimeout(controlsTimer);
+            controlsTimer = null;
+        }
     }
 
     function handleTampering() {
@@ -418,7 +475,7 @@
     }
 
     function startControlsTimer() {
-        clearTimeout(controlsTimer);
+        if (controlsTimer) clearTimeout(controlsTimer);
         isControlsVisible = true;
         controlsTimer = setTimeout(() => {
             if (!showParticipantList) {

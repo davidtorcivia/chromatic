@@ -3,6 +3,7 @@ package middleware
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -421,13 +422,9 @@ func TestRateLimiterConcurrency(t *testing.T) {
 
 // TestSecurityHeaders tests the security headers middleware
 func TestSecurityHeaders(t *testing.T) {
-	handler := SecurityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	noop := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-	}))
-
-	req := httptest.NewRequest("GET", "/", nil)
-	rr := httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
+	})
 
 	expectedHeaders := map[string]string{
 		"X-Frame-Options":        "DENY",
@@ -436,9 +433,35 @@ func TestSecurityHeaders(t *testing.T) {
 		"Referrer-Policy":        "strict-origin-when-cross-origin",
 	}
 
-	for header, expected := range expectedHeaders {
-		if got := rr.Header().Get(header); got != expected {
-			t.Errorf("expected %s: %q, got %q", header, expected, got)
+	for _, prod := range []bool{false, true} {
+		handler := SecurityHeaders(prod)(noop)
+
+		req := httptest.NewRequest("GET", "/", nil)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		for header, expected := range expectedHeaders {
+			if got := rr.Header().Get(header); got != expected {
+				t.Errorf("prod=%v: expected %s: %q, got %q", prod, header, expected, got)
+			}
+		}
+
+		csp := rr.Header().Get("Content-Security-Policy")
+		if prod {
+			if strings.Contains(csp, "ws:") && !strings.Contains(csp, "wss:") {
+				t.Errorf("production CSP should not contain plain ws:, got %q", csp)
+			}
+			// Ensure ws: token is absent (but wss: is fine)
+			parts := strings.Split(csp, " ")
+			for _, p := range parts {
+				if p == "ws:" {
+					t.Errorf("production CSP token list includes ws:, got %q", csp)
+				}
+			}
+		} else {
+			if !strings.Contains(csp, "ws:") {
+				t.Errorf("dev CSP should allow plain ws: for local dev, got %q", csp)
+			}
 		}
 	}
 }

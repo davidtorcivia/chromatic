@@ -169,7 +169,18 @@ Rollback is just changing `CHROMATIC_IMAGE` back to an older pinned tag/digest a
 
 ## Monitoring and Backups
 
-- Metrics endpoint: `https://stream.yourdomain.com/metrics`
+- Metrics endpoint: `https://stream.yourdomain.com/metrics` — requires auth.
+  Prometheus scrape config must include the admin bearer token:
+  ```yaml
+  scrape_configs:
+    - job_name: chromatic
+      authorization:
+        type: Bearer
+        credentials: <ADMIN_TOKEN>
+      static_configs:
+        - targets: ['stream.yourdomain.com']
+      scheme: https
+  ```
 - Backup/restore docs: `docs/BACKUP.md`
 - Troubleshooting: `docs/TROUBLESHOOTING.md`
 

@@ -71,6 +71,13 @@ export class AudioDuckingManager {
             return;
         }
 
+        // If the participant already has a track registered (e.g. reconnect /
+        // renegotiation), tear down the old nodes first so we don't leak audio
+        // graph refs that keep the previous MediaStream alive.
+        if (this.voiceGainNodes.has(participantId) || this.voiceAnalysers.has(participantId)) {
+            this.removeVoiceTrack(participantId);
+        }
+
         const ctx = await getAudioContext();
 
         const stream = new MediaStreamCtor([track]);

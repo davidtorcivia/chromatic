@@ -39,6 +39,10 @@ func main() {
 		"production_mode", cfg.ProductionMode,
 	)
 
+	if !cfg.ProductionMode {
+		logger.Warn("Running in DEV mode — session cookies are NOT Secure, CSP allows ws://, CORS is permissive. Set PRODUCTION_MODE=true for any deployment reachable over the public internet.")
+	}
+
 	// Initialize database
 	db, err := database.New(cfg.DatabasePath)
 	if err != nil {

@@ -34,14 +34,40 @@ type SFU struct {
 
 	// Track subscribers per room
 	rooms map[string]*RoomTracks
-
-	// Shutdown flag
-	shutdown bool
 }
 
 // MaxICECandidates is the maximum number of ICE candidates allowed per session
 // to prevent memory exhaustion from ICE candidate flooding attacks
 const MaxICECandidates = 50
+
+// iceGatherTimeout bounds how long we wait for ICE gathering to complete before
+// returning the SDP with whatever candidates we already have. Host candidates
+// are usually sufficient for LAN use; server-reflexive / relay candidates can
+// trickle later via ICE restart. Without this cap a hung STUN/TURN server
+// freezes the handshake indefinitely.
+const iceGatherTimeout = 5 * time.Second
+
+// waitForICEGather blocks until ICE gathering completes or the timeout fires.
+// It logs (but does not fail) on timeout — the SDP typed so far is still
+// shippable and we'd rather ship a slightly degraded candidate set than hang.
+func waitForICEGather(pc *webrtc.PeerConnection) {
+	done := webrtc.GatheringCompletePromise(pc)
+	select {
+	case <-done:
+	case <-time.After(iceGatherTimeout):
+		log.Printf("ICE gathering timed out after %s; proceeding with current candidates", iceGatherTimeout)
+	}
+}
+
+// localSDP returns the peer connection's local SDP, or an error if it was
+// torn down between set and read (which happens under reconnect storms).
+// Previously a nil dereference here would panic the request goroutine.
+func localSDP(pc *webrtc.PeerConnection) (string, error) {
+	if ld := pc.LocalDescription(); ld != nil {
+		return ld.SDP, nil
+	}
+	return "", fmt.Errorf("local description unavailable (peer closed before SDP read)")
+}
 
 // IngestSession represents an active OBS WHIP connection
 type IngestSession struct {
@@ -327,7 +353,6 @@ func (s *SFU) GetRoomTracks(roomSlug string) *RoomTracks {
 // Shutdown gracefully shuts down the SFU
 func (s *SFU) Shutdown() {
 	s.mu.Lock()
-	s.shutdown = true
 
 	// Collect tokens to avoid modifying map while iterating
 	tokens := make([]string, 0, len(s.ingests))
@@ -376,34 +401,31 @@ func (rt *RoomTracks) AddSubscriber(sub *Subscriber) {
 	metrics.Get().ActiveSubscribers.Add(1)
 }
 
-// RemoveSubscriber removes a subscriber from a room
+// RemoveSubscriber removes a subscriber from a room and tears down its peer
+// connection. Idempotent: safe to call from OnConnectionStateChange and from
+// direct code paths. Pion's close is invoked outside the map lock to avoid
+// blocking sibling subscribers while teardown RTCP traffic drains.
 func (rt *RoomTracks) RemoveSubscriber(id string) {
 	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	if sub, ok := rt.Subscribers[id]; ok {
-		// Use sync.Once to prevent double-close panic
-		sub.closeOnce.Do(func() {
-			close(sub.done)
-		})
-		delete(rt.Subscribers, id)
-		// Track subscriber removal
-		metrics.Get().ActiveSubscribers.Add(-1)
+	sub, ok := rt.Subscribers[id]
+	if !ok {
+		rt.mu.Unlock()
+		return
 	}
-	// Clean up any voice state owned by this participant.
-	// The relay goroutine will exit on its own when Read() returns EOF.
+	delete(rt.Subscribers, id)
+	// Clean up any voice state owned by this participant. The relay goroutine
+	// will exit on its own when Read() returns EOF from the closed PC below.
 	delete(rt.VoiceRemoteTracks, id)
 	delete(rt.VoiceLocalTracks, id)
-}
+	rt.mu.Unlock()
 
-// BroadcastTrack sends track data to all subscribers
-func (rt *RoomTracks) BroadcastTrack(track *webrtc.TrackLocalStaticRTP, data []byte) error {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-
-	// Write to all subscribers
-	// Note: In production, you'd use track.WriteRTP for proper RTP handling
-	_, err := track.Write(data)
-	return err
+	sub.closeOnce.Do(func() {
+		close(sub.done)
+	})
+	if sub.PeerConnection != nil {
+		_ = sub.PeerConnection.Close()
+	}
+	metrics.Get().ActiveSubscribers.Add(-1)
 }
 
 // BindIngestToRoom binds an ingest session's tracks to a room for distribution.
@@ -615,8 +637,7 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 	}
 
 	// Wait for ICE gathering
-	gatherComplete := webrtc.GatheringCompletePromise(pc)
-	<-gatherComplete
+	waitForICEGather(pc)
 
 	return pc, pc.LocalDescription(), nil
 }
@@ -768,11 +789,14 @@ func (s *SFU) HandleSubscriberOffer(roomSlug, subscriberID, sdpOffer string) (st
 	}
 
 	// Wait for ICE gathering
-	gatherComplete := webrtc.GatheringCompletePromise(sub.PeerConnection)
-	<-gatherComplete
+	waitForICEGather(sub.PeerConnection)
 
 	log.Printf("Renegotiation completed for subscriber %s (rolledBack=%v)", subscriberID, rolledBack)
-	return sub.PeerConnection.LocalDescription().SDP, rolledBack, nil
+	sdp, err := localSDP(sub.PeerConnection)
+	if err != nil {
+		return "", rolledBack, err
+	}
+	return sdp, rolledBack, nil
 }
 
 // GetIngestForRoom finds the ingest session bound to a room's stream key
@@ -920,8 +944,7 @@ func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP string, onTrack
 	}
 
 	// Wait for ICE gathering
-	gatherComplete := webrtc.GatheringCompletePromise(pc)
-	<-gatherComplete
+	waitForICEGather(pc)
 
 	// Store the voice session
 	room := s.GetRoomTracks(roomSlug)
@@ -947,7 +970,12 @@ func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP string, onTrack
 		}
 	})
 
-	return pc.LocalDescription().SDP, nil
+	ld := pc.LocalDescription()
+	if ld == nil {
+		pc.Close()
+		return "", fmt.Errorf("local description nil after gather")
+	}
+	return ld.SDP, nil
 }
 
 // RemoveVoiceSession removes a voice session
@@ -1106,10 +1134,9 @@ func (s *SFU) AddVoiceTrackToSubscriber(roomSlug, subscriberID, voiceOwnerID str
 	}
 
 	// Wait for ICE gathering
-	gatherComplete := webrtc.GatheringCompletePromise(sub.PeerConnection)
-	<-gatherComplete
+	waitForICEGather(sub.PeerConnection)
 
-	return sub.PeerConnection.LocalDescription().SDP, nil
+	return localSDP(sub.PeerConnection)
 }
 
 // RenegotiateSubscriber creates a new offer for a subscriber after tracks have changed
@@ -1147,11 +1174,10 @@ func (s *SFU) RenegotiateSubscriber(roomSlug, subscriberID string) (string, erro
 	}
 
 	// Wait for ICE gathering
-	gatherComplete := webrtc.GatheringCompletePromise(sub.PeerConnection)
-	<-gatherComplete
+	waitForICEGather(sub.PeerConnection)
 
 	log.Printf("Renegotiation offer created for subscriber %s", subscriberID)
-	return sub.PeerConnection.LocalDescription().SDP, nil
+	return localSDP(sub.PeerConnection)
 }
 
 // HandleRenegotiationAnswer processes an answer from a subscriber during renegotiation

@@ -151,8 +151,15 @@ export class WebRTCManager {
 
             // Handle connection failures
             if (state === 'disconnected') {
-                // Give it some time to recover before triggering ICE restart
+                // Always clear any existing timer before starting a new one —
+                // rapid state oscillation (dis/connected/dis) otherwise leaves
+                // stale timers that trigger unnecessary ICE restarts after the
+                // connection has already recovered.
+                if (this.connectionLostTimeout) {
+                    clearTimeout(this.connectionLostTimeout);
+                }
                 this.connectionLostTimeout = setTimeout(() => {
+                    this.connectionLostTimeout = null;
                     if (this.pc?.connectionState === 'disconnected') {
                         console.log('Connection still disconnected, attempting ICE restart');
                         this.performIceRestart();

@@ -26,8 +26,8 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	streamKeyHandler := handlers.NewStreamKeyHandler(db)
 	fileHandler := handlers.NewFileHandler(db, cfg, cfg.AdminToken)
 	configHandler := handlers.NewConfigHandler(db, cfg, sfu)
-	wsHandler := handlers.NewWebSocketHandler(db, hub, sfu, cfg.AllowedOrigins, cfg.ProductionMode, cfg.AdminToken)
 	authHandler := handlers.NewAuthHandler(db, cfg.AdminToken, cfg.ProductionMode)
+	wsHandler := handlers.NewWebSocketHandler(db, hub, sfu, cfg.AllowedOrigins, cfg.ProductionMode, cfg.AdminToken, authHandler.ValidateSession)
 
 	// Wire up room live callback to initiate WebRTC subscriptions
 	roomHandler.SetOnRoomLive(wsHandler.InitiateSubscriptionsForRoom)
@@ -46,11 +46,8 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 		},
 	)
 
-	// Health check
+	// Health check (public — used by load balancers and Caddy)
 	mux.HandleFunc("GET /health", handlers.HealthCheck)
-
-	// Prometheus metrics endpoint
-	mux.HandleFunc("GET /metrics", metrics.Handler())
 
 	// Auth endpoints (no auth required)
 	mux.HandleFunc("POST /api/auth/login", authHandler.Login)
@@ -95,6 +92,11 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 		ValidateSession: authHandler.ValidateSession,
 	}
 	mux.Handle("/api/", middleware.RequireAuth(authConfig)(adminMux))
+
+	// Prometheus metrics — behind the same admin auth. Prometheus can scrape
+	// with `Authorization: Bearer <admin-token>` (or a proxy that injects the
+	// cookie). Leaving /metrics unauthenticated leaks operational counters.
+	mux.Handle("GET /metrics", middleware.RequireAuth(authConfig)(http.HandlerFunc(metrics.Handler())))
 
 	// File endpoints (session auth) - rate limited: 10 per minute
 	mux.Handle("POST /api/rooms/{slug}/files", middleware.FileUploadRateLimiter(cfg.TrustedProxies)(http.HandlerFunc(fileHandler.Upload)))
@@ -148,7 +150,7 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	handler = middleware.RateLimiter(rateLimitConfig)(handler)
 
 	// Security headers
-	handler = middleware.SecurityHeaders(handler)
+	handler = middleware.SecurityHeaders(cfg.ProductionMode)(handler)
 
 	// Request logging
 	handler = middleware.RequestLogger(handler)

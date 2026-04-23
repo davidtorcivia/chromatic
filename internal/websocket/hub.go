@@ -61,6 +61,11 @@ type Client struct {
 	AudioEnabled bool
 	VideoEnabled bool
 
+	// AdminSessionID is the value of the admin session cookie captured at upgrade
+	// time. It's used to re-validate admin privileges on each privileged action
+	// so that mid-session logout revokes them. Empty for non-admin clients.
+	AdminSessionID string
+
 	// Rate limiting for chat messages (30 per minute)
 	chatRateLimiter *RateLimiter
 	// Rate limiting for cursor updates (20 per second)

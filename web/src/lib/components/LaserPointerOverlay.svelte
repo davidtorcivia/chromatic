@@ -121,7 +121,7 @@
         window.addEventListener("blur", handleWindowBlur);
 
         // Subscribe to cursor updates from WebSocket
-        session.onMessage("cursor", (payload) => {
+        const disposeCursor = session.onMessage("cursor", (payload) => {
             const data = payload as {
                 participantId: string;
                 participantName: string;
@@ -164,6 +164,7 @@
                 sendThrottle = null;
             }
             clearInterval(cleanupInterval);
+            disposeCursor();
         };
     });
 
