@@ -237,6 +237,12 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 	pc, offer, err := h.sfu.CreateSubscriberConnection(roomSlug, client.ID)
 	if err != nil {
 		logger.Error("Failed to create subscriber connection", "participant_id", client.ID, "room", roomSlug, "error", err)
+		// Tell the client the handshake failed so it can surface an error and
+		// offer a retry instead of sitting on "Connecting…" forever.
+		client.SendJSON("signal:error", map[string]interface{}{
+			"code":    "subscription-failed",
+			"message": "Failed to initialize stream. Please refresh the page to retry.",
+		})
 		return
 	}
 
@@ -658,34 +664,38 @@ func (h *WebSocketHandler) handleSignalOffer(client *websocket.Client, payload j
 	}
 }
 
-// forwardVoiceTrack forwards a participant's voice track to all other participants in the room.
-// It creates a single relay local track that reads from the remote track once and fans out
-// writes to all subscriber PCs, preventing the multi-reader bug.
+// forwardVoiceTrack forwards a participant's voice track to all other
+// participants in the room. On first arrival for a given speaker it creates
+// a shared relay local track and fans it out to every subscriber with a
+// renegotiation. On subsequent arrivals (speaker rejoins) the relay track is
+// reused — subscribers' existing senders are already bound to it, so no fan-
+// out or renegotiation is needed; we only rebind the forwarding goroutine.
 func (h *WebSocketHandler) forwardVoiceTrack(roomSlug, participantID string, track *pionwebrtc.TrackRemote) {
 	logger.Debug("Forwarding voice track", "participant_id", participantID, "room", roomSlug)
 
-	// Store the remote track reference
 	h.sfu.StoreVoiceRemoteTrack(roomSlug, participantID, track)
 
-	// Create a single relay track that reads from the remote track once
-	// and fans out writes to all subscriber PCs via Pion's internal binding.
-	relayTrack, err := h.sfu.CreateVoiceRelayTrack(roomSlug, participantID, track)
+	relayTrack, isNew, err := h.sfu.CreateVoiceRelayTrack(roomSlug, participantID, track)
 	if err != nil {
 		logger.Error("Failed to create voice relay track", "participant_id", participantID, "error", err)
 		return
 	}
 
-	// Add the relay track to all other subscribers
-	h.forwardVoiceTrackToClients(roomSlug, participantID, relayTrack, "")
-
-	// Request a keyframe after voice renegotiation. The SDP renegotiation
-	// can cause some browsers (Firefox) to briefly reset the video decoder,
-	// and a fresh IDR frame helps them recover immediately.
-	h.sfu.RequestKeyframe(roomSlug)
+	if isNew {
+		// First time seeing this speaker — AddTrack on every subscriber and
+		// trigger a renegotiation so the browser creates a receiver for it.
+		h.forwardVoiceTrackToClients(roomSlug, participantID, relayTrack, "")
+		// A fresh renegotiation can stall Firefox's video decoder briefly;
+		// a PLI nudges it to recover immediately.
+		h.sfu.RequestKeyframe(roomSlug)
+	}
 }
 
-// forwardVoiceTrackToClients adds a shared voice relay track to clients in the room.
-// If targetClientID is non-empty, only that specific client receives the track.
+// forwardVoiceTrackToClients adds a shared voice relay track to clients in
+// the room. If targetClientID is non-empty, only that specific client
+// receives the track. Each subscriber is handled in its own goroutine so a
+// slow / renegotiating subscriber doesn't block voice fan-out to everyone
+// else (small rooms, 2–8 viewers per the product spec).
 func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID string, localTrack *pionwebrtc.TrackLocalStaticRTP, targetClientID string) {
 	clients := h.hub.GetRoomClients(roomSlug)
 	for _, client := range clients {
@@ -693,21 +703,23 @@ func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID str
 			continue // Don't send to self
 		}
 		if targetClientID != "" && client.ID != targetClientID {
-			continue // Only send to specific target
-		}
-
-		offerSDP, err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, client.ID, voiceOwnerID, localTrack)
-		if err != nil {
-			logger.Warn("Failed to add voice track to subscriber", "subscriber_id", client.ID, "source_id", voiceOwnerID, "error", err)
 			continue
 		}
 
-		client.SendJSON("signal:renegotiate", map[string]interface{}{
-			"sdp":           offerSDP,
-			"participantId": voiceOwnerID,
-		})
+		go func(c *websocket.Client) {
+			offerSDP, err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, c.ID, voiceOwnerID, localTrack)
+			if err != nil {
+				logger.Warn("Failed to add voice track to subscriber", "subscriber_id", c.ID, "source_id", voiceOwnerID, "error", err)
+				return
+			}
 
-		logger.Debug("Sent renegotiation offer for voice track", "subscriber_id", client.ID, "source_id", voiceOwnerID)
+			c.SendJSON("signal:renegotiate", map[string]interface{}{
+				"sdp":           offerSDP,
+				"participantId": voiceOwnerID,
+			})
+
+			logger.Debug("Sent renegotiation offer for voice track", "subscriber_id", c.ID, "source_id", voiceOwnerID)
+		}(client)
 	}
 }
 
@@ -807,6 +819,13 @@ func (h *WebSocketHandler) handleRenegotiateAnswer(client *websocket.Client, pay
 }
 
 func (h *WebSocketHandler) handleResync(client *websocket.Client) {
+	// No-op when the room has no live ingest — PLI to a nonexistent receiver
+	// is wasted work, and avoids log spam if a client spams resync while the
+	// publisher is offline.
+	if !h.sfu.IsRoomLive(client.RoomSlug) {
+		logger.Debug("Ignoring resync request for inactive room", "participant_id", client.ID, "room", client.RoomSlug)
+		return
+	}
 	logger.Debug("Processing resync/keyframe request", "participant_id", client.ID, "room", client.RoomSlug)
 	h.sfu.RequestKeyframe(client.RoomSlug)
 }
@@ -839,6 +858,12 @@ func (h *WebSocketHandler) handleAdminMute(client *websocket.Client, payload jso
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return
 	}
+
+	// Gate voice RTP at the server — admin:muted as a broadcast-only hint is
+	// advisory, and a malicious client could simply ignore it and keep
+	// sending. Flipping the relay's mute flag drops the packets regardless
+	// of what the client chooses to do.
+	h.sfu.SetVoiceMuted(client.RoomSlug, data.ParticipantID, true)
 
 	h.hub.BroadcastJSON(client.RoomSlug, "admin:muted", map[string]interface{}{
 		"participantId": data.ParticipantID,

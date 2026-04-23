@@ -514,6 +514,51 @@ func TestSFU_Shutdown(t *testing.T) {
 	}
 }
 
+// TestSFU_SetVoiceMuted verifies the server-side mute gate toggles the
+// per-session atomic that the voice relay forwarder checks on each RTP packet.
+// Without this gate, admin:mute is advisory-only — a client that ignores the
+// broadcast would keep sending audio to every subscriber.
+func TestSFU_SetVoiceMuted(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	participantID := "p1"
+	room := sfu.GetRoomTracks(roomSlug)
+	if room.VoiceSessions == nil {
+		room.VoiceSessions = make(map[string]*VoiceSession)
+	}
+	vs := &VoiceSession{
+		ParticipantID: participantID,
+		done:          make(chan struct{}),
+	}
+	room.mu.Lock()
+	room.VoiceSessions[participantID] = vs
+	room.mu.Unlock()
+
+	if vs.Muted.Load() {
+		t.Fatal("new voice session should start unmuted")
+	}
+
+	sfu.SetVoiceMuted(roomSlug, participantID, true)
+	if !vs.Muted.Load() {
+		t.Fatal("SetVoiceMuted(true) did not flip the atomic")
+	}
+
+	sfu.SetVoiceMuted(roomSlug, participantID, false)
+	if vs.Muted.Load() {
+		t.Fatal("SetVoiceMuted(false) did not clear the atomic")
+	}
+
+	// Non-existent room / participant must be a no-op (not panic).
+	sfu.SetVoiceMuted("nope", participantID, true)
+	sfu.SetVoiceMuted(roomSlug, "nobody", true)
+}
+
 func TestSFU_CreatePeerConnection(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)

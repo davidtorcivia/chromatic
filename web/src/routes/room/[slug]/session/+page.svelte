@@ -175,6 +175,15 @@
             if (webrtcManager) await webrtcManager.handleVoiceAnswer(data.sdp);
         });
 
+        // Server-reported signaling failure (e.g. subscriber setup failed).
+        // Surface it as a stream error so the user knows to refresh instead
+        // of sitting on "Connecting…" forever.
+        session.onMessage("signal:error", (payload: unknown) => {
+            const data = payload as { code?: string; message?: string };
+            console.error('Stream error from server:', data);
+            streamError = data?.message || 'Stream error. Please refresh the page.';
+        });
+
         // Release per-participant audio graph (VAD + ducking) when someone
         // leaves the room — otherwise their AnalyserNode and GainNode stay
         // connected to the shared AudioContext and the graph grows with churn.

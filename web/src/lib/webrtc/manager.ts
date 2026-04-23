@@ -31,8 +31,16 @@ export class WebRTCManager {
     // Enqueue an async signaling operation so SDP changes are serialized.
     private enqueueSignaling<T>(fn: () => Promise<T>): Promise<T> {
         const task = this.signalingQueue.then(fn, fn);
-        // Keep the queue moving regardless of success/failure
-        this.signalingQueue = task.then(() => {}, () => {});
+        // Keep the queue moving regardless of success/failure. Log rejections
+        // so they're not swallowed silently — previously a thrown op would
+        // disappear and the next op would run on possibly-stale PC state with
+        // no trace in the console.
+        this.signalingQueue = task.then(
+            () => {},
+            (err) => {
+                console.error('Signaling queue task failed:', err);
+            }
+        );
         return task;
     }
 
@@ -210,6 +218,10 @@ export class WebRTCManager {
                     clearTimeout(this.connectionLostTimeout);
                     this.connectionLostTimeout = null;
                 }
+                if (this.iceRestartTimeout) {
+                    clearTimeout(this.iceRestartTimeout);
+                    this.iceRestartTimeout = null;
+                }
                 this.iceRestartPending = false;
             }
         };
@@ -223,7 +235,13 @@ export class WebRTCManager {
         };
     }
 
-    // Perform ICE restart to recover from connection issues
+    // Perform ICE restart to recover from connection issues.
+    //
+    // If the answer never arrives (dropped WS, server restart mid-flight) the
+    // connection-state machine won't clear iceRestartPending — without the
+    // timeout below, the flag would stay true forever and every subsequent
+    // restart attempt would be a no-op, leaving the viewer stranded.
+    private iceRestartTimeout: ReturnType<typeof setTimeout> | null = null;
     async performIceRestart(): Promise<void> {
         if (!this.pc || this.iceRestartPending) {
             return;
@@ -232,6 +250,17 @@ export class WebRTCManager {
         this.iceRestartPending = true;
         console.log('Performing ICE restart...');
         this.options.onIceRestart?.();
+
+        if (this.iceRestartTimeout) {
+            clearTimeout(this.iceRestartTimeout);
+        }
+        this.iceRestartTimeout = setTimeout(() => {
+            this.iceRestartTimeout = null;
+            if (this.iceRestartPending) {
+                console.warn('ICE restart answer not received within 15s; clearing pending flag to allow retry');
+                this.iceRestartPending = false;
+            }
+        }, 15000);
 
         return this.enqueueSignaling(async () => {
             try {
@@ -247,6 +276,10 @@ export class WebRTCManager {
             } catch (err) {
                 console.error('Failed to perform ICE restart:', err);
                 this.iceRestartPending = false;
+                if (this.iceRestartTimeout) {
+                    clearTimeout(this.iceRestartTimeout);
+                    this.iceRestartTimeout = null;
+                }
             }
         });
     }
@@ -443,6 +476,10 @@ export class WebRTCManager {
         if (this.connectionLostTimeout) {
             clearTimeout(this.connectionLostTimeout);
             this.connectionLostTimeout = null;
+        }
+        if (this.iceRestartTimeout) {
+            clearTimeout(this.iceRestartTimeout);
+            this.iceRestartTimeout = null;
         }
 
         if (this.localStream) {
