@@ -36,36 +36,44 @@ export class WebRTCManager {
         return task;
     }
 
-    // Handle incoming SDP offer from server
+    // Handle incoming SDP offer from server. `signal:offer` is semantically a
+    // FRESH subscription (server just spun up a new SFU subscriber for us),
+    // distinct from `signal:renegotiate` which modifies an existing session.
+    // So if we already have a peer connection here, it's stale — tear it down
+    // before accepting the new one. This is what unblocks viewers hanging on
+    // reconnect: the old WS closed, the server replaced our subscriber, and
+    // we must mirror that by abandoning the old PC.
     async handleOffer(sdp: string): Promise<void> {
         return this.enqueueSignaling(async () => {
             console.log('Handling WebRTC offer');
 
-            // Create peer connection if not exists
+            if (this.pc) {
+                const state = this.pc.connectionState;
+                const sig = this.pc.signalingState;
+                // If we're partway through a fresh handshake (no local description
+                // yet), reuse the pc. Otherwise assume this is a reconnect-initiated
+                // fresh session and rebuild.
+                if (state !== 'new' || sig !== 'stable') {
+                    console.log('Resetting stale peer connection before fresh offer', { state, sig });
+                    this.resetPeerConnection();
+                }
+            }
+
             if (!this.pc) {
                 this.createPeerConnection();
             }
 
             const pc = this.pc!;
 
-            // Set remote description (the offer from server)
-            const offer: RTCSessionDescriptionInit = {
-                type: 'offer',
-                sdp: sdp
-            };
-
+            const offer: RTCSessionDescriptionInit = { type: 'offer', sdp };
             await pc.setRemoteDescription(offer);
             console.log('Set remote description');
 
-            // Create answer
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             console.log('Created and set local description (answer)');
 
-            // Send answer back to server
-            this.options.sendSignal('signal:answer', {
-                sdp: answer.sdp
-            });
+            this.options.sendSignal('signal:answer', { sdp: answer.sdp });
 
             // If we have a pending mic stream and mic is enabled, add it now
             if (this.localStream && !this.audioSender && !this.isMicMuted) {
@@ -73,6 +81,26 @@ export class WebRTCManager {
                 await this.addLocalAudioTrack();
             }
         });
+    }
+
+    // resetPeerConnection tears down the existing RTCPeerConnection without
+    // touching localStream (the mic may still be granted) or the signaling
+    // queue. Used on fresh-offer arrival when the old PC is stale.
+    private resetPeerConnection(): void {
+        if (this.connectionLostTimeout) {
+            clearTimeout(this.connectionLostTimeout);
+            this.connectionLostTimeout = null;
+        }
+        this.iceRestartPending = false;
+        this.audioSender = null;
+        if (this.pc) {
+            try {
+                this.pc.close();
+            } catch {
+                // already closed
+            }
+            this.pc = null;
+        }
     }
 
     // Handle ICE candidate from server (if server sends any)

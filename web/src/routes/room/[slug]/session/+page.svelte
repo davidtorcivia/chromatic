@@ -382,6 +382,13 @@
         // when created outside a user-gesture handler, so the AnalyserNode
         // would return silence and the VAD would never trigger.
         getAudioContext().then(ctx => {
+            // If a reconnect delivered a fresh track for the same participant,
+            // tear down the stale analyser first so we don't leak graph nodes
+            // and so the VAD reflects the new source.
+            const existing = voiceAnalysers.get(participantId);
+            if (existing) {
+                try { existing.disconnect(); } catch { /* already gone */ }
+            }
             const stream = new MediaStream([track]);
             const source = ctx.createMediaStreamSource(stream);
             const analyser = ctx.createAnalyser();

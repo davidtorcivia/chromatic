@@ -313,25 +313,60 @@ func (s *SFU) GetIngest(streamKeyToken string) *IngestSession {
 	return s.ingests[streamKeyToken]
 }
 
-// SetIngest registers an ingest session
+// SetIngest registers an ingest session. If an ingest with the same token
+// already exists (OBS reconnect before the old PC's teardown callback fired),
+// the old session is torn down first so its PC doesn't hold resources and so
+// its stale OnConnectionStateChange callback can't remove the replacement.
 func (s *SFU) SetIngest(streamKeyToken string, session *IngestSession) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	prev, replaced := s.ingests[streamKeyToken]
 	s.ingests[streamKeyToken] = session
-}
+	s.mu.Unlock()
 
-// RemoveIngest removes an ingest session
-func (s *SFU) RemoveIngest(streamKeyToken string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if session, ok := s.ingests[streamKeyToken]; ok {
-		// Use sync.Once to prevent double-close panic
-		session.closeOnce.Do(func() {
-			close(session.done)
-		})
-		delete(s.ingests, streamKeyToken)
+	if replaced && prev != nil {
+		log.Printf("Replacing existing ingest for key %s... (OBS reconnect)", streamKeyToken[:min(8, len(streamKeyToken))])
+		prev.closeOnce.Do(func() { close(prev.done) })
+		if prev.PeerConnection != nil {
+			_ = prev.PeerConnection.Close()
+		}
 	}
 }
+
+// RemoveIngest removes an ingest session unconditionally (used for explicit
+// teardown paths).
+func (s *SFU) RemoveIngest(streamKeyToken string) {
+	s.removeIngestIf(streamKeyToken, nil)
+}
+
+// removeIngestIfSame removes the ingest only when the current map entry
+// matches the given expected session. Prevents a stale Failed/Closed callback
+// from a replaced ingest from killing the new one.
+func (s *SFU) removeIngestIfSame(streamKeyToken string, expected *IngestSession) {
+	s.removeIngestIf(streamKeyToken, expected)
+}
+
+func (s *SFU) removeIngestIf(streamKeyToken string, expected *IngestSession) {
+	s.mu.Lock()
+	session, ok := s.ingests[streamKeyToken]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	if expected != nil && session != expected {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.ingests, streamKeyToken)
+	s.mu.Unlock()
+
+	session.closeOnce.Do(func() {
+		close(session.done)
+	})
+	if session.PeerConnection != nil {
+		_ = session.PeerConnection.Close()
+	}
+}
+
 
 // GetRoomTracks gets or creates room tracks for a slug
 func (s *SFU) GetRoomTracks(roomSlug string) *RoomTracks {
@@ -392,12 +427,31 @@ func (s *SFU) Shutdown() {
 	log.Println("SFU shutdown complete")
 }
 
-// AddSubscriber adds a subscriber to a room
+// AddSubscriber adds a subscriber to a room. If a subscriber with the same ID
+// already exists (rejoin after WebSocket reconnect) the old subscriber's peer
+// connection is closed and torn down *before* the new one takes its slot.
+// Without this, the old PC's OnConnectionStateChange(closed) callback would
+// fire later and delete the freshly-created replacement from the map — which
+// is exactly what caused viewers to hang indefinitely on reconnect.
 func (rt *RoomTracks) AddSubscriber(sub *Subscriber) {
 	rt.mu.Lock()
-	defer rt.mu.Unlock()
+	prev, replaced := rt.Subscribers[sub.ID]
 	rt.Subscribers[sub.ID] = sub
-	// Track active subscriber
+	rt.mu.Unlock()
+
+	if replaced {
+		log.Printf("Replacing existing subscriber %s (rejoin); tearing down prior PC", sub.ID)
+		prev.closeOnce.Do(func() {
+			close(prev.done)
+		})
+		if prev.PeerConnection != nil {
+			_ = prev.PeerConnection.Close()
+		}
+		// Don't decrement ActiveSubscribers here — the new sub is replacing it,
+		// so net count is unchanged. The Add(1) below would otherwise double-count.
+		return
+	}
+
 	metrics.Get().ActiveSubscribers.Add(1)
 }
 
@@ -406,9 +460,27 @@ func (rt *RoomTracks) AddSubscriber(sub *Subscriber) {
 // direct code paths. Pion's close is invoked outside the map lock to avoid
 // blocking sibling subscribers while teardown RTCP traffic drains.
 func (rt *RoomTracks) RemoveSubscriber(id string) {
+	rt.removeSubscriberIf(id, nil)
+}
+
+// removeSubscriberIfSame removes the subscriber only if the map entry for id
+// points to the given sub. This prevents an old PC's terminal-state callback
+// from tearing down its replacement after a participant rejoined with the
+// same ID.
+func (rt *RoomTracks) removeSubscriberIfSame(id string, expected *Subscriber) {
+	rt.removeSubscriberIf(id, expected)
+}
+
+func (rt *RoomTracks) removeSubscriberIf(id string, expected *Subscriber) {
 	rt.mu.Lock()
 	sub, ok := rt.Subscribers[id]
 	if !ok {
+		rt.mu.Unlock()
+		return
+	}
+	if expected != nil && sub != expected {
+		// The map now holds a different subscriber (same ID, fresh connection).
+		// Leave it alone — the caller is the old, stale subscriber's shadow.
 		rt.mu.Unlock()
 		return
 	}
@@ -612,12 +684,15 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 
 	// Handle connection state — only remove on terminal states.
 	// "disconnected" is transient and can recover via ICE restart from the client.
+	// Capture the sub pointer so that if the participant has rejoined (a new
+	// subscriber already sits under this ID in the map), our terminal-state
+	// callback is a no-op instead of killing the replacement.
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("Subscriber %s connection state: %s", subscriberID, state)
 		switch state {
 		case webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed:
-			room.RemoveSubscriber(subscriberID)
+			room.removeSubscriberIfSame(subscriberID, sub)
 		}
 	})
 
@@ -728,12 +803,12 @@ func (s *SFU) HandleIceRestart(roomSlug, subscriberID, sdpOffer string) (string,
 		return "", fmt.Errorf("failed to set local description: %w", err)
 	}
 
-	// Wait for ICE gathering so the answer includes candidates
-	gatherComplete := webrtc.GatheringCompletePromise(sub.PeerConnection)
-	<-gatherComplete
+	// Wait for ICE gathering so the answer includes candidates.
+	// Bounded — see iceGatherTimeout.
+	waitForICEGather(sub.PeerConnection)
 
 	log.Printf("ICE restart completed for subscriber %s", subscriberID)
-	return sub.PeerConnection.LocalDescription().SDP, nil
+	return localSDP(sub.PeerConnection)
 }
 
 // HandleSubscriberOffer processes a client-initiated offer on an existing subscriber connection.
@@ -946,27 +1021,40 @@ func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP string, onTrack
 	// Wait for ICE gathering
 	waitForICEGather(pc)
 
-	// Store the voice session
+	// Store the voice session. If the participant already had one (rejoin),
+	// close the old PC first so its terminal-state callback can't later tear
+	// down the replacement.
+	newSession := &VoiceSession{
+		ParticipantID:  participantID,
+		PeerConnection: pc,
+		done:           make(chan struct{}),
+	}
 	room := s.GetRoomTracks(roomSlug)
 	room.mu.Lock()
 	if room.VoiceSessions == nil {
 		room.VoiceSessions = make(map[string]*VoiceSession)
 	}
-	room.VoiceSessions[participantID] = &VoiceSession{
-		ParticipantID:  participantID,
-		PeerConnection: pc,
-		done:           make(chan struct{}),
-	}
+	prev, replaced := room.VoiceSessions[participantID]
+	room.VoiceSessions[participantID] = newSession
 	room.mu.Unlock()
 
-	// Handle connection state
+	if replaced && prev != nil {
+		log.Printf("Replacing existing voice session for %s (rejoin)", participantID)
+		prev.closeOnce.Do(func() { close(prev.done) })
+		if prev.PeerConnection != nil {
+			_ = prev.PeerConnection.Close()
+		}
+	}
+
+	// Handle connection state. Only act on terminal states — "disconnected" is
+	// transient and can recover. Identity-check so a zombie callback from a
+	// previously-replaced session can't delete the current one.
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("Voice connection state for %s: %s", participantID, state)
 		switch state {
-		case webrtc.PeerConnectionStateDisconnected,
-			webrtc.PeerConnectionStateFailed,
+		case webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed:
-			s.RemoveVoiceSession(roomSlug, participantID)
+			s.removeVoiceSessionIfSame(roomSlug, participantID, newSession)
 		}
 	})
 
@@ -980,26 +1068,41 @@ func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP string, onTrack
 
 // RemoveVoiceSession removes a voice session
 func (s *SFU) RemoveVoiceSession(roomSlug, participantID string) {
+	s.removeVoiceSessionIfSame(roomSlug, participantID, nil)
+}
+
+// removeVoiceSessionIfSame removes the participant's voice session only when
+// the map entry matches the given expected session. Prevents a zombie callback
+// from a replaced (rejoin) session from tearing down the live replacement.
+// If expected is nil, removal is unconditional (used for explicit cleanup).
+func (s *SFU) removeVoiceSessionIfSame(roomSlug, participantID string, expected *VoiceSession) {
 	room := s.GetRoomTracksForSlug(roomSlug)
 	if room == nil {
 		return
 	}
 
 	room.mu.Lock()
-	defer room.mu.Unlock()
-
-	if session, ok := room.VoiceSessions[participantID]; ok {
-		session.closeOnce.Do(func() {
-			close(session.done)
-		})
-		if session.PeerConnection != nil {
-			session.PeerConnection.Close()
-		}
-		delete(room.VoiceSessions, participantID)
-		delete(room.VoiceRemoteTracks, participantID)
-		delete(room.VoiceLocalTracks, participantID)
-		log.Printf("Removed voice session for %s from room %s", participantID, roomSlug)
+	session, ok := room.VoiceSessions[participantID]
+	if !ok {
+		room.mu.Unlock()
+		return
 	}
+	if expected != nil && session != expected {
+		room.mu.Unlock()
+		return
+	}
+	delete(room.VoiceSessions, participantID)
+	delete(room.VoiceRemoteTracks, participantID)
+	delete(room.VoiceLocalTracks, participantID)
+	room.mu.Unlock()
+
+	session.closeOnce.Do(func() {
+		close(session.done)
+	})
+	if session.PeerConnection != nil {
+		_ = session.PeerConnection.Close()
+	}
+	log.Printf("Removed voice session for %s from room %s", participantID, roomSlug)
 }
 
 // CreateVoiceRelayTrack creates a single local relay track for a voice source and

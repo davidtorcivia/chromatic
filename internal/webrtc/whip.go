@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 
 	"chromatic/internal/metrics"
 
@@ -67,12 +68,13 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 		return
 	}
 
-	// Check if already streaming with this key
-	if h.sfu.GetIngest(token) != nil {
-		http.Error(w, "Stream key already in use", http.StatusConflict)
-		return
-	}
-
+	// If an existing ingest is holding this stream key (typically an OBS
+	// instance reconnecting before its prior PC timed out), replace it rather
+	// than returning 409 — the new OBS connection IS the canonical sender.
+	// SetIngest below will close the old PC; subscriber connections keep
+	// their senders and will be rebound via BindIngestToRoom when the new PC
+	// reaches Connected.
+	//
 	// Read SDP offer
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1MB limit
 	if err != nil {
@@ -188,25 +190,35 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 		}()
 	})
 
-	// Handle connection state changes
+	// Handle connection state changes.
+	// - Only increment/decrement ActiveWHIPIngests once per session using a
+	//   sync.Once so flapping (connected→disconnected→connected) doesn't double-
+	//   count or send the counter negative.
+	// - Only act on terminal states (Failed/Closed) for teardown — Disconnected
+	//   is transient and can recover via ICE restart on OBS's side.
+	// - Use removeIngestIfSame so that if OBS has already reconnected and a
+	//   fresh ingest session is live under this token, a stale callback on the
+	//   old PC doesn't delete the replacement.
+	var startedMetric, endedMetric sync.Once
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("WHIP connection state: %s (key: %s...)", state, token[:8])
 
 		switch state {
 		case webrtc.PeerConnectionStateConnected:
-			// Track active WHIP ingest
-			metrics.Get().ActiveWHIPIngests.Add(1)
+			startedMetric.Do(func() {
+				metrics.Get().ActiveWHIPIngests.Add(1)
+			})
 			if h.onStreamStart != nil {
 				if err := h.onStreamStart(token); err != nil {
 					log.Printf("Error on stream start: %v", err)
 				}
 			}
-		case webrtc.PeerConnectionStateDisconnected,
-			webrtc.PeerConnectionStateFailed,
+		case webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed:
-			// Track WHIP ingest ended
-			metrics.Get().ActiveWHIPIngests.Add(-1)
-			h.sfu.RemoveIngest(token)
+			endedMetric.Do(func() {
+				metrics.Get().ActiveWHIPIngests.Add(-1)
+			})
+			h.sfu.removeIngestIfSame(token, session)
 			if h.onStreamEnd != nil {
 				h.onStreamEnd(token)
 			}

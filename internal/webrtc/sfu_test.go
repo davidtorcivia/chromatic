@@ -295,6 +295,138 @@ func TestRoomTracks_AddRemoveSubscriber(t *testing.T) {
 	room.RemoveSubscriber("nonexistent")
 }
 
+// TestRoomTracks_AddSubscriber_ReplacesOldOnRejoin is the regression test for
+// the "hang forever on reconnect" bug: when a participant rejoins with the
+// same ID, the old subscriber must be displaced (done channel closed, PC
+// referenced for teardown) so that its stale Failed/Closed callback can no
+// longer destroy the replacement.
+func TestRoomTracks_AddSubscriber_ReplacesOldOnRejoin(t *testing.T) {
+	room := &RoomTracks{
+		RoomSlug:    "test-room",
+		Subscribers: make(map[string]*Subscriber),
+	}
+
+	old := &Subscriber{ID: "p1", done: make(chan struct{})}
+	room.AddSubscriber(old)
+
+	newSub := &Subscriber{ID: "p1", done: make(chan struct{})}
+	room.AddSubscriber(newSub)
+
+	if len(room.Subscribers) != 1 {
+		t.Fatalf("expected 1 subscriber after rejoin, got %d", len(room.Subscribers))
+	}
+	if room.Subscribers["p1"] != newSub {
+		t.Fatalf("expected new subscriber in map, got old")
+	}
+
+	select {
+	case <-old.done:
+		// good — old's done was closed by the replacement
+	default:
+		t.Fatal("old subscriber's done channel was not closed on replacement")
+	}
+
+	// The simulation of a stale old-PC callback firing must NOT remove the
+	// replacement. This is the critical identity-check we rely on.
+	room.removeSubscriberIfSame("p1", old)
+	if room.Subscribers["p1"] != newSub {
+		t.Fatal("stale callback for replaced subscriber removed the live replacement")
+	}
+
+	// But an identity-matched removal DOES clear it.
+	room.removeSubscriberIfSame("p1", newSub)
+	if _, ok := room.Subscribers["p1"]; ok {
+		t.Fatal("matched removeSubscriberIfSame did not remove the subscriber")
+	}
+}
+
+func TestSFU_SetIngest_ReplacesOldOnReconnect(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	token := "obs-key-1"
+	old := &IngestSession{StreamKeyToken: token, done: make(chan struct{})}
+	newIng := &IngestSession{StreamKeyToken: token, done: make(chan struct{})}
+
+	sfu.SetIngest(token, old)
+	sfu.SetIngest(token, newIng)
+
+	// Old session's done must be closed on replacement.
+	select {
+	case <-old.done:
+	default:
+		t.Fatal("old ingest's done channel was not closed on replacement")
+	}
+
+	// Stale callback must not remove the live replacement.
+	sfu.removeIngestIfSame(token, old)
+	if got := sfu.GetIngest(token); got != newIng {
+		t.Fatalf("stale ingest callback removed the replacement (got %v)", got)
+	}
+
+	// Identity-matched removal clears it.
+	sfu.removeIngestIfSame(token, newIng)
+	if got := sfu.GetIngest(token); got != nil {
+		t.Fatal("matched removeIngestIfSame did not clear the ingest")
+	}
+}
+
+func TestSFU_RemoveVoiceSessionIfSame_IgnoresStaleCallback(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	// Pre-create the room so GetRoomTracksForSlug finds it.
+	sfu.GetRoomTracks(roomSlug)
+
+	participantID := "p1"
+	room := sfu.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		t.Fatal("expected room to exist")
+	}
+	if room.VoiceSessions == nil {
+		room.VoiceSessions = make(map[string]*VoiceSession)
+	}
+
+	oldVS := &VoiceSession{ParticipantID: participantID, done: make(chan struct{})}
+	newVS := &VoiceSession{ParticipantID: participantID, done: make(chan struct{})}
+
+	room.mu.Lock()
+	room.VoiceSessions[participantID] = oldVS
+	room.mu.Unlock()
+
+	// Replace: caller would normally close old outside the map operation.
+	room.mu.Lock()
+	room.VoiceSessions[participantID] = newVS
+	room.mu.Unlock()
+
+	// Simulate stale callback firing for oldVS — must not remove newVS.
+	sfu.removeVoiceSessionIfSame(roomSlug, participantID, oldVS)
+	room.mu.RLock()
+	got := room.VoiceSessions[participantID]
+	room.mu.RUnlock()
+	if got != newVS {
+		t.Fatal("stale voice-session callback removed the live replacement")
+	}
+
+	// Matched removal clears it.
+	sfu.removeVoiceSessionIfSame(roomSlug, participantID, newVS)
+	room.mu.RLock()
+	_, stillThere := room.VoiceSessions[participantID]
+	room.mu.RUnlock()
+	if stillThere {
+		t.Fatal("matched removeVoiceSessionIfSame did not remove the session")
+	}
+}
+
 func TestSFU_BindIngestToRoom_NotFound(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)

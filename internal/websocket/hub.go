@@ -179,8 +179,6 @@ func (h *Hub) Run() {
 
 func (h *Hub) registerClient(client *Client) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	room, ok := h.rooms[client.RoomSlug]
 	if !ok {
 		room = &Room{
@@ -188,13 +186,27 @@ func (h *Hub) registerClient(client *Client) {
 			Clients: make(map[string]*Client),
 		}
 		h.rooms[client.RoomSlug] = room
-		// Track new active room
 		metrics.Get().ActiveRooms.Add(1)
 	}
 
+	// If a client with the same ID already exists (viewer reconnecting with
+	// the same participant token before the old ReadPump noticed the drop),
+	// close the old one's send channel and connection now. Otherwise the old
+	// ReadPump's eventual Unregister would delete *this* client from the map.
+	prev, replaced := room.Clients[client.ID]
 	room.Clients[client.ID] = client
-	// Track WebSocket connections
-	metrics.Get().ActiveWebsockets.Add(1)
+	h.mu.Unlock()
+
+	if replaced && prev != nil {
+		log.Printf("Replacing existing websocket client %s (rejoin)", client.ID)
+		prev.closeOnce.Do(func() { close(prev.Send) })
+		if prev.Conn != nil {
+			_ = prev.Conn.Close()
+		}
+		// Net websocket count unchanged — the replacement cancels out.
+	} else {
+		metrics.Get().ActiveWebsockets.Add(1)
+	}
 	log.Printf("Client %s (%s) joined room %s", client.ID, client.Name, client.RoomSlug)
 }
 
@@ -202,50 +214,85 @@ func (h *Hub) unregisterClient(client *Client) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if room, ok := h.rooms[client.RoomSlug]; ok {
-		if _, ok := room.Clients[client.ID]; ok {
-			delete(room.Clients, client.ID)
-			// Use sync.Once to prevent double-close panic
-			client.closeOnce.Do(func() {
-				close(client.Send)
-			})
-			// Track WebSocket disconnection
-			metrics.Get().ActiveWebsockets.Add(-1)
-			log.Printf("Client %s (%s) left room %s", client.ID, client.Name, client.RoomSlug)
+	room, ok := h.rooms[client.RoomSlug]
+	if !ok {
+		return
+	}
+	existing, ok := room.Clients[client.ID]
+	if !ok {
+		return
+	}
+	// Only delete if the map entry still points at THIS client. A rejoin may
+	// have already replaced us — in that case the replacement is live and we
+	// must not delete it or close its channels.
+	if existing != client {
+		log.Printf("Stale unregister for %s ignored (replaced by newer connection)", client.ID)
+		return
+	}
+	delete(room.Clients, client.ID)
+	client.closeOnce.Do(func() {
+		close(client.Send)
+	})
+	metrics.Get().ActiveWebsockets.Add(-1)
+	log.Printf("Client %s (%s) left room %s", client.ID, client.Name, client.RoomSlug)
 
-			// Clean up empty rooms
-			if len(room.Clients) == 0 {
-				delete(h.rooms, client.RoomSlug)
-				// Track room closure
-				metrics.Get().ActiveRooms.Add(-1)
-			}
-		}
+	if len(room.Clients) == 0 {
+		delete(h.rooms, client.RoomSlug)
+		metrics.Get().ActiveRooms.Add(-1)
 	}
 }
 
 func (h *Hub) broadcastToRoom(msg *RoomMessage) {
+	// Snapshot the recipient list under RLock, then release before any writes.
+	// Previously this routine mutated room.Clients while holding only an
+	// RLock, racing with registerClient/unregisterClient; it could also delete
+	// a rejoined client's entry when the stale buffer was full.
 	h.mu.RLock()
-	defer h.mu.RUnlock()
-
 	room, ok := h.rooms[msg.RoomSlug]
 	if !ok {
+		h.mu.RUnlock()
 		return
 	}
-
+	recipients := make([]*Client, 0, len(room.Clients))
 	for id, client := range room.Clients {
 		if id == msg.Exclude {
 			continue
 		}
+		recipients = append(recipients, client)
+	}
+	h.mu.RUnlock()
 
+	var slow []*Client
+	for _, client := range recipients {
 		select {
 		case client.Send <- msg.Message:
 		default:
-			// Client's send buffer is full, close it safely
-			client.closeOnce.Do(func() {
-				close(client.Send)
-			})
-			delete(room.Clients, id)
+			slow = append(slow, client)
 		}
+	}
+
+	// Evict slow clients with identity check so a concurrent rejoin isn't
+	// kicked out by someone else's stalled buffer.
+	if len(slow) == 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	room, ok = h.rooms[msg.RoomSlug]
+	if !ok {
+		return
+	}
+	for _, client := range slow {
+		if current := room.Clients[client.ID]; current == client {
+			delete(room.Clients, client.ID)
+			client.closeOnce.Do(func() { close(client.Send) })
+			metrics.Get().ActiveWebsockets.Add(-1)
+			log.Printf("Dropped slow client %s (send buffer full)", client.ID)
+		}
+	}
+	if len(room.Clients) == 0 {
+		delete(h.rooms, msg.RoomSlug)
+		metrics.Get().ActiveRooms.Add(-1)
 	}
 }
 
