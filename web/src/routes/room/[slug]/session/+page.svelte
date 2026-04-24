@@ -36,6 +36,11 @@
     let adminMenuPosition = $state({ x: 0, y: 0 });
     let currentRtt = $state<number | null>(null);
     let statsInterval: ReturnType<typeof setInterval> | null = null;
+    // Cloudflare TURN credentials default to a 1 h TTL; long color-grading
+    // sessions (4–8 h) outlive that. Refresh every 30 min over the existing
+    // WebSocket so any ICE restart later always has fresh creds to gather
+    // with. The live media allocation is unaffected by the refresh.
+    let iceServerRefreshInterval: ReturnType<typeof setInterval> | null = null;
     let streamVolume = $state(1.0);
     let voiceVolume = $state(1.0);
     let showVolumeControls = $state(false);
@@ -79,11 +84,21 @@
 
         await unlockAudio();
 
-        // Handle ICE servers from room state
+        // Handle ICE servers from room state (initial delivery in room:state)
         session.onMessage("iceServers", (servers: unknown) => {
             iceServers = servers as RTCIceServer[];
             console.log('Received ICE servers:', iceServers);
             initializeWebRTC();
+            // Start the periodic refresh only once we have a live manager.
+            startICEServerRefresh();
+        });
+
+        // Handle refreshed ICE servers (periodic credential rotation)
+        session.onMessage("signal:ice-servers", (payload: unknown) => {
+            const data = payload as { iceServers?: RTCIceServer[] };
+            if (!data?.iceServers) return;
+            iceServers = data.iceServers;
+            webrtcManager?.updateICEServers(data.iceServers);
         });
 
         // Handle WebRTC offer from server
@@ -373,6 +388,23 @@
         }
     }
 
+    function startICEServerRefresh() {
+        if (iceServerRefreshInterval) return;
+        // 30 min — well under Cloudflare's 1 h TTL minus the 60 s skew the
+        // server applies, so creds are always fresh when gathered.
+        const THIRTY_MIN = 30 * 60 * 1000;
+        iceServerRefreshInterval = setInterval(() => {
+            session.send("signal:ice-servers-request", {});
+        }, THIRTY_MIN);
+    }
+
+    function stopICEServerRefresh() {
+        if (iceServerRefreshInterval) {
+            clearInterval(iceServerRefreshInterval);
+            iceServerRefreshInterval = null;
+        }
+    }
+
     function handleVoiceTrack(participantId: string, track: MediaStreamTrack) {
         if (audioDuckingManager) {
             audioDuckingManager.addVoiceTrack(participantId, track);
@@ -452,6 +484,7 @@
 
     function cleanupWebRTC() {
         stopStatsPolling();
+        stopICEServerRefresh();
         if (vadFrame) {
             cancelAnimationFrame(vadFrame);
             vadFrame = null;

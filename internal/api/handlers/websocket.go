@@ -434,6 +434,8 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 		h.handleRenegotiateAnswer(client, msg.Payload)
 	case "signal:resync":
 		h.handleResync(client)
+	case "signal:ice-servers-request":
+		h.handleICEServersRequest(client)
 	// Admin commands
 	case "admin:mute":
 		h.handleAdminMute(client, msg.Payload)
@@ -816,6 +818,19 @@ func (h *WebSocketHandler) handleRenegotiateAnswer(client *websocket.Client, pay
 	}
 
 	logger.Debug("Renegotiation completed", "participant_id", client.ID)
+}
+
+// handleICEServersRequest returns a fresh set of ICE servers (including
+// refreshed Cloudflare TURN credentials). Long sessions (4–8 h for color
+// grading) outlive the 1 h default Cloudflare TTL; clients periodically
+// request fresh creds so that any ICE restart that happens later gathers
+// with valid credentials instead of hanging.
+func (h *WebSocketHandler) handleICEServersRequest(client *websocket.Client) {
+	servers := h.sfu.GetICEServers()
+	client.SendJSON("signal:ice-servers", map[string]interface{}{
+		"iceServers": servers,
+	})
+	logger.Debug("Sent refreshed ICE servers", "participant_id", client.ID, "count", len(servers))
 }
 
 func (h *WebSocketHandler) handleResync(client *websocket.Client) {
