@@ -98,14 +98,16 @@ func (p *cloudflareTURNProvider) GetICEServer(ctx context.Context, preferredURLs
 }
 
 func (p *cloudflareTURNProvider) getCredentials(ctx context.Context) (string, string, error) {
+	// Hold the mutex across the fetch-and-store so concurrent callers don't
+	// all hit the Cloudflare API on a cache miss. Waiting callers would have
+	// blocked on their own HTTP round-trip anyway, and the fetch is bounded
+	// by the client timeout and the caller's context.
 	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	if p.cachedUser != "" && p.cachedPass != "" && time.Now().Before(p.expiresAt) {
-		user := p.cachedUser
-		pass := p.cachedPass
-		p.mu.Unlock()
-		return user, pass, nil
+		return p.cachedUser, p.cachedPass, nil
 	}
-	p.mu.Unlock()
 
 	reqBody, err := json.Marshal(cloudflareTURNGenerateRequest{
 		TTL: p.cfg.TTLSeconds,
@@ -143,7 +145,7 @@ func (p *cloudflareTURNProvider) getCredentials(ctx context.Context) (string, st
 		if err != nil {
 			return "", "", err
 		}
-		p.cacheCredentials(user, pass)
+		p.cacheCredentialsLocked(user, pass)
 		return user, pass, nil
 	}
 
@@ -161,17 +163,15 @@ func (p *cloudflareTURNProvider) getCredentials(ctx context.Context) (string, st
 		return "", "", err
 	}
 
-	p.cacheCredentials(user, pass)
+	p.cacheCredentialsLocked(user, pass)
 	return user, pass, nil
 }
 
-func (p *cloudflareTURNProvider) cacheCredentials(username, credential string) {
-	expiresAt := time.Now().Add(time.Duration(p.cfg.TTLSeconds)*time.Second - p.cfg.Skew)
-	p.mu.Lock()
+// cacheCredentialsLocked stores credentials in the cache. Caller must hold p.mu.
+func (p *cloudflareTURNProvider) cacheCredentialsLocked(username, credential string) {
 	p.cachedUser = username
 	p.cachedPass = credential
-	p.expiresAt = expiresAt
-	p.mu.Unlock()
+	p.expiresAt = time.Now().Add(time.Duration(p.cfg.TTLSeconds)*time.Second - p.cfg.Skew)
 }
 
 func firstCredentials(servers []cloudflareTURNServer) (string, string, error) {

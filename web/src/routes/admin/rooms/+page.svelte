@@ -1,6 +1,7 @@
 <script lang="ts">
     import { onMount } from "svelte";
     import { rooms, type Room } from "$lib/api/client";
+    import StatusBadge from "$lib/components/StatusBadge.svelte";
 
     let allRooms = $state<Room[]>([]);
     let isLoading = $state(true);
@@ -78,8 +79,10 @@
     </div>
 
     {#if isLoading}
-        <div class="loading">
-            <div class="waiting-spinner"></div>
+        <div class="rooms-grid" aria-busy="true" aria-label="Loading rooms">
+            {#each [0, 1, 2] as i (i)}
+                <div class="skeleton skeleton-card"></div>
+            {/each}
         </div>
     {:else if filteredRooms.length === 0}
         <div class="empty-state card">
@@ -100,7 +103,7 @@
                 <a href="/admin/rooms/{room.slug}" class="room-card card">
                     <div class="room-header">
                         <h3>{room.name}</h3>
-                        <span class="status-badge {room.status}">{room.status}</span>
+                        <StatusBadge status={room.status} />
                     </div>
                     <div class="room-meta">
                         <span class="room-slug">/room/{room.slug}</span>
@@ -129,13 +132,6 @@
         margin: 0 auto;
     }
 
-    .page-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: flex-start;
-        margin-bottom: var(--space-lg);
-    }
-
     .header-left {
         display: flex;
         flex-direction: column;
@@ -145,10 +141,6 @@
     .back-link {
         font-size: 0.875rem;
         color: var(--color-text-muted);
-    }
-
-    .page-header h1 {
-        margin: 0;
     }
 
     .filters {
@@ -211,28 +203,6 @@
         font-weight: 600;
     }
 
-    .status-badge {
-        font-size: 0.7rem;
-        padding: var(--space-xs) var(--space-sm);
-        border-radius: var(--radius-full);
-        flex-shrink: 0;
-    }
-
-    .status-badge.live {
-        background: rgba(34, 197, 94, 0.2);
-        color: var(--color-success);
-    }
-
-    .status-badge.pending {
-        background: rgba(245, 158, 11, 0.2);
-        color: var(--color-warning);
-    }
-
-    .status-badge.ended {
-        background: rgba(107, 114, 128, 0.2);
-        color: var(--color-text-muted);
-    }
-
     .room-meta {
         display: flex;
         flex-direction: column;
@@ -258,7 +228,7 @@
     }
 
     .feature-badge {
-        font-size: 0.65rem;
+        font-size: var(--text-min);
         padding: 2px var(--space-xs);
         background: var(--color-surface-elevated);
         border-radius: var(--radius-sm);
@@ -275,9 +245,7 @@
         margin-bottom: var(--space-lg);
     }
 
-    .loading {
-        display: flex;
-        justify-content: center;
-        padding: var(--space-2xl);
+    .skeleton-card {
+        min-height: 140px;
     }
 </style>

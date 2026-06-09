@@ -1,6 +1,13 @@
 <script lang="ts">
+  import '@fontsource/work-sans/400.css';
+  import '@fontsource/work-sans/500.css';
+  import '@fontsource/work-sans/600.css';
+  import '@fontsource/space-grotesk/400.css';
+  import '@fontsource/space-grotesk/500.css';
+  import '@fontsource/space-grotesk/600.css';
+  import '@fontsource/space-grotesk/700.css';
   import '../app.css';
-  
+
   let { children } = $props();
 </script>
 
@@ -8,9 +15,6 @@
   <title>Chromatic</title>
   <meta name="description" content="Self-hosted streaming platform for professional colorists" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous">
-  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Work+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 </svelte:head>
 
 {@render children()}

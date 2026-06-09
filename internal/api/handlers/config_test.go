@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"chromatic/internal/config"
@@ -466,8 +467,10 @@ func TestConfigHandler_GetLogo_FileNotFound(t *testing.T) {
 	handler, cleanup := setupConfigTest(t)
 	defer cleanup()
 
-	// Manually set a logo path in the database that doesn't exist
-	handler.db.Exec(`INSERT INTO config (id, default_watermark_logo_path) VALUES (1, '/nonexistent/path/logo.png')`)
+	// Manually set a logo path (inside the logo root) that doesn't exist
+	missingPath := filepath.Join(handler.cfg.LogoPath, "missing-logo.png")
+	handler.db.Exec(`INSERT OR IGNORE INTO config (id) VALUES (1)`)
+	handler.db.Exec(`UPDATE config SET default_watermark_logo_path = ? WHERE id = 1`, missingPath)
 
 	req := httptest.NewRequest("GET", "/api/config/logo", nil)
 	rr := httptest.NewRecorder()
@@ -476,6 +479,25 @@ func TestConfigHandler_GetLogo_FileNotFound(t *testing.T) {
 
 	if rr.Code != http.StatusNotFound {
 		t.Errorf("expected status %d for missing file, got %d", http.StatusNotFound, rr.Code)
+	}
+}
+
+func TestConfigHandler_GetLogo_PathOutsideLogoRoot(t *testing.T) {
+	handler, cleanup := setupConfigTest(t)
+	defer cleanup()
+
+	// A logo path outside the configured logo root must be rejected even if
+	// the file exists (e.g. tampered database)
+	handler.db.Exec(`INSERT OR IGNORE INTO config (id) VALUES (1)`)
+	handler.db.Exec(`UPDATE config SET default_watermark_logo_path = '/etc/passwd' WHERE id = 1`)
+
+	req := httptest.NewRequest("GET", "/api/config/logo", nil)
+	rr := httptest.NewRecorder()
+
+	handler.GetLogo(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("expected status %d for path outside logo root, got %d", http.StatusForbidden, rr.Code)
 	}
 }
 

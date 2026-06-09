@@ -4,11 +4,13 @@ export interface WebRTCManagerOptions {
     iceServers: RTCIceServer[];
     onTrack: (event: RTCTrackEvent) => void;
     onVoiceTrack?: (participantId: string, track: MediaStreamTrack) => void;
+    onScreenShareTrack?: (participantId: string, track: MediaStreamTrack) => void;
     sendSignal: (type: string, payload: unknown) => void;
     onConnectionStateChange?: (state: RTCPeerConnectionState) => void;
     onIceRestart?: () => void;
     onIceRestartFailed?: () => void;
     onRenegotiation?: () => void;
+    onScreenShareEnded?: () => void;
 }
 
 export class WebRTCManager {
@@ -16,9 +18,20 @@ export class WebRTCManager {
     private options: WebRTCManagerOptions;
     private localStream: MediaStream | null = null;
     private audioSender: RTCRtpSender | null = null;
+    private screenShareStream: MediaStream | null = null;
+    private screenShareSender: RTCRtpSender | null = null;
     private isMicMuted: boolean = true;
     private iceRestartPending: boolean = false;
+    // True once an ICE restart offer has actually been sent to the server,
+    // so a second 'failed' state can be attributed to a genuine restart
+    // failure rather than firing onIceRestartFailed prematurely.
+    private iceRestartAttempted: boolean = false;
     private connectionLostTimeout: ReturnType<typeof setTimeout> | null = null;
+    // Watchdog: retries voice renegotiation if the offer goes unanswered
+    private voiceOfferTimer: ReturnType<typeof setTimeout> | null = null;
+    private voiceOfferRetries: number = 0;
+    private static readonly VOICE_OFFER_TIMEOUT_MS = 8000;
+    private static readonly VOICE_OFFER_MAX_RETRIES = 3;
     // Serialize all SDP operations to prevent concurrent modifications
     // to the PeerConnection's signaling state (e.g. handleOffer + handleRenegotiation
     // firing from separate WebSocket messages while awaiting).
@@ -48,6 +61,15 @@ export class WebRTCManager {
 
             const pc = this.pc!;
 
+            // If we have a pending local offer (voice renegotiation, etc.),
+            // rollback to accept the server's offer. Clear watchdog since
+            // the voice offer is being abandoned.
+            if (pc.signalingState === 'have-local-offer') {
+                console.log('Rolling back local offer to accept server offer');
+                this.clearVoiceOfferWatchdog();
+                await pc.setLocalDescription({ type: 'rollback' });
+            }
+
             // Set remote description (the offer from server)
             const offer: RTCSessionDescriptionInit = {
                 type: 'offer',
@@ -67,10 +89,18 @@ export class WebRTCManager {
                 sdp: answer.sdp
             });
 
-            // If we have a pending mic stream and mic is enabled, add it now
+            // If we have a pending mic stream and mic is enabled, add the
+            // track now and fire-and-forget a renegotiation. We must NOT
+            // await renegotiate() here because we're already inside
+            // enqueueSignaling — awaiting a nested enqueue would deadlock
+            // the signaling queue.
             if (this.localStream && !this.audioSender && !this.isMicMuted) {
-                console.log('Adding pending audio track after offer');
-                await this.addLocalAudioTrack();
+                const audioTrack = this.localStream.getAudioTracks()[0];
+                if (audioTrack) {
+                    this.audioSender = pc.addTrack(audioTrack, this.localStream);
+                    console.log('Added pending mic track after offer, scheduling renegotiation');
+                    this.renegotiate();
+                }
             }
         });
     }
@@ -100,6 +130,24 @@ export class WebRTCManager {
             const streamId = event.streams[0]?.id ?? '';
             const trackId = event.track.id;
             console.log('Received track:', event.track.kind, 'trackId:', trackId, 'streamId:', streamId, 'streams:', event.streams.length);
+
+            // Identify screen share tracks by stream/track ID.
+            // Server creates relay tracks with:
+            //   track ID:  "screenshare-{participantId}"
+            //   stream ID: "screenshare-stream-{participantId}"
+            let screenShareParticipantId: string | null = null;
+
+            if (streamId.startsWith('screenshare-stream-')) {
+                screenShareParticipantId = streamId.substring('screenshare-stream-'.length);
+            } else if (trackId.startsWith('screenshare-')) {
+                screenShareParticipantId = trackId.substring('screenshare-'.length);
+            }
+
+            if (screenShareParticipantId) {
+                console.log('Identified screen share track from participant:', screenShareParticipantId);
+                this.options.onScreenShareTrack?.(screenShareParticipantId, event.track);
+                return;
+            }
 
             // Identify voice tracks by stream/track ID.
             // Server creates voice relay tracks with:
@@ -159,11 +207,25 @@ export class WebRTCManager {
                     }
                 }, 5000);
             } else if (state === 'failed') {
+                // Don't let the 5s 'disconnected' timer trigger a second
+                // restart on top of the one handled here.
+                if (this.connectionLostTimeout) {
+                    clearTimeout(this.connectionLostTimeout);
+                    this.connectionLostTimeout = null;
+                }
                 if (this.iceRestartPending) {
-                    // ICE restart was already attempted but failed
-                    console.log('ICE restart failed, connection unrecoverable');
-                    this.iceRestartPending = false;
-                    this.options.onIceRestartFailed?.();
+                    if (this.iceRestartAttempted) {
+                        // A restart offer was actually sent and the connection
+                        // failed again - genuinely unrecoverable.
+                        console.log('ICE restart failed, connection unrecoverable');
+                        this.iceRestartPending = false;
+                        this.iceRestartAttempted = false;
+                        this.options.onIceRestartFailed?.();
+                    } else {
+                        // Restart is still being prepared (offer not yet
+                        // sent) - don't declare failure prematurely.
+                        console.log('Connection failed while ICE restart is being prepared, waiting');
+                    }
                 } else {
                     // First failure - attempt ICE restart
                     console.log('Connection failed, attempting ICE restart');
@@ -176,6 +238,7 @@ export class WebRTCManager {
                     this.connectionLostTimeout = null;
                 }
                 this.iceRestartPending = false;
+                this.iceRestartAttempted = false;
             }
         };
 
@@ -195,23 +258,33 @@ export class WebRTCManager {
         }
 
         this.iceRestartPending = true;
+        this.iceRestartAttempted = false;
+        // Clear voice watchdog — ICE restart takes priority
+        this.clearVoiceOfferWatchdog();
         console.log('Performing ICE restart...');
         this.options.onIceRestart?.();
 
         return this.enqueueSignaling(async () => {
+            if (!this.pc) return;
+
             try {
-                const offer = await this.pc!.createOffer({ iceRestart: true });
-                await this.pc!.setLocalDescription(offer);
+                const offer = await this.pc.createOffer({ iceRestart: true });
+                await this.pc.setLocalDescription(offer);
 
                 // Send offer to server for ICE restart
                 this.options.sendSignal('signal:ice-restart', {
                     sdp: offer.sdp
                 });
 
+                // The restart has genuinely been attempted; a subsequent
+                // 'failed' state now means the restart itself failed.
+                this.iceRestartAttempted = true;
+
                 console.log('Sent ICE restart offer');
             } catch (err) {
                 console.error('Failed to perform ICE restart:', err);
                 this.iceRestartPending = false;
+                this.iceRestartAttempted = false;
             }
         });
     }
@@ -234,15 +307,28 @@ export class WebRTCManager {
         }
 
         const stats = await this.pc.getStats();
-        let rtt: number | undefined;
+        // Prefer the nominated (actively used) candidate pair so the latency
+        // display is stable; fall back to any succeeded pair if none is
+        // marked nominated.
+        let nominatedRtt: number | undefined;
+        let fallbackRtt: number | undefined;
 
         stats.forEach(report => {
-            if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-                rtt = report.currentRoundTripTime * 1000; // Convert to ms
+            if (
+                report.type === 'candidate-pair' &&
+                report.state === 'succeeded' &&
+                typeof report.currentRoundTripTime === 'number'
+            ) {
+                const rttMs = report.currentRoundTripTime * 1000; // Convert to ms
+                if (report.nominated) {
+                    nominatedRtt = rttMs;
+                } else if (fallbackRtt === undefined) {
+                    fallbackRtt = rttMs;
+                }
             }
         });
 
-        return { rtt };
+        return { rtt: nominatedRtt ?? fallbackRtt };
     }
 
     // Request microphone access and prepare for sending
@@ -283,7 +369,13 @@ export class WebRTCManager {
 
         // If we have a peer connection and local stream, add/update track
         if (enabled && this.pc && this.localStream) {
-            this.addLocalAudioTrack();
+            this.addLocalAudioTrack().catch(err => {
+                console.error('Failed to add local audio track, reverting mic state:', err);
+                this.isMicMuted = true;
+                if (this.localStream) {
+                    this.localStream.getAudioTracks().forEach(t => { t.enabled = false; });
+                }
+            });
         }
 
         console.log('Microphone', enabled ? 'enabled' : 'muted');
@@ -314,7 +406,8 @@ export class WebRTCManager {
         }
     }
 
-    // Renegotiate the connection after adding tracks
+    // Renegotiate the connection after adding tracks.
+    // Starts a watchdog timer that retries if the offer goes unanswered.
     private async renegotiate(): Promise<void> {
         return this.enqueueSignaling(async () => {
             if (!this.pc) return;
@@ -328,11 +421,57 @@ export class WebRTCManager {
                     sdp: offer.sdp
                 });
 
+                // Start watchdog: if we're still in have-local-offer after
+                // the timeout, the server never answered — retry.
+                this.startVoiceOfferWatchdog();
+
                 console.log('Sent renegotiation offer for voice');
             } catch (err) {
                 console.error('Failed to renegotiate:', err);
             }
         });
+    }
+
+    // Start (or restart) the watchdog timer for unanswered voice offers
+    private startVoiceOfferWatchdog(): void {
+        this.clearVoiceOfferWatchdog();
+        this.voiceOfferTimer = setTimeout(() => {
+            if (!this.pc) return;
+            if (this.pc.signalingState !== 'have-local-offer') return;
+            // Don't interfere with ICE restart offers
+            if (this.iceRestartPending) return;
+            if (this.voiceOfferRetries >= WebRTCManager.VOICE_OFFER_MAX_RETRIES) {
+                console.error('Voice offer unanswered after max retries, rolling back stale offer');
+                this.voiceOfferRetries = 0;
+                // Rollback so PC isn't stuck in have-local-offer
+                this.enqueueSignaling(async () => {
+                    if (this.pc?.signalingState === 'have-local-offer' && !this.iceRestartPending) {
+                        await this.pc.setLocalDescription({ type: 'rollback' });
+                    }
+                });
+                return;
+            }
+            this.voiceOfferRetries++;
+            console.warn(`Voice offer unanswered after ${WebRTCManager.VOICE_OFFER_TIMEOUT_MS}ms, retrying (${this.voiceOfferRetries}/${WebRTCManager.VOICE_OFFER_MAX_RETRIES})`);
+            // Rollback the stale offer and re-send
+            this.enqueueSignaling(async () => {
+                if (!this.pc || this.pc.signalingState !== 'have-local-offer') return;
+                if (this.iceRestartPending) return;
+                await this.pc.setLocalDescription({ type: 'rollback' });
+                const offer = await this.pc.createOffer();
+                await this.pc.setLocalDescription(offer);
+                this.options.sendSignal('signal:offer', { sdp: offer.sdp });
+                this.startVoiceOfferWatchdog();
+                console.log('Re-sent voice offer');
+            });
+        }, WebRTCManager.VOICE_OFFER_TIMEOUT_MS);
+    }
+
+    private clearVoiceOfferWatchdog(): void {
+        if (this.voiceOfferTimer) {
+            clearTimeout(this.voiceOfferTimer);
+            this.voiceOfferTimer = null;
+        }
     }
 
     // Handle answer for voice renegotiation
@@ -346,6 +485,9 @@ export class WebRTCManager {
             };
 
             await this.pc.setRemoteDescription(answer);
+            // Answer received — clear the watchdog and reset retries
+            this.clearVoiceOfferWatchdog();
+            this.voiceOfferRetries = 0;
             console.log('Set remote description for voice answer');
         });
     }
@@ -361,13 +503,17 @@ export class WebRTCManager {
             console.log('Handling server-initiated renegotiation', participantId ? `for voice from ${participantId}` : '');
             this.options.onRenegotiation?.();
 
+            let rolledBack = false;
+
             try {
                 // If we have a pending local offer (client-initiated renegotiation),
                 // rollback to accept the server's offer instead. The server is the
                 // "impolite" peer in our signaling model.
                 if (this.pc.signalingState === 'have-local-offer') {
                     console.log('Rolling back local offer to accept server renegotiation');
+                    this.clearVoiceOfferWatchdog();
                     await this.pc.setLocalDescription({ type: 'rollback' });
+                    rolledBack = true;
                 }
 
                 // Set the new offer from server
@@ -397,14 +543,88 @@ export class WebRTCManager {
                 });
 
                 console.log('Sent renegotiation answer');
+
+                // If we rolled back a client-initiated offer, any locally-added
+                // tracks (mic, screen share) still exist on the PC but were NOT
+                // included in the answer (createAnswer can only match the server's
+                // offer m-lines). Re-trigger a client offer so those tracks get
+                // properly negotiated.
+                if (rolledBack && (this.audioSender || this.screenShareSender)) {
+                    console.log('Re-offering after rollback to negotiate local tracks');
+                    this.renegotiate();
+                }
             } catch (err) {
                 console.error('Failed to handle renegotiation:', err);
             }
         });
     }
 
+    // Start screen sharing — captures display and adds video track to peer connection
+    async startScreenShare(): Promise<boolean> {
+        if (!this.pc) return false;
+
+        try {
+            this.screenShareStream = await navigator.mediaDevices.getDisplayMedia({
+                video: true,
+                audio: false
+            });
+
+            const videoTrack = this.screenShareStream.getVideoTracks()[0];
+            if (!videoTrack) {
+                this.screenShareStream = null;
+                return false;
+            }
+
+            // Listen for browser "Stop sharing" button
+            videoTrack.onended = () => {
+                console.log('Screen share ended by user (browser chrome)');
+                this.stopScreenShare();
+                this.options.onScreenShareEnded?.();
+            };
+
+            // Add track to peer connection and renegotiate
+            this.screenShareSender = this.pc.addTrack(videoTrack, this.screenShareStream);
+            await this.renegotiate();
+
+            console.log('Screen share started');
+            return true;
+        } catch (err) {
+            console.error('Failed to start screen share:', err);
+            this.screenShareStream = null;
+            return false;
+        }
+    }
+
+    // Stop screen sharing
+    stopScreenShare(): void {
+        const needsRenegotiation = this.screenShareSender != null && this.pc != null;
+
+        if (this.screenShareSender && this.pc) {
+            try {
+                this.pc.removeTrack(this.screenShareSender);
+            } catch (err) {
+                console.error('Failed to remove screen share track:', err);
+            }
+            this.screenShareSender = null;
+        }
+
+        if (this.screenShareStream) {
+            this.screenShareStream.getTracks().forEach(track => track.stop());
+            this.screenShareStream = null;
+        }
+
+        // Renegotiate so the server knows the track was removed
+        if (needsRenegotiation) {
+            this.renegotiate();
+        }
+
+        console.log('Screen share stopped');
+    }
+
     // Clean up
     close(): void {
+        this.clearVoiceOfferWatchdog();
+
         if (this.connectionLostTimeout) {
             clearTimeout(this.connectionLostTimeout);
             this.connectionLostTimeout = null;
@@ -415,6 +635,12 @@ export class WebRTCManager {
             this.localStream = null;
         }
         this.audioSender = null;
+
+        if (this.screenShareStream) {
+            this.screenShareStream.getTracks().forEach(track => track.stop());
+            this.screenShareStream = null;
+        }
+        this.screenShareSender = null;
 
         if (this.pc) {
             this.pc.close();

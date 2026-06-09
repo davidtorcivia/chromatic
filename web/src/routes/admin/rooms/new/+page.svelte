@@ -1,8 +1,10 @@
 <script lang="ts">
-    import { rooms, streamKeys, type StreamKey } from "$lib/api/client";
+    import { rooms, streamKeys, appConfig, type StreamKey, type AppConfig } from "$lib/api/client";
     import { onMount } from "svelte";
+    import WatermarkOverlay from "$lib/components/WatermarkOverlay.svelte";
 
     let keys = $state<StreamKey[]>([]);
+    let config = $state<AppConfig | null>(null);
     let isLoading = $state(true);
     let isSaving = $state(false);
     let error = $state("");
@@ -20,7 +22,12 @@
 
     onMount(async () => {
         try {
-            keys = (await streamKeys.list()) ?? [];
+            const [keysData, configData] = await Promise.all([
+                streamKeys.list(),
+                appConfig.get().catch(() => null),
+            ]);
+            keys = keysData ?? [];
+            config = configData;
             if (keys.length > 0) {
                 streamKeyId = keys[0].id;
             }
@@ -107,13 +114,11 @@
     </header>
 
     {#if isLoading}
-        <div class="loading">
-            <div class="waiting-spinner"></div>
-        </div>
+        <div class="skeleton skeleton-form" aria-busy="true" aria-label="Loading form"></div>
     {:else}
         <form class="room-form card" onsubmit={handleSubmit}>
             {#if error}
-                <div class="error-message">{error}</div>
+                <div class="alert alert-error">{error}</div>
             {/if}
 
             <div class="form-section">
@@ -300,6 +305,23 @@
                             bind:value={watermarkOpacity}
                         />
                     </div>
+
+                    <div class="form-group">
+                        <span class="form-hint">Preview</span>
+                        <div class="watermark-preview">
+                            {#key `${watermarkMode}-${watermarkLogoPosition}-${config?.defaultWatermarkLogoUrl ?? ""}`}
+                                <WatermarkOverlay
+                                    mode={watermarkMode}
+                                    text={watermarkText}
+                                    logoUrl={config?.defaultWatermarkLogoUrl}
+                                    logoPosition={watermarkLogoPosition}
+                                    opacity={watermarkOpacity}
+                                    participantName="Jane Colorist"
+                                    roomName={name || "My Color Session"}
+                                />
+                            {/key}
+                        </div>
+                    </div>
                 {/if}
             </div>
 
@@ -310,7 +332,12 @@
                     class="btn btn-primary"
                     disabled={isSaving}
                 >
-                    {isSaving ? "Creating..." : "Create Room"}
+                    {#if isSaving}
+                        <span class="btn-spinner" aria-hidden="true"></span>
+                        Creating...
+                    {:else}
+                        Create Room
+                    {/if}
                 </button>
             </div>
         </form>
@@ -323,10 +350,6 @@
         margin: 0 auto;
     }
 
-    .page-header {
-        margin-bottom: var(--space-xl);
-    }
-
     .header-left {
         display: flex;
         flex-direction: column;
@@ -336,10 +359,6 @@
     .back-link {
         font-size: 0.875rem;
         color: var(--color-text-muted);
-    }
-
-    .page-header h1 {
-        margin: 0;
     }
 
     .room-form {
@@ -378,13 +397,6 @@
         font-weight: 500;
         margin-bottom: var(--space-sm);
         color: var(--color-text-muted);
-    }
-
-    .form-hint {
-        display: block;
-        font-size: 0.75rem;
-        color: var(--color-text-subtle);
-        margin-top: var(--space-xs);
     }
 
     .slug-preview {
@@ -434,16 +446,6 @@
         gap: var(--space-md);
     }
 
-    .error-message {
-        padding: var(--space-md);
-        background: rgba(239, 68, 68, 0.1);
-        border: 1px solid var(--color-error);
-        border-radius: var(--radius-md);
-        color: var(--color-error);
-        font-size: 0.875rem;
-        margin-bottom: var(--space-lg);
-    }
-
     .empty-note {
         color: var(--color-text-muted);
         font-size: 0.875rem;
@@ -453,46 +455,18 @@
         color: var(--color-primary);
     }
 
-    .loading {
-        display: flex;
-        justify-content: center;
-        padding: var(--space-2xl);
+    .skeleton-form {
+        min-height: 400px;
     }
 
-    .btn-secondary {
-        background: var(--color-surface-hover);
-        color: var(--color-text);
-        border: 1px solid var(--color-border);
-    }
-
-    .btn-secondary:hover {
-        background: var(--color-border);
-    }
-
-    .range-input {
+    .watermark-preview {
+        position: relative;
         width: 100%;
-        height: 6px;
-        background: var(--color-surface-elevated);
-        border-radius: var(--radius-full);
-        appearance: none;
-        cursor: pointer;
-    }
-
-    .range-input::-webkit-slider-thumb {
-        appearance: none;
-        width: 16px;
-        height: 16px;
-        background: var(--color-primary);
-        border-radius: 50%;
-        cursor: pointer;
-    }
-
-    .range-input::-moz-range-thumb {
-        width: 16px;
-        height: 16px;
-        background: var(--color-primary);
-        border-radius: 50%;
-        cursor: pointer;
-        border: none;
+        aspect-ratio: 16 / 9;
+        background: #000;
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-md);
+        overflow: hidden;
+        margin-top: var(--space-xs);
     }
 </style>

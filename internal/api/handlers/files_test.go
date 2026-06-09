@@ -15,7 +15,7 @@ import (
 	"chromatic/internal/database"
 )
 
-const testTokenSecret = "test-secret"
+var testTokenSecret = DeriveTokenSecret("test-admin-token")
 
 func setupFileTest(t *testing.T) (*FileHandler, *RoomHandler, *database.DB, func()) {
 	db, dbCleanup := database.NewTestDB(t)

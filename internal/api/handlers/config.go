@@ -280,6 +280,14 @@ func (h *ConfigHandler) GetLogo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Containment check: the logo path comes from the database and must
+	// resolve inside the configured logo root.
+	if !isPathWithin(h.cfg.LogoPath, *logoPath) {
+		logger.Warn("Blocked logo outside logo root", "path", *logoPath)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
 	// Check if file exists
 	if _, err := os.Stat(*logoPath); os.IsNotExist(err) {
 		http.Error(w, "Logo file not found", http.StatusNotFound)

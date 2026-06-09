@@ -23,10 +23,19 @@ type TokenManager struct {
 }
 
 // NewTokenManager creates a new TokenManager with the given secret
-func NewTokenManager(secret string) *TokenManager {
+func NewTokenManager(secret []byte) *TokenManager {
 	return &TokenManager{
-		secret: []byte(secret),
+		secret: secret,
 	}
+}
+
+// DeriveTokenSecret derives the HMAC secret used for signing join tokens from
+// the admin token. The admin token itself must never be used directly as a
+// signing key — deriving a separate secret ensures a leaked token signature
+// oracle cannot be used to attack the admin credential (and vice versa).
+func DeriveTokenSecret(adminToken string) []byte {
+	sum := sha256.Sum256([]byte("chromatic-join-token-v1:" + adminToken))
+	return sum[:]
 }
 
 var (

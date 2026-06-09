@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,10 +14,12 @@ import (
 	"chromatic/internal/database"
 )
 
-const roomsTestTokenSecret = "test-secret"
+const roomsTestAdminToken = "rooms-test-admin-token"
+
+var roomsTestTokenSecret = DeriveTokenSecret(roomsTestAdminToken)
 
 func newTestRoomHandler(db *database.DB) *RoomHandler {
-	cfg := &config.Config{}
+	cfg := &config.Config{AdminToken: roomsTestAdminToken}
 	return NewRoomHandler(db, cfg, roomsTestTokenSecret)
 }
 
@@ -611,7 +614,7 @@ func TestRoomHandler_CheckParticipantStatus(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/rooms/status-test/status/"+participantID, nil)
 		req.SetPathValue("slug", "status-test")
 		req.SetPathValue("id", participantID)
-		req.URL.RawQuery = "token=" + url.QueryEscape(token)
+		req.Header.Set("X-Join-Token", token)
 
 		rr := httptest.NewRecorder()
 		handler.CheckParticipantStatus(rr, req)
@@ -638,7 +641,7 @@ func TestRoomHandler_CheckParticipantStatus(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/rooms/status-test/status/"+participantID, nil)
 		req.SetPathValue("slug", "status-test")
 		req.SetPathValue("id", participantID)
-		req.URL.RawQuery = "token=" + url.QueryEscape(token)
+		req.Header.Set("X-Join-Token", token)
 
 		rr := httptest.NewRecorder()
 		handler.CheckParticipantStatus(rr, req)
@@ -655,13 +658,41 @@ func TestRoomHandler_CheckParticipantStatus(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/rooms/status-test/status/invalid-id", nil)
 		req.SetPathValue("slug", "status-test")
 		req.SetPathValue("id", "invalid-id")
-		req.URL.RawQuery = "token=" + url.QueryEscape(invalidToken)
+		req.Header.Set("X-Join-Token", invalidToken)
 
 		rr := httptest.NewRecorder()
 		handler.CheckParticipantStatus(rr, req)
 
 		if rr.Code != http.StatusNotFound {
 			t.Errorf("expected status %d, got %d", http.StatusNotFound, rr.Code)
+		}
+	})
+
+	t.Run("check status - token in query param is rejected", func(t *testing.T) {
+		// Credentials must not be accepted via query params (they get logged)
+		req := httptest.NewRequest("GET", "/api/rooms/status-test/status/"+participantID, nil)
+		req.SetPathValue("slug", "status-test")
+		req.SetPathValue("id", participantID)
+		req.URL.RawQuery = "token=" + url.QueryEscape(token)
+
+		rr := httptest.NewRecorder()
+		handler.CheckParticipantStatus(rr, req)
+
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("expected status %d for query-param token, got %d", http.StatusUnauthorized, rr.Code)
+		}
+	})
+
+	t.Run("check status - missing token", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/rooms/status-test/status/"+participantID, nil)
+		req.SetPathValue("slug", "status-test")
+		req.SetPathValue("id", participantID)
+
+		rr := httptest.NewRecorder()
+		handler.CheckParticipantStatus(rr, req)
+
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("expected status %d for missing token, got %d", http.StatusUnauthorized, rr.Code)
 		}
 	})
 }
@@ -780,4 +811,216 @@ func TestRoomHandler_PublicInfo(t *testing.T) {
 			t.Errorf("expected status %d, got %d", http.StatusNotFound, rr.Code)
 		}
 	})
+}
+
+// TestRoomHandler_AdminJoin tests joining a room with an admin token in the request body
+func TestRoomHandler_AdminJoin(t *testing.T) {
+	db, cleanup := database.NewTestDB(t)
+	defer cleanup()
+
+	handler := newTestRoomHandler(db)
+
+	// Create a room with both a waiting room and a password — admins bypass both
+	createBody := map[string]interface{}{
+		"slug":               "admin-join",
+		"name":               "Admin Join Room",
+		"password":           "secret12",
+		"watermarkMode":      "none",
+		"waitingRoomEnabled": true,
+	}
+	bodyBytes, _ := json.Marshal(createBody)
+	createReq := httptest.NewRequest("POST", "/api/rooms", bytes.NewReader(bodyBytes))
+	createReq.Header.Set("Content-Type", "application/json")
+	createRR := httptest.NewRecorder()
+	handler.Create(createRR, createReq)
+	if createRR.Code != http.StatusCreated {
+		t.Fatalf("failed to create test room: %s", createRR.Body.String())
+	}
+
+	doJoin := func(t *testing.T, body map[string]interface{}) *httptest.ResponseRecorder {
+		t.Helper()
+		bodyBytes, _ := json.Marshal(body)
+		req := httptest.NewRequest("POST", "/api/rooms/admin-join/join", bytes.NewReader(bodyBytes))
+		req.SetPathValue("slug", "admin-join")
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		handler.Join(rr, req)
+		return rr
+	}
+
+	t.Run("valid admin token bypasses waiting room and password", func(t *testing.T) {
+		rr := doJoin(t, map[string]interface{}{
+			"name":       "Admin User",
+			"adminToken": roomsTestAdminToken,
+		})
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d: %s", http.StatusOK, rr.Code, rr.Body.String())
+		}
+
+		var resp map[string]interface{}
+		json.Unmarshal(rr.Body.Bytes(), &resp)
+		if resp["role"] != "admin" {
+			t.Errorf("expected role 'admin', got %v", resp["role"])
+		}
+		if resp["isAdmitted"] != true {
+			t.Error("expected admin to be admitted immediately")
+		}
+		if resp["waitingRoom"] != false {
+			t.Error("expected admin to bypass the waiting room")
+		}
+
+		// Verify the participant role was persisted
+		var role string
+		var isAdmitted bool
+		err := db.QueryRow(`SELECT role, is_admitted FROM participants WHERE id = ?`, resp["participantId"]).Scan(&role, &isAdmitted)
+		if err != nil {
+			t.Fatalf("failed to look up participant: %v", err)
+		}
+		if role != "admin" || !isAdmitted {
+			t.Errorf("expected persisted role=admin, is_admitted=true; got role=%s, is_admitted=%v", role, isAdmitted)
+		}
+	})
+
+	t.Run("invalid admin token is rejected", func(t *testing.T) {
+		rr := doJoin(t, map[string]interface{}{
+			"name":       "Fake Admin",
+			"adminToken": "wrong-token",
+		})
+
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("expected status %d, got %d", http.StatusUnauthorized, rr.Code)
+		}
+	})
+
+	t.Run("viewer join still returns viewer role", func(t *testing.T) {
+		rr := doJoin(t, map[string]interface{}{
+			"name":     "Regular User",
+			"password": "secret12",
+		})
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d: %s", http.StatusOK, rr.Code, rr.Body.String())
+		}
+
+		var resp map[string]interface{}
+		json.Unmarshal(rr.Body.Bytes(), &resp)
+		if resp["role"] != "viewer" {
+			t.Errorf("expected role 'viewer', got %v", resp["role"])
+		}
+	})
+
+	t.Run("admin token rejected when none configured", func(t *testing.T) {
+		// Handler with no admin token configured must never grant admin
+		noAdminHandler := NewRoomHandler(db, &config.Config{}, roomsTestTokenSecret)
+		bodyBytes, _ := json.Marshal(map[string]interface{}{
+			"name":       "Sneaky User",
+			"adminToken": "",
+		})
+		req := httptest.NewRequest("POST", "/api/rooms/admin-join/join", bytes.NewReader(bodyBytes))
+		req.SetPathValue("slug", "admin-join")
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		noAdminHandler.Join(rr, req)
+
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("expected status %d, got %d", http.StatusUnauthorized, rr.Code)
+		}
+	})
+}
+
+// TestRoomHandler_ParticipantCap tests the per-room participant limit
+func TestRoomHandler_ParticipantCap(t *testing.T) {
+	db, cleanup := database.NewTestDB(t)
+	defer cleanup()
+
+	cfg := &config.Config{
+		AdminToken:             roomsTestAdminToken,
+		MaxParticipantsPerRoom: 2,
+	}
+	handler := NewRoomHandler(db, cfg, roomsTestTokenSecret)
+
+	// Create a room
+	createBody := map[string]interface{}{
+		"slug":          "cap-test",
+		"name":          "Cap Test Room",
+		"watermarkMode": "none",
+	}
+	bodyBytes, _ := json.Marshal(createBody)
+	createReq := httptest.NewRequest("POST", "/api/rooms", bytes.NewReader(bodyBytes))
+	createReq.Header.Set("Content-Type", "application/json")
+	createRR := httptest.NewRecorder()
+	handler.Create(createRR, createReq)
+	if createRR.Code != http.StatusCreated {
+		t.Fatalf("failed to create test room: %s", createRR.Body.String())
+	}
+
+	join := func(t *testing.T, name string) *httptest.ResponseRecorder {
+		t.Helper()
+		bodyBytes, _ := json.Marshal(map[string]interface{}{"name": name})
+		req := httptest.NewRequest("POST", "/api/rooms/cap-test/join", bytes.NewReader(bodyBytes))
+		req.SetPathValue("slug", "cap-test")
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		handler.Join(rr, req)
+		return rr
+	}
+
+	// First two joins succeed
+	for i, name := range []string{"User One", "User Two"} {
+		rr := join(t, name)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("join %d: expected status %d, got %d: %s", i+1, http.StatusOK, rr.Code, rr.Body.String())
+		}
+	}
+
+	// Third join is rejected with 503
+	rr := join(t, "User Three")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected status %d when room is full, got %d", http.StatusServiceUnavailable, rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "Room is full") {
+		t.Errorf("expected 'Room is full' in response, got %q", rr.Body.String())
+	}
+}
+
+// TestDeriveTokenSecret tests the join-token secret derivation
+func TestDeriveTokenSecret(t *testing.T) {
+	adminToken := "super-secret-admin-token"
+	secret := DeriveTokenSecret(adminToken)
+
+	if len(secret) != 32 {
+		t.Fatalf("expected 32-byte derived secret, got %d bytes", len(secret))
+	}
+
+	// The derived secret must never equal the raw admin token
+	if string(secret) == adminToken {
+		t.Error("derived secret must differ from the admin token")
+	}
+
+	// Derivation must be deterministic
+	if string(DeriveTokenSecret(adminToken)) != string(secret) {
+		t.Error("derivation must be deterministic")
+	}
+
+	// Different admin tokens must derive different secrets
+	if string(DeriveTokenSecret("other-token")) == string(secret) {
+		t.Error("different admin tokens must derive different secrets")
+	}
+
+	// A token signed with the derived secret must not validate against a
+	// manager keyed with the raw admin token (and vice versa)
+	derivedTM := NewTokenManager(secret)
+	rawTM := NewTokenManager([]byte(adminToken))
+
+	token, err := derivedTM.GenerateToken("pid-1", "room-1", "Name", time.Hour)
+	if err != nil {
+		t.Fatalf("failed to generate token: %v", err)
+	}
+	if _, err := derivedTM.ValidateToken(token); err != nil {
+		t.Errorf("token should validate with derived-secret manager: %v", err)
+	}
+	if _, err := rawTM.ValidateToken(token); err == nil {
+		t.Error("token signed with derived secret must not validate with raw admin token secret")
+	}
 }

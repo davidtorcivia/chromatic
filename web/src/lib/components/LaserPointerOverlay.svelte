@@ -120,8 +120,9 @@
         window.addEventListener("pointercancel", handleGlobalPointerUp);
         window.addEventListener("blur", handleWindowBlur);
 
-        // Subscribe to cursor updates from WebSocket
-        session.onMessage("cursor", (payload) => {
+        // Subscribe to cursor updates from WebSocket (unsubscribed in cleanup
+        // so handlers don't pile up across remounts)
+        const unsubscribeCursor = session.onMessage("cursor", (payload) => {
             const data = payload as {
                 participantId: string;
                 participantName: string;
@@ -164,6 +165,7 @@
                 sendThrottle = null;
             }
             clearInterval(cleanupInterval);
+            unsubscribeCursor();
         };
     });
 

@@ -70,12 +70,15 @@ func main() {
 	// Create HTTP router
 	router := api.NewRouter(cfg, db, sfu, hub)
 
-	// Create HTTP server
+	// Create HTTP server.
+	// WriteTimeout is 60s (not 15s) so long-running handlers — the WHIP offer
+	// exchange (ICE gathering) and SSE responses — aren't killed mid-flight.
+	// Per-handler deadlines are enforced at the handler level where needed.
 	server := &http.Server{
 		Addr:         cfg.ListenAddr(),
 		Handler:      router,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
@@ -99,7 +102,10 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Stop accepting new WebRTC connections
+	// Shutdown order matters: stop the SFU first so WebRTC teardown
+	// notifications (e.g. stream-end broadcasts) can still be delivered
+	// through the running WebSocket hub, then close the hub, then drain the
+	// HTTP server.
 	sfu.Shutdown()
 	logger.Info("WebRTC SFU stopped")
 

@@ -123,18 +123,27 @@ export const rooms = {
     delete: (slug: string) => apiDelete(`/api/rooms/${slug}`),
     end: (slug: string) => apiPost(`/api/rooms/${slug}/end`),
     info: (slug: string) => apiGet<RoomInfo>(`/api/rooms/${slug}/info`),
-    join: (slug: string, name: string, password?: string) =>
-        apiPost<{ participantId: string; token: string; isAdmitted: boolean; waitingRoom: boolean; color: string; name: string }>(
+    join: (slug: string, name: string, password?: string, adminToken?: string) =>
+        apiPost<{ participantId: string; token: string; isAdmitted: boolean; waitingRoom: boolean; color: string; name: string; role: 'admin' | 'viewer' }>(
             `/api/rooms/${slug}/join`,
-            { name, password }
+            { name, password, adminToken }
         ),
     listWaiting: (slug: string) => apiGet<{ id: string; name: string; joinedAt: string }[]>(`/api/rooms/${slug}/waiting`),
     admit: (slug: string, participantId: string) => apiPost(`/api/rooms/${slug}/admit/${participantId}`),
     admitAll: (slug: string) => apiPost(`/api/rooms/${slug}/admit-all`),
-    checkStatus: (slug: string, participantId: string, token: string) =>
-        apiGet<{ isAdmitted: boolean; roomStatus: string }>(
-            `/api/rooms/${slug}/status/${participantId}?token=${encodeURIComponent(token)}`
-        )
+    checkStatus: async (slug: string, participantId: string, token: string): Promise<{ isAdmitted: boolean; roomStatus: string }> => {
+        // The join token travels in a header rather than a query param so it
+        // doesn't leak into server/proxy logs. (The SSE waitingEvents endpoint
+        // keeps the query param — EventSource can't set headers.)
+        const res = await fetch(`${API_BASE}/api/rooms/${slug}/status/${participantId}`, {
+            credentials: 'include',
+            headers: { 'X-Join-Token': token }
+        });
+        if (!res.ok) {
+            throw new Error(await res.text());
+        }
+        return res.json();
+    }
 };
 
 export const streamKeys = {

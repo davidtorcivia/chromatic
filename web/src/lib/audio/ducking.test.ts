@@ -93,6 +93,71 @@ describe('AudioDuckingManager', () => {
         manager.destroy();
     });
 
+    it('restores base stream volume on destroy', () => {
+        manager = new AudioDuckingManager(mockStreamElement, false);
+
+        // Simulate the element being left in a ducked state
+        mockStreamElement.volume = 0.2;
+        manager.destroy();
+
+        expect(mockStreamElement.volume).toBe(1.0);
+    });
+
+    it('restores the user-set base volume (not 1.0) on destroy', () => {
+        manager = new AudioDuckingManager(mockStreamElement, false);
+        manager.setStreamVolume(0.6);
+
+        // Simulate a ducked state
+        mockStreamElement.volume = 0.12;
+        manager.destroy();
+
+        expect(mockStreamElement.volume).toBeCloseTo(0.6);
+    });
+
+    describe('animateVolume cancellation', () => {
+        it('cancels an in-flight animation when a new one starts', () => {
+            const rafSpy = vi
+                .spyOn(globalThis, 'requestAnimationFrame')
+                .mockReturnValue(42 as unknown as number);
+            const cancelSpy = vi
+                .spyOn(globalThis, 'cancelAnimationFrame')
+                .mockImplementation(() => {});
+
+            manager = new AudioDuckingManager(mockStreamElement, false);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const m = manager as any;
+
+            m.animateVolume(0.2, 100);
+            expect(cancelSpy).not.toHaveBeenCalled();
+
+            // A second animation while the first is in flight must cancel it
+            m.animateVolume(1.0, 200);
+            expect(cancelSpy).toHaveBeenCalledWith(42);
+
+            rafSpy.mockRestore();
+            cancelSpy.mockRestore();
+        });
+
+        it('cancels an in-flight animation on destroy', () => {
+            const rafSpy = vi
+                .spyOn(globalThis, 'requestAnimationFrame')
+                .mockReturnValue(7 as unknown as number);
+            const cancelSpy = vi
+                .spyOn(globalThis, 'cancelAnimationFrame')
+                .mockImplementation(() => {});
+
+            manager = new AudioDuckingManager(mockStreamElement, false);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (manager as any).animateVolume(0.2, 100);
+
+            manager.destroy();
+            expect(cancelSpy).toHaveBeenCalledWith(7);
+
+            rafSpy.mockRestore();
+            cancelSpy.mockRestore();
+        });
+    });
+
     describe('easeOutQuad calculation', () => {
         // We test the easing function indirectly through volume animation
         // The easeOutQuad formula is t * (2 - t)

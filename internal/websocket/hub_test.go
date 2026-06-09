@@ -34,7 +34,7 @@ func newTestClient(id, name, roomSlug string, hub *Hub) *Client {
 		RoomSlug: roomSlug,
 		Hub:      hub,
 		Send:     make(chan []byte, 256),
-		done:     make(chan struct{}),
+		Done:     make(chan struct{}),
 		Conn:     nil, // Will use mock in tests that need it
 	}
 }
@@ -374,4 +374,56 @@ func TestHub_ConcurrentAccess(t *testing.T) {
 	if count != numClients {
 		t.Errorf("expected %d clients, got %d", numClients, count)
 	}
+}
+
+func TestHub_BroadcastAfterShutdown(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+
+	client := newTestClient("client-1", "Alice", "test-room", hub)
+	hub.Register(client)
+
+	hub.Shutdown()
+
+	// Broadcast after shutdown must be a no-op: it must not block, panic,
+	// or deliver messages.
+	done := make(chan struct{})
+	go func() {
+		hub.Broadcast("test-room", []byte("late message"), "")
+		if err := hub.BroadcastJSON("test-room", "test", map[string]string{"k": "v"}, ""); err != nil {
+			t.Errorf("BroadcastJSON after shutdown returned error: %v", err)
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Broadcast blocked after shutdown")
+	}
+
+	select {
+	case msg := <-client.Send:
+		t.Errorf("client received message after shutdown: %s", msg)
+	default:
+		// Expected — nothing delivered
+	}
+}
+
+func TestClient_MediaStateConcurrency(t *testing.T) {
+	client := newTestClient("client-1", "Alice", "test-room", nil)
+	client.SetVideoEnabled(true)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			client.SetAudioEnabled(i%2 == 0)
+			_ = client.AudioEnabled()
+			client.SetVideoEnabled(i%2 == 1)
+			_ = client.VideoEnabled()
+		}(i)
+	}
+	wg.Wait()
 }

@@ -31,7 +31,8 @@
 
     let canvasEl = $state<HTMLCanvasElement | null>(null);
     let observer: MutationObserver;
-    let animationFrame: number;
+    let resizeObserver: ResizeObserver | null = null;
+    let redrawInterval: ReturnType<typeof setInterval> | null = null;
     let logoImage: HTMLImageElement | null = null;
     let logoLoaded = false;
 
@@ -163,8 +164,6 @@
             ctx.shadowOffsetX = 0;
             ctx.shadowOffsetY = 0;
         }
-
-        animationFrame = requestAnimationFrame(draw);
     }
 
     function setupTamperDetection() {
@@ -196,12 +195,15 @@
         });
 
         // Watch the canvas and its parent
-        observer.observe(canvas.parentElement!, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ["style", "class"],
-        });
+        const parent = canvas.parentElement;
+        if (parent) {
+            observer.observe(parent, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ["style", "class"],
+            });
+        }
 
         observer.observe(canvas, {
             attributes: true,
@@ -234,14 +236,37 @@
                 }
             }
 
+            // The watermark is static between size changes and timestamp
+            // updates, so draw on demand only (not in a RAF loop):
+            // once now, on container resize, and every 60s for {{ time }}.
             draw();
+
+            const parent = canvasEl?.parentElement;
+            if (parent && typeof ResizeObserver !== "undefined") {
+                resizeObserver = new ResizeObserver(() => draw());
+                resizeObserver.observe(parent);
+            }
+
+            redrawInterval = setInterval(() => draw(), 60_000);
+
             setupTamperDetection();
         }
     });
 
+    // Redraw when watermark configuration changes (draw() reads the props,
+    // so the effect tracks them automatically), or when the canvas binds.
+    $effect(() => {
+        draw();
+    });
+
     onDestroy(() => {
-        if (animationFrame) {
-            cancelAnimationFrame(animationFrame);
+        if (resizeObserver) {
+            resizeObserver.disconnect();
+            resizeObserver = null;
+        }
+        if (redrawInterval) {
+            clearInterval(redrawInterval);
+            redrawInterval = null;
         }
         if (observer) {
             observer.disconnect();

@@ -1,7 +1,12 @@
 package webrtc
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"chromatic/internal/config"
 	"chromatic/internal/metrics"
@@ -380,6 +385,12 @@ func TestSFU_Shutdown(t *testing.T) {
 	if sfu.GetIngest(token2) != nil {
 		t.Error("ingest should be removed after shutdown")
 	}
+	if len(sfu.rooms) != 0 {
+		t.Error("rooms map should be cleared after shutdown")
+	}
+	if len(room.Subscribers) != 0 {
+		t.Error("room subscribers should be cleared after shutdown")
+	}
 }
 
 func TestSFU_CreatePeerConnection(t *testing.T) {
@@ -474,19 +485,74 @@ func TestSFU_HandleRenegotiationAnswer_RoomNotFound(t *testing.T) {
 	}
 }
 
-func TestSFU_RemoveVoiceSession_NonexistentRoom(t *testing.T) {
-	cfg := createTestConfig()
-	sfu, err := NewSFU(cfg)
-	if err != nil {
-		t.Fatalf("failed to create SFU: %v", err)
+func TestRoomTracks_RemoveSubscriberStopsVoiceRelay(t *testing.T) {
+	relayDone := make(chan struct{})
+	room := &RoomTracks{
+		RoomSlug:       "test-room",
+		Subscribers:    make(map[string]*Subscriber),
+		voiceRelayDone: map[string]chan struct{}{"sub-1": relayDone},
 	}
-	defer sfu.Shutdown()
 
-	// Should not panic
-	sfu.RemoveVoiceSession("nonexistent", "participant-1")
+	sub := &Subscriber{
+		ID:   "sub-1",
+		done: make(chan struct{}),
+	}
+	room.AddSubscriber(sub)
+	room.RemoveSubscriber("sub-1")
+
+	select {
+	case <-relayDone:
+		// closed as expected
+	default:
+		t.Error("voice relay done channel should be closed when subscriber is removed")
+	}
+	if _, ok := room.voiceRelayDone["sub-1"]; ok {
+		t.Error("voice relay done entry should be deleted on subscriber removal")
+	}
 }
 
-func TestSFU_RemoveVoiceSession_NonexistentParticipant(t *testing.T) {
+func TestExtractProfileLevelID(t *testing.T) {
+	cases := []struct {
+		name string
+		sdp  string
+		want string
+	}{
+		{
+			name: "standard fmtp line",
+			sdp:  "a=fmtp:97 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+			want: "42e01f",
+		},
+		{
+			name: "uppercase parameter with CRLF",
+			sdp:  "a=fmtp:102 PROFILE-LEVEL-ID=4d001f\r\n",
+			want: "4d001f",
+		},
+		{
+			name: "no profile-level-id",
+			sdp:  "a=fmtp:96 apt=102",
+			want: "",
+		},
+		{
+			name: "profile-id must not match",
+			sdp:  "a=fmtp:98 profile-id=0",
+			want: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := extractProfileLevelID(tc.sdp); got != tc.want {
+				t.Errorf("extractProfileLevelID(%q) = %q, want %q", tc.sdp, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWHIPHandler_TeardownFiresOnce verifies that the WHIP session teardown
+// (ingest removal + stream-end notification) runs exactly once across DELETE
+// requests and connection state callbacks, and that a session that never
+// reached Connected does not produce a stream-end notification.
+func TestWHIPHandler_TeardownFiresOnce(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)
 	if err != nil {
@@ -494,11 +560,100 @@ func TestSFU_RemoveVoiceSession_NonexistentParticipant(t *testing.T) {
 	}
 	defer sfu.Shutdown()
 
-	// Create room
-	_ = sfu.GetRoomTracks("test-room")
+	var endCalls int32
+	handler := NewWHIPHandler(sfu,
+		func(string) (bool, error) { return true, nil },
+		func(string) error { return nil },
+		func(string) { atomic.AddInt32(&endCalls, 1) },
+	)
 
-	// Should not panic
-	sfu.RemoveVoiceSession("test-room", "nonexistent")
+	establishSession := func(t *testing.T, token string) *IngestSession {
+		t.Helper()
+
+		// Build a real SDP offer with sendonly audio/video, like OBS would send.
+		offerPC, err := sfu.CreatePeerConnection()
+		if err != nil {
+			t.Fatalf("failed to create offer PC: %v", err)
+		}
+		t.Cleanup(func() { offerPC.Close() })
+
+		for _, kind := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
+			if _, err := offerPC.AddTransceiverFromKind(kind, webrtc.RTPTransceiverInit{
+				Direction: webrtc.RTPTransceiverDirectionSendonly,
+			}); err != nil {
+				t.Fatalf("failed to add %s transceiver: %v", kind, err)
+			}
+		}
+
+		offer, err := offerPC.CreateOffer(nil)
+		if err != nil {
+			t.Fatalf("failed to create offer: %v", err)
+		}
+		if err := offerPC.SetLocalDescription(offer); err != nil {
+			t.Fatalf("failed to set local description: %v", err)
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/whip/"+token, strings.NewReader(offer.SDP))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("expected 201 from WHIP offer, got %d: %s", rec.Code, rec.Body.String())
+		}
+
+		session := sfu.GetIngest(token)
+		if session == nil {
+			t.Fatal("ingest session should be registered after offer")
+		}
+		return session
+	}
+
+	t.Run("never connected session fires no stream end", func(t *testing.T) {
+		token := "whip-never-connected-token"
+		session := establishSession(t, token)
+
+		req := httptest.NewRequest(http.MethodDelete, "/whip/"+token, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204 from DELETE, got %d", rec.Code)
+		}
+
+		if sfu.GetIngest(token) != nil {
+			t.Error("ingest should be removed after DELETE")
+		}
+		// Simulate the async Closed state callback racing the DELETE path.
+		session.teardown()
+		if got := atomic.LoadInt32(&endCalls); got != 0 {
+			t.Errorf("never-connected session should not fire stream end, got %d calls", got)
+		}
+	})
+
+	t.Run("connected session fires stream end exactly once", func(t *testing.T) {
+		token := "whip-connected-token-1"
+		session := establishSession(t, token)
+		// Pretend the session reached Connected.
+		session.everConnected.Store(true)
+
+		req := httptest.NewRequest(http.MethodDelete, "/whip/"+token, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204 from DELETE, got %d", rec.Code)
+		}
+
+		// Simulate the async Failed/Closed callbacks firing after DELETE.
+		session.teardown()
+		session.teardown()
+		// Give the real Closed state callback (from pc.Close) time to fire too.
+		time.Sleep(200 * time.Millisecond)
+
+		if got := atomic.LoadInt32(&endCalls); got != 1 {
+			t.Errorf("stream end should fire exactly once, got %d calls", got)
+		}
+		if sfu.GetIngest(token) != nil {
+			t.Error("ingest should be removed after teardown")
+		}
+	})
 }
 
 func TestMaxICECandidates_Constant(t *testing.T) {

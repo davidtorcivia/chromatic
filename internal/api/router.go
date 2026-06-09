@@ -18,15 +18,19 @@ import (
 func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websocket.Hub) http.Handler {
 	mux := http.NewServeMux()
 
+	// Join tokens are signed with a secret derived from the admin token,
+	// never the admin token itself.
+	tokenSecret := handlers.DeriveTokenSecret(cfg.AdminToken)
+
 	// Create handlers
-	roomHandler := handlers.NewRoomHandler(db, cfg, cfg.AdminToken) // Use admin token as signing secret
+	roomHandler := handlers.NewRoomHandler(db, cfg, tokenSecret)
 	roomHandler.SetSFU(sfu)
 	roomHandler.SetHub(hub)
 
 	streamKeyHandler := handlers.NewStreamKeyHandler(db)
-	fileHandler := handlers.NewFileHandler(db, cfg, cfg.AdminToken)
+	fileHandler := handlers.NewFileHandler(db, cfg, tokenSecret)
 	configHandler := handlers.NewConfigHandler(db, cfg, sfu)
-	wsHandler := handlers.NewWebSocketHandler(db, hub, sfu, cfg.AllowedOrigins, cfg.ProductionMode, cfg.AdminToken)
+	wsHandler := handlers.NewWebSocketHandler(db, hub, sfu, cfg.AllowedOrigins, cfg.ProductionMode, tokenSecret)
 	authHandler := handlers.NewAuthHandler(db, cfg.AdminToken, cfg.ProductionMode)
 
 	// Wire up room live callback to initiate WebRTC subscriptions
@@ -46,14 +50,22 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 		},
 	)
 
+	// Auth configuration shared by admin routes and the metrics endpoint
+	authConfig := middleware.AuthConfig{
+		AdminToken:      cfg.AdminToken,
+		SessionCookie:   handlers.SessionCookieName,
+		ValidateSession: authHandler.ValidateSession,
+	}
+
 	// Health check
 	mux.HandleFunc("GET /health", handlers.HealthCheck)
 
-	// Prometheus metrics endpoint
-	mux.HandleFunc("GET /metrics", metrics.Handler())
+	// Prometheus metrics endpoint (requires admin session cookie or bearer
+	// token — Prometheus can scrape with an Authorization header)
+	mux.Handle("GET /metrics", middleware.RequireAuth(authConfig)(http.HandlerFunc(metrics.Handler())))
 
-	// Auth endpoints (no auth required)
-	mux.HandleFunc("POST /api/auth/login", authHandler.Login)
+	// Auth endpoints (no auth required) - login rate limited: 5 per minute per IP
+	mux.Handle("POST /api/auth/login", middleware.LoginRateLimiter(cfg.TrustedProxies)(http.HandlerFunc(authHandler.Login)))
 	mux.HandleFunc("POST /api/auth/logout", authHandler.Logout)
 
 	// WHIP endpoints (no auth - stream key is in URL)
@@ -89,11 +101,6 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	adminMux.HandleFunc("POST /api/config/test-turn", configHandler.TestTURN)
 
 	// Wrap admin routes with auth middleware
-	authConfig := middleware.AuthConfig{
-		AdminToken:      cfg.AdminToken,
-		SessionCookie:   handlers.SessionCookieName,
-		ValidateSession: authHandler.ValidateSession,
-	}
 	mux.Handle("/api/", middleware.RequireAuth(authConfig)(adminMux))
 
 	// File endpoints (session auth) - rate limited: 10 per minute

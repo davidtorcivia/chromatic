@@ -24,11 +24,14 @@ export class AudioDuckingManager {
     private isAdmin: boolean;
     private voiceAnalysers: Map<string, AnalyserNode> = new Map();
     private voiceGainNodes: Map<string, GainNode> = new Map();
+    private voiceSources: Map<string, MediaStreamAudioSourceNode> = new Map();
     private isDucked: boolean = false;
     private releaseTimer: ReturnType<typeof setTimeout> | null = null;
     private monitorFrame: number | null = null;
+    private volumeAnimationFrame: number | null = null;
     private baseStreamVolume: number = 1.0;
     private voiceVolume: number = 1.0;
+    private vadBuffer: Uint8Array<ArrayBuffer> | null = null;
 
     constructor(streamElement: HTMLMediaElement, isAdmin: boolean, config?: Partial<DuckingConfig>) {
         this.streamElement = streamElement;
@@ -89,6 +92,7 @@ export class AudioDuckingManager {
 
         this.voiceAnalysers.set(participantId, analyser);
         this.voiceGainNodes.set(participantId, gainNode);
+        this.voiceSources.set(participantId, source);
 
         // Start monitoring if not already
         if (!this.monitorFrame) {
@@ -97,7 +101,19 @@ export class AudioDuckingManager {
     }
 
     removeVoiceTrack(participantId: string): void {
-        // Disconnect and remove gain node
+        // Disconnect the full chain (source -> analyser -> gain) so the
+        // nodes and the underlying MediaStreamTrack can be released.
+        const source = this.voiceSources.get(participantId);
+        if (source) {
+            source.disconnect();
+            this.voiceSources.delete(participantId);
+        }
+
+        const analyser = this.voiceAnalysers.get(participantId);
+        if (analyser) {
+            analyser.disconnect();
+        }
+
         const gainNode = this.voiceGainNodes.get(participantId);
         if (gainNode) {
             gainNode.disconnect();
@@ -130,11 +146,16 @@ export class AudioDuckingManager {
 
     private detectVoiceActivity(): boolean {
         for (const analyser of this.voiceAnalysers.values()) {
-            const data = new Uint8Array(analyser.frequencyBinCount);
-            analyser.getByteFrequencyData(data);
+            // Reuse or resize the buffer to avoid per-frame allocation
+            if (!this.vadBuffer || this.vadBuffer.length !== analyser.frequencyBinCount) {
+                this.vadBuffer = new Uint8Array(analyser.frequencyBinCount) as Uint8Array<ArrayBuffer>;
+            }
+            analyser.getByteFrequencyData(this.vadBuffer);
 
             // Calculate average volume in dB
-            const avg = data.reduce((sum, val) => sum + val, 0) / data.length;
+            let sum = 0;
+            for (let i = 0; i < this.vadBuffer.length; i++) sum += this.vadBuffer[i];
+            const avg = sum / this.vadBuffer.length;
             const db = 20 * Math.log10(avg / 255);
 
             if (db > this.config.vadThreshold) {
@@ -169,6 +190,13 @@ export class AudioDuckingManager {
     }
 
     private animateVolume(targetMultiplier: number, duration: number): void {
+        // Cancel any in-flight animation so rapid duck/release cycles don't
+        // spawn parallel RAF loops fighting over the volume (audible jitter).
+        if (this.volumeAnimationFrame !== null) {
+            cancelAnimationFrame(this.volumeAnimationFrame);
+            this.volumeAnimationFrame = null;
+        }
+
         const targetVolume = this.baseStreamVolume * targetMultiplier;
         const start = this.streamElement.volume;
         const startTime = performance.now();
@@ -181,11 +209,13 @@ export class AudioDuckingManager {
             this.streamElement.volume = start + (targetVolume - start) * eased;
 
             if (progress < 1) {
-                requestAnimationFrame(animate);
+                this.volumeAnimationFrame = requestAnimationFrame(animate);
+            } else {
+                this.volumeAnimationFrame = null;
             }
         };
 
-        requestAnimationFrame(animate);
+        this.volumeAnimationFrame = requestAnimationFrame(animate);
     }
 
     private easeOutQuad(t: number): number {
@@ -195,15 +225,32 @@ export class AudioDuckingManager {
     destroy(): void {
         if (this.monitorFrame) {
             cancelAnimationFrame(this.monitorFrame);
+            this.monitorFrame = null;
+        }
+        if (this.volumeAnimationFrame !== null) {
+            cancelAnimationFrame(this.volumeAnimationFrame);
+            this.volumeAnimationFrame = null;
         }
         if (this.releaseTimer) {
             clearTimeout(this.releaseTimer);
+            this.releaseTimer = null;
         }
-        // Disconnect all gain nodes
+        // Disconnect all audio graph nodes (source -> analyser -> gain)
+        for (const source of this.voiceSources.values()) {
+            source.disconnect();
+        }
+        this.voiceSources.clear();
+        for (const analyser of this.voiceAnalysers.values()) {
+            analyser.disconnect();
+        }
         for (const gainNode of this.voiceGainNodes.values()) {
             gainNode.disconnect();
         }
         this.voiceGainNodes.clear();
         this.voiceAnalysers.clear();
+        // Restore the un-ducked volume so a re-created manager (or the bare
+        // video element) doesn't inherit a ducked volume.
+        this.streamElement.volume = this.baseStreamVolume;
+        this.isDucked = false;
     }
 }

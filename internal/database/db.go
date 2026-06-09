@@ -35,9 +35,12 @@ func New(path string) (*DB, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	// Set connection pool settings (SQLite works best with single connection for writes)
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	// Connection pool settings: WAL mode allows concurrent readers alongside
+	// a single writer, so a small pool avoids serializing every query behind
+	// one connection. _busy_timeout=5000 (set in the DSN above) makes
+	// concurrent writers wait instead of erroring with SQLITE_BUSY.
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
 
 	log.Printf("Database connected: %s (WAL mode)", path)
 

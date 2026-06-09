@@ -26,5 +26,9 @@
 		"typescript": "^5.9.3",
 		"vite": "^7.2.6",
 		"vitest": "^3.2.3"
+	},
+	"dependencies": {
+		"@fontsource/space-grotesk": "^5.2.10",
+		"@fontsource/work-sans": "^5.2.8"
 	}
 }

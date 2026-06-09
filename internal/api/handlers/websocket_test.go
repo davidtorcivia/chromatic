@@ -96,6 +96,21 @@ func TestSanitizeText(t *testing.T) {
 			input:    "<div onclick=alert(1)>Click</div>",
 			expected: "Click",
 		},
+		{
+			name:     "control characters stripped",
+			input:    "Hello\x00\x01World\x7f",
+			expected: "HelloWorld",
+		},
+		{
+			name:     "newline and tab preserved",
+			input:    "Line1\nLine2\tEnd",
+			expected: "Line1\nLine2\tEnd",
+		},
+		{
+			name:     "bidi override characters stripped",
+			input:    "Admin\u202E\u202DName\u2066\u2069",
+			expected: "AdminName",
+		},
 	}
 
 	for _, tt := range tests {
@@ -332,7 +347,7 @@ func TestChatMessageParsing(t *testing.T) {
 			}
 
 			sanitized := sanitizeText(data.Content)
-			isValid := len(sanitized) > 0 && len(data.Content) <= 2000
+			isValid := len(sanitized) > 0 && len(sanitized) <= 2000
 
 			if isValid != tt.shouldBeValid {
 				t.Errorf("validity: got %v, want %v (sanitized: %q)", isValid, tt.shouldBeValid, sanitized)

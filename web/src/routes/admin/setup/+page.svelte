@@ -1,6 +1,7 @@
 <script lang="ts">
     import { onMount } from "svelte";
     import { goto } from "$app/navigation";
+    import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
     import {
         appConfig,
         rooms,
@@ -45,6 +46,7 @@
     let currentStep = $state(0);
     let isLoading = $state(true);
     let loadError = $state("");
+    let confirmDeleteLogoOpen = $state(false);
 
     let config = $state<AppConfig | null>(null);
     let baseUrl = $state("");
@@ -420,10 +422,7 @@
     }
 
     async function handleDeleteLogo() {
-        if (!confirm("Delete the default logo?")) {
-            return;
-        }
-
+        confirmDeleteLogoOpen = false;
         brandingError = "";
         brandingSuccess = "";
 
@@ -586,7 +585,7 @@
             <div class="waiting-spinner"></div>
         </div>
     {:else if loadError}
-        <div class="error-message">{loadError}</div>
+        <div class="alert alert-error">{loadError}</div>
     {:else}
         <section class="setup-progress card">
             <div class="progress-meta">
@@ -804,11 +803,11 @@
                                 </div>
 
                                 {#if turnError}
-                                    <div class="error-message">{turnError}</div>
+                                    <div class="alert alert-error">{turnError}</div>
                                 {/if}
 
                                 {#if turnSuccess}
-                                    <div class="success-message">
+                                    <div class="alert alert-success">
                                         {turnSuccess}
                                     </div>
                                 {/if}
@@ -893,9 +892,12 @@
                                             class="btn btn-primary"
                                             disabled={isSavingTurn}
                                         >
-                                            {isSavingTurn
-                                                ? "Saving..."
-                                                : "Save TURN"}
+                                            {#if isSavingTurn}
+                                                <span class="btn-spinner" aria-hidden="true"></span>
+                                                Saving...
+                                            {:else}
+                                                Save TURN
+                                            {/if}
                                         </button>
                                         <button
                                             type="button"
@@ -903,9 +905,12 @@
                                             onclick={handleTestTurn}
                                             disabled={isTestingTurn}
                                         >
-                                            {isTestingTurn
-                                                ? "Testing..."
-                                                : "Test Connectivity"}
+                                            {#if isTestingTurn}
+                                                <span class="btn-spinner" aria-hidden="true"></span>
+                                                Testing...
+                                            {:else}
+                                                Test Connectivity
+                                            {/if}
                                         </button>
                                     </div>
                                 </form>
@@ -1019,13 +1024,13 @@
                                 </p>
 
                                 {#if brandingError}
-                                    <div class="error-message">
+                                    <div class="alert alert-error">
                                         {brandingError}
                                     </div>
                                 {/if}
 
                                 {#if brandingSuccess}
-                                    <div class="success-message">
+                                    <div class="alert alert-success">
                                         {brandingSuccess}
                                     </div>
                                 {/if}
@@ -1056,9 +1061,12 @@
                                         class="btn btn-primary"
                                         disabled={isSavingBranding}
                                     >
-                                        {isSavingBranding
-                                            ? "Saving..."
-                                            : "Save Watermark"}
+                                        {#if isSavingBranding}
+                                            <span class="btn-spinner" aria-hidden="true"></span>
+                                            Saving...
+                                        {:else}
+                                            Save Watermark
+                                        {/if}
                                     </button>
                                 </form>
 
@@ -1086,7 +1094,7 @@
                                         />
                                         <button
                                             class="btn btn-secondary btn-sm btn-danger-text"
-                                            onclick={handleDeleteLogo}
+                                            onclick={() => (confirmDeleteLogoOpen = true)}
                                         >
                                             Delete
                                         </button>
@@ -1094,17 +1102,24 @@
                                 {/if}
 
                                 <div class="file-upload">
-                                    <input
-                                        type="file"
-                                        accept="image/png,image/jpeg,image/webp"
-                                        onchange={handleLogoUpload}
-                                        disabled={isUploadingLogo}
-                                    />
-                                    {#if isUploadingLogo}
-                                        <span class="upload-status"
-                                            >Uploading...</span
-                                        >
-                                    {/if}
+                                    <label
+                                        class="btn btn-secondary file-btn"
+                                        class:disabled={isUploadingLogo}
+                                    >
+                                        {#if isUploadingLogo}
+                                            <span class="btn-spinner" aria-hidden="true"></span>
+                                            Uploading...
+                                        {:else}
+                                            Choose Logo File
+                                        {/if}
+                                        <input
+                                            type="file"
+                                            class="visually-hidden-input"
+                                            accept="image/png,image/jpeg,image/webp"
+                                            onchange={handleLogoUpload}
+                                            disabled={isUploadingLogo}
+                                        />
+                                    </label>
                                 </div>
                                 <p class="hint">
                                     Recommended: transparent PNG, max 500x500px,
@@ -1131,7 +1146,7 @@
                                 </p>
 
                                 {#if streamError}
-                                    <div class="error-message">
+                                    <div class="alert alert-error">
                                         {streamError}
                                     </div>
                                 {/if}
@@ -1152,9 +1167,12 @@
                                         class="btn btn-primary"
                                         disabled={isCreatingKey}
                                     >
-                                        {isCreatingKey
-                                            ? "Creating..."
-                                            : "Create Key"}
+                                        {#if isCreatingKey}
+                                            <span class="btn-spinner" aria-hidden="true"></span>
+                                            Creating...
+                                        {:else}
+                                            Create Key
+                                        {/if}
                                     </button>
                                 </form>
 
@@ -1256,7 +1274,7 @@
                             <section class="card">
                                 <h3>Room details</h3>
                                 {#if roomError}
-                                    <div class="error-message">{roomError}</div>
+                                    <div class="alert alert-error">{roomError}</div>
                                 {/if}
                                 <form onsubmit={handleCreateRoom}>
                                     <div class="form-group">
@@ -1324,9 +1342,12 @@
                                         class="btn btn-primary"
                                         disabled={isCreatingRoom}
                                     >
-                                        {isCreatingRoom
-                                            ? "Creating..."
-                                            : "Create Room"}
+                                        {#if isCreatingRoom}
+                                            <span class="btn-spinner" aria-hidden="true"></span>
+                                            Creating...
+                                        {:else}
+                                            Create Room
+                                        {/if}
                                     </button>
                                 </form>
                             </section>
@@ -1408,6 +1429,16 @@
     {/if}
 </div>
 
+<ConfirmDialog
+    open={confirmDeleteLogoOpen}
+    title="Delete the default logo?"
+    body="Rooms using the default watermark logo will no longer display it."
+    confirmLabel="Delete Logo"
+    danger
+    onConfirm={handleDeleteLogo}
+    onCancel={() => (confirmDeleteLogoOpen = false)}
+/>
+
 <style>
     .setup-page {
         max-width: 1200px;
@@ -1425,8 +1456,8 @@
         border: 1px solid var(--color-border);
         background: linear-gradient(
             135deg,
-            rgba(72, 182, 166, 0.18),
-            rgba(230, 162, 60, 0.12)
+            rgba(72, 182, 166, 0.1),
+            var(--color-surface)
         );
         display: flex;
         justify-content: space-between;
@@ -1443,7 +1474,7 @@
         top: -140px;
         background: radial-gradient(
             circle,
-            rgba(72, 182, 166, 0.35),
+            rgba(72, 182, 166, 0.18),
             transparent 70%
         );
         opacity: 0.8;
@@ -1491,7 +1522,7 @@
 
     .progress-fill {
         height: 100%;
-        background: linear-gradient(90deg, var(--color-primary), #e6a23c);
+        background: var(--color-primary);
         transition: width var(--transition-normal);
     }
 
@@ -1527,7 +1558,7 @@
     }
 
     .setup-steps li.complete .step-index {
-        background: rgba(47, 191, 113, 0.2);
+        background: var(--color-success-bg);
         color: var(--color-success);
         border-color: rgba(47, 191, 113, 0.4);
     }
@@ -1635,39 +1666,39 @@
         border-radius: var(--radius-full);
         font-size: 0.75rem;
         border: 1px solid transparent;
-        background: rgba(148, 163, 184, 0.15);
+        background: var(--color-neutral-bg);
         color: var(--color-text-muted);
     }
 
     .status-pill.ok,
     .status-pill.good {
-        background: rgba(47, 191, 113, 0.18);
+        background: var(--color-success-bg);
         border-color: rgba(47, 191, 113, 0.35);
         color: var(--color-success);
     }
 
     .status-pill.warn {
-        background: rgba(230, 162, 60, 0.18);
+        background: var(--color-warning-bg);
         border-color: rgba(230, 162, 60, 0.35);
         color: var(--color-warning);
     }
 
     .status-pill.bad,
     .status-pill.error {
-        background: rgba(239, 90, 90, 0.18);
+        background: var(--color-error-bg);
         border-color: rgba(239, 90, 90, 0.35);
         color: var(--color-error);
     }
 
     .status-pill.checking {
-        background: rgba(59, 130, 246, 0.15);
-        border-color: rgba(59, 130, 246, 0.35);
-        color: #93c5fd;
+        background: var(--color-neutral-bg);
+        border-color: var(--color-border);
+        color: var(--color-text-muted);
     }
 
     .status-pill.neutral {
-        background: rgba(148, 163, 184, 0.2);
-        border-color: rgba(148, 163, 184, 0.3);
+        background: var(--color-neutral-bg);
+        border-color: var(--color-border);
         color: var(--color-text-muted);
     }
 
@@ -1727,26 +1758,6 @@
         margin-top: var(--space-md);
     }
 
-    .error-message,
-    .success-message {
-        padding: var(--space-sm) var(--space-md);
-        border-radius: var(--radius-md);
-        font-size: 0.875rem;
-        margin-bottom: var(--space-md);
-    }
-
-    .error-message {
-        background: rgba(239, 90, 90, 0.12);
-        border: 1px solid var(--color-error);
-        color: var(--color-error);
-    }
-
-    .success-message {
-        background: rgba(47, 191, 113, 0.12);
-        border: 1px solid var(--color-success);
-        color: var(--color-success);
-    }
-
     .test-summary {
         padding: var(--space-sm) var(--space-md);
         border-radius: var(--radius-md);
@@ -1755,13 +1766,13 @@
     }
 
     .test-summary.success {
-        background: rgba(47, 191, 113, 0.12);
+        background: var(--color-success-bg);
         border: 1px solid var(--color-success);
         color: var(--color-success);
     }
 
     .test-summary.failure {
-        background: rgba(239, 90, 90, 0.12);
+        background: var(--color-error-bg);
         border: 1px solid var(--color-error);
         color: var(--color-error);
     }
@@ -1835,9 +1846,26 @@
         gap: var(--space-sm);
     }
 
-    .upload-status {
-        font-size: 0.875rem;
-        color: var(--color-text-muted);
+    .file-btn {
+        position: relative;
+        overflow: hidden;
+    }
+
+    .file-btn.disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+    }
+
+    .visually-hidden-input {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
     }
 
     .whip-block .field-label {
@@ -1898,13 +1926,6 @@
         flex: 1;
     }
 
-    .form-hint {
-        display: block;
-        font-size: 0.75rem;
-        color: var(--color-text-subtle);
-        margin-top: var(--space-xs);
-    }
-
     .callout {
         margin-top: var(--space-lg);
         padding: var(--space-md);
@@ -1933,23 +1954,12 @@
         border-top: 1px solid var(--color-border-subtle);
     }
 
-    .btn-sm {
-        padding: var(--space-xs) var(--space-sm);
-        font-size: 0.75rem;
-    }
-
     .btn-danger-text {
         color: var(--color-error);
     }
 
     .btn-danger-text:hover {
-        background: rgba(239, 90, 90, 0.15);
-    }
-
-    .loading {
-        display: flex;
-        justify-content: center;
-        padding: var(--space-2xl);
+        background: var(--color-error-bg);
     }
 
     @media (max-width: 1024px) {

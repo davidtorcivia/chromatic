@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount } from "svelte";
+    import { fly } from "svelte/transition";
     import { session } from "$lib/stores/session.svelte";
     import { chatStore } from "$lib/stores/chat.svelte";
     import { uploadFile, type UploadedFile } from "$lib/api/client";
@@ -9,9 +9,20 @@
         onClose: () => void;
         roomSlug: string;
         joinToken: string;
+        /** Map of participant id → display color (tints author names). */
+        participantColors?: Record<string, string>;
+        /** Own participant id, used to distinguish own messages. */
+        selfId?: string;
     }
 
-    let { isOpen, onClose, roomSlug, joinToken }: Props = $props();
+    let {
+        isOpen,
+        onClose,
+        roomSlug,
+        joinToken,
+        participantColors = {},
+        selfId = "",
+    }: Props = $props();
 
     // Allowed file types (must match backend)
     const ALLOWED_TYPES = [
@@ -55,51 +66,8 @@
     let uploadError = $state<string | null>(null);
     let isDragOver = $state(false);
 
-    onMount(() => {
-        // Load chat history from server
-        session.onMessage("chat:history", (payload) => {
-            const data = payload as {
-                messages: Array<{
-                    id: string;
-                    participantId: string;
-                    participantName: string;
-                    type: "text" | "file";
-                    content: string;
-                    timestamp: number;
-                    file?: {
-                        id: string;
-                        name: string;
-                        mimeType: string;
-                        url: string;
-                        thumbnailUrl?: string;
-                    };
-                }>;
-            };
-            chatStore.loadHistory(data.messages);
-            scrollToBottom();
-        });
-
-        // Subscribe to new chat messages
-        session.onMessage("chat:message", (payload) => {
-            const msg = payload as {
-                id?: string;
-                participantId: string;
-                participantName: string;
-                type: "text" | "file";
-                content: string;
-                timestamp?: number;
-                file?: {
-                    id: string;
-                    name: string;
-                    mimeType: string;
-                    url: string;
-                    thumbnailUrl?: string;
-                };
-            };
-            chatStore.addMessage(msg);
-            scrollToBottom();
-        });
-    });
+    // Chat message handlers are registered by the session page (always
+    // mounted) and feed chatStore; this panel just renders the store.
 
     function scrollToBottom() {
         if (!messagesContainer) return;
@@ -218,6 +186,13 @@
 
     let messages = $derived(chatStore.messages);
     let unreadCount = $derived(chatStore.unreadCount);
+
+    // Keep the view scrolled to the newest message
+    $effect(() => {
+        if (messages.length > 0) {
+            scrollToBottom();
+        }
+    });
 </script>
 
 {#if isOpen}
@@ -228,19 +203,22 @@
         ondragover={handleDragOver}
         ondragleave={handleDragLeave}
         ondrop={handleDrop}
+        transition:fly={{ x: 320, duration: 200 }}
     >
         <div class="chat-header">
             <h3>Chat</h3>
-            <button class="btn btn-icon btn-ghost" onclick={onClose}>
-                ✕
+            <button class="btn btn-icon btn-ghost" onclick={onClose} aria-label="Close chat">
+                <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18" aria-hidden="true"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
             </button>
         </div>
 
         <div class="chat-messages" bind:this={messagesContainer}>
             {#each messages as msg (msg.id)}
-                <div class="chat-message">
+                <div class="chat-message" class:own={msg.participantId === selfId}>
                     <div class="chat-message-meta">
-                        <span class="chat-message-author"
+                        <span
+                            class="chat-message-author"
+                            style="color: {participantColors[msg.participantId] ?? 'var(--color-text)'}"
                             >{msg.participantName}</span
                         >
                         <span class="chat-message-time"
@@ -267,7 +245,9 @@
                                 </div>
                             {:else}
                                 <a href={withJoinToken(msg.file.url)} target="_blank" rel="noopener noreferrer" class="file-link">
-                                    <span class="file-icon">📄</span>
+                                    <span class="file-icon" aria-hidden="true">
+                                        <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
+                                    </span>
                                     <span class="file-name">{msg.file.name}</span>
                                 </a>
                             {/if}
@@ -277,7 +257,7 @@
             {/each}
 
             {#if messages.length === 0}
-                <div class="chat-empty">No messages yet</div>
+                <div class="chat-empty">Notes, links and stills shared during the session appear here.</div>
             {/if}
         </div>
 
@@ -291,14 +271,18 @@
         {#if uploadError}
             <div class="upload-error">
                 <span>{uploadError}</span>
-                <button class="btn-dismiss" onclick={() => uploadError = null}>✕</button>
+                <button class="btn-dismiss" onclick={() => uploadError = null} aria-label="Dismiss error">
+                    <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14" aria-hidden="true"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+                </button>
             </div>
         {/if}
 
         {#if isDragOver}
             <div class="drop-overlay">
                 <div class="drop-overlay-content">
-                    <span class="drop-icon">📎</span>
+                    <span class="drop-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="currentColor" width="32" height="32"><path d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5c0-1.38 1.12-2.5 2.5-2.5s2.5 1.12 2.5 2.5v10.5c0 .55-.45 1-1 1s-1-.45-1-1V6H10v9.5c0 1.38 1.12 2.5 2.5 2.5s2.5-1.12 2.5-2.5V5c0-2.21-1.79-4-4-4S7 2.79 7 5v12.5c0 3.04 2.46 5.5 5.5 5.5s5.5-2.46 5.5-5.5V6h-1.5z"/></svg>
+                    </span>
                     <span>Drop file to upload</span>
                 </div>
             </div>
@@ -318,8 +302,9 @@
                 onclick={handleFileSelect}
                 disabled={uploadProgress !== null}
                 title="Attach file (images, audio, PDF - max 5MB)"
+                aria-label="Attach file"
             >
-                📎
+                <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18" aria-hidden="true"><path d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5c0-1.38 1.12-2.5 2.5-2.5s2.5 1.12 2.5 2.5v10.5c0 .55-.45 1-1 1s-1-.45-1-1V6H10v9.5c0 1.38 1.12 2.5 2.5 2.5s2.5-1.12 2.5-2.5V5c0-2.21-1.79-4-4-4S7 2.79 7 5v12.5c0 3.04 2.46 5.5 5.5 5.5s5.5-2.46 5.5-5.5V6h-1.5z"/></svg>
             </button>
             <input
                 type="text"
@@ -372,6 +357,15 @@
         margin-bottom: var(--space-md);
     }
 
+    /* Subtle elevated bubble for the viewer's own messages */
+    .chat-message.own {
+        background: var(--color-surface-elevated);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-md);
+        padding: var(--space-sm);
+        margin-left: var(--space-xl);
+    }
+
     .chat-message-meta {
         display: flex;
         gap: var(--space-sm);
@@ -386,7 +380,7 @@
     }
 
     .chat-message-time {
-        font-size: 0.625rem;
+        font-size: 0.6875rem;
         color: var(--color-text-subtle);
     }
 
@@ -429,7 +423,10 @@
     }
 
     .chat-message-file .file-icon {
-        font-size: 1.25rem;
+        display: flex;
+        align-items: center;
+        color: var(--color-text-muted);
+        flex-shrink: 0;
     }
 
     .chat-message-file .file-name {
@@ -441,6 +438,8 @@
         text-align: center;
         color: var(--color-text-subtle);
         padding: var(--space-xl);
+        font-size: var(--text-body, 0.875rem);
+        line-height: 1.5;
     }
 
     .upload-progress {
@@ -485,6 +484,8 @@
         color: white;
         cursor: pointer;
         padding: var(--space-xs);
+        display: flex;
+        align-items: center;
     }
 
     .drop-overlay {
@@ -508,7 +509,9 @@
     }
 
     .drop-icon {
-        font-size: 2rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
     }
 
     .chat-panel.drag-over {

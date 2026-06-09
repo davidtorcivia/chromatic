@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -26,13 +25,12 @@ type WebSocketHandler struct {
 	hub             *websocket.Hub
 	sfu             *webrtc.SFU
 	originValidator *middleware.OriginValidator
-	adminToken      string
 	tokenManager    *TokenManager
 	upgrader        gorillaws.Upgrader
 }
 
 // NewWebSocketHandler creates a new WebSocketHandler
-func NewWebSocketHandler(db *database.DB, hub *websocket.Hub, sfu *webrtc.SFU, allowedOrigins []string, productionMode bool, adminToken string) *WebSocketHandler {
+func NewWebSocketHandler(db *database.DB, hub *websocket.Hub, sfu *webrtc.SFU, allowedOrigins []string, productionMode bool, tokenSecret []byte) *WebSocketHandler {
 	validator := middleware.NewOriginValidator(allowedOrigins, productionMode)
 
 	h := &WebSocketHandler{
@@ -40,8 +38,7 @@ func NewWebSocketHandler(db *database.DB, hub *websocket.Hub, sfu *webrtc.SFU, a
 		hub:             hub,
 		sfu:             sfu,
 		originValidator: validator,
-		adminToken:      adminToken,
-		tokenManager:    NewTokenManager(adminToken), // Use adminToken as HMAC secret
+		tokenManager:    NewTokenManager(tokenSecret),
 	}
 
 	h.upgrader = gorillaws.Upgrader{
@@ -65,15 +62,11 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	slug := r.PathValue("slug")
 	token := r.URL.Query().Get("token")
 	name := r.URL.Query().Get("name")
-	adminAuth := r.URL.Query().Get("admin") // Optional admin token for admin access
 
 	if token == "" || name == "" {
 		http.Error(w, "Missing token or name", http.StatusBadRequest)
 		return
 	}
-
-	// Check if this is an admin connection (using constant-time comparison)
-	isAdminAuth := adminAuth != "" && subtle.ConstantTimeCompare([]byte(adminAuth), []byte(h.adminToken)) == 1
 
 	// Validate the signed token
 	tokenPayload, err := h.tokenManager.ValidateToken(token)
@@ -142,23 +135,23 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Create client
-	// Admin if authenticated via admin token OR has admin role in database
-	isAdmin := isAdminAuth || role == "admin"
-	if isAdminAuth {
-		role = "admin" // Set role to admin for authenticated admin
-	}
+	// Admin status comes from the participant's role in the database; the
+	// role is assigned at join time when a valid admin token is provided in
+	// the join request body (never via URL query params, which get logged).
+	isAdmin := role == "admin"
 	client := &websocket.Client{
-		ID:           participantID,
-		Name:         name,
-		Role:         role,
-		RoomSlug:     slug,
-		Hub:          h.hub,
-		Conn:         conn,
-		Send:         make(chan []byte, 256),
-		IsAdmin:      isAdmin,
-		AudioEnabled: false,
-		VideoEnabled: true,
+		ID:       participantID,
+		Name:     name,
+		Role:     role,
+		RoomSlug: slug,
+		Hub:      h.hub,
+		Conn:     conn,
+		Send:     make(chan []byte, 256),
+		Done:     make(chan struct{}),
+		IsAdmin:  isAdmin,
 	}
+	client.SetAudioEnabled(false)
+	client.SetVideoEnabled(true)
 	// Initialize chat rate limiter: 30 messages per minute
 	client.InitChatRateLimiter()
 	// Initialize cursor rate limiter: 20 updates per second
@@ -184,8 +177,8 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 			"name":         client.Name,
 			"role":         client.Role,
 			"color":        client.Color,
-			"audioEnabled": client.AudioEnabled,
-			"videoEnabled": client.VideoEnabled,
+			"audioEnabled": client.AudioEnabled(),
+			"videoEnabled": client.VideoEnabled(),
 		},
 	}, client.ID)
 
@@ -203,6 +196,28 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 			h.handleMessage(c, msg)
 		},
 		func(c *websocket.Client) {
+			// If this client was replaced by a new connection (page refresh),
+			// skip all cleanup — the participant is still in the room.
+			if !h.hub.IsCurrentClient(c) {
+				logger.Info("Client replaced (page refresh), skipping cleanup", "participant_id", c.ID, "name", c.Name, "room", c.RoomSlug)
+				return
+			}
+
+			// Clean up screen share if this participant was sharing
+			roomTracks := h.sfu.GetRoomTracksForSlug(c.RoomSlug)
+			if roomTracks != nil {
+				roomTracks.RLockVoiceTracks()
+				wasSharing := roomTracks.ScreenShareParticipantID == c.ID
+				roomTracks.RUnlockVoiceTracks()
+				if wasSharing {
+					affected := h.sfu.RemoveScreenShareTrack(c.RoomSlug)
+					h.hub.BroadcastJSON(c.RoomSlug, "screenshare:stopped", map[string]interface{}{}, "")
+					// Renegotiate affected subscribers
+					for _, subID := range affected {
+						go h.renegotiateSubscriber(c.RoomSlug, subID)
+					}
+				}
+			}
 			// Broadcast participant:left when client disconnects
 			h.hub.BroadcastJSON(c.RoomSlug, "participant:left", map[string]interface{}{
 				"participantId": c.ID,
@@ -214,32 +229,50 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 
 // initiateSubscription starts the WebRTC subscription for a client
 func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSlug string) {
-	// Create subscriber connection and get offer
-	pc, offer, err := h.sfu.CreateSubscriberConnection(roomSlug, client.ID)
+	// Create subscriber connection and get offer (no ICE candidates yet — trickle ICE)
+	pc, offerSDP, err := h.sfu.CreateSubscriberConnection(roomSlug, client.ID)
 	if err != nil {
 		logger.Error("Failed to create subscriber connection", "participant_id", client.ID, "room", roomSlug, "error", err)
 		return
 	}
 
-	// Listen for inbound audio (voice) tracks from this participant
+	// Listen for inbound tracks from this participant (voice audio + screen share video)
 	pc.OnTrack(func(track *pionwebrtc.TrackRemote, receiver *pionwebrtc.RTPReceiver) {
-		if track.Kind() != pionwebrtc.RTPCodecTypeAudio {
+		streamID := track.StreamID()
+
+		// Screen share tracks are identified by stream ID prefix
+		if strings.HasPrefix(streamID, "screenshare-stream-") {
+			h.forwardScreenShareTrack(roomSlug, client.ID, track)
 			return
 		}
-		h.forwardVoiceTrack(roomSlug, client.ID, track)
+
+		if track.Kind() == pionwebrtc.RTPCodecTypeVideo {
+			// Video track from subscriber — must be screen share
+			h.forwardScreenShareTrack(roomSlug, client.ID, track)
+			return
+		}
+
+		if track.Kind() == pionwebrtc.RTPCodecTypeAudio {
+			h.forwardVoiceTrack(roomSlug, client.ID, track)
+		}
 	})
 
-	// Send offer to client
+	// Send offer to client FIRST (before enabling trickle ICE)
 	client.SendJSON("signal:offer", map[string]interface{}{
-		"sdp": offer.SDP,
+		"sdp": offerSDP,
 	})
 
-	logger.Debug("Sent WebRTC offer to client", "participant_id", client.ID, "room", roomSlug)
+	// Enable trickle ICE: flush any buffered candidates and send future ones directly.
+	// This must happen AFTER the offer is sent to guarantee correct message ordering.
+	h.sfu.EnableSubscriberTrickleICE(roomSlug, client.ID, func(init *pionwebrtc.ICECandidateInit) {
+		client.SendJSON("signal:candidate", map[string]interface{}{
+			"candidate":     init.Candidate,
+			"sdpMid":        init.SDPMid,
+			"sdpMLineIndex": init.SDPMLineIndex,
+		})
+	})
 
-	// Note: existing voice relay tracks are already included in the initial
-	// offer by CreateSubscriberConnection. No separate renegotiation needed
-	// for late joiners — this avoids the signaling state race that occurs
-	// when creating offers before the initial answer has been received.
+	logger.Debug("Sent WebRTC offer to client (trickle ICE)", "participant_id", client.ID, "room", roomSlug)
 }
 
 // InitiateSubscriptionsForRoom sends WebRTC offers to all clients in a room
@@ -289,8 +322,8 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 			"name":         p.Name,
 			"role":         p.Role,
 			"color":        p.Color,
-			"audioEnabled": p.AudioEnabled,
-			"videoEnabled": p.VideoEnabled,
+			"audioEnabled": p.AudioEnabled(),
+			"videoEnabled": p.VideoEnabled(),
 		})
 	}
 
@@ -312,11 +345,36 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 		roomData["watermarkLogoUrl"] = "/api/config/logo"
 	}
 
+	// Include active screen share state for late joiners
+	var screenShareData interface{}
+	roomTracks := h.sfu.GetRoomTracksForSlug(slug)
+	if roomTracks != nil {
+		roomTracks.RLockVoiceTracks() // reuse RLock helper
+		if roomTracks.ScreenShareParticipantID != "" {
+			// Look up the sharer's name
+			sharerName := roomTracks.ScreenShareParticipantID
+			for _, p := range participantData {
+				if p["id"] == roomTracks.ScreenShareParticipantID {
+					if n, ok := p["name"].(string); ok {
+						sharerName = n
+					}
+					break
+				}
+			}
+			screenShareData = map[string]interface{}{
+				"participantId": roomTracks.ScreenShareParticipantID,
+				"name":          sharerName,
+			}
+		}
+		roomTracks.RUnlockVoiceTracks()
+	}
+
 	client.SendJSON("room:state", map[string]interface{}{
 		"room":         roomData,
 		"participants": participantData,
 		"isLive":       isLive,
 		"iceServers":   h.sfu.GetICEServers(),
+		"screenShare":  screenShareData,
 	})
 }
 
@@ -406,6 +464,15 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 		h.handleAdminKick(client, msg.Payload)
 	case "admin:end-session":
 		h.handleAdminEndSession(client)
+	// Screen sharing
+	case "screenshare:request":
+		h.handleScreenShareRequest(client)
+	case "admin:screenshare-approve":
+		h.handleScreenShareApprove(client, msg.Payload)
+	case "admin:screenshare-deny":
+		h.handleScreenShareDeny(client, msg.Payload)
+	case "screenshare:stop":
+		h.handleScreenShareStop(client)
 	default:
 		logger.Debug("Unknown message type", "type", msg.Type, "participant_id", client.ID)
 	}
@@ -426,7 +493,7 @@ func (h *WebSocketHandler) handleChatSend(client *websocket.Client, payload json
 	}
 
 	sanitizedContent := sanitizeText(data.Content)
-	if len(sanitizedContent) == 0 || len(data.Content) > 2000 {
+	if len(sanitizedContent) == 0 || len(sanitizedContent) > 2000 {
 		return
 	}
 
@@ -568,18 +635,18 @@ func (h *WebSocketHandler) handleMediaToggle(client *websocket.Client, payload j
 	}
 
 	if data.Audio != nil {
-		client.AudioEnabled = *data.Audio
+		client.SetAudioEnabled(*data.Audio)
 	}
 	if data.Video != nil {
-		client.VideoEnabled = *data.Video
+		client.SetVideoEnabled(*data.Video)
 	}
 
 	// Notify others
 	h.hub.BroadcastJSON(client.RoomSlug, "participant:updated", map[string]interface{}{
 		"participant": map[string]interface{}{
 			"id":           client.ID,
-			"audioEnabled": client.AudioEnabled,
-			"videoEnabled": client.VideoEnabled,
+			"audioEnabled": client.AudioEnabled(),
+			"videoEnabled": client.VideoEnabled(),
 		},
 	}, client.ID)
 }
@@ -817,15 +884,11 @@ func (h *WebSocketHandler) handleAdminKick(client *websocket.Client, payload jso
 		"reason": data.Reason,
 	})
 
-	// Force disconnect if the client is connected
+	// Force disconnect — closing the connection triggers ReadPump exit,
+	// which fires onDisconnect and broadcasts participant:left.
 	if target := h.hub.GetClient(client.RoomSlug, data.ParticipantID); target != nil {
 		target.Conn.Close()
 	}
-
-	// Notify others
-	h.hub.BroadcastJSON(client.RoomSlug, "participant:left", map[string]interface{}{
-		"participantId": data.ParticipantID,
-	}, "")
 }
 
 func (h *WebSocketHandler) handleAdminEndSession(client *websocket.Client) {
@@ -844,4 +907,181 @@ func (h *WebSocketHandler) handleAdminEndSession(client *websocket.Client) {
 
 	// Broadcast session end to all
 	h.hub.BroadcastJSON(client.RoomSlug, "room:ended", map[string]interface{}{}, "")
+}
+
+// handleScreenShareRequest processes a guest's request to share their screen
+func (h *WebSocketHandler) handleScreenShareRequest(client *websocket.Client) {
+	roomTracks := h.sfu.GetRoomTracksForSlug(client.RoomSlug)
+	if roomTracks != nil {
+		roomTracks.RLockVoiceTracks()
+		active := roomTracks.ScreenShareParticipantID
+		roomTracks.RUnlockVoiceTracks()
+		if active != "" {
+			// Already an active screen share
+			client.SendJSON("screenshare:denied", map[string]interface{}{
+				"reason": "Another participant is already sharing their screen",
+			})
+			return
+		}
+	}
+
+	// Admin auto-approves their own request
+	if client.IsAdmin {
+		client.SendJSON("screenshare:approved", map[string]interface{}{})
+		return
+	}
+
+	// Find admin(s) in the room and send pending request
+	clients := h.hub.GetRoomClients(client.RoomSlug)
+	for _, c := range clients {
+		if c.IsAdmin {
+			c.SendJSON("screenshare:pending", map[string]interface{}{
+				"participantId": client.ID,
+				"name":          client.Name,
+			})
+		}
+	}
+	logger.Debug("Screen share request sent to admin", "participant_id", client.ID, "room", client.RoomSlug)
+}
+
+// handleScreenShareApprove processes admin approval of a screen share request
+func (h *WebSocketHandler) handleScreenShareApprove(client *websocket.Client, payload json.RawMessage) {
+	if !client.IsAdmin {
+		return
+	}
+
+	var data struct {
+		ParticipantID string `json:"participantId"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return
+	}
+
+	// Check no active screen share
+	roomTracks := h.sfu.GetRoomTracksForSlug(client.RoomSlug)
+	if roomTracks != nil {
+		roomTracks.RLockVoiceTracks()
+		active := roomTracks.ScreenShareParticipantID
+		roomTracks.RUnlockVoiceTracks()
+		if active != "" {
+			return
+		}
+	}
+
+	// Send approval to the requester
+	h.hub.SendToJSON(client.RoomSlug, data.ParticipantID, "screenshare:approved", map[string]interface{}{})
+	logger.Info("Screen share approved", "participant_id", data.ParticipantID, "admin", client.ID, "room", client.RoomSlug)
+}
+
+// handleScreenShareDeny processes admin denial of a screen share request
+func (h *WebSocketHandler) handleScreenShareDeny(client *websocket.Client, payload json.RawMessage) {
+	if !client.IsAdmin {
+		return
+	}
+
+	var data struct {
+		ParticipantID string `json:"participantId"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return
+	}
+
+	h.hub.SendToJSON(client.RoomSlug, data.ParticipantID, "screenshare:denied", map[string]interface{}{})
+	logger.Info("Screen share denied", "participant_id", data.ParticipantID, "admin", client.ID, "room", client.RoomSlug)
+}
+
+// handleScreenShareStop processes a request to stop screen sharing
+func (h *WebSocketHandler) handleScreenShareStop(client *websocket.Client) {
+	roomTracks := h.sfu.GetRoomTracksForSlug(client.RoomSlug)
+	if roomTracks == nil {
+		return
+	}
+
+	// Only the sharer or admin can stop
+	roomTracks.RLockVoiceTracks()
+	sharerID := roomTracks.ScreenShareParticipantID
+	roomTracks.RUnlockVoiceTracks()
+
+	if sharerID == "" {
+		return
+	}
+	if client.ID != sharerID && !client.IsAdmin {
+		return
+	}
+
+	affected := h.sfu.RemoveScreenShareTrack(client.RoomSlug)
+	h.hub.BroadcastJSON(client.RoomSlug, "screenshare:stopped", map[string]interface{}{}, "")
+
+	// Renegotiate affected subscribers to remove the track
+	for _, subID := range affected {
+		go h.renegotiateSubscriber(client.RoomSlug, subID)
+	}
+
+	logger.Info("Screen share stopped", "stopped_by", client.ID, "sharer", sharerID, "room", client.RoomSlug)
+}
+
+// forwardScreenShareTrack forwards a participant's screen share track to all other participants.
+// Modeled on forwardVoiceTrack — creates a single relay track for fan-out.
+func (h *WebSocketHandler) forwardScreenShareTrack(roomSlug, participantID string, track *pionwebrtc.TrackRemote) {
+	logger.Debug("Forwarding screen share track", "participant_id", participantID, "room", roomSlug)
+
+	relayTrack, err := h.sfu.CreateScreenShareRelayTrack(roomSlug, participantID, track)
+	if err != nil {
+		logger.Error("Failed to create screen share relay track", "participant_id", participantID, "error", err)
+		return
+	}
+
+	// Add the relay track to all other subscribers
+	clients := h.hub.GetRoomClients(roomSlug)
+	for _, client := range clients {
+		if client.ID == participantID {
+			continue
+		}
+
+		offerSDP, err := h.sfu.AddScreenShareTrackToSubscriber(roomSlug, client.ID, participantID, relayTrack)
+		if err != nil {
+			logger.Warn("Failed to add screen share track to subscriber", "subscriber_id", client.ID, "source_id", participantID, "error", err)
+			continue
+		}
+
+		client.SendJSON("signal:renegotiate", map[string]interface{}{
+			"sdp": offerSDP,
+		})
+	}
+
+	// Broadcast that screen share has started
+	sharerName := participantID
+	for _, c := range clients {
+		if c.ID == participantID {
+			sharerName = c.Name
+			break
+		}
+	}
+	h.hub.BroadcastJSON(roomSlug, "screenshare:started", map[string]interface{}{
+		"participantId": participantID,
+		"name":          sharerName,
+	}, "")
+
+	// Request keyframes: main stream (renegotiation may disrupt browser decoders)
+	// and screen share (so subscribers can decode immediately).
+	h.sfu.RequestKeyframe(roomSlug)
+	h.sfu.RequestScreenShareKeyframe(roomSlug)
+
+	logger.Info("Screen share track forwarded", "participant_id", participantID, "room", roomSlug)
+}
+
+// renegotiateSubscriber creates a renegotiation offer for a subscriber and sends it
+func (h *WebSocketHandler) renegotiateSubscriber(roomSlug, subscriberID string) {
+	offerSDP, err := h.sfu.RenegotiateSubscriber(roomSlug, subscriberID)
+	if err != nil {
+		logger.Warn("Failed to renegotiate subscriber", "subscriber_id", subscriberID, "error", err)
+		return
+	}
+
+	client := h.hub.GetClient(roomSlug, subscriberID)
+	if client != nil {
+		client.SendJSON("signal:renegotiate", map[string]interface{}{
+			"sdp": offerSDP,
+		})
+	}
 }

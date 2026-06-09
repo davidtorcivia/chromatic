@@ -1,17 +1,25 @@
 <script lang="ts">
     import { onMount, onDestroy } from "svelte";
+    import { fade } from "svelte/transition";
     import { page } from "$app/stores";
-    import { rooms, streamKeys, type Room, type StreamKey } from "$lib/api/client";
+    import { rooms, streamKeys, appConfig, type Room, type StreamKey, type AppConfig } from "$lib/api/client";
+    import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
+    import CopyField from "$lib/components/CopyField.svelte";
+    import StatusBadge from "$lib/components/StatusBadge.svelte";
+    import WatermarkOverlay from "$lib/components/WatermarkOverlay.svelte";
 
     const slug = $page.params.slug!;
 
     let room = $state<Room | null>(null);
     let keys = $state<StreamKey[]>([]);
+    let config = $state<AppConfig | null>(null);
     let waitingParticipants = $state<{ id: string; name: string; joinedAt: string }[]>([]);
     let isLoading = $state(true);
     let isSaving = $state(false);
     let error = $state("");
     let successMessage = $state("");
+    let confirmEndOpen = $state(false);
+    let confirmDeleteOpen = $state(false);
 
     // Form fields (populated from room)
     let name = $state("");
@@ -28,13 +36,15 @@
 
     onMount(async () => {
         try {
-            const [roomData, keysData] = await Promise.all([
+            const [roomData, keysData, configData] = await Promise.all([
                 rooms.get(slug),
-                streamKeys.list()
+                streamKeys.list(),
+                appConfig.get().catch(() => null)
             ]);
 
             room = roomData;
             keys = keysData;
+            config = configData;
 
             // Populate form fields
             name = room.name;
@@ -136,10 +146,7 @@
     }
 
     async function handleEndSession() {
-        if (!confirm("Are you sure you want to end this session? This cannot be undone.")) {
-            return;
-        }
-
+        confirmEndOpen = false;
         try {
             await rooms.end(slug);
             if (room) {
@@ -151,10 +158,7 @@
     }
 
     async function handleDelete() {
-        if (!confirm("Are you sure you want to delete this room? This cannot be undone.")) {
-            return;
-        }
-
+        confirmDeleteOpen = false;
         try {
             await rooms.delete(slug);
             window.location.href = "/admin";
@@ -180,10 +184,8 @@
         return `${window.location.origin}/whip/${key.keyToken}`;
     }
 
-    function copyToClipboard(text: string) {
-        navigator.clipboard.writeText(text);
-        successMessage = "Copied to clipboard!";
-        setTimeout(() => successMessage = "", 2000);
+    function getInviteUrl(): string {
+        return `${window.location.origin}/room/${slug}`;
     }
 </script>
 
@@ -195,10 +197,12 @@
     <header class="page-header">
         <div class="header-left">
             <a href="/admin" class="back-link">&larr; Back to Dashboard</a>
-            <h1>{room?.name || "Loading..."}</h1>
-            {#if room}
-                <span class="status-badge {room.status}">{room.status}</span>
-            {/if}
+            <div class="title-row">
+                <h1>{room?.name || "Loading..."}</h1>
+                {#if room}
+                    <StatusBadge status={room.status} />
+                {/if}
+            </div>
         </div>
         {#if room && room.status !== "ended"}
             <div class="header-actions">
@@ -210,8 +214,10 @@
     </header>
 
     {#if isLoading}
-        <div class="loading">
-            <div class="waiting-spinner"></div>
+        <div class="room-content" aria-busy="true" aria-label="Loading room">
+            {#each [0, 1, 2] as i (i)}
+                <div class="skeleton skeleton-card"></div>
+            {/each}
         </div>
     {:else if room}
         <div class="room-content">
@@ -220,7 +226,7 @@
                 <div class="card live-card">
                     <div class="card-header">
                         <h3><span class="live-dot"></span> Session Live</h3>
-                        <button class="btn btn-danger" onclick={handleEndSession}>
+                        <button class="btn btn-danger" onclick={() => (confirmEndOpen = true)}>
                             End Session
                         </button>
                     </div>
@@ -274,18 +280,7 @@
                     <h3>Stream Setup</h3>
                     {#if room.streamKeyId}
                         <div class="stream-info">
-                            <div class="stream-field">
-                                <span class="field-label">WHIP URL</span>
-                                <div class="copy-field">
-                                    <code>{getWhipUrl()}</code>
-                                    <button
-                                        class="btn btn-ghost btn-sm"
-                                        onclick={() => copyToClipboard(getWhipUrl())}
-                                    >
-                                        Copy
-                                    </button>
-                                </div>
-                            </div>
+                            <CopyField label="WHIP URL" value={getWhipUrl()} />
                             <p class="stream-hint">
                                 In OBS: Settings &rarr; Stream &rarr; Service: WHIP &rarr;
                                 paste the URL above into <strong>Server</strong> and leave <strong>Bearer Token empty</strong>.
@@ -299,16 +294,25 @@
                 </div>
             {/if}
 
+            <!-- Invite Link -->
+            {#if room.status !== "ended"}
+                <div class="card">
+                    <h3>Invite Link</h3>
+                    <p class="invite-hint">Share this link with participants to join the room.</p>
+                    <CopyField value={getInviteUrl()} />
+                </div>
+            {/if}
+
             <!-- Room Settings -->
             <form class="card settings-card" onsubmit={handleSave}>
                 <h3>Room Settings</h3>
 
                 {#if error}
-                    <div class="error-message">{error}</div>
+                    <div class="alert alert-error" transition:fade={{ duration: 150 }}>{error}</div>
                 {/if}
 
                 {#if successMessage}
-                    <div class="success-message">{successMessage}</div>
+                    <div class="alert alert-success" transition:fade={{ duration: 150 }}>{successMessage}</div>
                 {/if}
 
                 <div class="form-group">
@@ -384,7 +388,7 @@
                             bind:value={watermarkText}
                             placeholder={"{{name}} - {{date}}"}
                         />
-                        <p class="hint">Variables: {"{{name}}"}, {"{{room}}"}, {"{{date}}"}, {"{{time}}"}</p>
+                        <p class="form-hint">Variables: {"{{name}}"}, {"{{room}}"}, {"{{date}}"}, {"{{time}}"}</p>
                     </div>
                 {/if}
 
@@ -397,7 +401,7 @@
                             <option value="bottom-left">Bottom Left</option>
                             <option value="bottom-right">Bottom Right</option>
                         </select>
-                        <p class="hint">Logo is configured in Settings. Uses the default watermark logo.</p>
+                        <p class="form-hint">Logo is configured in Settings. Uses the default watermark logo.</p>
                     </div>
                 {/if}
 
@@ -414,11 +418,33 @@
                             bind:value={watermarkOpacity}
                         />
                     </div>
+
+                    <div class="form-group">
+                        <span class="form-hint">Preview</span>
+                        <div class="watermark-preview">
+                            {#key `${watermarkMode}-${watermarkLogoPosition}-${config?.defaultWatermarkLogoUrl ?? ""}`}
+                                <WatermarkOverlay
+                                    mode={watermarkMode}
+                                    text={watermarkText}
+                                    logoUrl={config?.defaultWatermarkLogoUrl}
+                                    logoPosition={watermarkLogoPosition}
+                                    opacity={watermarkOpacity}
+                                    participantName="Jane Colorist"
+                                    roomName={name}
+                                />
+                            {/key}
+                        </div>
+                    </div>
                 {/if}
 
                 <div class="form-actions">
                     <button type="submit" class="btn btn-primary" disabled={isSaving}>
-                        {isSaving ? "Saving..." : "Save Changes"}
+                        {#if isSaving}
+                            <span class="btn-spinner" aria-hidden="true"></span>
+                            Saving...
+                        {:else}
+                            Save Changes
+                        {/if}
                     </button>
                 </div>
             </form>
@@ -428,7 +454,7 @@
                 <div class="card danger-card">
                     <h3>Danger Zone</h3>
                     <p>Permanently delete this room and all its data.</p>
-                    <button class="btn btn-danger" onclick={handleDelete}>
+                    <button class="btn btn-danger" onclick={() => (confirmDeleteOpen = true)}>
                         Delete Room
                     </button>
                 </div>
@@ -443,17 +469,30 @@
     {/if}
 </div>
 
+<ConfirmDialog
+    open={confirmEndOpen}
+    title="End this session?"
+    body="All participants will be disconnected and the room will be marked as ended. This cannot be undone."
+    confirmLabel="End Session"
+    danger
+    onConfirm={handleEndSession}
+    onCancel={() => (confirmEndOpen = false)}
+/>
+
+<ConfirmDialog
+    open={confirmDeleteOpen}
+    title="Delete this room?"
+    body="The room and all its data will be permanently deleted. This cannot be undone."
+    confirmLabel="Delete Room"
+    danger
+    onConfirm={handleDelete}
+    onCancel={() => (confirmDeleteOpen = false)}
+/>
+
 <style>
     .room-manage {
         max-width: 800px;
         margin: 0 auto;
-    }
-
-    .page-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: flex-start;
-        margin-bottom: var(--space-xl);
     }
 
     .header-left {
@@ -462,36 +501,14 @@
         gap: var(--space-xs);
     }
 
+    .title-row {
+        display: flex;
+        align-items: center;
+        gap: var(--space-sm);
+    }
+
     .back-link {
-        font-size: 0.875rem;
-        color: var(--color-text-muted);
-    }
-
-    .page-header h1 {
-        margin: 0;
-        display: inline;
-    }
-
-    .status-badge {
-        display: inline-block;
-        font-size: 0.75rem;
-        padding: var(--space-xs) var(--space-sm);
-        border-radius: var(--radius-full);
-        margin-left: var(--space-sm);
-    }
-
-    .status-badge.live {
-        background: rgba(34, 197, 94, 0.2);
-        color: var(--color-success);
-    }
-
-    .status-badge.pending {
-        background: rgba(245, 158, 11, 0.2);
-        color: var(--color-warning);
-    }
-
-    .status-badge.ended {
-        background: rgba(107, 114, 128, 0.2);
+        font-size: var(--text-body);
         color: var(--color-text-muted);
     }
 
@@ -501,12 +518,16 @@
         gap: var(--space-lg);
     }
 
+    .skeleton-card {
+        min-height: 120px;
+    }
+
     .card {
         padding: var(--space-lg);
     }
 
     .card h3 {
-        font-size: 1rem;
+        font-size: var(--text-card-title);
         font-weight: 600;
         margin: 0 0 var(--space-md);
     }
@@ -527,7 +548,7 @@
 
     .live-card {
         border: 1px solid var(--color-success);
-        background: rgba(34, 197, 94, 0.05);
+        background: var(--color-success-bg);
     }
 
     .live-dot {
@@ -546,7 +567,7 @@
 
     .live-info {
         color: var(--color-text-muted);
-        font-size: 0.875rem;
+        font-size: var(--text-body);
         margin: 0;
     }
 
@@ -571,41 +592,21 @@
     }
 
     .participant-time {
-        font-size: 0.75rem;
+        font-size: var(--text-meta);
         color: var(--color-text-subtle);
         display: block;
     }
 
-    .stream-field {
+    .invite-hint {
+        font-size: var(--text-body);
+        color: var(--color-text-muted);
         margin-bottom: var(--space-md);
     }
 
-    .stream-field .field-label {
-        display: block;
-        font-size: 0.875rem;
-        color: var(--color-text-muted);
-        margin-bottom: var(--space-xs);
-    }
-
-    .copy-field {
-        display: flex;
-        gap: var(--space-sm);
-        align-items: center;
-    }
-
-    .copy-field code {
-        flex: 1;
-        padding: var(--space-sm);
-        background: var(--color-surface-elevated);
-        border-radius: var(--radius-md);
-        font-size: 0.75rem;
-        overflow-x: auto;
-    }
-
     .stream-hint {
-        font-size: 0.75rem;
+        font-size: var(--text-meta);
         color: var(--color-text-subtle);
-        margin: 0;
+        margin: var(--space-sm) 0 0;
     }
 
     .form-group {
@@ -614,7 +615,7 @@
 
     .form-group label {
         display: block;
-        font-size: 0.875rem;
+        font-size: var(--text-body);
         font-weight: 500;
         margin-bottom: var(--space-sm);
         color: var(--color-text-muted);
@@ -637,6 +638,18 @@
     .radio-group {
         display: flex;
         gap: var(--space-lg);
+        flex-wrap: wrap;
+    }
+
+    .watermark-preview {
+        position: relative;
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        background: #000;
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-md);
+        overflow: hidden;
+        margin-top: var(--space-xs);
     }
 
     .form-actions {
@@ -646,29 +659,9 @@
         margin-top: var(--space-lg);
     }
 
-    .error-message {
-        padding: var(--space-md);
-        background: rgba(239, 68, 68, 0.1);
-        border: 1px solid var(--color-error);
-        border-radius: var(--radius-md);
-        color: var(--color-error);
-        font-size: 0.875rem;
-        margin-bottom: var(--space-lg);
-    }
-
-    .success-message {
-        padding: var(--space-md);
-        background: rgba(34, 197, 94, 0.1);
-        border: 1px solid var(--color-success);
-        border-radius: var(--radius-md);
-        color: var(--color-success);
-        font-size: 0.875rem;
-        margin-bottom: var(--space-lg);
-    }
-
     .empty-state {
         color: var(--color-text-muted);
-        font-size: 0.875rem;
+        font-size: var(--text-body);
         text-align: center;
         padding: var(--space-lg) 0;
     }
@@ -683,38 +676,8 @@
 
     .danger-card p {
         color: var(--color-text-muted);
-        font-size: 0.875rem;
+        font-size: var(--text-body);
         margin-bottom: var(--space-md);
-    }
-
-    .btn-danger {
-        background: var(--color-error);
-        color: white;
-    }
-
-    .btn-danger:hover {
-        background: #dc2626;
-    }
-
-    .btn-secondary {
-        background: var(--color-surface-hover);
-        color: var(--color-text);
-        border: 1px solid var(--color-border);
-    }
-
-    .btn-secondary:hover {
-        background: var(--color-border);
-    }
-
-    .btn-sm {
-        padding: var(--space-xs) var(--space-sm);
-        font-size: 0.75rem;
-    }
-
-    .loading {
-        display: flex;
-        justify-content: center;
-        padding: var(--space-2xl);
     }
 
     .error-card {
@@ -728,38 +691,5 @@
     .error-card p {
         margin-bottom: var(--space-lg);
         color: var(--color-text-muted);
-    }
-
-    .hint {
-        font-size: 0.75rem;
-        color: var(--color-text-subtle);
-        margin-top: var(--space-xs);
-    }
-
-    .range-input {
-        width: 100%;
-        height: 6px;
-        background: var(--color-surface-elevated);
-        border-radius: var(--radius-full);
-        appearance: none;
-        cursor: pointer;
-    }
-
-    .range-input::-webkit-slider-thumb {
-        appearance: none;
-        width: 16px;
-        height: 16px;
-        background: var(--color-primary);
-        border-radius: 50%;
-        cursor: pointer;
-    }
-
-    .range-input::-moz-range-thumb {
-        width: 16px;
-        height: 16px;
-        background: var(--color-primary);
-        border-radius: 50%;
-        cursor: pointer;
-        border: none;
     }
 </style>

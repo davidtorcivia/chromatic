@@ -50,12 +50,29 @@ type FileHandler struct {
 }
 
 // NewFileHandler creates a new FileHandler
-func NewFileHandler(db *database.DB, cfg *config.Config, tokenSecret string) *FileHandler {
+func NewFileHandler(db *database.DB, cfg *config.Config, tokenSecret []byte) *FileHandler {
 	return &FileHandler{
 		db:           db,
 		cfg:          cfg,
 		tokenManager: NewTokenManager(tokenSecret),
 	}
+}
+
+// isPathWithin reports whether target resolves to a location inside baseDir.
+// Used to ensure paths read from the database cannot escape the storage root.
+func isPathWithin(baseDir, target string) bool {
+	absBase, err := filepath.Abs(filepath.Clean(baseDir))
+	if err != nil {
+		return false
+	}
+	absTarget, err := filepath.Abs(filepath.Clean(target))
+	if err != nil {
+		return false
+	}
+	if absTarget == absBase {
+		return true
+	}
+	return strings.HasPrefix(absTarget, absBase+string(filepath.Separator))
 }
 
 // getJoinToken extracts a join token from headers or query params.
@@ -263,14 +280,29 @@ func (h *FileHandler) Download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Containment check: the stored path comes from the database and must
+	// resolve inside the configured upload root.
+	if !isPathWithin(h.cfg.UploadPath, storedPath) {
+		logger.Warn("Blocked file download outside upload root", "file_id", id, "path", storedPath)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
 	// Check file exists
 	if _, err := os.Stat(storedPath); os.IsNotExist(err) {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
 
+	// PDFs can contain embedded JavaScript that executes when rendered
+	// inline in the browser — force them to download instead.
+	disposition := "inline"
+	if mimeType == "application/pdf" {
+		disposition = "attachment"
+	}
+
 	w.Header().Set("Content-Type", mimeType)
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitizeFilename(originalName)))
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`%s; filename="%s"`, disposition, sanitizeFilename(originalName)))
 
 	http.ServeFile(w, r, storedPath)
 }
@@ -303,8 +335,13 @@ func (h *FileHandler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If we have a thumbnail, serve it
+	// If we have a thumbnail, serve it (after containment check)
 	if thumbnailPath != nil && *thumbnailPath != "" {
+		if !isPathWithin(h.cfg.UploadPath, *thumbnailPath) {
+			logger.Warn("Blocked thumbnail outside upload root", "file_id", id, "path", *thumbnailPath)
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
 		if _, err := os.Stat(*thumbnailPath); err == nil {
 			w.Header().Set("Content-Type", "image/jpeg")
 			http.ServeFile(w, r, *thumbnailPath)
@@ -312,7 +349,12 @@ func (h *FileHandler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Fall back to original if no thumbnail
+	// Fall back to original if no thumbnail (after containment check)
+	if !isPathWithin(h.cfg.UploadPath, storedPath) {
+		logger.Warn("Blocked file download outside upload root", "file_id", id, "path", storedPath)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
 	http.ServeFile(w, r, storedPath)
 }
 

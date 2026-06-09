@@ -1,14 +1,16 @@
 <script lang="ts">
     import { onMount, onDestroy } from "svelte";
+    import { fade, fly } from "svelte/transition";
     import { goto } from "$app/navigation";
     import { page } from "$app/stores";
     import { session } from "$lib/stores/session.svelte";
-    import { chatStore } from "$lib/stores/chat.svelte";
-    import { unlockAudio, getAudioContext } from "$lib/audio/context";
+    import { chatStore, type ChatMessage } from "$lib/stores/chat.svelte";
+    import { unlockAudio, getAudioContext, closeAudioContext } from "$lib/audio/context";
     import { WebRTCManager } from "$lib/webrtc/manager";
     import { AudioDuckingManager } from "$lib/audio/ducking";
     import LaserPointerOverlay from "$lib/components/LaserPointerOverlay.svelte";
     import ChatPanel from "$lib/components/ChatPanel.svelte";
+    import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
     import WatermarkOverlay from "$lib/components/WatermarkOverlay.svelte";
     import BrowserToast from "$lib/components/BrowserToast.svelte";
 
@@ -32,8 +34,12 @@
     let micAutoEnablePending = false;
     let initialOfferHandled = false;
     let micPromptTimer: ReturnType<typeof setTimeout> | null = null;
-    let selectedParticipant = $state<{ id: string; name: string; role: string } | null>(null);
-    let adminMenuPosition = $state({ x: 0, y: 0 });
+    let kickTarget = $state<{ id: string; name: string } | null>(null);
+    let endState = $state<{ title: string; body: string } | null>(null);
+    let isFullscreen = $state(false);
+    let soundBtnEl = $state<HTMLButtonElement | null>(null);
+    let volumePopoverEl = $state<HTMLDivElement | null>(null);
+    let participantListEl = $state<HTMLDivElement | null>(null);
     let currentRtt = $state<number | null>(null);
     let statsInterval: ReturnType<typeof setInterval> | null = null;
     let streamVolume = $state(1.0);
@@ -45,12 +51,25 @@
     let isLaserEnabled = $state(false);
     let showParticipantList = $state(false);
     let speakingParticipants = $state<Set<string>>(new Set());
-    let voiceAnalysers = new Map<string, AnalyserNode>();
+    let voiceAnalysers = new Map<string, { analyser: AnalyserNode; source: MediaStreamAudioSourceNode }>();
+    // Participants with a live (or pending) voice analyser registration. Used
+    // to detect "participant left while the async analyser setup was in
+    // flight" so the source node gets disconnected instead of leaking.
+    let activeVoicePids = new Set<string>();
     let vadFrame: ReturnType<typeof requestAnimationFrame> | null = null;
     // Buffer voice tracks that arrive before audioDuckingManager is created
     // (can happen when voice relay tracks are in the initial offer and ontrack
     // fires for them before the main video/audio track triggers handleTrack).
     let pendingVoiceTracks = new Map<string, MediaStreamTrack>();
+
+    // Screen sharing state
+    let screenShareRequested = $state(false);
+    let screenShareActive = $state(false);
+    let screenShareParticipantId = $state<string | null>(null);
+    let screenShareParticipantName = $state<string | null>(null);
+    let screenShareStream = $state<MediaStream | null>(null);
+    let screenShareVideoEl = $state<HTMLVideoElement | null>(null);
+    let pendingScreenShareRequest = $state<{participantId: string, name: string} | null>(null);
 
     // Get session data from storage
     let sessionData = $state<{
@@ -58,6 +77,7 @@
         token: string;
         color: string;
         name?: string;
+        role?: "admin" | "viewer";
     } | null>(null);
 
     onMount(async () => {
@@ -77,6 +97,12 @@
 
         await unlockAudio();
 
+        // Clean up any stale WebRTC state from a previous mount (e.g. page refresh)
+        cleanupWebRTC();
+
+        // Clear any stale message handlers from a previous session
+        session.clearHandlers();
+
         // Handle ICE servers from room state
         session.onMessage("iceServers", (servers: unknown) => {
             iceServers = servers as RTCIceServer[];
@@ -94,9 +120,13 @@
             }
 
             if (webrtcManager) {
-                await webrtcManager.handleOffer(data.sdp);
-                initialOfferHandled = true;
-                tryEnablePendingAutoMic();
+                try {
+                    await webrtcManager.handleOffer(data.sdp);
+                    initialOfferHandled = true;
+                    tryEnablePendingAutoMic();
+                } catch (err) {
+                    console.error('Failed to handle offer:', err);
+                }
             }
         });
 
@@ -104,11 +134,15 @@
         session.onMessage("signal:candidate", async (payload: unknown) => {
             const data = payload as { candidate: string; sdpMid?: string; sdpMLineIndex?: number };
             if (webrtcManager) {
-                await webrtcManager.handleCandidate({
-                    candidate: data.candidate,
-                    sdpMid: data.sdpMid ?? null,
-                    sdpMLineIndex: data.sdpMLineIndex ?? null
-                });
+                try {
+                    await webrtcManager.handleCandidate({
+                        candidate: data.candidate,
+                        sdpMid: data.sdpMid ?? null,
+                        sdpMLineIndex: data.sdpMLineIndex ?? null
+                    });
+                } catch (err) {
+                    console.error('Failed to add ICE candidate:', err);
+                }
             }
         });
 
@@ -129,16 +163,22 @@
         });
 
         session.onMessage("room:ended", () => {
-            alert("The session has ended.");
             cleanupWebRTC();
-            goto(`/room/${slug}`);
+            session.disconnect();
+            endState = {
+                title: "Session ended",
+                body: "The host has ended this review session. Thanks for joining.",
+            };
         });
 
         session.onMessage("kicked", (payload: unknown) => {
             const data = payload as { reason?: string };
-            alert(data.reason || "You have been removed from the session.");
             cleanupWebRTC();
-            goto(`/room/${slug}`);
+            session.disconnect();
+            endState = {
+                title: "You were removed from the session",
+                body: data.reason || "An admin removed you from this session.",
+            };
         });
 
         session.onMessage("admin:muted", (payload: unknown) => {
@@ -151,26 +191,116 @@
             }
         });
 
-        session.onMessage("voice:track", async (payload: unknown) => {
-            const data = payload as { participantId: string; track: MediaStreamTrack };
-            if (audioDuckingManager && data.track) {
-                await audioDuckingManager.addVoiceTrack(data.participantId, data.track);
-            }
-        });
-
         session.onMessage("signal:voice-answer", async (payload: unknown) => {
             const data = payload as { sdp: string };
-            if (webrtcManager) await webrtcManager.handleVoiceAnswer(data.sdp);
+            try {
+                if (webrtcManager) await webrtcManager.handleVoiceAnswer(data.sdp);
+            } catch (err) {
+                console.error('Failed to handle voice answer:', err);
+            }
         });
 
         session.onMessage("signal:renegotiate", async (payload: unknown) => {
             const data = payload as { sdp: string; participantId?: string };
-            if (webrtcManager) await webrtcManager.handleRenegotiation(data.sdp, data.participantId);
+            try {
+                if (webrtcManager) await webrtcManager.handleRenegotiation(data.sdp, data.participantId);
+            } catch (err) {
+                console.error('Failed to handle renegotiation:', err);
+            }
         });
 
+        // ICE restart answers — route to handleVoiceAnswer which applies the
+        // answer SDP to the same peer connection (same setRemoteDescription call).
         session.onMessage("signal:answer", async (payload: unknown) => {
             const data = payload as { sdp: string };
-            if (webrtcManager) await webrtcManager.handleVoiceAnswer(data.sdp);
+            try {
+                if (webrtcManager) await webrtcManager.handleVoiceAnswer(data.sdp);
+            } catch (err) {
+                console.error('Failed to handle answer:', err);
+            }
+        });
+
+        // Screen sharing messages
+        session.onMessage("screenshare:approved", async () => {
+            screenShareRequested = false;
+            const ok = await webrtcManager?.startScreenShare();
+            if (ok) {
+                screenShareActive = true;
+            } else {
+                screenShareActive = false;
+            }
+        });
+
+        session.onMessage("screenshare:denied", (payload: unknown) => {
+            screenShareRequested = false;
+            const data = payload as { reason?: string };
+            console.log('Screen share denied:', data.reason || 'Request denied by admin');
+        });
+
+        session.onMessage("screenshare:started", (payload: unknown) => {
+            const data = payload as { participantId: string; name: string };
+            screenShareParticipantId = data.participantId;
+            screenShareParticipantName = data.name;
+            pendingScreenShareRequest = null;
+        });
+
+        session.onMessage("screenshare:stopped", () => {
+            screenShareActive = false;
+            screenShareParticipantId = null;
+            screenShareParticipantName = null;
+            screenShareStream = null;
+        });
+
+        session.onMessage("screenshare:pending", (payload: unknown) => {
+            const data = payload as { participantId: string; name: string };
+            pendingScreenShareRequest = data;
+        });
+
+        // Clean up voice resources when a participant leaves
+        session.onMessage("participant:left", (payload: unknown) => {
+            const data = payload as { participantId: string };
+            cleanupParticipantVoice(data.participantId);
+        });
+
+        // Chat handlers live here (always active) rather than in ChatPanel,
+        // which is conditionally rendered — otherwise history/messages
+        // arriving before the panel is first opened would be missed.
+        session.onMessage("chat:history", (payload: unknown) => {
+            const data = payload as { messages: ChatMessage[] };
+            chatStore.loadHistory(data.messages ?? []);
+        });
+
+        session.onMessage("chat:message", (payload: unknown) => {
+            chatStore.addMessage(payload as ChatMessage);
+        });
+
+        // After a successful WS reconnect the server sends a fresh
+        // room:state/iceServers/signal:offer sequence. Tear down all stale
+        // per-connection state so it re-initializes cleanly instead of the
+        // fresh offer hitting a dead peer connection.
+        session.onReconnect(() => {
+            // The session was terminated (ended/kicked) — don't resurrect it.
+            if (endState) return;
+            console.log("WebSocket reconnected, resetting WebRTC state");
+            cleanupWebRTC();
+            if (audioDuckingManager) {
+                audioDuckingManager.destroy();
+                audioDuckingManager = null;
+            }
+            // Allow the auto-mic flow to run again against the new manager
+            // (the new peer connection has no local stream).
+            micAutoRequestStarted = false;
+            hasMicPermission = false;
+            isMicEnabled = false;
+            // Screen share state is re-sent by the server in room:state
+            screenShareRequested = false;
+            screenShareActive = false;
+            screenShareParticipantId = null;
+            screenShareParticipantName = null;
+            screenShareStream = null;
+            pendingScreenShareRequest = null;
+            streamPaused = false;
+            streamError = null;
         });
 
         // Connect only after handlers are registered so early messages aren't dropped.
@@ -187,8 +317,10 @@
             audioDuckingManager = null;
         }
         session.disconnect();
+        closeAudioContext();
         window.removeEventListener("chromatic:tampering", handleTampering);
         clearMicPromptTimer();
+        clearTimeout(controlsTimer);
     });
 
     function initializeWebRTC() {
@@ -198,9 +330,14 @@
             iceServers,
             onTrack: handleTrack,
             onVoiceTrack: handleVoiceTrack,
+            onScreenShareTrack: handleScreenShareTrack,
             sendSignal: (type, payload) => session.send(type, payload),
             onIceRestartFailed: () => {
                 streamError = "Connection failed. The stream could not be reached. Please try refreshing the page.";
+            },
+            onScreenShareEnded: () => {
+                screenShareActive = false;
+                session.send("screenshare:stop", {});
             }
         });
 
@@ -304,10 +441,7 @@
             }
 
             if (!audioDuckingManager) {
-                const isUserAdmin = roomState?.participants?.find(
-                    (p: { id: string }) => p.id === sessionData?.participantId
-                )?.role === 'admin';
-                audioDuckingManager = new AudioDuckingManager(videoElement, isUserAdmin ?? false);
+                audioDuckingManager = new AudioDuckingManager(videoElement, isAdmin);
                 // Flush any voice tracks that arrived before we were created
                 for (const [pid, vTrack] of pendingVoiceTracks) {
                     audioDuckingManager.addVoiceTrack(pid, vTrack);
@@ -324,8 +458,12 @@
 
     function handlePlayClick() {
         if (videoElement) {
-            videoElement.play();
-            needsPlayClick = false;
+            videoElement.play().then(() => {
+                needsPlayClick = false;
+            }).catch(err => {
+                console.warn('Play still blocked:', err);
+                // Keep the play button visible so user can retry
+            });
         }
     }
 
@@ -354,6 +492,10 @@
             pendingVoiceTracks.set(participantId, track);
         }
 
+        // Mark this participant as having a pending/active voice registration
+        // so the async setup below can detect if they left in the meantime.
+        activeVoicePids.add(participantId);
+
         // Set up voice activity detection for speaking indicator.
         // Reuse the shared AudioContext (already resumed) rather than
         // creating new ones — Firefox keeps new AudioContexts suspended
@@ -365,7 +507,21 @@
             const analyser = ctx.createAnalyser();
             analyser.fftSize = 256;
             source.connect(analyser);
-            voiceAnalysers.set(participantId, analyser);
+
+            // The participant may have left (or the connection may have been
+            // cleaned up) while we awaited the AudioContext — don't register a
+            // node that nobody will ever disconnect.
+            if (!activeVoicePids.has(participantId)) {
+                source.disconnect();
+                return;
+            }
+
+            // Replace any previous analyser for this participant
+            const existing = voiceAnalysers.get(participantId);
+            if (existing) {
+                existing.source.disconnect();
+            }
+            voiceAnalysers.set(participantId, { analyser, source });
 
             // Start VAD monitoring if not running
             if (!vadFrame) startVADMonitoring();
@@ -374,19 +530,111 @@
         });
     }
 
+    function handleScreenShareTrack(participantId: string, track: MediaStreamTrack) {
+        console.log('Received screen share track from', participantId);
+        const stream = new MediaStream([track]);
+        // Binding to the video element happens in the $effect below once the
+        // element is rendered — no separate RAF path racing it.
+        screenShareStream = stream;
+
+        // Clean up when track ends
+        track.onended = () => {
+            if (screenShareStream === stream) {
+                screenShareStream = null;
+            }
+        };
+    }
+
+    function cleanupParticipantVoice(participantId: string) {
+        // Marks any in-flight async analyser setup as cancelled
+        activeVoicePids.delete(participantId);
+        const entry = voiceAnalysers.get(participantId);
+        if (entry) {
+            entry.source.disconnect();
+            voiceAnalysers.delete(participantId);
+        }
+        pendingVoiceTracks.delete(participantId);
+        audioDuckingManager?.removeVoiceTrack(participantId);
+    }
+
+    function toggleScreenShare() {
+        if (screenShareActive) {
+            // Stop sharing
+            webrtcManager?.stopScreenShare();
+            screenShareActive = false;
+            session.send("screenshare:stop", {});
+            return;
+        }
+
+        if (screenShareParticipantId) {
+            // Someone else is sharing
+            return;
+        }
+
+        // Request to share
+        screenShareRequested = true;
+        session.send("screenshare:request", {});
+    }
+
+    function approveScreenShare() {
+        if (!pendingScreenShareRequest) return;
+        session.send("admin:screenshare-approve", { participantId: pendingScreenShareRequest.participantId });
+        pendingScreenShareRequest = null;
+    }
+
+    function denyScreenShare() {
+        if (!pendingScreenShareRequest) return;
+        session.send("admin:screenshare-deny", { participantId: pendingScreenShareRequest.participantId });
+        pendingScreenShareRequest = null;
+    }
+
+    function stopScreenSharePip() {
+        session.send("screenshare:stop", {});
+        if (screenShareActive) {
+            webrtcManager?.stopScreenShare();
+            screenShareActive = false;
+        }
+    }
+
     function startVADMonitoring() {
+        // Reuse a single buffer to avoid allocating on every frame
+        let vadBuffer: Uint8Array<ArrayBuffer> | null = null;
+        // Throttle to ~15fps (every 4th animation frame) — sufficient for
+        // speaker detection while significantly reducing CPU usage on mobile.
+        let vadFrameCount = 0;
         const check = () => {
+            vadFrameCount++;
+            if (vadFrameCount % 4 !== 0) {
+                vadFrame = requestAnimationFrame(check);
+                return;
+            }
+            let changed = false;
             const newSpeaking = new Set<string>();
-            for (const [pid, analyser] of voiceAnalysers) {
-                const data = new Uint8Array(analyser.frequencyBinCount);
-                analyser.getByteFrequencyData(data);
-                const avg = data.reduce((sum, val) => sum + val, 0) / data.length;
+            for (const [pid, { analyser }] of voiceAnalysers) {
+                // Reuse or resize the buffer as needed
+                if (!vadBuffer || vadBuffer.length !== analyser.frequencyBinCount) {
+                    vadBuffer = new Uint8Array(analyser.frequencyBinCount) as Uint8Array<ArrayBuffer>;
+                }
+                analyser.getByteFrequencyData(vadBuffer);
+                let sum = 0;
+                for (let i = 0; i < vadBuffer.length; i++) sum += vadBuffer[i];
+                const avg = sum / vadBuffer.length;
                 const db = 20 * Math.log10(avg / 255);
                 if (db > -50) {
                     newSpeaking.add(pid);
                 }
             }
-            speakingParticipants = newSpeaking;
+            // Only trigger reactivity if the set actually changed
+            if (newSpeaking.size !== speakingParticipants.size) {
+                changed = true;
+            } else {
+                for (const pid of newSpeaking) {
+                    if (!speakingParticipants.has(pid)) { changed = true; break; }
+                }
+            }
+            if (changed) {
+                speakingParticipants = newSpeaking;
+            }
             vadFrame = requestAnimationFrame(check);
         };
         vadFrame = requestAnimationFrame(check);
@@ -398,7 +646,14 @@
             cancelAnimationFrame(vadFrame);
             vadFrame = null;
         }
+        // Disconnect voice analyser source nodes before clearing
+        for (const entry of voiceAnalysers.values()) {
+            entry.source.disconnect();
+        }
         voiceAnalysers.clear();
+        // Cancel any in-flight async analyser setups
+        activeVoicePids.clear();
+        pendingVoiceTracks.clear();
         if (webrtcManager) {
             webrtcManager.close();
             webrtcManager = null;
@@ -412,9 +667,19 @@
     }
 
     function handleTampering() {
+        cleanupWebRTC();
         session.disconnect();
-        alert("Session terminated due to policy violation.");
-        goto("/");
+        endState = {
+            title: "Session terminated",
+            body: "This session was closed due to a content protection policy violation.",
+        };
+    }
+
+    // Leave control + end-state exit: clear stored credentials for this room
+    // and return to the join page.
+    function leaveToRoomPage() {
+        sessionStorage.removeItem(`chromatic_session_${slug}`);
+        goto(`/room/${slug}`);
     }
 
     function startControlsTimer() {
@@ -507,27 +772,85 @@
         }
     }
 
-    function handleParticipantClick(event: MouseEvent, participant: { id: string; name: string; role: string }) {
-        if (!isAdmin || participant.id === sessionData?.participantId) return;
-        const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
-        adminMenuPosition = { x: rect.left, y: rect.top - 10 };
-        selectedParticipant = participant;
+    function muteParticipant(participantId: string) {
+        session.send("admin:mute", { participantId });
     }
 
-    function closeAdminMenu() { selectedParticipant = null; }
-
-    function handleMuteParticipant() {
-        if (!selectedParticipant) return;
-        session.send("admin:mute", { participantId: selectedParticipant.id });
-        closeAdminMenu();
-    }
-
-    function handleKickParticipant() {
-        if (!selectedParticipant) return;
-        if (confirm(`Remove ${selectedParticipant.name} from the session?`)) {
-            session.send("admin:kick", { participantId: selectedParticipant.id });
+    function confirmKickParticipant() {
+        if (kickTarget) {
+            session.send("admin:kick", { participantId: kickTarget.id });
         }
-        closeAdminMenu();
+        kickTarget = null;
+    }
+
+    function handleFullscreenChange() {
+        isFullscreen = !!document.fullscreenElement;
+    }
+
+    // Keyboard shortcuts: M mic, F fullscreen, C chat, L laser, Esc closes
+    // popovers. Ignored while typing or while a dialog/end-state is up.
+    function handleKeydown(e: KeyboardEvent) {
+        const target = e.target as HTMLElement | null;
+        if (
+            target &&
+            (target.tagName === "INPUT" ||
+                target.tagName === "TEXTAREA" ||
+                target.isContentEditable)
+        ) {
+            return;
+        }
+        if (e.metaKey || e.ctrlKey || e.altKey) return;
+        if (endState || kickTarget) return;
+
+        switch (e.key.toLowerCase()) {
+            case "m":
+                void toggleMic();
+                break;
+            case "f":
+                toggleFullscreen();
+                break;
+            case "c":
+                toggleChat();
+                break;
+            case "l":
+                toggleLaser();
+                break;
+            case "escape":
+                if (showVolumeControls) {
+                    showVolumeControls = false;
+                } else if (showParticipantList) {
+                    showParticipantList = false;
+                } else if (isChatOpen) {
+                    isChatOpen = false;
+                }
+                break;
+        }
+    }
+
+    // Close the volume popover on click/tap outside it.
+    function handleWindowPointerDown(e: PointerEvent) {
+        if (!showVolumeControls) return;
+        const target = e.target as Node;
+        if (volumePopoverEl?.contains(target) || soundBtnEl?.contains(target)) return;
+        showVolumeControls = false;
+    }
+
+    // Touch: any tap brings the controls back.
+    function handlePagePointerDown(e: PointerEvent) {
+        if (e.pointerType !== "touch") return;
+        startControlsTimer();
+    }
+
+    // Touch: a tap on the bare video toggles the controls (when laser is off).
+    function handleVideoPointerDown(e: PointerEvent) {
+        if (e.pointerType !== "touch" || isLaserEnabled) return;
+        e.stopPropagation();
+        if (isControlsVisible) {
+            clearTimeout(controlsTimer);
+            isControlsVisible = false;
+        } else {
+            startControlsTimer();
+        }
     }
 
     // Derived state
@@ -535,23 +858,82 @@
     let roomState = $derived(session.state.room);
     let participants = $derived(roomState?.participants || []);
     let isLive = $derived(roomState?.isLive || false);
+    // Prefer the live role from the server-pushed room state; fall back to the
+    // role returned by the join API (persisted in sessionStorage).
     let isAdmin = $derived(
-        roomState?.participants?.find(
+        (roomState?.participants?.find(
             (p: { id: string }) => p.id === sessionData?.participantId
-        )?.role === 'admin'
+        )?.role ?? sessionData?.role) === 'admin'
     );
     let activeSpeakers = $derived(
         participants.filter((p: { id: string }) => speakingParticipants.has(p.id))
     );
+    let isScreenShareDisabled = $derived(
+        !screenShareActive && screenShareParticipantId !== null && screenShareParticipantId !== sessionData?.participantId
+    );
+    // B7: connection quality bucket from the existing RTT polling
+    let connectionQuality = $derived(
+        currentRtt === null ? null : currentRtt < 100 ? "good" : currentRtt < 300 ? "fair" : "poor"
+    );
+    // Map of participant id → display color, used to tint chat author names
+    let participantColors = $derived(
+        Object.fromEntries(
+            participants.map((p: { id: string; color: string }) => [p.id, p.color])
+        ) as Record<string, string>
+    );
+
+    // Move focus into the participant list when it opens (Esc closes it via
+    // the global keyboard handler).
+    $effect(() => {
+        if (showParticipantList && participantListEl) {
+            participantListEl.focus();
+        }
+    });
+
+    // Bind screen share stream to video element when both are available.
+    // Cleanup nulls srcObject so a stale stream doesn't hold decoder resources.
+    $effect(() => {
+        const el = screenShareVideoEl;
+        const stream = screenShareStream;
+        if (el && stream) {
+            el.srcObject = stream;
+            el.play().catch(err => {
+                console.warn('Failed to autoplay screen share video:', err);
+            });
+            return () => {
+                el.srcObject = null;
+            };
+        }
+    });
 </script>
 
 <svelte:head>
     <title>{roomState?.name || "Session"} | Chromatic</title>
 </svelte:head>
 
-<main class="session-page" onmousemove={handleMouseMove}>
-    <div class="video-wrapper">
-        <div class="video-container">
+<svelte:window onkeydown={handleKeydown} onpointerdown={handleWindowPointerDown} />
+<svelte:document onfullscreenchange={handleFullscreenChange} />
+
+<main class="session-page" onmousemove={handleMouseMove} onpointerdown={handlePagePointerDown}>
+    <div class="video-wrapper" class:split-active={screenShareStream}>
+        {#if screenShareStream}
+            <div class="split-screenshare">
+                <video bind:this={screenShareVideoEl} autoplay playsinline muted>
+                    <track kind="captions" />
+                </video>
+                <div class="split-screenshare-label">
+                    <span>{screenShareParticipantName || "Screen"}'s screen</span>
+                    {#if isAdmin || screenShareParticipantId === sessionData?.participantId}
+                        <button class="split-screenshare-stop" onclick={stopScreenSharePip} title="Stop screen share">
+                            <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+                            Stop
+                        </button>
+                    {/if}
+                </div>
+            </div>
+        {/if}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="video-container" onpointerdown={handleVideoPointerDown}>
             <video bind:this={videoElement} autoplay playsinline muted={isMuted}>
                 <track kind="captions" />
             </video>
@@ -573,73 +955,102 @@
             {/if}
         </div>
 
-        <!-- Status overlays - OUTSIDE video-container so they stack above controls -->
+        <!-- Status overlays: dim layer never captures input, only the inner
+             buttons are interactive, and the controls layer stacks above. -->
         {#if needsPlayClick}
-            <div class="stream-status-overlay">
-                <button class="play-btn" aria-label="Play stream" onclick={handlePlayClick}>
-                    <svg viewBox="0 0 24 24" fill="currentColor" width="48" height="48"><path d="M8 5v14l11-7z"/></svg>
-                </button>
-                <p>Tap to play stream</p>
+            <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
+                <div class="stream-card">
+                    <button class="play-btn" aria-label="Play stream" onclick={handlePlayClick}>
+                        <svg viewBox="0 0 24 24" fill="currentColor" width="48" height="48"><path d="M8 5v14l11-7z"/></svg>
+                    </button>
+                    <p>Tap to play stream</p>
+                </div>
             </div>
         {:else if streamError}
-            <div class="stream-status-overlay error">
-                <div class="error-icon">!</div>
-                <p class="error-message">{streamError}</p>
-                <button class="btn btn-primary" onclick={() => window.location.reload()}>
-                    Refresh Page
-                </button>
+            <div class="stream-status-overlay error" transition:fade={{ duration: 150 }}>
+                <div class="stream-card">
+                    <div class="error-icon">!</div>
+                    <p class="error-message">{streamError}</p>
+                    <button class="btn btn-primary" onclick={() => window.location.reload()}>
+                        Refresh Page
+                    </button>
+                </div>
             </div>
         {:else if streamPaused}
-            <div class="stream-status-overlay">
-                <div class="paused-icon">
-                    <svg viewBox="0 0 24 24" fill="currentColor" width="48" height="48"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+            <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
+                <div class="stream-card">
+                    <div class="paused-icon">
+                        <svg viewBox="0 0 24 24" fill="currentColor" width="48" height="48"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+                    </div>
+                    <p>Stream paused</p>
+                    <p class="stream-subtext">Waiting for host to reconnect...</p>
                 </div>
-                <p>Stream paused</p>
-                <p class="stream-subtext">Waiting for host to reconnect...</p>
             </div>
         {:else if !hasStream}
-            <div class="stream-status-overlay">
-                <div class="waiting-spinner"></div>
-                <p>{isLive ? "Connecting to stream..." : "Waiting for stream..."}</p>
+            <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
+                <div class="stream-card">
+                    <h2 class="stream-card-title">{roomState?.name || "Session"}</h2>
+                    <span class="pulse-dot" aria-hidden="true"></span>
+                    <p>
+                        {isLive
+                            ? "Connecting to stream..."
+                            : "The host hasn't started streaming yet — you'll connect automatically."}
+                    </p>
+                </div>
             </div>
         {/if}
 
-        {#if micPromptState !== "hidden"}
-            <div class="mic-prompt" class:success={micPromptState === "granted"} class:error={micPromptState === "denied"} role="status" aria-live="polite">
-                {#if micPromptState === "requesting"}
-                    <div class="mic-spinner" aria-hidden="true"></div>
-                    <div class="mic-prompt-copy">
-                        <p class="mic-prompt-title">Connecting your microphone...</p>
-                        <p class="mic-prompt-text">Allow browser mic access so you can talk right away.</p>
+        <!-- Top banners share one stack so they never overlap -->
+        <div class="banner-stack">
+            {#if pendingScreenShareRequest}
+                <div class="screenshare-approval" transition:fly={{ y: 8, duration: 200 }}>
+                    <span class="screenshare-approval-text">{pendingScreenShareRequest.name} wants to share their screen</span>
+                    <div class="screenshare-approval-actions">
+                        <button class="screenshare-approval-btn approve" onclick={approveScreenShare}>Approve</button>
+                        <button class="screenshare-approval-btn deny" onclick={denyScreenShare}>Deny</button>
                     </div>
-                {:else if micPromptState === "granted"}
-                    <div class="mic-prompt-copy">
-                        <p class="mic-prompt-title">Microphone connected</p>
-                    </div>
-                {:else}
-                    <div class="mic-prompt-copy">
-                        <p class="mic-prompt-title">Microphone access is blocked</p>
-                        <p class="mic-prompt-text">Enable your mic to join voice chat.</p>
-                    </div>
-                    <div class="mic-prompt-actions">
-                        <button class="mic-prompt-btn primary" onclick={retryMicConnection}>Enable Mic</button>
-                        <button class="mic-prompt-btn" onclick={dismissMicPrompt}>Continue Muted</button>
-                    </div>
-                {/if}
-            </div>
-        {/if}
+                </div>
+            {/if}
+
+            {#if micPromptState !== "hidden"}
+                <div class="mic-prompt" class:success={micPromptState === "granted"} class:error={micPromptState === "denied"} role="status" aria-live="polite" transition:fly={{ y: 8, duration: 200 }}>
+                    {#if micPromptState === "requesting"}
+                        <div class="mic-spinner" aria-hidden="true"></div>
+                        <div class="mic-prompt-copy">
+                            <p class="mic-prompt-title">Connecting your microphone...</p>
+                            <p class="mic-prompt-text">Allow browser mic access so you can talk right away.</p>
+                        </div>
+                    {:else if micPromptState === "granted"}
+                        <div class="mic-prompt-copy">
+                            <p class="mic-prompt-title">Microphone connected</p>
+                        </div>
+                    {:else}
+                        <div class="mic-prompt-copy">
+                            <p class="mic-prompt-title">Microphone access is blocked</p>
+                            <p class="mic-prompt-text">Enable your mic to join voice chat.</p>
+                        </div>
+                        <div class="mic-prompt-actions">
+                            <button class="mic-prompt-btn primary" onclick={retryMicConnection}>Enable Mic</button>
+                            <button class="mic-prompt-btn" onclick={dismissMicPrompt}>Continue Muted</button>
+                        </div>
+                    {/if}
+                </div>
+            {/if}
+        </div>
 
         <!-- Controls overlay -->
         <div class="controls-overlay" class:visible={isControlsVisible}>
             <div class="top-bar">
                 <div class="room-name">{roomState?.name || "Session"}</div>
                 <div class="top-bar-right">
-                    {#if isAdmin && currentRtt !== null}
-                        <div class="latency-display" class:good={currentRtt < 100} class:warning={currentRtt >= 100 && currentRtt < 300} class:bad={currentRtt >= 300}>
-                            ~{Math.round(currentRtt)}ms
-                        </div>
-                    {/if}
-                    <button class="participant-count" onclick={toggleParticipantList} class:active={showParticipantList}>
+                    <button
+                        class="participant-count"
+                        onclick={toggleParticipantList}
+                        class:active={showParticipantList}
+                        aria-label="Participants ({participants.length})"
+                        aria-expanded={showParticipantList}
+                        aria-haspopup="dialog"
+                    >
                         <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
                         {participants.length}
                     </button>
@@ -647,47 +1058,58 @@
             </div>
 
             <div class="bottom-bar">
-                <div class="participants">
-                    {#each participants.slice(0, 5) as p (p.id)}
-                        <button
-                            class="participant-avatar"
-                            class:clickable={isAdmin && p.id !== sessionData?.participantId}
-                            class:is-admin={p.role === 'admin'}
-                            style="background-color: {p.color}"
-                            title={p.name}
-                            onclick={(e) => handleParticipantClick(e, p)}
-                        >
-                            {p.name.charAt(0).toUpperCase()}
-                            {#if p.audioEnabled}
-                                <span class="mic-indicator"></span>
-                            {/if}
-                        </button>
-                    {/each}
-                    {#if participants.length > 5}
-                        <div class="participant-avatar more">
-                            +{participants.length - 5}
-                        </div>
-                    {/if}
-                </div>
-
-                {#if selectedParticipant}
-                    <!-- svelte-ignore a11y_click_events_have_key_events -->
-                    <!-- svelte-ignore a11y_no_static_element_interactions -->
-                    <div class="admin-menu-backdrop" onclick={closeAdminMenu}></div>
-                    <div class="admin-menu" style="left: {adminMenuPosition.x}px; bottom: calc(100vh - {adminMenuPosition.y}px)">
-                        <div class="admin-menu-header">{selectedParticipant.name}</div>
-                        <button class="admin-menu-item" onclick={handleMuteParticipant}>Mute</button>
-                        <button class="admin-menu-item danger" onclick={handleKickParticipant}>Remove</button>
-                    </div>
-                {/if}
+                <div class="bottom-left" aria-hidden="true"></div>
 
                 <!-- Main control bar - large, obvious buttons with labels -->
+                <div class="control-bar-anchor">
+                {#if showVolumeControls}
+                    <div
+                        class="volume-popover"
+                        bind:this={volumePopoverEl}
+                        transition:fly={{ y: 8, duration: 200 }}
+                        role="dialog"
+                        aria-label="Volume controls"
+                    >
+                        <div class="volume-row">
+                            <label for="program-volume">Program</label>
+                            <input
+                                id="program-volume"
+                                class="range-input"
+                                type="range"
+                                min="0"
+                                max="1"
+                                step="0.05"
+                                value={streamVolume}
+                                oninput={handleStreamVolumeChange}
+                            />
+                        </div>
+                        <div class="volume-row">
+                            <label for="voice-volume">Voice chat</label>
+                            <input
+                                id="voice-volume"
+                                class="range-input"
+                                type="range"
+                                min="0"
+                                max="1"
+                                step="0.05"
+                                value={voiceVolume}
+                                oninput={handleVoiceVolumeChange}
+                            />
+                        </div>
+                        <button class="volume-mute-btn" onclick={toggleMute} aria-pressed={isMuted}>
+                            {isMuted ? "Unmute program audio" : "Mute program audio"}
+                        </button>
+                    </div>
+                {/if}
                 <div class="control-bar">
                     <button
                         class="control-btn"
                         class:active={isMicEnabled}
                         class:off={!isMicEnabled}
                         onclick={toggleMic}
+                        aria-pressed={isMicEnabled}
+                        aria-label="Microphone (M)"
+                        title="Toggle microphone (M)"
                     >
                         <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
                             {#if isMicEnabled}
@@ -702,7 +1124,13 @@
                     <button
                         class="control-btn"
                         class:off={isMuted}
-                        onclick={toggleMute}
+                        class:active={showVolumeControls}
+                        onclick={toggleVolumeControls}
+                        bind:this={soundBtnEl}
+                        aria-label="Sound and volume"
+                        aria-expanded={showVolumeControls}
+                        aria-haspopup="dialog"
+                        title="Sound and volume"
                     >
                         <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
                             {#if isMuted}
@@ -718,6 +1146,9 @@
                         class="control-btn chat-btn"
                         class:active={isChatOpen}
                         onclick={toggleChat}
+                        aria-pressed={isChatOpen}
+                        aria-label="Chat (C)"
+                        title="Toggle chat (C)"
                     >
                         <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
                             <path d="M20 2H4c-1.1 0-1.99.9-1.99 2L2 22l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM6 9h12v2H6V9zm8 5H6v-2h8v2zm4-6H6V6h12v2z"/>
@@ -731,19 +1162,22 @@
                     <button
                         class="control-btn"
                         onclick={handleResync}
-                        title="Fix frozen stream"
+                        title="Fixes a frozen or stuck picture"
+                        aria-label="Reload stream"
                     >
                         <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
                             <path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>
                         </svg>
-                        <span class="control-label">Resync</span>
+                        <span class="control-label">Reload stream</span>
                     </button>
 
                     <button
                         class="control-btn"
                         class:active={isLaserEnabled}
                         onclick={toggleLaser}
-                        title="Toggle laser pointer mode"
+                        title="Toggle laser pointer mode (L)"
+                        aria-pressed={isLaserEnabled}
+                        aria-label="Laser pointer (L)"
                     >
                         <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
                             <path d="M4 20h2l6-6-2-2-6 6v2zm7.4-7.4 2 2L18 10.01a1.41 1.41 0 0 0 0-2l-2.01-2.01a1.41 1.41 0 0 0-2 0L11.4 8.6zM19 14l-4 4 1 1a2.83 2.83 0 0 0 4 0 2.83 2.83 0 0 0 0-4l-1-1z"/>
@@ -753,13 +1187,70 @@
 
                     <button
                         class="control-btn"
-                        onclick={toggleFullscreen}
+                        class:active={screenShareActive}
+                        class:requesting={screenShareRequested}
+                        disabled={isScreenShareDisabled}
+                        onclick={toggleScreenShare}
+                        title={isScreenShareDisabled ? "Screen share in progress" : screenShareActive ? "Stop sharing" : "Share screen"}
                     >
                         <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
-                            <path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/>
+                            <path d="M20 18c1.1 0 1.99-.9 1.99-2L22 6c0-1.11-.9-2-2-2H4c-1.11 0-2 .89-2 2v10c0 1.1.89 2 2 2H0v2h24v-2h-4zM4 6h16v10H4V6z"/>
                         </svg>
-                        <span class="control-label">Fullscreen</span>
+                        <span class="control-label">{screenShareActive ? "Stop Share" : screenShareRequested ? "Pending..." : "Share"}</span>
                     </button>
+
+                    <button
+                        class="control-btn"
+                        onclick={toggleFullscreen}
+                        aria-pressed={isFullscreen}
+                        aria-label={isFullscreen ? "Exit fullscreen (F)" : "Fullscreen (F)"}
+                        title="Toggle fullscreen (F)"
+                    >
+                        <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
+                            {#if isFullscreen}
+                                <path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/>
+                            {:else}
+                                <path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/>
+                            {/if}
+                        </svg>
+                        <span class="control-label">{isFullscreen ? "Exit Full" : "Fullscreen"}</span>
+                    </button>
+
+                    <button
+                        class="control-btn leave-btn"
+                        onclick={leaveToRoomPage}
+                        aria-label="Leave session"
+                        title="Leave the session"
+                    >
+                        <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
+                            <path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/>
+                        </svg>
+                        <span class="control-label">Leave</span>
+                    </button>
+                </div>
+                </div>
+
+                <div class="bottom-right">
+                    {#if isLive}
+                        <span class="live-pill"><span class="live-dot" aria-hidden="true"></span>Live</span>
+                    {/if}
+                    {#if connectionQuality && currentRtt !== null}
+                        <div
+                            class="signal-indicator {connectionQuality}"
+                            role="img"
+                            title="Connection: {connectionQuality} ({Math.round(currentRtt)}ms)"
+                            aria-label="Connection: {connectionQuality} ({Math.round(currentRtt)}ms)"
+                        >
+                            <span class="signal-bar"></span>
+                            <span class="signal-bar"></span>
+                            <span class="signal-bar"></span>
+                        </div>
+                    {/if}
+                    {#if isAdmin && currentRtt !== null}
+                        <div class="latency-display" class:good={currentRtt < 100} class:warning={currentRtt >= 100 && currentRtt < 300} class:bad={currentRtt >= 300}>
+                            ~{Math.round(currentRtt)}ms
+                        </div>
+                    {/if}
                 </div>
             </div>
         </div>
@@ -781,13 +1272,18 @@
 
         <!-- Participant list (outside controls overlay so it doesn't auto-hide) -->
         {#if showParticipantList}
-            <div class="participant-list">
+            <div
+                class="participant-list"
+                role="dialog"
+                aria-label="Participants"
+                tabindex="-1"
+                bind:this={participantListEl}
+                transition:fly={{ y: 8, duration: 200 }}
+            >
                 {#each participants as p (p.id)}
-                    <button
+                    <div
                         class="participant-list-item"
-                        class:clickable={isAdmin && p.id !== sessionData?.participantId}
                         class:speaking={speakingParticipants.has(p.id)}
-                        onclick={(e) => handleParticipantClick(e, p)}
                     >
                         <span class="participant-list-avatar" style="background-color: {p.color}">
                             {p.name.charAt(0).toUpperCase()}
@@ -810,8 +1306,40 @@
                                 <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" opacity="0.5"/></svg>
                             </span>
                         {/if}
-                    </button>
+                        {#if isAdmin && p.id !== sessionData?.participantId}
+                            <span class="participant-actions">
+                                <button
+                                    class="participant-action"
+                                    onclick={() => muteParticipant(p.id)}
+                                    title="Mute {p.name}"
+                                >Mute</button>
+                                <button
+                                    class="participant-action danger"
+                                    onclick={() => (kickTarget = { id: p.id, name: p.name })}
+                                    title="Remove {p.name} from the session"
+                                >Remove</button>
+                            </span>
+                        {/if}
+                    </div>
                 {/each}
+            </div>
+        {/if}
+
+        <!-- Full-screen end state (session ended / removed / terminated) -->
+        {#if endState}
+            <div class="end-state-overlay" transition:fade={{ duration: 150 }}>
+                <div class="end-state-card" role="alertdialog" aria-labelledby="end-state-title">
+                    <div class="end-state-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28">
+                            <path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/>
+                        </svg>
+                    </div>
+                    <h2 id="end-state-title">{endState.title}</h2>
+                    <p>{endState.body}</p>
+                    <button class="btn btn-primary" onclick={leaveToRoomPage}>
+                        Back to room page
+                    </button>
+                </div>
             </div>
         {/if}
     </div>
@@ -821,8 +1349,20 @@
         onClose={() => (isChatOpen = false)}
         roomSlug={slug}
         joinToken={sessionData?.token || ""}
+        {participantColors}
+        selfId={sessionData?.participantId || ""}
     />
     <BrowserToast />
+
+    <ConfirmDialog
+        open={kickTarget !== null}
+        title="Remove participant"
+        body={kickTarget ? `Remove ${kickTarget.name} from the session? They can rejoin from the room page.` : ""}
+        confirmLabel="Remove"
+        danger
+        onConfirm={confirmKickParticipant}
+        onCancel={() => (kickTarget = null)}
+    />
 </main>
 
 <style>
@@ -861,18 +1401,55 @@
         z-index: 0;
     }
 
+    /* Dim layer never captures input (chat/mic stay reachable); only the
+       inner buttons are interactive. Sits below the controls layer. */
     .stream-status-overlay {
         position: absolute;
         inset: 0;
         z-index: 15;
-        pointer-events: auto;
+        pointer-events: none;
         display: flex;
         flex-direction: column;
         align-items: center;
         justify-content: center;
-        background: rgba(0, 0, 0, 0.8);
+        background: rgba(0, 0, 0, 0.65);
         color: var(--color-text-muted);
         gap: var(--space-md);
+    }
+    .stream-status-overlay .play-btn,
+    .stream-status-overlay .btn {
+        pointer-events: auto;
+    }
+
+    .stream-card {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: var(--space-md);
+        max-width: 380px;
+        padding: var(--space-xl);
+        text-align: center;
+        background: rgba(12, 12, 14, 0.72);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: var(--radius-lg);
+    }
+    .stream-card p { margin: 0; }
+    .stream-card-title {
+        margin: 0;
+        font-size: 1.125rem;
+        font-weight: 600;
+        color: var(--color-text);
+    }
+    .pulse-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: var(--color-text-muted);
+        animation: pulse-dot 2s ease-in-out infinite;
+    }
+    @keyframes pulse-dot {
+        0%, 100% { opacity: 0.3; transform: scale(0.85); }
+        50% { opacity: 1; transform: scale(1); }
     }
 
     .stream-status-overlay .paused-icon { color: var(--color-text-muted); }
@@ -901,12 +1478,24 @@
     }
     .play-btn:hover { transform: scale(1.1); background: var(--color-primary-hover); }
 
-    .mic-prompt {
+    /* All top banners share one stack so they never overlap */
+    .banner-stack {
         position: absolute;
         top: 18px;
         left: 50%;
         transform: translateX(-50%);
-        z-index: 16;
+        z-index: 25;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+        pointer-events: none;
+    }
+    .banner-stack > * {
+        pointer-events: auto;
+    }
+
+    .mic-prompt {
         width: min(92vw, 460px);
         display: flex;
         flex-direction: column;
@@ -977,15 +1566,17 @@
         to { transform: rotate(360deg); }
     }
 
-    /* Controls overlay */
+    /* Controls overlay — stacks above the stream-status dim layer so chat,
+       mic and the rest stay reachable while waiting for the stream. */
     .controls-overlay {
         position: absolute;
         inset: 0;
-        z-index: 10;
+        z-index: 20;
         display: flex;
         flex-direction: column;
         justify-content: space-between;
         padding: var(--space-md) var(--space-lg);
+        padding-bottom: calc(var(--space-md) + env(safe-area-inset-bottom, 0px));
         pointer-events: none;
         opacity: 0;
         visibility: hidden;
@@ -1048,11 +1639,15 @@
         -webkit-backdrop-filter: blur(12px);
         border: 1px solid rgba(255,255,255,0.1);
         border-radius: var(--radius-md);
-        min-width: 220px;
+        min-width: 280px;
         max-height: 300px;
         overflow-y: auto;
         z-index: 50;
         padding: var(--space-xs) 0;
+    }
+
+    .participant-list:focus {
+        outline: none;
     }
 
     .participant-list-item {
@@ -1061,18 +1656,49 @@
         gap: var(--space-sm);
         padding: var(--space-sm) var(--space-md);
         width: 100%;
-        background: none;
-        border: none;
         color: var(--color-text);
         font-size: 0.8125rem;
-        cursor: default;
         transition: background 0.1s ease;
         text-align: left;
     }
-    .participant-list-item.clickable { cursor: pointer; }
-    .participant-list-item.clickable:hover { background: rgba(255,255,255,0.08); }
+    .participant-list-item:hover { background: rgba(255,255,255,0.06); }
     .participant-list-item.speaking {
         background: rgba(72, 182, 166, 0.1);
+    }
+
+    /* Admin per-row actions, revealed on hover/focus */
+    .participant-actions {
+        display: flex;
+        gap: var(--space-xs);
+        opacity: 0;
+        transition: opacity 0.12s ease;
+    }
+    .participant-list-item:hover .participant-actions,
+    .participant-list-item:focus-within .participant-actions {
+        opacity: 1;
+    }
+    .participant-action {
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        border-radius: var(--radius-sm);
+        color: var(--color-text);
+        font-size: var(--text-min);
+        font-weight: 500;
+        padding: 2px 8px;
+        cursor: pointer;
+        transition: background 0.12s ease, border-color 0.12s ease;
+    }
+    .participant-action:hover {
+        background: rgba(255, 255, 255, 0.16);
+        border-color: rgba(255, 255, 255, 0.3);
+    }
+    .participant-action.danger {
+        color: var(--color-error);
+        border-color: rgba(239, 68, 68, 0.4);
+    }
+    .participant-action.danger:hover {
+        background: rgba(239, 68, 68, 0.15);
+        border-color: rgba(239, 68, 68, 0.6);
     }
 
     .participant-list-avatar {
@@ -1113,61 +1739,157 @@
         50% { opacity: 0.5; }
     }
 
+    /* 3-column grid keeps the control bar truly centered */
     .bottom-bar {
+        display: grid;
+        grid-template-columns: 1fr auto 1fr;
+        align-items: end;
+        gap: var(--space-sm);
+    }
+
+    .bottom-right {
         display: flex;
-        justify-content: space-between;
+        align-items: center;
+        gap: var(--space-sm);
+        justify-self: end;
+    }
+
+    .live-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: #fff;
+        background: rgba(0, 0, 0, 0.6);
+        padding: var(--space-xs) var(--space-sm);
+        border-radius: var(--radius-full);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+    }
+    .live-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--color-error);
+        animation: pulse-speaking 1.6s infinite;
+    }
+
+    /* Discreet 3-bar connection quality indicator */
+    .signal-indicator {
+        display: flex;
         align-items: flex-end;
+        gap: 2px;
+        height: 14px;
+        padding: var(--space-xs) var(--space-sm);
+        box-sizing: content-box;
+        background: rgba(0, 0, 0, 0.6);
+        border-radius: var(--radius-sm);
+    }
+    .signal-bar {
+        width: 3px;
+        border-radius: 1px;
+        background: rgba(255, 255, 255, 0.25);
+    }
+    .signal-bar:nth-child(1) { height: 6px; }
+    .signal-bar:nth-child(2) { height: 10px; }
+    .signal-bar:nth-child(3) { height: 14px; }
+    .signal-indicator.good .signal-bar { background: var(--color-success); }
+    .signal-indicator.fair .signal-bar:nth-child(-n + 2) { background: var(--color-warning); }
+    .signal-indicator.poor .signal-bar:nth-child(1) { background: var(--color-error); }
+
+    /* Anchor for the volume popover above the control bar */
+    .control-bar-anchor {
+        position: relative;
     }
 
-    .participants {
+    .volume-popover {
+        position: absolute;
+        bottom: calc(100% + 8px);
+        left: 50%;
+        width: 240px;
+        margin-left: -120px;
         display: flex;
-        gap: var(--space-xs);
-    }
-
-    .participant-avatar {
-        width: 2.5rem; height: 2.5rem;
-        border-radius: 50%;
-        display: flex; align-items: center; justify-content: center;
-        font-size: 0.875rem; font-weight: 600; color: white;
-        border: 2px solid var(--color-bg);
-        position: relative; cursor: default; padding: 0;
-    }
-    .participant-avatar.clickable { cursor: pointer; transition: transform var(--transition-fast); }
-    .participant-avatar.clickable:hover { transform: scale(1.1); box-shadow: 0 0 0 2px var(--color-primary); }
-    .participant-avatar.is-admin { border-color: var(--color-warning); }
-    .participant-avatar .mic-indicator {
-        position: absolute; bottom: -2px; right: -2px;
-        width: 10px; height: 10px;
-        background: var(--color-success);
-        border-radius: 50%;
-        border: 2px solid #000;
-    }
-    .participant-avatar.more { background: var(--color-surface); font-size: 0.75rem; }
-
-    /* Admin menu */
-    .admin-menu-backdrop { position: fixed; inset: 0; z-index: 100; }
-    .admin-menu {
-        position: fixed; z-index: 101;
-        background: var(--color-surface);
-        border: 1px solid var(--color-border);
+        flex-direction: column;
+        gap: var(--space-md);
+        padding: var(--space-md);
+        background: rgba(0, 0, 0, 0.85);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        border: 1px solid rgba(255, 255, 255, 0.12);
         border-radius: var(--radius-md);
         box-shadow: var(--shadow-lg);
-        min-width: 140px; overflow: hidden;
+        z-index: 30;
     }
-    .admin-menu-header {
-        padding: var(--space-sm) var(--space-md);
-        font-weight: 600; font-size: 0.875rem;
-        border-bottom: 1px solid var(--color-border);
+    .volume-row {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-xs);
     }
-    .admin-menu-item {
-        width: 100%; padding: var(--space-sm) var(--space-md);
-        background: none; border: none; text-align: left; cursor: pointer;
-        font-size: 0.875rem; color: var(--color-text);
-        transition: background var(--transition-fast);
+    .volume-row label {
+        font-size: var(--text-min);
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--color-text-muted);
     }
-    .admin-menu-item:hover { background: var(--color-bg-hover); }
-    .admin-menu-item.danger { color: var(--color-error); }
-    .admin-menu-item.danger:hover { background: rgba(239, 68, 68, 0.1); }
+    .volume-mute-btn {
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        border-radius: var(--radius-sm);
+        color: var(--color-text);
+        font-size: var(--text-meta);
+        padding: 6px 10px;
+        cursor: pointer;
+        transition: background 0.12s ease;
+    }
+    .volume-mute-btn:hover { background: rgba(255, 255, 255, 0.16); }
+
+    /* Full-screen end-state panel */
+    .end-state-overlay {
+        position: absolute;
+        inset: 0;
+        z-index: 60;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.85);
+        padding: var(--space-lg);
+    }
+    .end-state-card {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: var(--space-md);
+        max-width: 400px;
+        padding: var(--space-xl);
+        text-align: center;
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-lg);
+        box-shadow: var(--shadow-lg);
+    }
+    .end-state-icon {
+        width: 56px;
+        height: 56px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--color-neutral-bg);
+        color: var(--color-text-muted);
+    }
+    .end-state-card h2 {
+        margin: 0;
+        font-size: 1.25rem;
+        color: var(--color-text);
+    }
+    .end-state-card p {
+        margin: 0;
+        color: var(--color-text-muted);
+        font-size: var(--text-body);
+    }
 
     /* ========== CONTROL BAR - Large, obvious, user-friendly ========== */
     .control-bar {
@@ -1201,15 +1923,23 @@
         border-color: rgba(255, 255, 255, 0.2);
     }
 
+    /* Neutral active state: saturated UI next to the picture contaminates
+       color judgment, so "on" reads as brighter, not teal. */
     .control-btn.active {
-        background: rgba(72, 182, 166, 0.2);
-        border-color: var(--color-primary);
-        color: var(--color-primary);
+        background: rgba(255, 255, 255, 0.22);
+        border-color: rgba(255, 255, 255, 0.45);
+        color: #fff;
     }
 
     .control-btn.off {
         background: rgba(239, 68, 68, 0.15);
         border-color: rgba(239, 68, 68, 0.4);
+        color: var(--color-error);
+    }
+
+    .control-btn.leave-btn:hover {
+        background: rgba(239, 68, 68, 0.18);
+        border-color: rgba(239, 68, 68, 0.5);
         color: var(--color-error);
     }
 
@@ -1229,7 +1959,7 @@
         position: absolute;
         top: -4px;
         right: -4px;
-        background: var(--color-error);
+        background: var(--color-primary);
         color: white;
         font-size: 0.6rem;
         font-weight: 700;
@@ -1298,13 +2028,152 @@
         to { opacity: 1; transform: translateY(0); }
     }
 
+    /* Split-screen layout for screen share */
+    .video-wrapper.split-active {
+        flex-direction: row;
+        gap: 2px;
+        align-items: stretch;
+    }
+    .video-wrapper.split-active .video-container {
+        flex: 2;
+        min-width: 0;
+        width: auto;
+    }
+    .split-screenshare {
+        flex: 3;
+        min-width: 0;
+        position: relative;
+        background: #000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+    }
+    .split-screenshare video {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        background: #000;
+    }
+    .split-screenshare-label {
+        position: absolute;
+        top: 8px;
+        left: 8px;
+        display: flex;
+        align-items: center;
+        gap: var(--space-sm);
+        padding: 4px 10px;
+        border-radius: var(--radius-sm);
+        background: rgba(0, 0, 0, 0.7);
+        color: #fff;
+        font-size: 0.75rem;
+        font-weight: 500;
+        z-index: 5;
+    }
+    .split-screenshare-stop {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 2px 8px;
+        border-radius: var(--radius-sm);
+        background: rgba(239, 68, 68, 0.8);
+        border: none;
+        color: #fff;
+        font-size: 0.7rem;
+        cursor: pointer;
+        transition: background 0.15s ease;
+    }
+    .split-screenshare-stop:hover {
+        background: rgba(239, 68, 68, 1);
+    }
+
+    /* Screen share admin approval prompt */
+    .screenshare-approval {
+        display: flex;
+        align-items: center;
+        gap: var(--space-sm);
+        padding: var(--space-sm) var(--space-md);
+        border-radius: var(--radius-md);
+        background: rgba(6, 18, 32, 0.92);
+        border: 1px solid rgba(72, 182, 166, 0.35);
+        color: #fff;
+        box-shadow: var(--shadow-lg);
+        pointer-events: auto;
+    }
+    .screenshare-approval-text {
+        font-size: 0.875rem;
+        font-weight: 500;
+    }
+    .screenshare-approval-actions {
+        display: flex;
+        gap: var(--space-xs);
+    }
+    .screenshare-approval-btn {
+        border: none;
+        border-radius: var(--radius-sm);
+        padding: 6px 12px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: filter 0.15s ease;
+    }
+    .screenshare-approval-btn:hover {
+        filter: brightness(1.1);
+    }
+    .screenshare-approval-btn.approve {
+        background: var(--color-primary);
+        color: #041014;
+    }
+    .screenshare-approval-btn.deny {
+        background: rgba(239, 68, 68, 0.8);
+        color: #fff;
+    }
+
+    /* Screen share requesting state (pulsing) */
+    .control-btn.requesting {
+        animation: share-pulse 1.5s ease-in-out infinite;
+        border-color: var(--color-warning);
+        color: var(--color-warning);
+    }
+    @keyframes share-pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+    }
+    .control-btn:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+    }
+
     @media (max-width: 768px) {
         .session-page { flex-direction: column; }
-        .video-wrapper { flex: none; height: 60vh; }
+        .video-wrapper { flex: 1; min-height: 0; }
         .control-bar { gap: 4px; padding: var(--space-xs) var(--space-sm); }
         .control-btn { padding: 8px 10px; min-width: 52px; }
         .control-btn svg { width: 20px; height: 20px; }
         .control-label { font-size: 0.5625rem; }
         .active-speaker-indicator { bottom: 80px; }
+        .video-wrapper.split-active { flex-direction: column; }
+        .video-wrapper.split-active .video-container { flex: 1; }
+        .split-screenshare { flex: 1; }
+    }
+
+    /* Icon-only controls on small phones so all buttons fit a 375px screen */
+    @media (max-width: 480px) {
+        .controls-overlay { padding-left: var(--space-sm); padding-right: var(--space-sm); }
+        .control-label { display: none; }
+        .control-bar { gap: 2px; }
+        .control-btn {
+            min-width: 44px;
+            min-height: 44px;
+            padding: 10px;
+            justify-content: center;
+        }
+        .bottom-bar {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: var(--space-xs);
+        }
+        .bottom-left { display: none; }
     }
 </style>

@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"chromatic/internal/metrics"
 
@@ -173,28 +175,48 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 		}()
 	})
 
+	// Teardown runs exactly once per session across Failed/Closed state
+	// callbacks and explicit DELETE requests, preventing duplicate
+	// stream-end broadcasts and negative ingest metrics.
+	var teardownOnce sync.Once
+	session.teardown = func() {
+		teardownOnce.Do(func() {
+			// Only adjust the metric if this session ever counted itself in.
+			if session.everConnected.Load() {
+				metrics.Get().ActiveWHIPIngests.Add(-1)
+			}
+			h.sfu.RemoveIngest(token)
+			// Only notify stream end if the stream actually started;
+			// otherwise viewers would see a spurious "stream ended" for a
+			// session that never connected.
+			if session.everConnected.Load() && h.onStreamEnd != nil {
+				h.onStreamEnd(token)
+			}
+		})
+	}
+
 	// Handle connection state changes
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("WHIP connection state: %s (key: %s...)", state, token[:8])
 
 		switch state {
 		case webrtc.PeerConnectionStateConnected:
-			// Track active WHIP ingest
-			metrics.Get().ActiveWHIPIngests.Add(1)
+			// Only count the first transition to Connected; a reconnect
+			// after a transient Disconnected must not double-increment.
+			if session.everConnected.CompareAndSwap(false, true) {
+				metrics.Get().ActiveWHIPIngests.Add(1)
+			}
 			if h.onStreamStart != nil {
 				if err := h.onStreamStart(token); err != nil {
 					log.Printf("Error on stream start: %v", err)
 				}
 			}
-		case webrtc.PeerConnectionStateDisconnected,
-			webrtc.PeerConnectionStateFailed,
+		case webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed:
-			// Track WHIP ingest ended
-			metrics.Get().ActiveWHIPIngests.Add(-1)
-			h.sfu.RemoveIngest(token)
-			if h.onStreamEnd != nil {
-				h.onStreamEnd(token)
-			}
+			// Disconnected is deliberately NOT treated as terminal: Pion
+			// transitions to Failed if the connection doesn't recover, and
+			// transient network blips resolve back to Connected.
+			session.teardown()
 		}
 	})
 
@@ -227,12 +249,19 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 		return
 	}
 
-	// Wait for ICE gathering to complete
-	gatherComplete := webrtc.GatheringCompletePromise(pc)
-	<-gatherComplete
-
-	// Store the session
+	// Register the session before waiting for ICE gathering so trickle-ICE
+	// PATCH requests arriving during gathering can find it.
 	h.sfu.SetIngest(token, session)
+
+	// Bound the wait for ICE gathering. Host/srflx candidates gather quickly
+	// and are sufficient for OBS-to-server connectivity; a slow TURN server
+	// must not stall the WHIP response past client/server write timeouts.
+	gatherComplete := webrtc.GatheringCompletePromise(pc)
+	select {
+	case <-gatherComplete:
+	case <-time.After(3 * time.Second):
+		log.Printf("ICE gathering incomplete after 3s for key %s..., responding with partial candidates", token[:8])
+	}
 
 	// Return the answer
 	w.Header().Set("Content-Type", "application/sdp")
@@ -291,10 +320,14 @@ func (h *WHIPHandler) handleDelete(w http.ResponseWriter, r *http.Request, token
 	}
 
 	session.PeerConnection.Close()
-	h.sfu.RemoveIngest(token)
 
-	if h.onStreamEnd != nil {
-		h.onStreamEnd(token)
+	// Run the shared teardown (idempotent): removes the ingest and notifies
+	// stream end exactly once, even though Close() also fires the Closed
+	// state callback asynchronously.
+	if session.teardown != nil {
+		session.teardown()
+	} else {
+		h.sfu.RemoveIngest(token)
 	}
 
 	w.WriteHeader(http.StatusNoContent)
@@ -375,8 +408,10 @@ func extractProfileLevelID(sdp string) string {
 		for _, param := range params {
 			param = strings.TrimSpace(param)
 			if strings.HasPrefix(strings.ToLower(param), "profile-level-id=") {
-				value := strings.TrimPrefix(param, param[:len("profile-level-id=")])
-				return value
+				parts := strings.SplitN(param, "=", 2)
+				if len(parts) == 2 {
+					return parts[1]
+				}
 			}
 		}
 	}

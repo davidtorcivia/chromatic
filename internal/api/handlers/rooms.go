@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -25,6 +26,10 @@ var slugRegex = regexp.MustCompile(`^[a-z0-9-]{3,64}$`)
 
 const earlyAccessWindow = 10 * time.Minute
 
+// maxWaitingSubscriptions caps concurrent waiting-room SSE connections to
+// prevent file-descriptor exhaustion from abusive clients.
+const maxWaitingSubscriptions = 100
+
 // WaitingSubscription represents a waiting room participant's SSE connection
 type WaitingSubscription struct {
 	ParticipantID string
@@ -44,17 +49,29 @@ func NewWaitingManager() *WaitingManager {
 	}
 }
 
-// Subscribe adds a participant's SSE subscription
-func (m *WaitingManager) Subscribe(participantID string) chan string {
+// Subscribe adds a participant's SSE subscription.
+// Returns false if the global subscription cap has been reached.
+func (m *WaitingManager) Subscribe(participantID string) (chan string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Re-subscribing the same participant replaces the old subscription and
+	// does not count against the cap.
+	if existing, ok := m.subscriptions[participantID]; ok {
+		close(existing.Channel)
+		delete(m.subscriptions, participantID)
+	}
+
+	if len(m.subscriptions) >= maxWaitingSubscriptions {
+		return nil, false
+	}
 
 	ch := make(chan string, 1)
 	m.subscriptions[participantID] = &WaitingSubscription{
 		ParticipantID: participantID,
 		Channel:       ch,
 	}
-	return ch
+	return ch, true
 }
 
 // Unsubscribe removes a participant's SSE subscription
@@ -111,17 +128,25 @@ type RoomHandler struct {
 	onRoomLive          func(roomSlug string) // Called when room goes live
 	tokenManager        *TokenManager         // For generating signed WebSocket tokens
 	waitingManager      *WaitingManager       // For waiting room SSE notifications
+	adminToken          string                // For validating admin joins (constant-time compared)
+	maxParticipants     int                   // Cap on non-ended participants per room
 	obsReconnectTimeout time.Duration
 	timerMu             sync.Mutex
 	streamEndTimers     map[string]*time.Timer
 }
 
 // NewRoomHandler creates a new RoomHandler
-func NewRoomHandler(db *database.DB, cfg *config.Config, tokenSecret string) *RoomHandler {
+func NewRoomHandler(db *database.DB, cfg *config.Config, tokenSecret []byte) *RoomHandler {
+	maxParticipants := cfg.MaxParticipantsPerRoom
+	if maxParticipants <= 0 {
+		maxParticipants = 20
+	}
 	return &RoomHandler{
 		db:                  db,
 		tokenManager:        NewTokenManager(tokenSecret),
 		waitingManager:      NewWaitingManager(),
+		adminToken:          cfg.AdminToken,
+		maxParticipants:     maxParticipants,
 		obsReconnectTimeout: cfg.OBSReconnectTimeout,
 		streamEndTimers:     make(map[string]*time.Timer),
 	}
@@ -647,8 +672,9 @@ func (h *RoomHandler) PublicInfo(w http.ResponseWriter, r *http.Request) {
 
 // JoinRequest is the request body for joining a room
 type JoinRequest struct {
-	Name     string  `json:"name"`
-	Password *string `json:"password,omitempty"`
+	Name       string  `json:"name"`
+	Password   *string `json:"password,omitempty"`
+	AdminToken *string `json:"adminToken,omitempty"`
 }
 
 // Join handles the room join flow
@@ -694,8 +720,20 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check password
-	if passwordHash != "" {
+	// Admin join: validate the admin token from the request body (never from
+	// the URL, where it would be logged by proxies). Admins bypass the
+	// waiting room and password check.
+	isAdmin := false
+	if req.AdminToken != nil {
+		if h.adminToken == "" || subtle.ConstantTimeCompare([]byte(*req.AdminToken), []byte(h.adminToken)) != 1 {
+			http.Error(w, "Invalid admin token", http.StatusUnauthorized)
+			return
+		}
+		isAdmin = true
+	}
+
+	// Check password (admins bypass)
+	if passwordHash != "" && !isAdmin {
 		if req.Password == nil {
 			http.Error(w, "Password required", http.StatusUnauthorized)
 			return
@@ -706,15 +744,30 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Enforce participant cap (room status was already verified as non-ended)
+	var participantCount int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM participants WHERE room_id = ?`, roomID).Scan(&participantCount); err != nil {
+		http.Error(w, "Failed to join room", http.StatusInternalServerError)
+		return
+	}
+	if participantCount >= h.maxParticipants {
+		http.Error(w, "Room is full", http.StatusServiceUnavailable)
+		return
+	}
+
 	// Create participant
 	participantID := generateID()
 	color := assignColor(participantID)
-	isAdmitted := !waitingRoom // Auto-admit if no waiting room
+	isAdmitted := isAdmin || !waitingRoom // Admins bypass the waiting room
+	role := "viewer"
+	if isAdmin {
+		role = "admin"
+	}
 
 	_, err = h.db.Exec(`
 		INSERT INTO participants (id, room_id, name, role, color, is_admitted)
-		VALUES (?, ?, ?, 'viewer', ?, ?)
-	`, participantID, roomID, req.Name, color, isAdmitted)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, participantID, roomID, req.Name, role, color, isAdmitted)
 
 	if err != nil {
 		http.Error(w, "Failed to join room", http.StatusInternalServerError)
@@ -743,6 +796,7 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 		"waitingRoom":   waitingRoom && !isAdmitted,
 		"color":         color,
 		"name":          req.Name,
+		"role":          role,
 	}
 
 	respondJSON(w, response)
@@ -856,11 +910,15 @@ func (h *RoomHandler) AdmitAll(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// CheckParticipantStatus checks if a participant has been admitted
+// CheckParticipantStatus checks if a participant has been admitted.
+// The join token is taken from the X-Join-Token header only — query params
+// are logged by proxies and must not carry credentials. (The SSE endpoint
+// WaitingEvents keeps a query-param fallback because EventSource cannot set
+// headers.)
 func (h *RoomHandler) CheckParticipantStatus(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 	participantID := r.PathValue("id")
-	token := r.URL.Query().Get("token")
+	token := r.Header.Get("X-Join-Token")
 
 	if token == "" {
 		http.Error(w, "Missing token", http.StatusUnauthorized)
@@ -1087,11 +1145,22 @@ func respondJSON(w http.ResponseWriter, data interface{}) {
 func (h *RoomHandler) WaitingEvents(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 	participantID := r.PathValue("id")
-	token := r.URL.Query().Get("token")
+	// Prefer the X-Join-Token header; fall back to the query param because
+	// EventSource cannot set request headers.
+	token := r.Header.Get("X-Join-Token")
+	if token == "" {
+		token = r.URL.Query().Get("token")
+	}
 
 	if token == "" {
 		http.Error(w, "Missing token", http.StatusUnauthorized)
 		return
+	}
+
+	// SSE connections are long-lived; disable the server's write deadline so
+	// http.Server.WriteTimeout doesn't kill the stream mid-wait.
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil {
+		logger.Debug("Failed to clear write deadline for SSE", "error", err)
 	}
 
 	payload, err := h.tokenManager.ValidateToken(token)
@@ -1132,14 +1201,18 @@ func (h *RoomHandler) WaitingEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Subscribe to notifications (capped to prevent fd exhaustion)
+	ch, ok := h.waitingManager.Subscribe(participantID)
+	if !ok {
+		http.Error(w, "Too many waiting connections, please retry", http.StatusServiceUnavailable)
+		return
+	}
+	defer h.waitingManager.Unsubscribe(participantID)
+
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-
-	// Subscribe to notifications
-	ch := h.waitingManager.Subscribe(participantID)
-	defer h.waitingManager.Unsubscribe(participantID)
 
 	// Send initial heartbeat
 	fmt.Fprintf(w, ": heartbeat\n\n")

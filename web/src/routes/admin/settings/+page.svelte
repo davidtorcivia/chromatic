@@ -1,6 +1,9 @@
 <script lang="ts">
     import { onMount } from "svelte";
+    import { fade } from "svelte/transition";
     import { appConfig, type AppConfig, type TURNTestResponse } from "$lib/api/client";
+    import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
+    import CopyField from "$lib/components/CopyField.svelte";
 
     let config = $state<AppConfig | null>(null);
     let isLoading = $state(true);
@@ -10,6 +13,7 @@
     let turnTestResults = $state<TURNTestResponse | null>(null);
     let error = $state("");
     let successMessage = $state("");
+    let confirmDeleteLogoOpen = $state(false);
 
     // Form state
     let watermarkText = $state("");
@@ -126,10 +130,7 @@
     }
 
     async function handleDeleteLogo() {
-        if (!confirm("Are you sure you want to delete the default logo?")) {
-            return;
-        }
-
+        confirmDeleteLogoOpen = false;
         error = "";
         successMessage = "";
 
@@ -140,14 +141,6 @@
             setTimeout(() => (successMessage = ""), 3000);
         } catch (e: any) {
             error = e.message || "Failed to delete logo";
-        }
-    }
-
-    function copyWhipFormat() {
-        if (config?.whipFormat) {
-            navigator.clipboard.writeText(config.whipFormat);
-            successMessage = "WHIP URL format copied to clipboard";
-            setTimeout(() => (successMessage = ""), 3000);
         }
     }
 
@@ -196,16 +189,18 @@
     </header>
 
     {#if error}
-        <div class="error-message">{error}</div>
+        <div class="alert alert-error" transition:fade={{ duration: 150 }}>{error}</div>
     {/if}
 
     {#if successMessage}
-        <div class="success-message">{successMessage}</div>
+        <div class="alert alert-success" transition:fade={{ duration: 150 }}>{successMessage}</div>
     {/if}
 
     {#if isLoading}
-        <div class="loading">
-            <div class="waiting-spinner"></div>
+        <div class="settings-skeletons" aria-busy="true" aria-label="Loading settings">
+            {#each [0, 1, 2] as i (i)}
+                <div class="skeleton skeleton-card"></div>
+            {/each}
         </div>
     {:else}
         <!-- Server Info -->
@@ -228,16 +223,10 @@
                 >
             </div>
             <div class="info-row">
-                <span class="field-label">WHIP URL Format</span>
-                <div class="copy-row">
-                    <code>{config?.whipFormat || "Not configured"}</code>
-                    <button
-                        class="btn btn-secondary btn-sm"
-                        onclick={copyWhipFormat}
-                    >
-                        Copy
-                    </button>
-                </div>
+                <CopyField
+                    label="WHIP URL Format"
+                    value={config?.whipFormat || "Not configured"}
+                />
                 <p class="hint">
                     Replace <code>{"{stream_key_token}"}</code> with your actual
                     stream key token from the Stream Keys page.
@@ -275,7 +264,12 @@
                     class="btn btn-primary"
                     disabled={isSaving}
                 >
-                    {isSaving ? "Saving..." : "Save Watermark Text"}
+                    {#if isSaving}
+                        <span class="btn-spinner" aria-hidden="true"></span>
+                        Saving...
+                    {:else}
+                        Save Watermark Text
+                    {/if}
                 </button>
             </form>
 
@@ -291,22 +285,28 @@
                         />
                         <button
                             class="btn btn-secondary btn-sm btn-danger-text"
-                            onclick={handleDeleteLogo}
+                            onclick={() => (confirmDeleteLogoOpen = true)}
                         >
                             Delete Logo
                         </button>
                     </div>
                 {/if}
                 <div class="file-upload">
-                    <input
-                        type="file"
-                        accept="image/png,image/jpeg,image/webp"
-                        onchange={handleLogoUpload}
-                        disabled={isUploadingLogo}
-                    />
-                    {#if isUploadingLogo}
-                        <span class="upload-status">Uploading...</span>
-                    {/if}
+                    <label class="btn btn-secondary file-btn" class:disabled={isUploadingLogo}>
+                        {#if isUploadingLogo}
+                            <span class="btn-spinner" aria-hidden="true"></span>
+                            Uploading...
+                        {:else}
+                            Choose Logo File
+                        {/if}
+                        <input
+                            type="file"
+                            class="visually-hidden-input"
+                            accept="image/png,image/jpeg,image/webp"
+                            onchange={handleLogoUpload}
+                            disabled={isUploadingLogo}
+                        />
+                    </label>
                 </div>
                 <p class="hint">
                     Recommended: PNG with transparency, max 500x500px, max 1MB
@@ -402,7 +402,12 @@
                         class="btn btn-primary"
                         disabled={isSaving}
                     >
-                        {isSaving ? "Saving..." : "Save TURN Settings"}
+                        {#if isSaving}
+                            <span class="btn-spinner" aria-hidden="true"></span>
+                            Saving...
+                        {:else}
+                            Save TURN Settings
+                        {/if}
                     </button>
                     <button
                         type="button"
@@ -410,7 +415,12 @@
                         onclick={handleTestTurn}
                         disabled={isTesting}
                     >
-                        {isTesting ? "Testing..." : "Test TURN Connectivity"}
+                        {#if isTesting}
+                            <span class="btn-spinner" aria-hidden="true"></span>
+                            Testing...
+                        {:else}
+                            Test TURN Connectivity
+                        {/if}
                     </button>
                 </div>
             </form>
@@ -465,17 +475,20 @@
     {/if}
 </div>
 
+<ConfirmDialog
+    open={confirmDeleteLogoOpen}
+    title="Delete the default logo?"
+    body="Rooms using the default watermark logo will no longer display it."
+    confirmLabel="Delete Logo"
+    danger
+    onConfirm={handleDeleteLogo}
+    onCancel={() => (confirmDeleteLogoOpen = false)}
+/>
+
 <style>
     .settings-page {
         max-width: 800px;
         margin: 0 auto;
-    }
-
-    .page-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: flex-start;
-        margin-bottom: var(--space-lg);
     }
 
     .header-left {
@@ -487,10 +500,6 @@
     .back-link {
         font-size: 0.875rem;
         color: var(--color-text-muted);
-    }
-
-    .page-header h1 {
-        margin: 0;
     }
 
     .settings-section {
@@ -560,16 +569,6 @@
         white-space: nowrap;
     }
 
-    .copy-row {
-        display: flex;
-        gap: var(--space-sm);
-        align-items: center;
-    }
-
-    .copy-row code {
-        flex: 1;
-    }
-
     .logo-preview {
         display: flex;
         align-items: center;
@@ -592,9 +591,26 @@
         gap: var(--space-sm);
     }
 
-    .upload-status {
-        font-size: 0.875rem;
-        color: var(--color-text-muted);
+    .file-btn {
+        position: relative;
+        overflow: hidden;
+    }
+
+    .file-btn.disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+    }
+
+    .visually-hidden-input {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
     }
 
     hr {
@@ -603,45 +619,14 @@
         margin: var(--space-lg) 0;
     }
 
-    .error-message {
-        padding: var(--space-sm) var(--space-md);
-        background: rgba(239, 68, 68, 0.1);
-        border: 1px solid var(--color-error);
-        border-radius: var(--radius-md);
-        color: var(--color-error);
-        font-size: 0.875rem;
-        margin-bottom: var(--space-md);
-    }
-
-    .success-message {
-        padding: var(--space-sm) var(--space-md);
-        background: rgba(34, 197, 94, 0.1);
-        border: 1px solid var(--color-success);
-        border-radius: var(--radius-md);
-        color: var(--color-success);
-        font-size: 0.875rem;
-        margin-bottom: var(--space-md);
-    }
-
-    .loading {
+    .settings-skeletons {
         display: flex;
-        justify-content: center;
-        padding: var(--space-2xl);
+        flex-direction: column;
+        gap: var(--space-lg);
     }
 
-    .btn-secondary {
-        background: var(--color-surface-hover);
-        color: var(--color-text);
-        border: 1px solid var(--color-border);
-    }
-
-    .btn-secondary:hover {
-        background: var(--color-border);
-    }
-
-    .btn-sm {
-        padding: var(--space-xs) var(--space-sm);
-        font-size: 0.75rem;
+    .skeleton-card {
+        min-height: 180px;
     }
 
     .btn-danger-text {
@@ -649,7 +634,7 @@
     }
 
     .btn-danger-text:hover {
-        background: rgba(239, 68, 68, 0.1);
+        background: var(--color-error-bg);
     }
 
     .button-row {
@@ -678,13 +663,13 @@
     }
 
     .test-summary.success {
-        background: rgba(34, 197, 94, 0.1);
+        background: var(--color-success-bg);
         border: 1px solid var(--color-success);
         color: var(--color-success);
     }
 
     .test-summary.failure {
-        background: rgba(239, 68, 68, 0.1);
+        background: var(--color-error-bg);
         border: 1px solid var(--color-error);
         color: var(--color-error);
     }
@@ -714,24 +699,6 @@
         background: var(--color-surface-elevated);
         padding: 0.1em 0.3em;
         border-radius: var(--radius-sm);
-    }
-
-    .status-badge {
-        display: inline-block;
-        padding: 0.15em 0.5em;
-        border-radius: var(--radius-sm);
-        font-size: 0.75rem;
-        font-weight: 500;
-    }
-
-    .status-badge.success {
-        background: rgba(34, 197, 94, 0.1);
-        color: var(--color-success);
-    }
-
-    .status-badge.failure {
-        background: rgba(239, 68, 68, 0.1);
-        color: var(--color-error);
     }
 
     .error-text {

@@ -12,6 +12,7 @@
 
     let status = $state<"waiting" | "admitted" | "ended" | "error" | "connection_failed">("waiting");
     let error = $state("");
+    let roomName = $state("");
     let eventSource: EventSource | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout>;
     let reconnectAttempts = $state(0);
@@ -32,6 +33,16 @@
         }
 
         sessionData = JSON.parse(stored);
+
+        // Fetch the room name so the wait screen says what you're joining
+        rooms
+            .info(slug)
+            .then((info) => {
+                roomName = info.name;
+            })
+            .catch(() => {
+                // Non-fatal: fall back to generic copy
+            });
 
         // Connect to SSE endpoint for push notifications
         connectSSE();
@@ -184,11 +195,11 @@
 </svelte:head>
 
 <main class="waiting-page">
-    <div class="waiting-content">
+    <div class="waiting-content" aria-live="polite">
         {#if status === "waiting"}
             <div class="waiting-card">
-                <div class="waiting-spinner large"></div>
-                <h1>Waiting to be admitted</h1>
+                <div class="waiting-pulse" aria-hidden="true"></div>
+                <h1>Waiting to join {roomName || "the session"}</h1>
                 <p>The host will let you in soon.</p>
                 <p class="muted">Please keep this page open.</p>
                 <button class="btn btn-secondary" onclick={handleLeave}>
@@ -274,14 +285,19 @@
         margin-bottom: var(--space-lg);
     }
 
-    .waiting-spinner {
+    /* Soft pulse instead of a generic spinner */
+    .waiting-pulse {
+        width: 16px;
+        height: 16px;
         margin: 0 auto var(--space-lg);
+        border-radius: 50%;
+        background: var(--color-primary);
+        animation: waiting-pulse 2s ease-in-out infinite;
     }
 
-    .waiting-spinner.large {
-        width: 60px;
-        height: 60px;
-        border-width: 4px;
+    @keyframes waiting-pulse {
+        0%, 100% { opacity: 0.35; transform: scale(0.8); }
+        50% { opacity: 1; transform: scale(1); }
     }
 
     .success-icon {
@@ -320,15 +336,5 @@
         gap: var(--space-sm);
         justify-content: center;
         margin-top: var(--space-lg);
-    }
-
-    .btn-secondary {
-        background: var(--color-surface-hover);
-        color: var(--color-text);
-        border: 1px solid var(--color-border);
-    }
-
-    .btn-secondary:hover {
-        background: var(--color-border);
     }
 </style>

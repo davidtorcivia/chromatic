@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -52,6 +53,47 @@ func TestCloudflareTURNProvider_GetICEServer_DirectResponse_CachesCredentials(t 
 	}
 	if len(ice1.URLs) != 1 || ice1.URLs[0] != "turn:turn.cloudflare.com:3478?transport=udp" {
 		t.Fatalf("expected sanitized preferred URL list, got %+v", ice1.URLs)
+	}
+}
+
+func TestCloudflareTURNProvider_ConcurrentCallersSingleFetch(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		// Slow the response down so concurrent callers pile up on a cold cache.
+		time.Sleep(50 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"iceServers":[{"urls":["turn:turn.cloudflare.com:3478?transport=udp"],"username":"shared-user","credential":"shared-pass"}]}`))
+	}))
+	defer server.Close()
+
+	provider := newCloudflareTURNProvider(cloudflareTURNProviderConfig{
+		KeyID:            "test-key-id",
+		APIToken:         "test-token",
+		TTLSeconds:       3600,
+		Skew:             60 * time.Second,
+		EndpointTemplate: server.URL + "/v1/turn/keys/%s/credentials/generate-ice-servers",
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ice, err := provider.GetICEServer(context.Background(), nil)
+			if err != nil {
+				t.Errorf("GetICEServer failed: %v", err)
+				return
+			}
+			if ice.Username != "shared-user" || ice.Credential != "shared-pass" {
+				t.Errorf("unexpected credentials: %+v", ice)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("expected exactly 1 credential API call for concurrent cold-cache callers, got %d", got)
 	}
 }
 

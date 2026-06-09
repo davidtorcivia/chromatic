@@ -41,6 +41,9 @@ type Config struct {
 	TrustedProxies []string // IP addresses/CIDRs of trusted reverse proxies
 	ProductionMode bool     // When true, enforces strict security (requires ALLOWED_ORIGINS)
 
+	// Limits
+	MaxParticipantsPerRoom int // Maximum non-ended participants per room
+
 	// TURN
 	TurnMode                     string
 	TurnSecret                   string
@@ -62,23 +65,24 @@ type Config struct {
 // Load loads configuration from environment variables
 func Load() (*Config, error) {
 	cfg := &Config{
-		Port:                getEnvInt("PORT", 3000),
-		PublicURL:           getEnvRequired("PUBLIC_URL"),
-		DatabasePath:        getEnv("DATABASE_PATH", "/data/chromatic.db"),
-		UploadPath:          getEnv("UPLOAD_PATH", "/data/files"),
-		LogoPath:            getEnv("LOGO_PATH", "/data/logos"),
-		AdminToken:          getEnvRequired("ADMIN_TOKEN"),
-		AllowedOrigins:      getEnvList("ALLOWED_ORIGINS", nil),
-		TrustedProxies:      getEnvList("TRUSTED_PROXIES", nil),
-		ProductionMode:      getEnvBool("PRODUCTION_MODE", false),
-		TurnMode:            normalizeTurnMode(getEnv("TURN_MODE", TurnModeHybrid)),
-		TurnSecret:          getEnvRequired("TURN_SECRET"),
-		TurnRealm:           getEnvRequired("TURN_REALM"),
-		TurnExternalURL:     getEnv("TURN_EXTERNAL_URL", ""),
-		TurnExternalURLs:    getEnvList("TURN_EXTERNAL_URLS", nil),
-		TurnExternalUser:    getEnv("TURN_EXTERNAL_USER", ""),
-		TurnExternalPass:    getEnv("TURN_EXTERNAL_PASS", ""),
-		TurnCloudflareKeyID: getEnv("TURN_CLOUDFLARE_KEY_ID", ""),
+		Port:                   getEnvInt("PORT", 3000),
+		PublicURL:              getEnvRequired("PUBLIC_URL"),
+		DatabasePath:           getEnv("DATABASE_PATH", "/data/chromatic.db"),
+		UploadPath:             getEnv("UPLOAD_PATH", "/data/files"),
+		LogoPath:               getEnv("LOGO_PATH", "/data/logos"),
+		AdminToken:             getEnvRequired("ADMIN_TOKEN"),
+		AllowedOrigins:         getEnvList("ALLOWED_ORIGINS", nil),
+		TrustedProxies:         getEnvList("TRUSTED_PROXIES", nil),
+		ProductionMode:         getEnvBool("PRODUCTION_MODE", false),
+		MaxParticipantsPerRoom: getEnvInt("MAX_PARTICIPANTS_PER_ROOM", 20),
+		TurnMode:               normalizeTurnMode(getEnv("TURN_MODE", TurnModeHybrid)),
+		TurnSecret:             getEnvRequired("TURN_SECRET"),
+		TurnRealm:              getEnvRequired("TURN_REALM"),
+		TurnExternalURL:        getEnv("TURN_EXTERNAL_URL", ""),
+		TurnExternalURLs:       getEnvList("TURN_EXTERNAL_URLS", nil),
+		TurnExternalUser:       getEnv("TURN_EXTERNAL_USER", ""),
+		TurnExternalPass:       getEnv("TURN_EXTERNAL_PASS", ""),
+		TurnCloudflareKeyID:    getEnv("TURN_CLOUDFLARE_KEY_ID", ""),
 		TurnCloudflareAPIToken: getEnv("TURN_CLOUDFLARE_API_TOKEN",
 			"",
 		),
@@ -134,6 +138,10 @@ func Load() (*Config, error) {
 		if !hasExternalStatic && !cfg.HasCloudflareTURN() {
 			return nil, fmt.Errorf("TURN_MODE=external requires either Cloudflare TURN credentials or TURN_EXTERNAL_URLS + TURN_EXTERNAL_USER/PASS")
 		}
+	}
+
+	if cfg.MaxParticipantsPerRoom <= 0 {
+		return nil, fmt.Errorf("MAX_PARTICIPANTS_PER_ROOM must be > 0")
 	}
 
 	if cfg.TurnCloudflareCredentialTTL < 60 {

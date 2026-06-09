@@ -7,11 +7,20 @@
         type Room,
         type StreamKey,
     } from "$lib/api/client";
+    import StatusBadge from "$lib/components/StatusBadge.svelte";
 
-    let recentRooms = $state<Room[]>([]);
+    let allRooms = $state<Room[]>([]);
     let keys = $state<StreamKey[]>([]);
     let isLoading = $state(true);
     let showSetupBanner = $state(false);
+
+    let recentRooms = $derived(allRooms.slice(0, 5));
+    let liveCount = $derived(
+        allRooms.filter((r) => r.status === "live").length,
+    );
+    let scheduledCount = $derived(
+        allRooms.filter((r) => r.status === "pending").length,
+    );
 
     onMount(async () => {
         try {
@@ -19,15 +28,15 @@
                 rooms.list(),
                 streamKeys.list(),
             ]);
-            recentRooms = roomsData.slice(0, 5);
-            keys = keysData;
+            allRooms = roomsData ?? [];
+            keys = keysData ?? [];
             if (typeof localStorage !== "undefined") {
                 const setupComplete =
                     localStorage.getItem("chromatic-setup-complete") === "true";
                 const setupDismissed =
                     localStorage.getItem("chromatic-setup-dismissed") === "true";
                 const isFirstRun =
-                    roomsData.length === 0 && keysData.length === 0;
+                    allRooms.length === 0 && keys.length === 0;
                 showSetupBanner = !setupComplete && isFirstRun;
                 if (!setupComplete && !setupDismissed && isFirstRun) {
                     goto("/admin/setup");
@@ -88,8 +97,10 @@
     {/if}
 
     {#if isLoading}
-        <div class="loading">
-            <div class="waiting-spinner"></div>
+        <div class="dashboard-grid" aria-busy="true" aria-label="Loading dashboard">
+            {#each [0, 1, 2] as i (i)}
+                <div class="skeleton skeleton-card"></div>
+            {/each}
         </div>
     {:else}
         <div class="dashboard-grid">
@@ -98,17 +109,11 @@
                 <h3>Quick Stats</h3>
                 <div class="stats">
                     <div class="stat">
-                        <span class="stat-value"
-                            >{recentRooms.filter((r) => r.status === "live")
-                                .length}</span
-                        >
+                        <span class="stat-value">{liveCount}</span>
                         <span class="stat-label">Live Now</span>
                     </div>
                     <div class="stat">
-                        <span class="stat-value"
-                            >{recentRooms.filter((r) => r.status === "pending")
-                                .length}</span
-                        >
+                        <span class="stat-value">{scheduledCount}</span>
                         <span class="stat-label">Scheduled</span>
                     </div>
                     <div class="stat">
@@ -144,9 +149,7 @@
                                             >{formatDate(room.createdAt)}</span
                                         >
                                     </div>
-                                    <span class="status-badge {room.status}"
-                                        >{room.status}</span
-                                    >
+                                    <StatusBadge status={room.status} />
                                 </a>
                             </li>
                         {/each}
@@ -193,7 +196,7 @@
                         Set <strong>B-Frames to 0</strong> in encoder settings
                     </li>
                 </ol>
-                <a href="/docs/obs-setup" class="btn btn-secondary btn-sm"
+                <a href="/admin/setup" class="btn btn-secondary btn-sm"
                     >Full Guide</a
                 >
             </div>
@@ -207,39 +210,25 @@
         margin: 0 auto;
     }
 
-    .page-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: var(--space-xl);
-    }
-
-    .page-header h1 {
-        margin: 0;
-    }
-
     .setup-banner {
         display: flex;
         justify-content: space-between;
         align-items: center;
         gap: var(--space-lg);
         margin-bottom: var(--space-xl);
-        background: linear-gradient(
-            135deg,
-            rgba(72, 182, 166, 0.12),
-            rgba(230, 162, 60, 0.08)
-        );
+        background: var(--color-surface-elevated);
+        border-left: 2px solid var(--color-primary);
     }
 
     .setup-banner-content h2 {
         margin: 0 0 var(--space-xs);
-        font-size: 1.25rem;
+        font-size: 1.125rem;
     }
 
     .setup-banner-content p {
         margin: 0;
         color: var(--color-text-muted);
-        font-size: 0.875rem;
+        font-size: var(--text-body);
     }
 
     .setup-banner-actions {
@@ -252,6 +241,10 @@
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
         gap: var(--space-lg);
+    }
+
+    .skeleton-card {
+        min-height: 180px;
     }
 
     .card-header {
@@ -279,11 +272,12 @@
         display: block;
         font-size: 2rem;
         font-weight: 700;
+        font-family: var(--font-display);
         color: var(--color-primary);
     }
 
     .stat-label {
-        font-size: 0.875rem;
+        font-size: var(--text-body);
         color: var(--color-text-muted);
     }
 
@@ -310,29 +304,8 @@
     }
 
     .room-date {
-        font-size: 0.75rem;
+        font-size: var(--text-meta);
         color: var(--color-text-subtle);
-    }
-
-    .status-badge {
-        font-size: 0.75rem;
-        padding: var(--space-xs) var(--space-sm);
-        border-radius: var(--radius-full);
-    }
-
-    .status-badge.live {
-        background: rgba(34, 197, 94, 0.2);
-        color: var(--color-success);
-    }
-
-    .status-badge.pending {
-        background: rgba(245, 158, 11, 0.2);
-        color: var(--color-warning);
-    }
-
-    .status-badge.ended {
-        background: rgba(107, 114, 128, 0.2);
-        color: var(--color-text-muted);
     }
 
     .key-item {
@@ -343,7 +316,7 @@
     }
 
     .key-token {
-        font-size: 0.75rem;
+        font-size: var(--text-meta);
         background: var(--color-surface-elevated);
         padding: var(--space-xs) var(--space-sm);
         border-radius: var(--radius-sm);
@@ -352,7 +325,7 @@
     .setup-steps {
         margin: var(--space-md) 0;
         padding-left: var(--space-lg);
-        font-size: 0.875rem;
+        font-size: var(--text-body);
         color: var(--color-text-muted);
     }
 
@@ -362,20 +335,9 @@
 
     .empty-state {
         color: var(--color-text-muted);
-        font-size: 0.875rem;
+        font-size: var(--text-body);
         padding: var(--space-lg) 0;
         text-align: center;
-    }
-
-    .loading {
-        display: flex;
-        justify-content: center;
-        padding: var(--space-2xl);
-    }
-
-    .btn-sm {
-        padding: var(--space-xs) var(--space-sm);
-        font-size: 0.75rem;
     }
 
     @media (max-width: 768px) {

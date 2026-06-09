@@ -3,11 +3,14 @@
     import { goto } from "$app/navigation";
     import { page } from "$app/stores";
     import { rooms, type RoomInfo } from "$lib/api/client";
+    import StatusBadge from "$lib/components/StatusBadge.svelte";
 
     let roomInfo = $state<RoomInfo | null>(null);
     let error = $state("");
     let name = $state("");
     let password = $state("");
+    let adminToken = $state("");
+    let showHostSection = $state(false);
     let isLoading = $state(false);
     let now = $state(Date.now());
     let timer: ReturnType<typeof setInterval>;
@@ -17,6 +20,17 @@
     const slug = $page.params.slug!;
 
     onMount(async () => {
+        // Pre-fill the name from a previous session
+        const storedName = localStorage.getItem("chromatic_name");
+        if (storedName) {
+            name = storedName;
+        }
+
+        // Reveal the host token field when arriving via a host link
+        if ($page.url.searchParams.get("host") === "1") {
+            showHostSection = true;
+        }
+
         try {
             roomInfo = await rooms.info(slug);
         } catch (e) {
@@ -39,6 +53,14 @@
         scheduledAt ? new Date(scheduledAt.getTime() - EARLY_ACCESS_WINDOW_MS) : null
     );
     let canJoin = $derived(!earlyAccessAt || now >= earlyAccessAt.getTime());
+    let scheduledLabel = $derived(
+        scheduledAt?.toLocaleString(undefined, {
+            month: "short",
+            day: "numeric",
+            hour: "2-digit",
+            minute: "2-digit",
+        }) ?? ""
+    );
 
     async function handleJoin(e: SubmitEvent) {
         e.preventDefault();
@@ -56,12 +78,14 @@
                 slug,
                 name.trim(),
                 password || undefined,
+                adminToken.trim() || undefined,
             );
 
             // Store sanitized participant name for future sessions
             localStorage.setItem('chromatic_name', result.name || name.trim());
 
-            // Store session info
+            // Store session info (includes the server-assigned role, so the
+            // session page knows whether this participant is an admin)
             sessionStorage.setItem(
                 `chromatic_session_${slug}`,
                 JSON.stringify(result),
@@ -93,15 +117,14 @@
         </div>
     {:else if roomInfo}
         <div class="join-content">
+            <div class="invite-header">
+                <div class="wordmark">Chromatic</div>
+                <p class="invite-line">You've been invited to a live color review session.</p>
+            </div>
+
             <div class="room-info">
                 <h1>{roomInfo.name}</h1>
-                {#if roomInfo.status === "live"}
-                    <span class="status-badge live">● Live</span>
-                {:else if roomInfo.status === "pending"}
-                    <span class="status-badge pending">Waiting for host</span>
-                {:else}
-                    <span class="status-badge ended">Session ended</span>
-                {/if}
+                <StatusBadge status={roomInfo.status} />
             </div>
 
             {#if roomInfo.status === "ended"}
@@ -111,20 +134,14 @@
             {:else if !canJoin}
                 <div class="card">
                     <p>
-                        This session opens at
-                        {earlyAccessAt?.toLocaleString(undefined, {
-                            month: "short",
-                            day: "numeric",
-                            hour: "2-digit",
-                            minute: "2-digit"
-                        })}
-                        .
+                        This session is scheduled for {scheduledLabel}.
+                        The room opens 10 minutes before.
                     </p>
                 </div>
             {:else}
                 <form class="card join-form" onsubmit={handleJoin}>
                     {#if error}
-                        <div class="error-message">{error}</div>
+                        <div class="alert alert-error">{error}</div>
                     {/if}
 
                     <div class="form-group">
@@ -153,13 +170,36 @@
                         </div>
                     {/if}
 
+                    {#if showHostSection}
+                        <div class="form-group">
+                            <label for="adminToken">Admin Token</label>
+                            <input
+                                type="password"
+                                id="adminToken"
+                                class="input"
+                                bind:value={adminToken}
+                                placeholder="Enter admin token"
+                            />
+                        </div>
+                    {/if}
+
                     <button
                         type="submit"
                         class="btn btn-primary btn-large"
                         disabled={isLoading}
                     >
-                        {isLoading ? "Joining..." : "Join Session"}
+                        {#if isLoading}
+                            <span class="btn-spinner" aria-hidden="true"></span>
+                            Joining...
+                        {:else}
+                            Join Session
+                        {/if}
                     </button>
+
+                    <p class="form-hint mic-hint">
+                        Chromatic uses your microphone for voice chat — your
+                        browser will ask for permission.
+                    </p>
 
                     {#if roomInfo.waitingRoomEnabled}
                         <p class="waiting-note">
@@ -168,6 +208,18 @@
                         </p>
                     {/if}
                 </form>
+
+                {#if !showHostSection}
+                    <p class="host-link-row">
+                        <button
+                            type="button"
+                            class="host-link"
+                            onclick={() => (showHostSection = true)}
+                        >
+                            Joining as host?
+                        </button>
+                    </p>
+                {/if}
             {/if}
         </div>
     {:else}
@@ -192,6 +244,26 @@
         width: 100%;
     }
 
+    .invite-header {
+        text-align: center;
+        margin-bottom: var(--space-xl);
+    }
+
+    .wordmark {
+        font-size: 0.875rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        color: var(--color-text-muted);
+        margin-bottom: var(--space-xs);
+    }
+
+    .invite-line {
+        font-size: var(--text-body);
+        color: var(--color-text-muted);
+        margin: 0;
+    }
+
     .room-info {
         text-align: center;
         margin-bottom: var(--space-lg);
@@ -199,29 +271,6 @@
 
     .room-info h1 {
         margin-bottom: var(--space-sm);
-    }
-
-    .status-badge {
-        display: inline-block;
-        padding: var(--space-xs) var(--space-md);
-        border-radius: var(--radius-full);
-        font-size: 0.75rem;
-        font-weight: 500;
-    }
-
-    .status-badge.live {
-        background: rgba(34, 197, 94, 0.2);
-        color: var(--color-success);
-    }
-
-    .status-badge.pending {
-        background: rgba(245, 158, 11, 0.2);
-        color: var(--color-warning);
-    }
-
-    .status-badge.ended {
-        background: rgba(239, 68, 68, 0.2);
-        color: var(--color-error);
     }
 
     .join-form {
@@ -246,6 +295,11 @@
         font-size: 1rem;
     }
 
+    .mic-hint {
+        margin-top: var(--space-md);
+        text-align: center;
+    }
+
     .waiting-note {
         margin-top: var(--space-lg);
         font-size: 0.875rem;
@@ -253,13 +307,26 @@
         text-align: center;
     }
 
-    .error-message {
-        padding: var(--space-md);
-        background: rgba(239, 68, 68, 0.1);
-        border: 1px solid var(--color-error);
-        border-radius: var(--radius-md);
-        color: var(--color-error);
-        font-size: 0.875rem;
+    .host-link-row {
+        text-align: center;
+        margin-top: var(--space-lg);
+    }
+
+    .host-link {
+        background: none;
+        border: none;
+        padding: 0;
+        font-size: var(--text-meta);
+        color: var(--color-text-subtle);
+        text-decoration: underline;
+        cursor: pointer;
+    }
+
+    .host-link:hover {
+        color: var(--color-text);
+    }
+
+    .alert {
         margin-bottom: var(--space-lg);
     }
 

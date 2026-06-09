@@ -32,21 +32,21 @@
 <main class="landing">
   <div class="landing-content">
     <div class="logo">
-      <h1>Chromatic</h1>
+      <h1>Chromatic<span class="logo-mark">.</span></h1>
       <p class="tagline">Self-hosted streaming for color-critical review</p>
     </div>
 
     <form class="login-form card" onsubmit={handleLogin}>
       <h2>Admin Login</h2>
-      
+
       {#if error}
-        <div class="error-message">{error}</div>
+        <div class="alert alert-error">{error}</div>
       {/if}
 
       <div class="form-group">
         <label for="token">Admin Token</label>
-        <input 
-          type="password" 
+        <input
+          type="password"
           id="token"
           class="input"
           bind:value={adminToken}
@@ -56,7 +56,12 @@
       </div>
 
       <button type="submit" class="btn btn-primary" disabled={isLoading}>
-        {isLoading ? 'Verifying...' : 'Login'}
+        {#if isLoading}
+          <span class="btn-spinner" aria-hidden="true"></span>
+          Verifying...
+        {:else}
+          Login
+        {/if}
       </button>
     </form>
   </div>
@@ -70,8 +75,7 @@
     justify-content: center;
     padding: var(--space-lg);
     background:
-      radial-gradient(ellipse at top, rgba(72, 182, 166, 0.25) 0%, transparent 70%),
-      radial-gradient(ellipse at bottom, rgba(230, 162, 60, 0.15) 0%, transparent 65%),
+      radial-gradient(ellipse at top, rgba(72, 182, 166, 0.06) 0%, transparent 70%),
       var(--color-bg);
   }
 
@@ -86,12 +90,14 @@
   }
 
   .logo h1 {
-    font-size: 3rem;
+    font-size: 2.5rem;
     font-weight: 700;
-    background: linear-gradient(135deg, #48b6a6, #e6a23c);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
+    letter-spacing: -0.02em;
+    color: var(--color-text);
+  }
+
+  .logo-mark {
+    color: var(--color-primary);
   }
 
   .tagline {
@@ -107,6 +113,7 @@
   .login-form h2 {
     margin-bottom: var(--space-lg);
     text-align: center;
+    font-size: 1.25rem;
   }
 
   .form-group {
@@ -124,15 +131,4 @@
   .login-form .btn {
     width: 100%;
   }
-
-  .error-message {
-    padding: var(--space-md);
-    background: rgba(239, 68, 68, 0.1);
-    border: 1px solid var(--color-error);
-    border-radius: var(--radius-md);
-    color: var(--color-error);
-    font-size: 0.875rem;
-    margin-bottom: var(--space-lg);
-  }
-
 </style>

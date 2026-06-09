@@ -32,8 +32,9 @@ type Hub struct {
 	// Rooms contain clients organized by room slug
 	rooms map[string]*Room
 
-	// Broadcast to all clients in a room
-	broadcast chan *RoomMessage
+	// Set under mu when Shutdown is called; makes Broadcast a no-op so late
+	// callers (e.g. async Pion callbacks) can never block or panic.
+	shutdown bool
 
 	// Shutdown channel
 	done chan struct{}
@@ -47,24 +48,56 @@ type Room struct {
 
 // Client represents a single WebSocket connection
 type Client struct {
-	ID           string
-	Name         string
-	Role         string
-	RoomSlug     string
-	Color        string
-	Hub          *Hub
-	Conn         *websocket.Conn
-	Send         chan []byte
-	done         chan struct{}
-	closeOnce    sync.Once // Ensures Send channel is closed only once
-	IsAdmin      bool
-	AudioEnabled bool
-	VideoEnabled bool
+	ID        string
+	Name      string
+	Role      string
+	RoomSlug  string
+	Color     string
+	Hub       *Hub
+	Conn      *websocket.Conn
+	Send      chan []byte
+	Done      chan struct{} // Closed when client disconnects; gates SendJSON
+	closeOnce sync.Once     // Ensures Send channel is closed only once
+	IsAdmin   bool
+
+	// Media state is written by the read pump (media:toggle) and read by
+	// other goroutines (e.g. room-state snapshots), so it is guarded by a mutex.
+	mediaMu      sync.Mutex
+	audioEnabled bool
+	videoEnabled bool
 
 	// Rate limiting for chat messages (30 per minute)
 	chatRateLimiter *RateLimiter
 	// Rate limiting for cursor updates (20 per second)
 	cursorRateLimiter *RateLimiter
+}
+
+// AudioEnabled returns whether the client's audio is enabled.
+func (c *Client) AudioEnabled() bool {
+	c.mediaMu.Lock()
+	defer c.mediaMu.Unlock()
+	return c.audioEnabled
+}
+
+// SetAudioEnabled updates the client's audio state.
+func (c *Client) SetAudioEnabled(enabled bool) {
+	c.mediaMu.Lock()
+	defer c.mediaMu.Unlock()
+	c.audioEnabled = enabled
+}
+
+// VideoEnabled returns whether the client's video is enabled.
+func (c *Client) VideoEnabled() bool {
+	c.mediaMu.Lock()
+	defer c.mediaMu.Unlock()
+	return c.videoEnabled
+}
+
+// SetVideoEnabled updates the client's video state.
+func (c *Client) SetVideoEnabled(enabled bool) {
+	c.mediaMu.Lock()
+	defer c.mediaMu.Unlock()
+	c.videoEnabled = enabled
 }
 
 // RateLimiter tracks rate limits per client
@@ -137,13 +170,6 @@ func (c *Client) AllowCursor() bool {
 	return c.cursorRateLimiter.Allow()
 }
 
-// RoomMessage is a message to be broadcast to a room
-type RoomMessage struct {
-	RoomSlug string
-	Message  []byte
-	Exclude  string // Exclude this client ID from broadcast
-}
-
 // Message represents a WebSocket message
 type Message struct {
 	Type    string          `json:"type"`
@@ -153,23 +179,19 @@ type Message struct {
 // NewHub creates a new Hub
 func NewHub() *Hub {
 	return &Hub{
-		rooms:     make(map[string]*Room),
-		broadcast: make(chan *RoomMessage, 256),
-		done:      make(chan struct{}),
+		rooms: make(map[string]*Room),
+		done:  make(chan struct{}),
 	}
 }
 
-// Run starts the Hub's main event loop (processes broadcasts)
+// Run blocks until the hub is shut down.
+// Broadcasts are fanned out synchronously in the caller's goroutine (per-client
+// buffered send channels provide slow-client decoupling), so there is no
+// central event loop anymore — a single loop was a head-of-line bottleneck
+// where bursts of cursor messages delayed time-critical WebRTC signaling.
+// Run is kept so existing `go hub.Run()` call sites remain valid.
 func (h *Hub) Run() {
-	for {
-		select {
-		case message := <-h.broadcast:
-			h.broadcastToRoom(message)
-
-		case <-h.done:
-			return
-		}
-	}
+	<-h.done
 }
 
 func (h *Hub) registerClient(client *Client) {
@@ -187,9 +209,24 @@ func (h *Hub) registerClient(client *Client) {
 		metrics.Get().ActiveRooms.Add(1)
 	}
 
+	// If an old client with the same ID exists (e.g. page refresh), close it
+	// so its ReadPump exits cleanly. The old client's onDisconnect handler
+	// will see that it was replaced and skip cleanup.
+	if old, exists := room.Clients[client.ID]; exists {
+		log.Printf("Replacing existing client %s (%s) in room %s (reconnect)", old.ID, old.Name, client.RoomSlug)
+		old.closeOnce.Do(func() {
+			close(old.Done)
+		})
+		if old.Conn != nil {
+			old.Conn.Close()
+		}
+		// Don't increment metrics — we're replacing, not adding
+	} else {
+		// Track WebSocket connections
+		metrics.Get().ActiveWebsockets.Add(1)
+	}
+
 	room.Clients[client.ID] = client
-	// Track WebSocket connections
-	metrics.Get().ActiveWebsockets.Add(1)
 	log.Printf("Client %s (%s) joined room %s", client.ID, client.Name, client.RoomSlug)
 }
 
@@ -198,12 +235,12 @@ func (h *Hub) unregisterClient(client *Client) {
 	defer h.mu.Unlock()
 
 	if room, ok := h.rooms[client.RoomSlug]; ok {
-		if _, ok := room.Clients[client.ID]; ok {
+		// Only remove if the current client in the map is this exact instance.
+		// On page refresh, registerClient replaces the old client with a new one;
+		// when the old client's ReadPump exits and calls Unregister, we must NOT
+		// remove the replacement client.
+		if current, ok := room.Clients[client.ID]; ok && current == client {
 			delete(room.Clients, client.ID)
-			// Use sync.Once to prevent double-close panic
-			client.closeOnce.Do(func() {
-				close(client.Send)
-			})
 			// Track WebSocket disconnection
 			metrics.Get().ActiveWebsockets.Add(-1)
 			log.Printf("Client %s (%s) left room %s", client.ID, client.Name, client.RoomSlug)
@@ -215,32 +252,12 @@ func (h *Hub) unregisterClient(client *Client) {
 				metrics.Get().ActiveRooms.Add(-1)
 			}
 		}
-	}
-}
-
-func (h *Hub) broadcastToRoom(msg *RoomMessage) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	room, ok := h.rooms[msg.RoomSlug]
-	if !ok {
-		return
-	}
-
-	for id, client := range room.Clients {
-		if id == msg.Exclude {
-			continue
-		}
-
-		select {
-		case client.Send <- msg.Message:
-		default:
-			// Client's send buffer is full, close it safely
-			client.closeOnce.Do(func() {
-				close(client.Send)
-			})
-			delete(room.Clients, id)
-		}
+		// Always close the client's Done channel regardless of whether it was still current.
+		// Send is intentionally never closed — WritePump selects on Done to exit, and
+		// leaving Send open avoids send-on-closed-channel panics in broadcast/SendJSON.
+		client.closeOnce.Do(func() {
+			close(client.Done)
+		})
 	}
 }
 
@@ -254,19 +271,55 @@ func (h *Hub) Unregister(client *Client) {
 	h.unregisterClient(client)
 }
 
-// Broadcast sends a message to all clients in a room
+// Broadcast sends a message to all clients in a room.
+// The fan-out happens synchronously in the caller's goroutine: per-client
+// buffered Send channels decouple slow clients, and there is no shared
+// channel that could block forever after Shutdown.
 func (h *Hub) Broadcast(roomSlug string, message []byte, excludeID string) {
-	h.broadcast <- &RoomMessage{
-		RoomSlug: roomSlug,
-		Message:  message,
-		Exclude:  excludeID,
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if h.shutdown {
+		// No-op after shutdown; async callbacks (e.g. Pion) may still fire.
+		return
+	}
+
+	room, ok := h.rooms[roomSlug]
+	if !ok {
+		return
+	}
+
+	for id, client := range room.Clients {
+		if id == excludeID {
+			continue
+		}
+
+		select {
+		case <-client.Done:
+			// Client is already disconnecting, skip
+			continue
+		case client.Send <- message:
+		default:
+			// Client's send buffer is full — close Done so pumps exit.
+			// Do NOT delete from map here: we only hold RLock, and map
+			// mutation under RLock is a data race. unregisterClient will
+			// clean up the map entry when ReadPump exits.
+			client.closeOnce.Do(func() {
+				close(client.Done)
+			})
+			if client.Conn != nil {
+				client.Conn.Close()
+			}
+		}
 	}
 }
 
-// BroadcastJSON sends a JSON message to all clients in a room
+// BroadcastJSON sends a JSON message to all clients in a room.
+// Marshal errors are logged here because most callers ignore the return value.
 func (h *Hub) BroadcastJSON(roomSlug string, msgType string, payload interface{}, excludeID string) error {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
+		log.Printf("BroadcastJSON: failed to marshal payload for %q in room %s: %v", msgType, roomSlug, err)
 		return err
 	}
 
@@ -277,6 +330,7 @@ func (h *Hub) BroadcastJSON(roomSlug string, msgType string, payload interface{}
 
 	msgBytes, err := json.Marshal(msg)
 	if err != nil {
+		log.Printf("BroadcastJSON: failed to marshal message %q in room %s: %v", msgType, roomSlug, err)
 		return err
 	}
 
@@ -346,16 +400,39 @@ func (h *Hub) GetClient(roomSlug, clientID string) *Client {
 	return nil
 }
 
+// IsCurrentClient checks if the given client is still the active client for its ID.
+// Returns false if the client was replaced by a new connection (e.g. page refresh).
+func (h *Hub) IsCurrentClient(client *Client) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if room, ok := h.rooms[client.RoomSlug]; ok {
+		if current, ok := room.Clients[client.ID]; ok {
+			return current == client
+		}
+	}
+	return false
+}
+
 // Shutdown gracefully shuts down the hub
 func (h *Hub) Shutdown() {
-	close(h.done)
-
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	if h.shutdown {
+		return
+	}
+	h.shutdown = true
+	close(h.done)
+
 	for _, room := range h.rooms {
 		for _, client := range room.Clients {
-			client.Conn.Close()
+			client.closeOnce.Do(func() {
+				close(client.Done)
+			})
+			if client.Conn != nil {
+				client.Conn.Close()
+			}
 		}
 	}
 

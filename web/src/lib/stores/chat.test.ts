@@ -1,72 +1,28 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { createChatStore, type ChatMessage } from './chat.svelte';
 
-// We need to test the store logic without Svelte runtime
-// Extract the core logic for testing
-
-interface ChatMessage {
-    id: string;
-    participantId: string;
-    participantName: string;
-    type: 'text' | 'file';
-    content: string;
-    file?: {
-        id: string;
-        name: string;
-        mimeType: string;
-        url: string;
-        thumbnailUrl?: string;
-    };
-    timestamp: number;
-}
-
-// Test the store logic directly
-function createTestChatStore() {
-    let messages: ChatMessage[] = [];
-    let unreadCount = 0;
-    let isVisible = false;
-
-    function addMessage(msg: Omit<ChatMessage, 'id' | 'timestamp'>) {
-        const message: ChatMessage = {
-            ...msg,
-            id: crypto.randomUUID(),
-            timestamp: Date.now()
-        };
-
-        messages = [...messages, message];
-
-        if (!isVisible) {
-            unreadCount++;
-        }
-    }
-
-    function setVisible(visible: boolean) {
-        isVisible = visible;
-        if (visible) {
-            unreadCount = 0;
-        }
-    }
-
-    function clear() {
-        messages = [];
-        unreadCount = 0;
-    }
-
+function makeMessage(id: string, content: string, overrides: Partial<ChatMessage> = {}): ChatMessage {
     return {
-        get messages() { return messages; },
-        get unreadCount() { return unreadCount; },
-        get isVisible() { return isVisible; },
-        addMessage,
-        setVisible,
-        clear
+        id,
+        participantId: 'user-1',
+        participantName: 'Alice',
+        type: 'text',
+        content,
+        timestamp: Date.now(),
+        ...overrides
     };
 }
 
 describe('ChatStore', () => {
-    let store: ReturnType<typeof createTestChatStore>;
+    let store: ReturnType<typeof createChatStore>;
 
     beforeEach(() => {
-        store = createTestChatStore();
+        store = createChatStore();
         vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
     });
 
     describe('addMessage', () => {
@@ -87,6 +43,20 @@ describe('ChatStore', () => {
             expect(store.messages[0].content).toBe('Hello, world!');
             expect(store.messages[0].id).toBeDefined();
             expect(store.messages[0].timestamp).toBeGreaterThanOrEqual(beforeTime);
+        });
+
+        it('preserves a provided id and timestamp', () => {
+            store.addMessage({
+                id: 'server-id-1',
+                participantId: 'user-1',
+                participantName: 'Alice',
+                type: 'text',
+                content: 'Hello',
+                timestamp: 12345
+            });
+
+            expect(store.messages[0].id).toBe('server-id-1');
+            expect(store.messages[0].timestamp).toBe(12345);
         });
 
         it('adds a file message', () => {
@@ -164,6 +134,64 @@ describe('ChatStore', () => {
             expect(store.messages[0].content).toBe('First');
             expect(store.messages[1].content).toBe('Second');
             expect(store.messages[1].timestamp).toBeGreaterThan(store.messages[0].timestamp);
+        });
+    });
+
+    describe('loadHistory', () => {
+        it('loads history into an empty store without marking unread', () => {
+            store.loadHistory([makeMessage('m1', 'one'), makeMessage('m2', 'two')]);
+
+            expect(store.messages).toHaveLength(2);
+            expect(store.messages[0].id).toBe('m1');
+            expect(store.unreadCount).toBe(0);
+        });
+
+        it('replaces local state with server history on reconnect', () => {
+            store.loadHistory([makeMessage('m1', 'one')]);
+            store.addMessage(makeMessage('m2', 'two'));
+
+            // Reconnect: server history now includes messages that arrived
+            // during the WS outage.
+            store.loadHistory([
+                makeMessage('m1', 'one'),
+                makeMessage('m2', 'two'),
+                makeMessage('m3', 'missed during outage')
+            ]);
+
+            expect(store.messages).toHaveLength(3);
+            expect(store.messages.map(m => m.id)).toEqual(['m1', 'm2', 'm3']);
+        });
+
+        it('is authoritative: drops local messages the server does not have', () => {
+            store.loadHistory([makeMessage('m1', 'one')]);
+            store.addMessage(makeMessage('local-only', 'ghost'));
+
+            store.loadHistory([makeMessage('m1', 'one'), makeMessage('m2', 'two')]);
+
+            expect(store.messages.map(m => m.id)).toEqual(['m1', 'm2']);
+        });
+
+        it('counts previously-unseen messages as unread on reconnect when hidden', () => {
+            store.loadHistory([makeMessage('m1', 'one')]);
+            expect(store.unreadCount).toBe(0);
+
+            store.loadHistory([
+                makeMessage('m1', 'one'),
+                makeMessage('m2', 'two'),
+                makeMessage('m3', 'three')
+            ]);
+
+            expect(store.unreadCount).toBe(2);
+        });
+
+        it('does not count reconnect messages as unread when panel is visible', () => {
+            store.loadHistory([makeMessage('m1', 'one')]);
+            store.setVisible(true);
+
+            store.loadHistory([makeMessage('m1', 'one'), makeMessage('m2', 'two')]);
+
+            expect(store.unreadCount).toBe(0);
+            expect(store.messages).toHaveLength(2);
         });
     });
 

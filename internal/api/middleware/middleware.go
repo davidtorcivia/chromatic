@@ -492,6 +492,16 @@ func RoomCreationRateLimiter(trustedProxies []string) func(http.Handler) http.Ha
 	})
 }
 
+// LoginRateLimiter creates a rate limiter for admin login attempts
+// (brute-force protection): 5 attempts per minute per IP
+func LoginRateLimiter(trustedProxies []string) func(http.Handler) http.Handler {
+	return EndpointRateLimiter(EndpointRateLimiterConfig{
+		RequestsPerWindow: 5,           // 5 attempts
+		WindowDuration:    time.Minute, // per minute
+		TrustedProxies:    trustedProxies,
+	})
+}
+
 // FileUploadRateLimiter creates a rate limiter for file uploads
 // 10 uploads per minute per IP
 func FileUploadRateLimiter(trustedProxies []string) func(http.Handler) http.Handler {
@@ -518,15 +528,20 @@ func SecurityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 
 		// Content Security Policy
-		// Note: WebRTC requires 'connect-src' for ws:// and turn:// protocols
+		// Notes:
+		// - connect-src 'self' covers same-origin WebSocket in all modern
+		//   browsers; ws:/wss: wildcards would allow exfiltration to any
+		//   WebSocket origin. WebRTC (turn:) is not governed by connect-src.
+		// - script-src keeps 'unsafe-inline' because SvelteKit's hydration
+		//   inline script requires it; removing it would break the app.
 		w.Header().Set("Content-Security-Policy",
 			"default-src 'self'; "+
 				"script-src 'self' 'unsafe-inline'; "+
-				"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "+
-				"font-src 'self' https://fonts.gstatic.com; "+
+				"style-src 'self' 'unsafe-inline'; "+
+				"font-src 'self'; "+
 				"img-src 'self' data: blob:; "+
 				"media-src 'self' blob:; "+
-				"connect-src 'self' ws: wss:; "+
+				"connect-src 'self'; "+
 				"frame-ancestors 'none';")
 
 		// Permissions Policy (limit browser features)

@@ -63,14 +63,15 @@ func (c *Client) WritePump() {
 
 	for {
 		select {
-		case message, ok := <-c.Send:
-			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if !ok {
-				// Hub closed the channel
-				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
+		case <-c.Done:
+			// Client is shutting down — send close frame and exit.
+			// Send channel is intentionally never closed to avoid
+			// send-on-closed-channel panics in concurrent producers.
+			c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+			return
 
+		case message := <-c.Send:
+			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
 				return
 			}
@@ -101,7 +102,11 @@ func (c *Client) SendJSON(msgType string, payload interface{}) error {
 		return err
 	}
 
+	// Single select avoids the TOCTOU race of check-then-send.
+	// Send channel is never closed, so this cannot panic.
 	select {
+	case <-c.Done:
+		// Client disconnected, don't send
 	case c.Send <- msgBytes:
 	default:
 		// Buffer full, message dropped
