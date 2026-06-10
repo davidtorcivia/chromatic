@@ -1141,6 +1141,15 @@ func TestRoomHandler_AdminJoin(t *testing.T) {
 	})
 }
 
+// capTestHub is a stub hub for capacity tests: the participant cap counts
+// LIVE connections (hub clients), not historical participant rows.
+type capTestHub struct{ count int }
+
+func (s *capTestHub) BroadcastJSON(string, string, interface{}, string) error { return nil }
+func (s *capTestHub) SendToJSON(string, string, string, interface{}) error    { return nil }
+func (s *capTestHub) BroadcastToAdminsJSON(string, string, interface{}) error { return nil }
+func (s *capTestHub) RoomClientCount(string) int                              { return s.count }
+
 // TestRoomHandler_ParticipantCap tests the per-room participant limit
 func TestRoomHandler_ParticipantCap(t *testing.T) {
 	db, cleanup := database.NewTestDB(t)
@@ -1151,6 +1160,8 @@ func TestRoomHandler_ParticipantCap(t *testing.T) {
 		MaxParticipantsPerRoom: 2,
 	}
 	handler := NewRoomHandler(db, cfg, roomsTestTokenSecret)
+	hub := &capTestHub{}
+	handler.SetHub(hub)
 
 	// Create a room
 	createBody := map[string]interface{}{
@@ -1178,21 +1189,30 @@ func TestRoomHandler_ParticipantCap(t *testing.T) {
 		return rr
 	}
 
-	// First two joins succeed
+	// First two joins succeed (0 then 1 live connection)
 	for i, name := range []string{"User One", "User Two"} {
+		hub.count = i
 		rr := join(t, name)
 		if rr.Code != http.StatusOK {
 			t.Fatalf("join %d: expected status %d, got %d: %s", i+1, http.StatusOK, rr.Code, rr.Body.String())
 		}
 	}
 
-	// Third join is rejected with 503
+	// With the room at capacity (2 live connections), the next join is rejected
+	hub.count = 2
 	rr := join(t, "User Three")
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Errorf("expected status %d when room is full, got %d", http.StatusServiceUnavailable, rr.Code)
 	}
 	if !strings.Contains(rr.Body.String(), "Room is full") {
 		t.Errorf("expected 'Room is full' in response, got %q", rr.Body.String())
+	}
+
+	// A leave/rejoin churn must NOT consume capacity: even after many
+	// historical participant rows, joins succeed while live count is low.
+	hub.count = 1
+	if rr := join(t, "Returning User"); rr.Code != http.StatusOK {
+		t.Errorf("expected rejoin to succeed with free capacity, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -1207,6 +1227,8 @@ func TestRoomHandler_PerRoomParticipantLimit(t *testing.T) {
 		MaxParticipantsPerRoom: 20, // global default is higher than the room limit
 	}
 	handler := NewRoomHandler(db, cfg, roomsTestTokenSecret)
+	hub := &capTestHub{}
+	handler.SetHub(hub)
 
 	// Create a room with a per-room limit of 1
 	createBody := map[string]interface{}{
@@ -1241,6 +1263,7 @@ func TestRoomHandler_PerRoomParticipantLimit(t *testing.T) {
 	}
 
 	// Second join is rejected despite the global cap of 20
+	hub.count = 1
 	rr := join(t, "User Two")
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Errorf("expected status %d when room is full, got %d", http.StatusServiceUnavailable, rr.Code)

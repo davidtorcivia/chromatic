@@ -483,6 +483,19 @@ func (h *Hub) GetRoomClients(roomSlug string) []*Client {
 	return clients
 }
 
+// RoomClientCount returns the number of currently connected clients in a
+// room. Used for the join-time participant cap — unlike the participants
+// table (which keeps a row per historical join), this reflects who is
+// actually in the room right now.
+func (h *Hub) RoomClientCount(roomSlug string) int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if room, ok := h.rooms[roomSlug]; ok {
+		return len(room.Clients)
+	}
+	return 0
+}
+
 // GetClient returns a specific client
 func (h *Hub) GetClient(roomSlug, clientID string) *Client {
 	h.mu.RLock()

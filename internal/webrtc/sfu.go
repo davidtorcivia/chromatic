@@ -222,6 +222,17 @@ func NewSFU(cfg *config.Config) (*SFU, error) {
 		}
 	}
 
+	// Header extensions: sdes:mid is REQUIRED for reliable BUNDLE demuxing
+	// in Chrome. Without it Chrome falls back to payload-type/SSRC matching,
+	// which breaks once multiple video m-lines exist ("Failed to apply
+	// demuxer criteria" on Chrome's own re-offers) and can leave the video
+	// receiver black while audio plays. Firefox/Safari tolerate its absence.
+	for _, kind := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
+		if err := m.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{URI: "urn:ietf:params:rtp-hdrext:sdes:mid"}, kind); err != nil {
+			return nil, fmt.Errorf("failed to register MID header extension: %w", err)
+		}
+	}
+
 	// VP8 for screen sharing (getDisplayMedia typically uses VP8/VP9)
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{

@@ -131,6 +131,7 @@ type RoomHandler struct {
 		BroadcastJSON(roomSlug string, msgType string, payload interface{}, excludeID string) error
 		SendToJSON(roomSlug, clientID, msgType string, payload interface{}) error
 		BroadcastToAdminsJSON(roomSlug, msgType string, payload interface{}) error
+		RoomClientCount(roomSlug string) int
 	}
 	onRoomLive          func(roomSlug string) // Called when room goes live
 	tokenManager        *TokenManager         // For generating signed WebSocket tokens
@@ -197,6 +198,7 @@ func (h *RoomHandler) SetHub(hub interface {
 	BroadcastJSON(roomSlug string, msgType string, payload interface{}, excludeID string) error
 	SendToJSON(roomSlug, clientID, msgType string, payload interface{}) error
 	BroadcastToAdminsJSON(roomSlug, msgType string, payload interface{}) error
+	RoomClientCount(roomSlug string) int
 }) {
 	h.hub = hub
 }
@@ -1129,12 +1131,10 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 	if roomMaxParticipants != nil && *roomMaxParticipants > 0 {
 		maxParticipants = *roomMaxParticipants
 	}
-	var participantCount int
-	if err := h.db.QueryRow(`SELECT COUNT(*) FROM participants WHERE room_id = ?`, roomID).Scan(&participantCount); err != nil {
-		http.Error(w, "Failed to join room", http.StatusInternalServerError)
-		return
-	}
-	if participantCount >= maxParticipants {
+	// Count people actually connected right now, not historical participant
+	// rows — every rejoin inserts a new row, so the old COUNT(*) marked a
+	// room "full" after enough leave/rejoin churn even when nearly empty.
+	if h.hub != nil && h.hub.RoomClientCount(slug) >= maxParticipants {
 		http.Error(w, "Room is full", http.StatusServiceUnavailable)
 		return
 	}
