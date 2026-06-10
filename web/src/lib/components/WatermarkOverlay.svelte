@@ -1,6 +1,13 @@
 <script lang="ts">
     import { onMount, onDestroy } from "svelte";
 
+    interface WatermarkBounds {
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+    }
+
     interface Props {
         mode: "none" | "text" | "logo" | "both";
         text?: string;
@@ -15,6 +22,17 @@
         roomName?: string;
         logoSize?: number; // Size in pixels (default 80)
         logoPadding?: number; // Padding from edges (default 20)
+        // Fractional center (0-1) of the watermark within the video.
+        // null/undefined = legacy built-in placement (text bottom-right,
+        // logo at logoPosition).
+        posX?: number | null;
+        posY?: number | null;
+        // Size multiplier applied to the base font size / logo size.
+        scale?: number;
+        // Reports the pixel bounds of the drawn watermark after each draw
+        // (null when nothing was drawn). Used by the admin preview for
+        // drag-to-position hit testing and the outline.
+        onBoundsChange?: (bounds: WatermarkBounds | null) => void;
     }
 
     let {
@@ -27,6 +45,10 @@
         roomName = "",
         logoSize = 80,
         logoPadding = 20,
+        posX = null,
+        posY = null,
+        scale = 1,
+        onBoundsChange,
     }: Props = $props();
 
     let canvasEl = $state<HTMLCanvasElement | null>(null);
@@ -63,18 +85,14 @@
             );
     }
 
-    // Calculate logo position based on logoPosition prop
-    function getLogoPosition(
+    // Calculate logo corner position based on logoPosition prop (legacy
+    // placement, used when no custom posX/posY is set)
+    function getLogoCornerPosition(
         canvasWidth: number,
         canvasHeight: number,
-        imgWidth: number,
-        imgHeight: number
+        scaledWidth: number,
+        scaledHeight: number,
     ): { x: number; y: number } {
-        // Scale image to fit within logoSize while maintaining aspect ratio
-        const scale = Math.min(logoSize / imgWidth, logoSize / imgHeight);
-        const scaledWidth = imgWidth * scale;
-        const scaledHeight = imgHeight * scale;
-
         let x: number;
         let y: number;
 
@@ -111,44 +129,58 @@
         if (!parent) return;
 
         // Match parent size
-        canvasEl.width = parent.clientWidth;
-        canvasEl.height = parent.clientHeight;
+        const w = parent.clientWidth;
+        const h = parent.clientHeight;
+        canvasEl.width = w;
+        canvasEl.height = h;
 
-        ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+        ctx.clearRect(0, 0, w, h);
         ctx.globalAlpha = opacity;
 
-        // Draw text watermark (bottom-right corner)
-        if ((mode === "text" || mode === "both") && text) {
-            const processedText = processText(text);
-            ctx.font = "14px 'Work Sans', sans-serif";
-            ctx.fillStyle = "white";
-            ctx.textAlign = "right";
-            ctx.textBaseline = "bottom";
-            ctx.shadowColor = "rgba(0, 0, 0, 0.8)";
-            ctx.shadowBlur = 2;
+        // Effective size multiplier (defensive clamp, mirrors server limits)
+        const effScale = Math.min(3, Math.max(0.25, scale ?? 1));
+        const fontSize = 14 * effScale;
+        const effLogoSize = logoSize * effScale;
 
-            ctx.fillText(
-                processedText,
-                canvasEl.width - logoPadding,
-                canvasEl.height - logoPadding,
+        // Custom fractional center position (null = legacy placement)
+        const hasCustomPos = posX != null && posY != null;
+        const cx = hasCustomPos ? (posX as number) * w : 0;
+        const cy = hasCustomPos ? (posY as number) * h : 0;
+
+        // Union of drawn element bounds (reported via onBoundsChange)
+        let bounds: WatermarkBounds | null = null;
+        const addBounds = (x: number, y: number, bw: number, bh: number) => {
+            if (!bounds) {
+                bounds = { x, y, width: bw, height: bh };
+                return;
+            }
+            const x2 = Math.max(bounds.x + bounds.width, x + bw);
+            const y2 = Math.max(bounds.y + bounds.height, y + bh);
+            bounds.x = Math.min(bounds.x, x);
+            bounds.y = Math.min(bounds.y, y);
+            bounds.width = x2 - bounds.x;
+            bounds.height = y2 - bounds.y;
+        };
+
+        // Logo metrics (needed before drawing text so "both" mode can stack
+        // the text below the logo at a custom position)
+        const drawLogo = (mode === "logo" || mode === "both") && logoImage && logoLoaded;
+        let scaledLogoWidth = 0;
+        let scaledLogoHeight = 0;
+        if (drawLogo && logoImage) {
+            const fit = Math.min(
+                effLogoSize / logoImage.width,
+                effLogoSize / logoImage.height,
             );
+            scaledLogoWidth = logoImage.width * fit;
+            scaledLogoHeight = logoImage.height * fit;
         }
 
         // Draw logo watermark
-        if ((mode === "logo" || mode === "both") && logoImage && logoLoaded) {
-            const scale = Math.min(
-                logoSize / logoImage.width,
-                logoSize / logoImage.height
-            );
-            const scaledWidth = logoImage.width * scale;
-            const scaledHeight = logoImage.height * scale;
-
-            const pos = getLogoPosition(
-                canvasEl.width,
-                canvasEl.height,
-                logoImage.width,
-                logoImage.height
-            );
+        if (drawLogo && logoImage) {
+            const pos = hasCustomPos
+                ? { x: cx - scaledLogoWidth / 2, y: cy - scaledLogoHeight / 2 }
+                : getLogoCornerPosition(w, h, scaledLogoWidth, scaledLogoHeight);
 
             // Add subtle shadow for visibility on any background
             ctx.shadowColor = "rgba(0, 0, 0, 0.5)";
@@ -156,7 +188,8 @@
             ctx.shadowOffsetX = 1;
             ctx.shadowOffsetY = 1;
 
-            ctx.drawImage(logoImage, pos.x, pos.y, scaledWidth, scaledHeight);
+            ctx.drawImage(logoImage, pos.x, pos.y, scaledLogoWidth, scaledLogoHeight);
+            addBounds(pos.x, pos.y, scaledLogoWidth, scaledLogoHeight);
 
             // Reset shadow
             ctx.shadowColor = "transparent";
@@ -164,6 +197,45 @@
             ctx.shadowOffsetX = 0;
             ctx.shadowOffsetY = 0;
         }
+
+        // Draw text watermark (legacy: bottom-right corner)
+        if ((mode === "text" || mode === "both") && text) {
+            const processedText = processText(text);
+            ctx.font = `${fontSize}px 'Work Sans', sans-serif`;
+            ctx.fillStyle = "white";
+            ctx.shadowColor = "rgba(0, 0, 0, 0.8)";
+            ctx.shadowBlur = 2;
+
+            const textWidth = ctx.measureText(processedText).width;
+            const textHeight = fontSize * 1.2;
+
+            if (hasCustomPos) {
+                ctx.textAlign = "center";
+                ctx.textBaseline = "middle";
+                // In "both" mode the text sits just below the logo so the
+                // pair moves as one unit around the shared center.
+                const textCy = drawLogo
+                    ? cy + scaledLogoHeight / 2 + textHeight / 2 + 4 * effScale
+                    : cy;
+                ctx.fillText(processedText, cx, textCy);
+                addBounds(cx - textWidth / 2, textCy - textHeight / 2, textWidth, textHeight);
+            } else {
+                ctx.textAlign = "right";
+                ctx.textBaseline = "bottom";
+                ctx.fillText(processedText, w - logoPadding, h - logoPadding);
+                addBounds(
+                    w - logoPadding - textWidth,
+                    h - logoPadding - textHeight,
+                    textWidth,
+                    textHeight,
+                );
+            }
+
+            ctx.shadowColor = "transparent";
+            ctx.shadowBlur = 0;
+        }
+
+        onBoundsChange?.(bounds);
     }
 
     function setupTamperDetection() {

@@ -6,7 +6,8 @@
     import { session } from "$lib/stores/session.svelte";
     import { chatStore, type ChatMessage } from "$lib/stores/chat.svelte";
     import { unlockAudio, getAudioContext, closeAudioContext } from "$lib/audio/context";
-    import { WebRTCManager } from "$lib/webrtc/manager";
+    import { WebRTCManager, getStoredMicDeviceId, storeMicDeviceId } from "$lib/webrtc/manager";
+    import { deriveStreamOverlayState } from "$lib/video/stream-overlay";
     import { AudioDuckingManager } from "$lib/audio/ducking";
     import LaserPointerOverlay from "$lib/components/LaserPointerOverlay.svelte";
     import ChatPanel from "$lib/components/ChatPanel.svelte";
@@ -53,6 +54,42 @@
     let streamError = $state<string | null>(null);
     let needsPlayClick = $state(false); // Autoplay fallback
     let streamPaused = $state(false); // Stream temporarily disconnected
+    // True once the video element fires 'playing' — the only reliable signal
+    // that frames are rendering. play()'s promise can stay pending forever on
+    // a stream waiting for a keyframe (BUG 1), so we never gate UI on it.
+    let isVideoPlaying = $state(false);
+    // Keyframe nudge: if tracks are bound but the video hasn't started
+    // playing shortly after, request a resync (PLI). The server's single PLI
+    // at subscriber-creation can be lost (sent before ICE finished), leaving
+    // a reloading viewer stuck waiting for a decodable keyframe.
+    let playNudgeTimer: ReturnType<typeof setTimeout> | null = null;
+    let playNudgeAttempts = 0;
+    const PLAY_NUDGE_MAX_ATTEMPTS = 3;
+    const PLAY_NUDGE_INTERVAL_MS = 2500;
+    // Controls auto-hide (ITEM 3)
+    let isPointerOverControls = $state(false);
+    let controlsHaveFocus = $state(false);
+    // Audio settings popover (ITEM 4)
+    let showAudioSettings = $state(false);
+    let audioSettingsBtnEl = $state<HTMLButtonElement | null>(null);
+    let audioSettingsPopoverEl = $state<HTMLDivElement | null>(null);
+    let audioInputs = $state<MediaDeviceInfo[]>([]);
+    let audioOutputs = $state<MediaDeviceInfo[]>([]);
+    let activeMicId = $state<string | null>(null);
+    let selectedSpeakerId = $state<string | null>(null);
+    let micSwitchPending = $state(false);
+    const SPEAKER_DEVICE_STORAGE_KEY = "chromatic_speaker_device";
+    const supportsSinkSelection =
+        typeof HTMLMediaElement !== "undefined" &&
+        "setSinkId" in HTMLMediaElement.prototype;
+    // Chat notification cues (ITEM 5)
+    let chatPulseActive = $state(false);
+    let chatPulseTimer: ReturnType<typeof setTimeout> | null = null;
+    let chatToast = $state<{ id: string; name: string; text: string } | null>(null);
+    let chatToastTimer: ReturnType<typeof setTimeout> | null = null;
+    const prefersReducedMotion =
+        typeof window !== "undefined" &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     let isLaserEnabled = $state(false);
     let showParticipantList = $state(false);
     let speakingParticipants = $state<Set<string>>(new Set());
@@ -315,7 +352,9 @@
         });
 
         session.onMessage("chat:message", (payload: unknown) => {
-            chatStore.addMessage(payload as ChatMessage);
+            const msg = payload as ChatMessage;
+            chatStore.addMessage(msg);
+            notifyChatMessage(msg);
         });
 
         // After a successful WS reconnect the server sends a fresh
@@ -361,6 +400,20 @@
         session.connect(slug, sessionData!.token, participantName);
 
         window.addEventListener("chromatic:tampering", handleTampering);
+
+        // Audio device plumbing (ITEM 4): restore the persisted speaker choice
+        // and keep the device lists fresh when hardware is (un)plugged.
+        try {
+            selectedSpeakerId = localStorage.getItem(SPEAKER_DEVICE_STORAGE_KEY);
+        } catch {
+            selectedSpeakerId = null;
+        }
+        if (selectedSpeakerId && supportsSinkSelection) {
+            void applySpeakerDevice(selectedSpeakerId);
+        }
+        navigator.mediaDevices?.addEventListener?.("devicechange", refreshAudioDevices);
+        void refreshAudioDevices();
+
         startControlsTimer();
     });
 
@@ -373,10 +426,19 @@
         session.disconnect();
         closeAudioContext();
         window.removeEventListener("chromatic:tampering", handleTampering);
+        navigator.mediaDevices?.removeEventListener?.("devicechange", refreshAudioDevices);
         clearMicPromptTimer();
         if (controlsTimer) {
             clearTimeout(controlsTimer);
             controlsTimer = null;
+        }
+        if (chatPulseTimer) {
+            clearTimeout(chatPulseTimer);
+            chatPulseTimer = null;
+        }
+        if (chatToastTimer) {
+            clearTimeout(chatToastTimer);
+            chatToastTimer = null;
         }
     });
 
@@ -495,20 +557,16 @@
 
             videoElement.srcObject = event.streams[0];
 
-            // Attempt autoplay (muted for browser compliance)
-            const playPromise = videoElement.play();
-            if (playPromise) {
-                playPromise.then(() => {
-                    hasStream = true;
-                    needsPlayClick = false;
-                }).catch(() => {
-                    // Autoplay blocked - show play button
-                    hasStream = true;
-                    needsPlayClick = true;
-                });
-            } else {
-                hasStream = true;
-            }
+            // Tracks have arrived and are bound — mark the stream present NOW.
+            // BUG 1: this used to be set only inside play()'s promise
+            // callbacks, but that promise never settles while the element is
+            // waiting for a decodable keyframe (common right after a reload,
+            // when there is no user gesture and the initial PLI was lost), so
+            // viewers sat on the waiting overlay despite a fully negotiated
+            // connection. Whether frames are rendering is tracked separately
+            // via the element's 'playing' event (isVideoPlaying).
+            hasStream = true;
+            attemptAutoplay();
 
             if (!audioDuckingManager) {
                 audioDuckingManager = new AudioDuckingManager(videoElement, isAdmin);
@@ -524,6 +582,68 @@
             streamError = "Failed to display stream. Please try refreshing the page.";
             hasStream = false;
         }
+    }
+
+    // Try to start playback without a user gesture. If the autoplay policy
+    // rejects (most likely unmuted after a reload), retry muted; if even
+    // muted playback is blocked, surface the tap-to-play card — never the
+    // "waiting for the host" copy.
+    function attemptAutoplay() {
+        const el = videoElement;
+        if (!el) return;
+        el.play()
+            .then(() => {
+                needsPlayClick = false;
+            })
+            .catch(() => {
+                if (!el.muted) {
+                    isMuted = true;
+                    el.muted = true;
+                    el.play()
+                        .then(() => {
+                            needsPlayClick = false;
+                        })
+                        .catch(() => {
+                            needsPlayClick = true;
+                        });
+                } else {
+                    needsPlayClick = true;
+                }
+            });
+        scheduleKeyframeNudge();
+    }
+
+    // The 'playing' event is the ground truth for "frames are rendering".
+    function handleVideoPlaying() {
+        isVideoPlaying = true;
+        needsPlayClick = false;
+        clearKeyframeNudge();
+    }
+
+    // If the stream is bound but never starts rendering, the decoder is most
+    // likely waiting on a keyframe that was lost in flight — ask the
+    // publisher for one (signal:resync → PLI), a few times with backoff.
+    function scheduleKeyframeNudge() {
+        if (playNudgeTimer) return;
+        playNudgeAttempts = 0;
+        const tick = () => {
+            playNudgeTimer = null;
+            if (isVideoPlaying || !webrtcManager) return;
+            if (playNudgeAttempts >= PLAY_NUDGE_MAX_ATTEMPTS) return;
+            playNudgeAttempts++;
+            console.log(`Video not rendering yet, requesting keyframe (attempt ${playNudgeAttempts}/${PLAY_NUDGE_MAX_ATTEMPTS})`);
+            webrtcManager.requestResync();
+            playNudgeTimer = setTimeout(tick, PLAY_NUDGE_INTERVAL_MS * playNudgeAttempts);
+        };
+        playNudgeTimer = setTimeout(tick, PLAY_NUDGE_INTERVAL_MS);
+    }
+
+    function clearKeyframeNudge() {
+        if (playNudgeTimer) {
+            clearTimeout(playNudgeTimer);
+            playNudgeTimer = null;
+        }
+        playNudgeAttempts = 0;
     }
 
     function handlePlayClick() {
@@ -791,6 +911,9 @@
             webrtcManager = null;
         }
         hasStream = false;
+        isVideoPlaying = false;
+        needsPlayClick = false;
+        clearKeyframeNudge();
         currentRtt = null;
         initialOfferHandled = false;
         micAutoEnablePending = false;
@@ -818,22 +941,184 @@
         goto(`/room/${slug}`);
     }
 
+    // Controls auto-hide (ITEM 3): idle for CONTROLS_HIDE_DELAY_MS with the
+    // cursor away from the bars fades them out fully; any pointer movement or
+    // touch brings them back. They never hide while the cursor is over a bar,
+    // a control has keyboard focus, a popover (volume / participants / audio
+    // settings) is open, or chat is open.
+    const CONTROLS_HIDE_DELAY_MS = 3000;
+
     function startControlsTimer() {
         if (controlsTimer) clearTimeout(controlsTimer);
         isControlsVisible = true;
         controlsTimer = setTimeout(() => {
-            if (!showParticipantList) {
+            controlsTimer = null;
+            if (!controlsPinned) {
                 isControlsVisible = false;
             }
-        }, 4000);
+        }, CONTROLS_HIDE_DELAY_MS);
     }
 
     function handleMouseMove() {
         startControlsTimer();
     }
 
+    function handleBarsPointerEnter() {
+        isPointerOverControls = true;
+    }
+
+    function handleBarsPointerLeave() {
+        isPointerOverControls = false;
+    }
+
+    // Keyboard focus on any control reveals (and pins) the bars — tab users
+    // must never have the control they're on fade away under them.
+    function handleControlsFocusIn() {
+        controlsHaveFocus = true;
+    }
+
+    function handleControlsFocusOut(e: FocusEvent) {
+        const container = e.currentTarget as HTMLElement;
+        const next = e.relatedTarget as Node | null;
+        if (!next || !container.contains(next)) {
+            controlsHaveFocus = false;
+        }
+    }
+
     function toggleChat() {
         isChatOpen = !isChatOpen;
+        if (isChatOpen) dismissChatToast();
+    }
+
+    // Chat notification cues (ITEM 5): pulse the chat button and show a
+    // transient toast for messages that arrive while the panel is closed.
+    function notifyChatMessage(msg: ChatMessage) {
+        if (isChatOpen) return;
+        if (msg.participantId === sessionData?.participantId) return;
+
+        // Retrigger the pulse animation even when messages arrive back-to-back.
+        if (!prefersReducedMotion) {
+            chatPulseActive = false;
+            requestAnimationFrame(() => {
+                chatPulseActive = true;
+            });
+            if (chatPulseTimer) clearTimeout(chatPulseTimer);
+            chatPulseTimer = setTimeout(() => {
+                chatPulseActive = false;
+                chatPulseTimer = null;
+            }, 700);
+        }
+
+        const raw =
+            msg.type === "file"
+                ? `Sent a file: ${msg.file?.name ?? "file"}`
+                : msg.content;
+        const text = raw.length > 60 ? `${raw.slice(0, 60)}…` : raw;
+        chatToast = { id: msg.id || crypto.randomUUID(), name: msg.participantName, text };
+        if (chatToastTimer) clearTimeout(chatToastTimer);
+        chatToastTimer = setTimeout(() => {
+            chatToast = null;
+            chatToastTimer = null;
+        }, 3000);
+    }
+
+    function dismissChatToast() {
+        chatToast = null;
+        if (chatToastTimer) {
+            clearTimeout(chatToastTimer);
+            chatToastTimer = null;
+        }
+    }
+
+    function openChatFromToast() {
+        dismissChatToast();
+        isChatOpen = true;
+    }
+
+    // Audio settings (ITEM 4)
+    async function refreshAudioDevices() {
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            audioInputs = devices.filter((d) => d.kind === "audioinput" && d.deviceId);
+            audioOutputs = devices.filter((d) => d.kind === "audiooutput" && d.deviceId);
+        } catch (err) {
+            console.warn("Failed to enumerate audio devices:", err);
+        }
+    }
+
+    async function toggleAudioSettings() {
+        showAudioSettings = !showAudioSettings;
+        if (showAudioSettings) {
+            await refreshAudioDevices();
+            // Reflect what's actually capturing (persisted choice may have
+            // fallen back to the default if the device was unplugged).
+            activeMicId =
+                webrtcManager?.getCurrentMicDeviceId() ?? getStoredMicDeviceId();
+        }
+    }
+
+    async function selectMicDevice(deviceId: string) {
+        if (!webrtcManager || micSwitchPending || deviceId === activeMicId) return;
+        micSwitchPending = true;
+        try {
+            const ok = await webrtcManager.setMicDevice(deviceId);
+            if (!ok) {
+                console.warn("Could not switch to the selected microphone");
+                return;
+            }
+            // setMicDevice acquired the mic, so permission is granted even if
+            // the auto-request flow hadn't completed yet.
+            hasMicPermission = true;
+            activeMicId = webrtcManager.getCurrentMicDeviceId() ?? deviceId;
+            storeMicDeviceId(deviceId);
+            // Labels become available after the first successful capture.
+            await refreshAudioDevices();
+        } finally {
+            micSwitchPending = false;
+        }
+    }
+
+    async function selectSpeakerDevice(deviceId: string) {
+        selectedSpeakerId = deviceId;
+        try {
+            localStorage.setItem(SPEAKER_DEVICE_STORAGE_KEY, deviceId);
+        } catch {
+            // Storage unavailable — the in-session choice still applies.
+        }
+        await applySpeakerDevice(deviceId);
+    }
+
+    // Route program audio (the stream video element) and voice chat (played
+    // through the shared AudioContext) to the chosen output. Only reachable
+    // where setSinkId exists (Chromium); the section is hidden elsewhere.
+    async function applySpeakerDevice(deviceId: string) {
+        if (!supportsSinkSelection) return;
+        try {
+            if (videoElement && "setSinkId" in videoElement) {
+                await (
+                    videoElement as HTMLMediaElement & {
+                        setSinkId(id: string): Promise<void>;
+                    }
+                ).setSinkId(deviceId);
+            }
+            const ctx = await getAudioContext();
+            const sinkCtx = ctx as AudioContext & {
+                setSinkId?: (id: string) => Promise<void>;
+            };
+            if (typeof sinkCtx.setSinkId === "function") {
+                await sinkCtx.setSinkId(deviceId);
+            }
+        } catch (err) {
+            console.warn("Failed to apply speaker device:", err);
+        }
+    }
+
+    // Request mic permission from the settings popover so device labels
+    // populate (browsers hide labels until a capture has been granted).
+    async function requestMicForLabels() {
+        await retryMicConnection();
+        await refreshAudioDevices();
+        activeMicId = webrtcManager?.getCurrentMicDeviceId() ?? getStoredMicDeviceId();
     }
 
     function toggleParticipantList() {
@@ -952,7 +1237,9 @@
                 toggleLaser();
                 break;
             case "escape":
-                if (showVolumeControls) {
+                if (showAudioSettings) {
+                    showAudioSettings = false;
+                } else if (showVolumeControls) {
                     showVolumeControls = false;
                 } else if (showParticipantList) {
                     showParticipantList = false;
@@ -963,12 +1250,22 @@
         }
     }
 
-    // Close the volume popover on click/tap outside it.
+    // Close the volume / audio-settings popovers on click/tap outside them.
     function handleWindowPointerDown(e: PointerEvent) {
-        if (!showVolumeControls) return;
         const target = e.target as Node;
-        if (volumePopoverEl?.contains(target) || soundBtnEl?.contains(target)) return;
-        showVolumeControls = false;
+        if (showVolumeControls) {
+            if (!volumePopoverEl?.contains(target) && !soundBtnEl?.contains(target)) {
+                showVolumeControls = false;
+            }
+        }
+        if (showAudioSettings) {
+            if (
+                !audioSettingsPopoverEl?.contains(target) &&
+                !audioSettingsBtnEl?.contains(target)
+            ) {
+                showAudioSettings = false;
+            }
+        }
     }
 
     // Touch: any tap brings the controls back.
@@ -1026,6 +1323,49 @@
             participants.map((p: { id: string; color: string }) => [p.id, p.color])
         ) as Record<string, string>
     );
+
+    // Explicit overlay state machine (BUG 1). All inputs feed one pure,
+    // tested function; "live" derives from room status OR track arrival so a
+    // reloading/late-joining viewer is never stuck on the waiting copy.
+    let overlayState = $derived(
+        deriveStreamOverlayState({
+            streamError,
+            connectionLost,
+            reconnecting: isReconnecting,
+            needsPlayClick,
+            streamPaused,
+            roomLive: isLive,
+            hasStream,
+            isVideoPlaying
+        })
+    );
+
+    // Controls stay visible while any of these hold (ITEM 3).
+    let controlsPinned = $derived(
+        isPointerOverControls ||
+            controlsHaveFocus ||
+            showVolumeControls ||
+            showParticipantList ||
+            showAudioSettings ||
+            isChatOpen
+    );
+
+    // While pinned, cancel the hide countdown; when unpinned, restart it.
+    $effect(() => {
+        if (controlsPinned) {
+            if (controlsTimer) {
+                clearTimeout(controlsTimer);
+                controlsTimer = null;
+            }
+            isControlsVisible = true;
+        } else {
+            startControlsTimer();
+        }
+    });
+
+    // Device labels are empty until the browser has granted a capture —
+    // used to show the permission hint in the audio settings popover.
+    let micLabelsAvailable = $derived(audioInputs.some((d) => d.label !== ""));
 
     // Move focus into the participant list when it opens (Esc closes it via
     // the global keyboard handler).
@@ -1094,7 +1434,13 @@
         {/if}
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div class="video-container" onpointerdown={handleVideoPointerDown}>
-            <video bind:this={videoElement} autoplay playsinline muted={isMuted}>
+            <video
+                bind:this={videoElement}
+                autoplay
+                playsinline
+                muted={isMuted}
+                onplaying={handleVideoPlaying}
+            >
                 <track kind="captions" />
             </video>
 
@@ -1109,6 +1455,9 @@
                     logoUrl={roomState.watermarkLogoUrl}
                     logoPosition={roomState.watermarkLogoPosition || 'bottom-right'}
                     opacity={roomState.watermarkOpacity ?? 0.3}
+                    posX={roomState.watermarkPosX ?? null}
+                    posY={roomState.watermarkPosY ?? null}
+                    scale={roomState.watermarkScale ?? 1}
                     {participantName}
                     roomName={roomState?.name || ""}
                 />
@@ -1117,7 +1466,7 @@
 
         <!-- Status overlays: dim layer never captures input, only the inner
              buttons are interactive, and the controls layer stacks above. -->
-        {#if needsPlayClick}
+        {#if overlayState === 'needs-click'}
             <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
                 <div class="stream-card">
                     <button class="play-btn" aria-label="Play stream" onclick={handlePlayClick}>
@@ -1126,7 +1475,7 @@
                     <p>Tap to play stream</p>
                 </div>
             </div>
-        {:else if streamError}
+        {:else if overlayState === 'error'}
             <div class="stream-status-overlay error" transition:fade={{ duration: 150 }}>
                 <div class="stream-card">
                     <div class="error-icon">!</div>
@@ -1136,7 +1485,7 @@
                     </button>
                 </div>
             </div>
-        {:else if connectionLost}
+        {:else if overlayState === 'connection-lost'}
             <div class="stream-status-overlay error" transition:fade={{ duration: 150 }}>
                 <div class="stream-card">
                     <div class="error-icon">!</div>
@@ -1146,7 +1495,7 @@
                     </button>
                 </div>
             </div>
-        {:else if isReconnecting}
+        {:else if overlayState === 'reconnecting'}
             <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
                 <div class="stream-card">
                     <span class="pulse-dot" aria-hidden="true"></span>
@@ -1154,7 +1503,7 @@
                     <p class="stream-subtext">Attempt {session.state.reconnectAttempt} — hang tight.</p>
                 </div>
             </div>
-        {:else if streamPaused}
+        {:else if overlayState === 'paused'}
             <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
                 <div class="stream-card">
                     <div class="paused-icon">
@@ -1164,13 +1513,13 @@
                     <p class="stream-subtext">Waiting for host to reconnect...</p>
                 </div>
             </div>
-        {:else if !hasStream}
+        {:else if overlayState === 'waiting' || overlayState === 'connecting'}
             <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
                 <div class="stream-card">
                     <h2 class="stream-card-title">{roomState?.name || "Session"}</h2>
                     <span class="pulse-dot" aria-hidden="true"></span>
                     <p>
-                        {isLive
+                        {overlayState === 'connecting'
                             ? "Connecting to stream..."
                             : "The host hasn't started streaming yet — you'll connect automatically."}
                     </p>
@@ -1217,8 +1566,19 @@
         </div>
 
         <!-- Controls overlay -->
-        <div class="controls-overlay" class:visible={isControlsVisible}>
-            <div class="top-bar">
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div
+            class="controls-overlay"
+            class:visible={isControlsVisible}
+            onfocusin={handleControlsFocusIn}
+            onfocusout={handleControlsFocusOut}
+        >
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div
+                class="top-bar"
+                onpointerenter={handleBarsPointerEnter}
+                onpointerleave={handleBarsPointerLeave}
+            >
                 <div class="room-name">{roomState?.name || "Session"}</div>
                 <div class="top-bar-right">
                     <!-- Compact presence row: one dot per participant, ring
@@ -1253,7 +1613,12 @@
                 </div>
             </div>
 
-            <div class="bottom-bar">
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div
+                class="bottom-bar"
+                onpointerenter={handleBarsPointerEnter}
+                onpointerleave={handleBarsPointerLeave}
+            >
                 <div class="bottom-left" aria-hidden="true"></div>
 
                 <!-- Main control bar - large, obvious buttons with labels -->
@@ -1297,6 +1662,66 @@
                         </button>
                     </div>
                 {/if}
+                {#if showAudioSettings}
+                    <div
+                        class="audio-settings-popover"
+                        bind:this={audioSettingsPopoverEl}
+                        transition:fly={{ y: 8, duration: 200 }}
+                        role="dialog"
+                        aria-label="Audio settings"
+                    >
+                        <div class="audio-settings-section">
+                            <span class="audio-settings-title">Microphone</span>
+                            {#if !micLabelsAvailable}
+                                <p class="audio-settings-hint">
+                                    Allow microphone access to see and choose your input devices.
+                                </p>
+                                <button class="audio-settings-grant" onclick={requestMicForLabels}>
+                                    Enable microphone
+                                </button>
+                            {/if}
+                            {#if audioInputs.length === 0 && micLabelsAvailable}
+                                <p class="audio-settings-hint">No microphones found.</p>
+                            {/if}
+                            {#each audioInputs as device (device.deviceId)}
+                                <button
+                                    class="audio-device-option"
+                                    class:selected={device.deviceId === activeMicId}
+                                    disabled={micSwitchPending}
+                                    onclick={() => selectMicDevice(device.deviceId)}
+                                    aria-pressed={device.deviceId === activeMicId}
+                                >
+                                    <span class="audio-device-check" aria-hidden="true">
+                                        {#if device.deviceId === activeMicId}
+                                            <svg viewBox="0 0 24 24" fill="currentColor" width="12" height="12"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
+                                        {/if}
+                                    </span>
+                                    <span class="audio-device-label">{device.label || "Microphone"}</span>
+                                </button>
+                            {/each}
+                        </div>
+                        {#if supportsSinkSelection && audioOutputs.length > 0}
+                            <div class="audio-settings-section">
+                                <span class="audio-settings-title">Speaker</span>
+                                {#each audioOutputs as device (device.deviceId)}
+                                    <button
+                                        class="audio-device-option"
+                                        class:selected={device.deviceId === (selectedSpeakerId ?? "default")}
+                                        onclick={() => selectSpeakerDevice(device.deviceId)}
+                                        aria-pressed={device.deviceId === (selectedSpeakerId ?? "default")}
+                                    >
+                                        <span class="audio-device-check" aria-hidden="true">
+                                            {#if device.deviceId === (selectedSpeakerId ?? "default")}
+                                                <svg viewBox="0 0 24 24" fill="currentColor" width="12" height="12"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
+                                            {/if}
+                                        </span>
+                                        <span class="audio-device-label">{device.label || "Speaker"}</span>
+                                    </button>
+                                {/each}
+                            </div>
+                        {/if}
+                    </div>
+                {/if}
                 <div class="control-bar">
                     <button
                         class="control-btn"
@@ -1315,6 +1740,22 @@
                             {/if}
                         </svg>
                         <span class="control-label">{isMicEnabled ? "Mic On" : "Mic Off"}</span>
+                    </button>
+
+                    <button
+                        class="control-btn"
+                        class:active={showAudioSettings}
+                        onclick={toggleAudioSettings}
+                        bind:this={audioSettingsBtnEl}
+                        aria-label="Audio settings"
+                        aria-expanded={showAudioSettings}
+                        aria-haspopup="dialog"
+                        title="Audio settings (input device)"
+                    >
+                        <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
+                            <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
+                        </svg>
+                        <span class="control-label">Audio</span>
                     </button>
 
                     <button
@@ -1341,6 +1782,7 @@
                     <button
                         class="control-btn chat-btn"
                         class:active={isChatOpen}
+                        class:pulse={chatPulseActive}
                         onclick={toggleChat}
                         aria-pressed={isChatOpen}
                         aria-label="Chat (C)"
@@ -1450,6 +1892,22 @@
                 </div>
             </div>
         </div>
+
+        <!-- Transient chat toast (ITEM 5): shows incoming messages while the
+             chat panel is closed; clicking it opens chat. -->
+        {#if chatToast}
+            {#key chatToast.id}
+                <button
+                    class="chat-toast"
+                    transition:fade={{ duration: prefersReducedMotion ? 0 : 200 }}
+                    onclick={openChatFromToast}
+                    title="Open chat"
+                >
+                    <span class="chat-toast-name">{chatToast.name}</span>
+                    <span class="chat-toast-text">{chatToast.text}</span>
+                </button>
+            {/key}
+        {/if}
 
         <!-- Active speaker indicator (always visible when someone is speaking) -->
         {#if activeSpeakers.length > 0}
@@ -1818,9 +2276,21 @@
         pointer-events: none;
         opacity: 0;
         visibility: hidden;
-        transition: opacity var(--transition-normal), visibility var(--transition-normal);
+        /* Idle fade-out is gentle (~300ms)… */
+        transition: opacity 300ms ease, visibility 300ms ease;
     }
-    .controls-overlay.visible { opacity: 1; visibility: visible; }
+    .controls-overlay.visible {
+        opacity: 1;
+        visibility: visible;
+        /* …but reappearing on movement is near-instant (~150ms). */
+        transition: opacity 150ms ease, visibility 150ms ease;
+    }
+    @media (prefers-reduced-motion: reduce) {
+        .controls-overlay,
+        .controls-overlay.visible {
+            transition: none;
+        }
+    }
     .controls-overlay.visible > * { pointer-events: auto; }
     .controls-overlay .top-bar,
     .controls-overlay .bottom-bar {
@@ -2236,6 +2706,97 @@
     }
     .volume-mute-btn:hover { background: rgba(255, 255, 255, 0.16); }
 
+    /* Audio settings popover (ITEM 4) */
+    .audio-settings-popover {
+        position: absolute;
+        bottom: calc(100% + 8px);
+        left: 50%;
+        width: 300px;
+        margin-left: -150px;
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-md);
+        padding: var(--space-md);
+        max-height: 320px;
+        overflow-y: auto;
+        background: rgba(0, 0, 0, 0.85);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: var(--radius-md);
+        box-shadow: var(--shadow-lg);
+        z-index: 30;
+    }
+    .audio-settings-section {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-xs);
+    }
+    .audio-settings-title {
+        font-size: var(--text-min);
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--color-text-muted);
+    }
+    .audio-settings-hint {
+        margin: 0;
+        font-size: 0.75rem;
+        color: var(--color-text-subtle);
+    }
+    .audio-settings-grant {
+        align-self: flex-start;
+        background: var(--color-primary);
+        border: none;
+        border-radius: var(--radius-sm);
+        color: #041014;
+        font-size: 0.75rem;
+        font-weight: 600;
+        padding: 6px 10px;
+        cursor: pointer;
+        transition: filter 0.15s ease;
+    }
+    .audio-settings-grant:hover { filter: brightness(1.08); }
+    .audio-device-option {
+        display: flex;
+        align-items: center;
+        gap: var(--space-xs);
+        width: 100%;
+        text-align: left;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid transparent;
+        border-radius: var(--radius-sm);
+        color: var(--color-text);
+        font-size: 0.8125rem;
+        padding: 6px 8px;
+        cursor: pointer;
+        transition: background 0.12s ease, border-color 0.12s ease;
+    }
+    .audio-device-option:hover { background: rgba(255, 255, 255, 0.1); }
+    .audio-device-option.selected {
+        border-color: rgba(255, 255, 255, 0.35);
+        background: rgba(255, 255, 255, 0.12);
+        color: #fff;
+    }
+    .audio-device-option:disabled {
+        opacity: 0.5;
+        cursor: wait;
+    }
+    .audio-device-check {
+        width: 14px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        color: var(--color-primary);
+    }
+    .audio-device-label {
+        flex: 1;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
     /* Full-screen end-state panel */
     .end-state-overlay {
         position: absolute;
@@ -2368,6 +2929,60 @@
         padding: 0 3px;
         line-height: 1;
         border: 2px solid #000;
+    }
+
+    /* Per-message pulse on the chat button (ITEM 5) */
+    .control-btn.chat-btn.pulse {
+        animation: chat-pulse 0.6s ease-out;
+    }
+    @keyframes chat-pulse {
+        0% { box-shadow: 0 0 0 0 rgba(72, 182, 166, 0.65); }
+        70% { box-shadow: 0 0 0 12px rgba(72, 182, 166, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(72, 182, 166, 0); }
+    }
+
+    /* Transient chat toast above the bottom bar (ITEM 5) */
+    .chat-toast {
+        position: absolute;
+        bottom: 150px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 22;
+        display: flex;
+        align-items: baseline;
+        gap: var(--space-xs);
+        max-width: min(80vw, 420px);
+        padding: 8px 14px;
+        background: rgba(0, 0, 0, 0.8);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        border: 1px solid rgba(72, 182, 166, 0.35);
+        border-radius: var(--radius-full);
+        color: var(--color-text);
+        cursor: pointer;
+        transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    .chat-toast:hover {
+        border-color: rgba(72, 182, 166, 0.7);
+        background: rgba(0, 0, 0, 0.9);
+    }
+    .chat-toast-name {
+        font-size: 0.75rem;
+        font-weight: 700;
+        color: var(--color-primary);
+        white-space: nowrap;
+        flex-shrink: 0;
+    }
+    .chat-toast-text {
+        font-size: 0.8125rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .control-btn.chat-btn.pulse { animation: none; }
+        .chat-toast { transition: none; }
     }
 
     /* Active speaker indicator */

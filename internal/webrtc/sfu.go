@@ -42,8 +42,13 @@ type SFU struct {
 	shutdown bool
 }
 
-// MaxICECandidates is the maximum number of ICE candidates allowed per session
-// to prevent memory exhaustion from ICE candidate flooding attacks
+// MaxICECandidates is the maximum number of ICE candidates allowed per
+// negotiation to prevent memory exhaustion from ICE candidate flooding
+// attacks. The counter is reset whenever a new negotiation begins (fresh
+// answer, client renegotiation offer, ICE restart) — a long session goes
+// through many negotiations (TURN credential refreshes, voice/screen-share
+// renegotiations, ICE restarts) and a never-resetting cap would eventually
+// reject all candidates and make ICE restarts fail permanently.
 const MaxICECandidates = 50
 
 // iceGatherTimeout bounds how long we wait for ICE gathering to complete before
@@ -123,8 +128,21 @@ type Subscriber struct {
 	pendingRemoteCandidates []*webrtc.ICECandidateInit
 	remoteDescSet           bool
 	remoteCandidateMu       sync.Mutex
-	// Rate limit client-to-server ICE candidates (matches ingest limit)
+	// Rate limit client-to-server ICE candidates (matches ingest limit).
+	// Scoped per negotiation: reset via resetICECandidateBudget whenever a
+	// new SDP negotiation begins.
 	iceCandidateCount int
+}
+
+// resetICECandidateBudget resets the per-negotiation ICE candidate counter.
+// Must be called whenever a new SDP negotiation begins (initial/renegotiation
+// answer from the client, client-initiated offer, ICE restart) so that long
+// sessions with periodic ICE restarts or TURN credential refreshes never
+// exhaust the flooding cap and lose the ability to trickle candidates.
+func (sub *Subscriber) resetICECandidateBudget() {
+	sub.remoteCandidateMu.Lock()
+	sub.iceCandidateCount = 0
+	sub.remoteCandidateMu.Unlock()
 }
 
 // NewSFU creates a new SFU instance
@@ -995,9 +1013,11 @@ func (s *SFU) SetSubscriberAnswer(roomSlug, subscriberID string, answer webrtc.S
 		return fmt.Errorf("failed to set remote description: %w", err)
 	}
 
-	// Flush any buffered client-to-server ICE candidates
+	// Flush any buffered client-to-server ICE candidates and start a fresh
+	// per-negotiation candidate budget for the trickle that follows.
 	sub.remoteCandidateMu.Lock()
 	sub.remoteDescSet = true
+	sub.iceCandidateCount = 0
 	pending := sub.pendingRemoteCandidates
 	sub.pendingRemoteCandidates = nil
 	sub.remoteCandidateMu.Unlock()
@@ -1091,6 +1111,12 @@ func (s *SFU) HandleIceRestart(roomSlug, subscriberID, sdpOffer string) (string,
 		return "", fmt.Errorf("failed to set remote description: %w", err)
 	}
 
+	// An ICE restart starts a brand-new candidate exchange (fresh ufrag/pwd),
+	// so the per-negotiation candidate budget starts over too. Without this,
+	// repeated restarts on a long session exhaust the cap and every later
+	// restart fails with "too many ICE candidates".
+	sub.resetICECandidateBudget()
+
 	// Create answer
 	answer, err := sub.PeerConnection.CreateAnswer(nil)
 	if err != nil {
@@ -1148,6 +1174,9 @@ func (s *SFU) HandleSubscriberOffer(roomSlug, subscriberID, sdpOffer string) (st
 	if err := sub.PeerConnection.SetRemoteDescription(offer); err != nil {
 		return "", false, fmt.Errorf("failed to set remote description: %w", err)
 	}
+
+	// New client-initiated negotiation — fresh per-negotiation candidate budget.
+	sub.resetICECandidateBudget()
 
 	answer, err := sub.PeerConnection.CreateAnswer(nil)
 	if err != nil {
@@ -1770,6 +1799,10 @@ func (s *SFU) HandleRenegotiationAnswer(roomSlug, subscriberID, sdpAnswer string
 	if err := sub.PeerConnection.SetRemoteDescription(answer); err != nil {
 		return fmt.Errorf("failed to set remote description: %w", err)
 	}
+
+	// The answer completes a server-initiated renegotiation; any candidates
+	// the client trickles for it count against a fresh budget.
+	sub.resetICECandidateBudget()
 
 	log.Printf("Renegotiation answer processed for subscriber %s", subscriberID)
 	return nil

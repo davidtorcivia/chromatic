@@ -18,6 +18,9 @@ export interface RoomState {
     watermarkLogoUrl?: string;
     watermarkLogoPosition?: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
     watermarkOpacity: number;
+    watermarkPosX?: number | null;
+    watermarkPosY?: number | null;
+    watermarkScale?: number;
 }
 
 export interface SessionState {
@@ -172,6 +175,9 @@ export function createSessionStore() {
                         watermarkLogoUrl?: string;
                         watermarkLogoPosition?: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
                         watermarkOpacity?: number;
+                        watermarkPosX?: number | null;
+                        watermarkPosY?: number | null;
+                        watermarkScale?: number;
                     };
                     participants: SessionParticipant[];
                     isLive: boolean;
@@ -188,7 +194,10 @@ export function createSessionStore() {
                     watermarkText: roomState.room.watermarkText,
                     watermarkLogoUrl: roomState.room.watermarkLogoUrl,
                     watermarkLogoPosition: roomState.room.watermarkLogoPosition || 'bottom-right',
-                    watermarkOpacity: roomState.room.watermarkOpacity ?? 0.3
+                    watermarkOpacity: roomState.room.watermarkOpacity ?? 0.3,
+                    watermarkPosX: roomState.room.watermarkPosX ?? null,
+                    watermarkPosY: roomState.room.watermarkPosY ?? null,
+                    watermarkScale: roomState.room.watermarkScale ?? 1
                 };
                 // Emit ICE servers for WebRTC connection
                 messageHandlers.get('iceServers')?.forEach(h => h(roomState.iceServers));

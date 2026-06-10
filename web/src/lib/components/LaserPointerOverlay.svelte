@@ -10,7 +10,11 @@
         trailAlpha,
         smoothingFactor,
         rippleAt,
+        shouldAppendPoint,
+        buildTrailSlices,
+        trailStyle,
         TRAIL_FADE_MS,
+        TRAIL_HEAD_WIDTH,
         type TrailPoint,
     } from "$lib/video/laser";
 
@@ -177,12 +181,20 @@
                 release?: boolean;
             };
             const now = Date.now();
+            // Color is server-authoritative (assigned at join, echoed in every
+            // cursor message). Fall back to the room participant list, then a
+            // palette default, so a missing field never paints an invalid color.
+            const color =
+                data.color ||
+                session.state.room?.participants.find((p) => p.id === data.participantId)
+                    ?.color ||
+                "#e63946";
             let cursor = cursorMap.get(data.participantId);
             if (!cursor) {
                 cursor = {
                     participantId: data.participantId,
                     participantName: data.participantName,
-                    color: data.color,
+                    color,
                     x: data.x,
                     y: data.y,
                     targetX: data.x,
@@ -201,7 +213,7 @@
                     cursor.trail = [];
                 }
                 cursor.participantName = data.participantName;
-                cursor.color = data.color;
+                cursor.color = color;
                 cursor.targetX = data.x;
                 cursor.targetY = data.y;
                 cursor.active = data.active;
@@ -358,17 +370,20 @@
                 cursor.y = cursor.targetY;
             }
 
-            // Record the smoothed position into the streak while pointing
+            // Record the smoothed position into the streak while pointing.
+            // Points closer than ~2px to the previous one are skipped — the
+            // smoothed curve doesn't need them, and dense sub-pixel points
+            // are what made the additive trail blow out and look jittery.
             if (cursor.active) {
                 const last = cursor.trail[cursor.trail.length - 1];
-                if (!last || last.x !== cursor.x || last.y !== cursor.y || now - last.t > 50) {
+                if (shouldAppendPoint(last, cursor.x, cursor.y, w, h)) {
                     cursor.trail.push({ x: cursor.x, y: cursor.y, t: now });
                 }
             }
 
             pruneTrail(cursor.trail, now);
 
-            if (cursor.trail.length > 1) {
+            if (cursor.trail.length > 0) {
                 drawTrail(ctx, cursor, w, h, now);
                 hasWork = true;
             }
@@ -413,25 +428,58 @@
         h: number,
         now: number
     ) {
-        const trail = cursor.trail;
+        // Recorded points are thinned to >=2px spacing, so while pointing we
+        // append a virtual head at the live (smoothed) position to keep the
+        // streak attached to the cursor dot.
+        let points: TrailPoint[] = cursor.trail;
+        if (cursor.active) {
+            const last = points[points.length - 1];
+            if (!last || last.x !== cursor.x || last.y !== cursor.y) {
+                points = [...points, { x: cursor.x, y: cursor.y, t: now }];
+            }
+        }
+        if (points.length < 2) return;
+
+        const slices = buildTrailSlices(points);
+        const headLife = trailAlpha(now - points[points.length - 1].t, TRAIL_FADE_MS);
+
         c.save();
-        // Additive-ish compositing for a laser feel without heavy glow
-        // (this overlays color-critical video, so keep it restrained)
+        // Additive compositing for the laser feel, kept restrained because
+        // this overlays color-critical video. Per-slice alpha is capped at
+        // TRAIL_MAX_ALPHA: round caps mean at most two adjacent slices
+        // overlap, so the additive sum stays bounded by the participant's
+        // color instead of clipping every channel to white.
         c.globalCompositeOperation = "lighter";
         c.strokeStyle = cursor.color;
         c.lineCap = "round";
         c.lineJoin = "round";
-        for (let i = 0; i < trail.length - 1; i++) {
-            const a = trail[i];
-            const b = trail[i + 1];
-            const life = trailAlpha(now - b.t, TRAIL_FADE_MS);
-            if (life <= 0) continue;
-            // Alpha fades to 0 over 2s; width tapers toward the tail
-            c.globalAlpha = life * 0.8;
-            c.lineWidth = 0.75 + 3 * life;
+
+        // Glow pass: one stroke of the entire smoothed path. A single
+        // stroke never overlaps itself, so the halo stays perfectly even.
+        c.globalAlpha = 0.14 * headLife;
+        c.lineWidth = TRAIL_HEAD_WIDTH * 1.9;
+        c.shadowColor = cursor.color;
+        c.shadowBlur = 6;
+        c.beginPath();
+        c.moveTo(slices[0].x0 * w, slices[0].y0 * h);
+        for (const s of slices) {
+            c.quadraticCurveTo(s.cx * w, s.cy * h, s.x1 * w, s.y1 * h);
+        }
+        c.stroke();
+        c.shadowBlur = 0;
+
+        // Core pass: newest -> oldest, each slice a quadratic through the
+        // segment midpoints, width and alpha tapering smoothly head -> tail.
+        for (let i = slices.length - 1; i >= 0; i--) {
+            const s = slices[i];
+            const life = trailAlpha(now - s.t, TRAIL_FADE_MS);
+            const { width, alpha } = trailStyle(s.pos, life);
+            if (alpha <= 0.004 || width <= 0.05) continue;
+            c.globalAlpha = alpha;
+            c.lineWidth = width;
             c.beginPath();
-            c.moveTo(a.x * w, a.y * h);
-            c.lineTo(b.x * w, b.y * h);
+            c.moveTo(s.x0 * w, s.y0 * h);
+            c.quadraticCurveTo(s.cx * w, s.cy * h, s.x1 * w, s.y1 * h);
             c.stroke();
         }
         c.restore();

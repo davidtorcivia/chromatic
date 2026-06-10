@@ -222,10 +222,12 @@ func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
 
 	query := `
-		SELECT id, slug, name, scheduled_at, duration_minutes, 
+		SELECT id, slug, name, scheduled_at, duration_minutes,
 		       password_hash IS NOT NULL as has_password, waiting_room_enabled,
 		       stream_key_id, watermark_mode, watermark_text, watermark_logo_path,
-		       watermark_logo_position, watermark_opacity, status, 
+		       watermark_logo_position, watermark_opacity,
+		       watermark_pos_x, watermark_pos_y, COALESCE(watermark_scale, 1.0),
+		       max_participants, status,
 		       created_at, started_at, ended_at
 		FROM rooms
 	`
@@ -253,7 +255,9 @@ func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 			&room.ID, &room.Slug, &room.Name, &room.ScheduledAt, &room.DurationMinutes,
 			&room.HasPassword, &room.WaitingRoomEnabled, &room.StreamKeyID,
 			&room.WatermarkMode, &room.WatermarkText, &room.WatermarkLogoPath,
-			&room.WatermarkLogoPosition, &room.WatermarkOpacity, &room.Status,
+			&room.WatermarkLogoPosition, &room.WatermarkOpacity,
+			&room.WatermarkPosX, &room.WatermarkPosY, &room.WatermarkScale,
+			&room.MaxParticipants, &room.Status,
 			&room.CreatedAt, &room.StartedAt, &room.EndedAt,
 		)
 		if err != nil {
@@ -280,7 +284,28 @@ type CreateRoomRequest struct {
 	WatermarkText         *string    `json:"watermarkText,omitempty"`
 	WatermarkLogoPosition string     `json:"watermarkLogoPosition,omitempty"`
 	WatermarkOpacity      *float64   `json:"watermarkOpacity,omitempty"`
+	WatermarkPosX         *float64   `json:"watermarkPosX,omitempty"`
+	WatermarkPosY         *float64   `json:"watermarkPosY,omitempty"`
+	WatermarkScale        *float64   `json:"watermarkScale,omitempty"`
+	MaxParticipants       *int       `json:"maxParticipants,omitempty"`
 }
+
+// clamp restricts v to the inclusive range [lo, hi].
+func clamp(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// Watermark scale bounds: 1.0 = default size, clamped to a sane range.
+const (
+	watermarkScaleMin = 0.25
+	watermarkScaleMax = 3.0
+)
 
 // Create creates a new room
 func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
@@ -355,16 +380,40 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 		req.WatermarkText = &text
 	}
 
+	// Watermark position (fractional center, clamped to 0-1; nil = legacy placement)
+	if req.WatermarkPosX != nil {
+		v := clamp(*req.WatermarkPosX, 0, 1)
+		req.WatermarkPosX = &v
+	}
+	if req.WatermarkPosY != nil {
+		v := clamp(*req.WatermarkPosY, 0, 1)
+		req.WatermarkPosY = &v
+	}
+
+	// Watermark scale (clamped; default 1.0)
+	watermarkScale := 1.0
+	if req.WatermarkScale != nil {
+		watermarkScale = clamp(*req.WatermarkScale, watermarkScaleMin, watermarkScaleMax)
+	}
+
+	// Per-room participant limit (nil = global default)
+	if req.MaxParticipants != nil && (*req.MaxParticipants < 1 || *req.MaxParticipants > 100) {
+		http.Error(w, "Participant limit must be between 1 and 100", http.StatusBadRequest)
+		return
+	}
+
 	// Insert room
 	_, err := h.db.Exec(`
 		INSERT INTO rooms (
 			id, slug, name, scheduled_at, duration_minutes, password_hash,
 			waiting_room_enabled, stream_key_id, watermark_mode, watermark_text,
-			watermark_logo_position, watermark_opacity
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			watermark_logo_position, watermark_opacity, watermark_pos_x,
+			watermark_pos_y, watermark_scale, max_participants
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, id, req.Slug, req.Name, req.ScheduledAt, req.DurationMinutes, passwordHash,
 		req.WaitingRoomEnabled, req.StreamKeyID, req.WatermarkMode, req.WatermarkText,
-		req.WatermarkLogoPosition, watermarkOpacity)
+		req.WatermarkLogoPosition, watermarkOpacity, req.WatermarkPosX,
+		req.WatermarkPosY, watermarkScale, req.MaxParticipants)
 
 	if err != nil {
 		// Check for unique constraint violation
@@ -386,6 +435,10 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 		WatermarkText:         req.WatermarkText,
 		WatermarkLogoPosition: req.WatermarkLogoPosition,
 		WatermarkOpacity:      watermarkOpacity,
+		WatermarkPosX:         req.WatermarkPosX,
+		WatermarkPosY:         req.WatermarkPosY,
+		WatermarkScale:        watermarkScale,
+		MaxParticipants:       req.MaxParticipants,
 		Status:                models.RoomStatusPending,
 		CreatedAt:             time.Now(),
 	}
@@ -575,6 +628,56 @@ func (h *RoomHandler) Update(w http.ResponseWriter, r *http.Request) {
 		args = append(args, opacity)
 	}
 
+	// Watermark position: fractional center (clamped 0-1), null = legacy placement
+	for key, column := range map[string]string{
+		"watermarkPosX": "watermark_pos_x",
+		"watermarkPosY": "watermark_pos_y",
+	} {
+		raw, ok := updates[key]
+		if !ok {
+			continue
+		}
+		if string(raw) == "null" {
+			setClauses = append(setClauses, column+" = NULL")
+			continue
+		}
+		var pos float64
+		if err := json.Unmarshal(raw, &pos); err != nil {
+			http.Error(w, "Invalid "+key, http.StatusBadRequest)
+			return
+		}
+		setClauses = append(setClauses, column+" = ?")
+		args = append(args, clamp(pos, 0, 1))
+	}
+
+	if raw, ok := updates["watermarkScale"]; ok {
+		var scale float64
+		if err := json.Unmarshal(raw, &scale); err != nil {
+			http.Error(w, "Invalid watermarkScale", http.StatusBadRequest)
+			return
+		}
+		setClauses = append(setClauses, "watermark_scale = ?")
+		args = append(args, clamp(scale, watermarkScaleMin, watermarkScaleMax))
+	}
+
+	if raw, ok := updates["maxParticipants"]; ok {
+		if string(raw) == "null" {
+			setClauses = append(setClauses, "max_participants = NULL")
+		} else {
+			var limit int
+			if err := json.Unmarshal(raw, &limit); err != nil {
+				http.Error(w, "Invalid maxParticipants", http.StatusBadRequest)
+				return
+			}
+			if limit < 1 || limit > 100 {
+				http.Error(w, "Participant limit must be between 1 and 100", http.StatusBadRequest)
+				return
+			}
+			setClauses = append(setClauses, "max_participants = ?")
+			args = append(args, limit)
+		}
+	}
+
 	if len(setClauses) == 0 {
 		http.Error(w, "No valid fields to update", http.StatusBadRequest)
 		return
@@ -699,11 +802,12 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 	var waitingRoom bool
 	var roomStatus string
 	var scheduledAt *time.Time
+	var roomMaxParticipants *int
 
 	err := h.db.QueryRow(`
-		SELECT id, COALESCE(password_hash, ''), waiting_room_enabled, status, scheduled_at
+		SELECT id, COALESCE(password_hash, ''), waiting_room_enabled, status, scheduled_at, max_participants
 		FROM rooms WHERE slug = ?
-	`, slug).Scan(&roomID, &passwordHash, &waitingRoom, &roomStatus, &scheduledAt)
+	`, slug).Scan(&roomID, &passwordHash, &waitingRoom, &roomStatus, &scheduledAt, &roomMaxParticipants)
 
 	if err != nil {
 		http.Error(w, "Room not found", http.StatusNotFound)
@@ -744,13 +848,18 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Enforce participant cap (room status was already verified as non-ended)
+	// Enforce participant cap (room status was already verified as non-ended).
+	// A per-room limit overrides the global default when set.
+	maxParticipants := h.maxParticipants
+	if roomMaxParticipants != nil && *roomMaxParticipants > 0 {
+		maxParticipants = *roomMaxParticipants
+	}
 	var participantCount int
 	if err := h.db.QueryRow(`SELECT COUNT(*) FROM participants WHERE room_id = ?`, roomID).Scan(&participantCount); err != nil {
 		http.Error(w, "Failed to join room", http.StatusInternalServerError)
 		return
 	}
-	if participantCount >= h.maxParticipants {
+	if participantCount >= maxParticipants {
 		http.Error(w, "Room is full", http.StatusServiceUnavailable)
 		return
 	}
@@ -1100,14 +1209,18 @@ func (h *RoomHandler) getRoomBySlug(slug string) (*models.Room, error) {
 		SELECT id, slug, name, scheduled_at, duration_minutes,
 		       password_hash IS NOT NULL, waiting_room_enabled, stream_key_id,
 		       watermark_mode, watermark_text, watermark_logo_path,
-		       watermark_logo_position, watermark_opacity, status,
+		       watermark_logo_position, watermark_opacity,
+		       watermark_pos_x, watermark_pos_y, COALESCE(watermark_scale, 1.0),
+		       max_participants, status,
 		       created_at, started_at, ended_at
 		FROM rooms WHERE slug = ?
 	`, slug).Scan(
 		&room.ID, &room.Slug, &room.Name, &room.ScheduledAt, &room.DurationMinutes,
 		&room.HasPassword, &room.WaitingRoomEnabled, &room.StreamKeyID,
 		&room.WatermarkMode, &room.WatermarkText, &room.WatermarkLogoPath,
-		&room.WatermarkLogoPosition, &room.WatermarkOpacity, &room.Status,
+		&room.WatermarkLogoPosition, &room.WatermarkOpacity,
+		&room.WatermarkPosX, &room.WatermarkPosY, &room.WatermarkScale,
+		&room.MaxParticipants, &room.Status,
 		&room.CreatedAt, &room.StartedAt, &room.EndedAt,
 	)
 	return &room, err

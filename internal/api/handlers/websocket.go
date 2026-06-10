@@ -350,6 +350,8 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 	var watermarkLogoPath *string
 	var watermarkLogoPosition string
 	var watermarkOpacity float64
+	var watermarkPosX, watermarkPosY *float64
+	var watermarkScale float64
 
 	err := h.db.QueryRow(`
 		SELECT name, status,
@@ -357,9 +359,12 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 			watermark_text,
 			watermark_logo_path,
 			COALESCE(watermark_logo_position, 'bottom-right'),
-			COALESCE(watermark_opacity, 0.3)
+			COALESCE(watermark_opacity, 0.3),
+			watermark_pos_x,
+			watermark_pos_y,
+			COALESCE(watermark_scale, 1.0)
 		FROM rooms WHERE slug = ?
-	`, slug).Scan(&roomName, &roomStatus, &watermarkMode, &watermarkText, &watermarkLogoPath, &watermarkLogoPosition, &watermarkOpacity)
+	`, slug).Scan(&roomName, &roomStatus, &watermarkMode, &watermarkText, &watermarkLogoPath, &watermarkLogoPosition, &watermarkOpacity, &watermarkPosX, &watermarkPosY, &watermarkScale)
 
 	if err != nil {
 		return
@@ -407,11 +412,19 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 		"watermarkMode":         watermarkMode,
 		"watermarkLogoPosition": watermarkLogoPosition,
 		"watermarkOpacity":      watermarkOpacity,
+		"watermarkScale":        watermarkScale,
 	}
 
 	// Add optional watermark fields if set
 	if watermarkText != nil {
 		roomData["watermarkText"] = *watermarkText
+	}
+	// Custom watermark position (fractional center); absent = legacy placement
+	if watermarkPosX != nil {
+		roomData["watermarkPosX"] = *watermarkPosX
+	}
+	if watermarkPosY != nil {
+		roomData["watermarkPosY"] = *watermarkPosY
 	}
 	if watermarkLogoPath != nil && *watermarkLogoPath != "" {
 		// Construct logo URL for client

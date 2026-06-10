@@ -1,5 +1,44 @@
 // WebRTC Manager - handles peer connection for receiving stream and sending voice
 
+// localStorage key for the preferred microphone input device. Read on every
+// getUserMedia call so the user's choice survives reloads and reconnects.
+export const MIC_DEVICE_STORAGE_KEY = 'chromatic_mic_device';
+
+export function getStoredMicDeviceId(): string | null {
+    try {
+        return localStorage.getItem(MIC_DEVICE_STORAGE_KEY);
+    } catch {
+        return null;
+    }
+}
+
+export function storeMicDeviceId(deviceId: string | null): void {
+    try {
+        if (deviceId) {
+            localStorage.setItem(MIC_DEVICE_STORAGE_KEY, deviceId);
+        } else {
+            localStorage.removeItem(MIC_DEVICE_STORAGE_KEY);
+        }
+    } catch {
+        // Storage unavailable (private mode) — the in-session choice still applies.
+    }
+}
+
+function micConstraints(deviceId?: string | null, exact = false): MediaTrackConstraints {
+    const constraints: MediaTrackConstraints = {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+    };
+    if (deviceId) {
+        // `ideal` lets getUserMedia fall back to the default mic when the
+        // remembered device was unplugged; `exact` is used for explicit
+        // user selection where silently picking another mic would be wrong.
+        constraints.deviceId = exact ? { exact: deviceId } : { ideal: deviceId };
+    }
+    return constraints;
+}
+
 export interface WebRTCManagerOptions {
     iceServers: RTCIceServer[];
     onTrack: (event: RTCTrackEvent) => void;
@@ -434,15 +473,14 @@ export class WebRTCManager {
         return { rtt: nominatedRtt ?? fallbackRtt };
     }
 
-    // Request microphone access and prepare for sending
-    async requestMicrophone(): Promise<boolean> {
+    // Request microphone access and prepare for sending. Honors the persisted
+    // device preference (chromatic_mic_device) unless an explicit deviceId is
+    // passed.
+    async requestMicrophone(deviceId?: string | null): Promise<boolean> {
         try {
+            const preferred = deviceId ?? getStoredMicDeviceId();
             this.localStream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true
-                },
+                audio: micConstraints(preferred),
                 video: false
             });
 
@@ -457,6 +495,53 @@ export class WebRTCManager {
         } catch (err) {
             console.error('Failed to get microphone access:', err);
             return false;
+        }
+    }
+
+    // Switch the microphone input device: re-acquire the mic with the given
+    // deviceId and swap the new track into the existing RTCRtpSender via
+    // replaceTrack — same kind, same m-line, so NO renegotiation is needed.
+    async setMicDevice(deviceId: string): Promise<boolean> {
+        try {
+            const newStream = await navigator.mediaDevices.getUserMedia({
+                audio: micConstraints(deviceId, true),
+                video: false
+            });
+
+            const newTrack = newStream.getAudioTracks()[0];
+            if (!newTrack) {
+                newStream.getTracks().forEach(t => t.stop());
+                return false;
+            }
+            newTrack.enabled = !this.isMicMuted;
+
+            if (this.audioSender) {
+                await this.audioSender.replaceTrack(newTrack);
+            }
+
+            // Release the previous capture only after the swap succeeded so a
+            // failed switch leaves the working mic untouched.
+            if (this.localStream && this.localStream !== newStream) {
+                this.localStream.getTracks().forEach(t => t.stop());
+            }
+            this.localStream = newStream;
+
+            console.log('Switched microphone device:', deviceId);
+            return true;
+        } catch (err) {
+            console.error('Failed to switch microphone device:', err);
+            return false;
+        }
+    }
+
+    // deviceId of the currently captured microphone, if any.
+    getCurrentMicDeviceId(): string | null {
+        const track = this.localStream?.getAudioTracks()[0];
+        if (!track) return null;
+        try {
+            return track.getSettings().deviceId ?? null;
+        } catch {
+            return null;
         }
     }
 

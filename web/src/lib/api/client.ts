@@ -84,6 +84,13 @@ export interface Room {
     watermarkText?: string;
     watermarkLogoPosition?: string;
     watermarkOpacity?: number;
+    /** Fractional center (0-1) of the watermark; absent = legacy placement */
+    watermarkPosX?: number;
+    watermarkPosY?: number;
+    /** Size multiplier for the watermark text/logo (0.25-3, default 1) */
+    watermarkScale?: number;
+    /** Per-room participant limit (1-100); absent = global default (20) */
+    maxParticipants?: number;
     status: 'pending' | 'live' | 'ended';
     createdAt: string;
     startedAt?: string;

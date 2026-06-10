@@ -19,6 +19,79 @@
     let watermarkText = $state("{{ name }} - {{ date }}");
     let watermarkLogoPosition = $state<"top-left" | "top-right" | "bottom-left" | "bottom-right">("bottom-right");
     let watermarkOpacity = $state(0.3);
+    // Fractional center of the watermark (null = built-in placement)
+    let watermarkPosX = $state<number | null>(null);
+    let watermarkPosY = $state<number | null>(null);
+    let watermarkScale = $state(1);
+    // Per-room participant limit (null = use the global default)
+    let maxParticipants = $state<number | null>(null);
+
+    // Watermark drag state for the preview
+    type Bounds = { x: number; y: number; width: number; height: number };
+    let previewEl = $state<HTMLDivElement | null>(null);
+    let watermarkBounds = $state<Bounds | null>(null);
+    let isPreviewHovered = $state(false);
+    let isOverWatermark = $state(false);
+    let isDraggingWatermark = $state(false);
+    let dragOffsetX = 0;
+    let dragOffsetY = 0;
+
+    function previewPoint(e: PointerEvent) {
+        const rect = previewEl!.getBoundingClientRect();
+        return {
+            x: e.clientX - rect.left,
+            y: e.clientY - rect.top,
+            w: rect.width,
+            h: rect.height,
+        };
+    }
+
+    function pointInWatermark(x: number, y: number): boolean {
+        if (!watermarkBounds) return false;
+        const pad = 6; // forgiving hit area
+        return (
+            x >= watermarkBounds.x - pad &&
+            x <= watermarkBounds.x + watermarkBounds.width + pad &&
+            y >= watermarkBounds.y - pad &&
+            y <= watermarkBounds.y + watermarkBounds.height + pad
+        );
+    }
+
+    function handlePreviewPointerDown(e: PointerEvent) {
+        if (!previewEl || !watermarkBounds) return;
+        const p = previewPoint(e);
+        if (!pointInWatermark(p.x, p.y)) return;
+        isDraggingWatermark = true;
+        // Keep the grab point stable relative to the watermark center
+        dragOffsetX = p.x - (watermarkBounds.x + watermarkBounds.width / 2);
+        dragOffsetY = p.y - (watermarkBounds.y + watermarkBounds.height / 2);
+        previewEl.setPointerCapture(e.pointerId);
+        e.preventDefault();
+    }
+
+    function handlePreviewPointerMove(e: PointerEvent) {
+        if (!previewEl) return;
+        const p = previewPoint(e);
+        if (!isDraggingWatermark) {
+            isOverWatermark = pointInWatermark(p.x, p.y);
+            return;
+        }
+        // Clamp the fractional center so the watermark stays inside the frame
+        const halfW = (watermarkBounds?.width ?? 0) / 2;
+        const halfH = (watermarkBounds?.height ?? 0) / 2;
+        const loX = Math.min(0.5, halfW / p.w);
+        const hiX = Math.max(0.5, 1 - halfW / p.w);
+        const loY = Math.min(0.5, halfH / p.h);
+        const hiY = Math.max(0.5, 1 - halfH / p.h);
+        watermarkPosX = Math.min(hiX, Math.max(loX, (p.x - dragOffsetX) / p.w));
+        watermarkPosY = Math.min(hiY, Math.max(loY, (p.y - dragOffsetY) / p.h));
+    }
+
+    function handlePreviewPointerUp(e: PointerEvent) {
+        if (!isDraggingWatermark) return;
+        isDraggingWatermark = false;
+        previewEl?.releasePointerCapture?.(e.pointerId);
+    }
 
     onMount(async () => {
         try {
@@ -89,6 +162,15 @@
 
             if (watermarkMode !== "none") {
                 roomData.watermarkOpacity = watermarkOpacity;
+                roomData.watermarkScale = watermarkScale;
+                if (watermarkPosX != null && watermarkPosY != null) {
+                    roomData.watermarkPosX = watermarkPosX;
+                    roomData.watermarkPosY = watermarkPosY;
+                }
+            }
+
+            if (typeof maxParticipants === "number" && !Number.isNaN(maxParticipants)) {
+                roomData.maxParticipants = maxParticipants;
             }
 
             await rooms.create(roomData);
@@ -213,6 +295,23 @@
                         >Require manual approval before viewers can join</span
                     >
                 </div>
+
+                <div class="form-group">
+                    <label for="maxParticipants">Participant Limit</label>
+                    <input
+                        type="number"
+                        id="maxParticipants"
+                        class="input"
+                        bind:value={maxParticipants}
+                        min="1"
+                        max="100"
+                        placeholder="20"
+                    />
+                    <span class="form-hint"
+                        >Maximum participants in this room. Leave blank to use
+                        the default (20).</span
+                    >
+                </div>
             </div>
 
             <div class="form-section">
@@ -307,8 +406,23 @@
                     </div>
 
                     <div class="form-group">
-                        <span class="form-hint">Preview</span>
-                        <div class="watermark-preview">
+                        <span class="form-hint">Preview &mdash; drag the watermark to position it</span>
+                        <!-- svelte-ignore a11y_no_static_element_interactions -->
+                        <div
+                            class="watermark-preview"
+                            class:grabbable={isOverWatermark && !isDraggingWatermark}
+                            class:grabbing={isDraggingWatermark}
+                            bind:this={previewEl}
+                            onpointerenter={() => (isPreviewHovered = true)}
+                            onpointerleave={() => {
+                                isPreviewHovered = false;
+                                isOverWatermark = false;
+                            }}
+                            onpointerdown={handlePreviewPointerDown}
+                            onpointermove={handlePreviewPointerMove}
+                            onpointerup={handlePreviewPointerUp}
+                            onpointercancel={handlePreviewPointerUp}
+                        >
                             {#key `${watermarkMode}-${watermarkLogoPosition}-${config?.defaultWatermarkLogoUrl ?? ""}`}
                                 <WatermarkOverlay
                                     mode={watermarkMode}
@@ -316,11 +430,34 @@
                                     logoUrl={config?.defaultWatermarkLogoUrl}
                                     logoPosition={watermarkLogoPosition}
                                     opacity={watermarkOpacity}
+                                    posX={watermarkPosX}
+                                    posY={watermarkPosY}
+                                    scale={watermarkScale}
+                                    onBoundsChange={(b) => (watermarkBounds = b)}
                                     participantName="Jane Colorist"
                                     roomName={name || "My Color Session"}
                                 />
                             {/key}
+                            {#if watermarkBounds && (isPreviewHovered || isDraggingWatermark)}
+                                <div
+                                    class="watermark-outline"
+                                    style="left: {watermarkBounds.x - 4}px; top: {watermarkBounds.y - 4}px; width: {watermarkBounds.width + 8}px; height: {watermarkBounds.height + 8}px"
+                                ></div>
+                            {/if}
                         </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="wmSize">Size: {watermarkScale.toFixed(2)}x</label>
+                        <input
+                            type="range"
+                            id="wmSize"
+                            class="range-input"
+                            min="0.25"
+                            max="3"
+                            step="0.05"
+                            bind:value={watermarkScale}
+                        />
                     </div>
                 {/if}
             </div>
@@ -468,5 +605,22 @@
         border-radius: var(--radius-md);
         overflow: hidden;
         margin-top: var(--space-xs);
+        touch-action: none;
+    }
+
+    .watermark-preview.grabbable {
+        cursor: grab;
+    }
+
+    .watermark-preview.grabbing {
+        cursor: grabbing;
+    }
+
+    .watermark-outline {
+        position: absolute;
+        border: 1px dashed rgba(255, 255, 255, 0.55);
+        border-radius: 2px;
+        pointer-events: none;
+        z-index: 11;
     }
 </style>

@@ -116,6 +116,115 @@ func TestRoomHandler_Create(t *testing.T) {
 			},
 			expectedStatus: http.StatusBadRequest,
 		},
+		{
+			name: "watermark position and scale persist",
+			body: map[string]interface{}{
+				"slug":           "wm-pos-room",
+				"name":           "Watermark Position Room",
+				"watermarkMode":  "text",
+				"watermarkText":  "{{ name }}",
+				"watermarkPosX":  0.25,
+				"watermarkPosY":  0.75,
+				"watermarkScale": 2.0,
+			},
+			expectedStatus: http.StatusCreated,
+			checkResponse: func(t *testing.T, body []byte) {
+				var room map[string]interface{}
+				json.Unmarshal(body, &room)
+				if room["watermarkPosX"] != 0.25 {
+					t.Errorf("expected watermarkPosX 0.25, got %v", room["watermarkPosX"])
+				}
+				if room["watermarkPosY"] != 0.75 {
+					t.Errorf("expected watermarkPosY 0.75, got %v", room["watermarkPosY"])
+				}
+				if room["watermarkScale"] != 2.0 {
+					t.Errorf("expected watermarkScale 2.0, got %v", room["watermarkScale"])
+				}
+			},
+		},
+		{
+			name: "watermark position and scale clamped",
+			body: map[string]interface{}{
+				"slug":           "wm-clamp-room",
+				"name":           "Watermark Clamp Room",
+				"watermarkMode":  "text",
+				"watermarkText":  "{{ name }}",
+				"watermarkPosX":  1.5,
+				"watermarkPosY":  -0.5,
+				"watermarkScale": 10.0,
+			},
+			expectedStatus: http.StatusCreated,
+			checkResponse: func(t *testing.T, body []byte) {
+				var room map[string]interface{}
+				json.Unmarshal(body, &room)
+				if room["watermarkPosX"] != 1.0 {
+					t.Errorf("expected watermarkPosX clamped to 1.0, got %v", room["watermarkPosX"])
+				}
+				if room["watermarkPosY"] != 0.0 {
+					t.Errorf("expected watermarkPosY clamped to 0.0, got %v", room["watermarkPosY"])
+				}
+				if room["watermarkScale"] != 3.0 {
+					t.Errorf("expected watermarkScale clamped to 3.0, got %v", room["watermarkScale"])
+				}
+			},
+		},
+		{
+			name: "watermark scale defaults and position omitted",
+			body: map[string]interface{}{
+				"slug":          "wm-default-room",
+				"name":          "Watermark Default Room",
+				"watermarkMode": "text",
+				"watermarkText": "{{ name }}",
+			},
+			expectedStatus: http.StatusCreated,
+			checkResponse: func(t *testing.T, body []byte) {
+				var room map[string]interface{}
+				json.Unmarshal(body, &room)
+				if room["watermarkScale"] != 1.0 {
+					t.Errorf("expected default watermarkScale 1.0, got %v", room["watermarkScale"])
+				}
+				if _, ok := room["watermarkPosX"]; ok {
+					t.Errorf("expected watermarkPosX omitted, got %v", room["watermarkPosX"])
+				}
+			},
+		},
+		{
+			name: "valid participant limit",
+			body: map[string]interface{}{
+				"slug":            "limit-room",
+				"name":            "Limit Room",
+				"watermarkMode":   "none",
+				"maxParticipants": 5,
+			},
+			expectedStatus: http.StatusCreated,
+			checkResponse: func(t *testing.T, body []byte) {
+				var room map[string]interface{}
+				json.Unmarshal(body, &room)
+				if room["maxParticipants"] != 5.0 {
+					t.Errorf("expected maxParticipants 5, got %v", room["maxParticipants"])
+				}
+			},
+		},
+		{
+			name: "participant limit too low",
+			body: map[string]interface{}{
+				"slug":            "limit-low-room",
+				"name":            "Limit Low Room",
+				"watermarkMode":   "none",
+				"maxParticipants": 0,
+			},
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name: "participant limit too high",
+			body: map[string]interface{}{
+				"slug":            "limit-high-room",
+				"name":            "Limit High Room",
+				"watermarkMode":   "none",
+				"maxParticipants": 101,
+			},
+			expectedStatus: http.StatusBadRequest,
+		},
 	}
 
 	for _, tt := range tests {
@@ -250,6 +359,109 @@ func TestRoomHandler_Update(t *testing.T) {
 				}
 				if room["waitingRoomEnabled"] != true {
 					t.Errorf("expected waitingRoomEnabled true, got %v", room["waitingRoomEnabled"])
+				}
+			},
+		},
+		{
+			name: "update watermark position and scale",
+			slug: "update-test",
+			body: map[string]interface{}{
+				"watermarkPosX":  0.5,
+				"watermarkPosY":  0.25,
+				"watermarkScale": 1.5,
+			},
+			expectedStatus: http.StatusOK,
+			checkResponse: func(t *testing.T, body []byte) {
+				var room map[string]interface{}
+				json.Unmarshal(body, &room)
+				if room["watermarkPosX"] != 0.5 {
+					t.Errorf("expected watermarkPosX 0.5, got %v", room["watermarkPosX"])
+				}
+				if room["watermarkPosY"] != 0.25 {
+					t.Errorf("expected watermarkPosY 0.25, got %v", room["watermarkPosY"])
+				}
+				if room["watermarkScale"] != 1.5 {
+					t.Errorf("expected watermarkScale 1.5, got %v", room["watermarkScale"])
+				}
+			},
+		},
+		{
+			name: "update clamps watermark position and scale",
+			slug: "update-test",
+			body: map[string]interface{}{
+				"watermarkPosX":  2.0,
+				"watermarkPosY":  -1.0,
+				"watermarkScale": 0.01,
+			},
+			expectedStatus: http.StatusOK,
+			checkResponse: func(t *testing.T, body []byte) {
+				var room map[string]interface{}
+				json.Unmarshal(body, &room)
+				if room["watermarkPosX"] != 1.0 {
+					t.Errorf("expected watermarkPosX clamped to 1.0, got %v", room["watermarkPosX"])
+				}
+				if room["watermarkPosY"] != 0.0 {
+					t.Errorf("expected watermarkPosY clamped to 0.0, got %v", room["watermarkPosY"])
+				}
+				if room["watermarkScale"] != 0.25 {
+					t.Errorf("expected watermarkScale clamped to 0.25, got %v", room["watermarkScale"])
+				}
+			},
+		},
+		{
+			name: "clear watermark position",
+			slug: "update-test",
+			body: map[string]interface{}{
+				"watermarkPosX": nil,
+				"watermarkPosY": nil,
+			},
+			expectedStatus: http.StatusOK,
+			checkResponse: func(t *testing.T, body []byte) {
+				var room map[string]interface{}
+				json.Unmarshal(body, &room)
+				if _, ok := room["watermarkPosX"]; ok {
+					t.Errorf("expected watermarkPosX cleared, got %v", room["watermarkPosX"])
+				}
+				if _, ok := room["watermarkPosY"]; ok {
+					t.Errorf("expected watermarkPosY cleared, got %v", room["watermarkPosY"])
+				}
+			},
+		},
+		{
+			name: "update participant limit",
+			slug: "update-test",
+			body: map[string]interface{}{
+				"maxParticipants": 42,
+			},
+			expectedStatus: http.StatusOK,
+			checkResponse: func(t *testing.T, body []byte) {
+				var room map[string]interface{}
+				json.Unmarshal(body, &room)
+				if room["maxParticipants"] != 42.0 {
+					t.Errorf("expected maxParticipants 42, got %v", room["maxParticipants"])
+				}
+			},
+		},
+		{
+			name: "invalid participant limit rejected",
+			slug: "update-test",
+			body: map[string]interface{}{
+				"maxParticipants": 200,
+			},
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name: "clear participant limit",
+			slug: "update-test",
+			body: map[string]interface{}{
+				"maxParticipants": nil,
+			},
+			expectedStatus: http.StatusOK,
+			checkResponse: func(t *testing.T, body []byte) {
+				var room map[string]interface{}
+				json.Unmarshal(body, &room)
+				if _, ok := room["maxParticipants"]; ok {
+					t.Errorf("expected maxParticipants cleared, got %v", room["maxParticipants"])
 				}
 			},
 		},
@@ -981,6 +1193,75 @@ func TestRoomHandler_ParticipantCap(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "Room is full") {
 		t.Errorf("expected 'Room is full' in response, got %q", rr.Body.String())
+	}
+}
+
+// TestRoomHandler_PerRoomParticipantLimit verifies that a room's
+// max_participants overrides the global MaxParticipantsPerRoom cap.
+func TestRoomHandler_PerRoomParticipantLimit(t *testing.T) {
+	db, cleanup := database.NewTestDB(t)
+	defer cleanup()
+
+	cfg := &config.Config{
+		AdminToken:             roomsTestAdminToken,
+		MaxParticipantsPerRoom: 20, // global default is higher than the room limit
+	}
+	handler := NewRoomHandler(db, cfg, roomsTestTokenSecret)
+
+	// Create a room with a per-room limit of 1
+	createBody := map[string]interface{}{
+		"slug":            "room-limit-test",
+		"name":            "Room Limit Test",
+		"watermarkMode":   "none",
+		"maxParticipants": 1,
+	}
+	bodyBytes, _ := json.Marshal(createBody)
+	createReq := httptest.NewRequest("POST", "/api/rooms", bytes.NewReader(bodyBytes))
+	createReq.Header.Set("Content-Type", "application/json")
+	createRR := httptest.NewRecorder()
+	handler.Create(createRR, createReq)
+	if createRR.Code != http.StatusCreated {
+		t.Fatalf("failed to create test room: %s", createRR.Body.String())
+	}
+
+	join := func(t *testing.T, name string) *httptest.ResponseRecorder {
+		t.Helper()
+		bodyBytes, _ := json.Marshal(map[string]interface{}{"name": name})
+		req := httptest.NewRequest("POST", "/api/rooms/room-limit-test/join", bytes.NewReader(bodyBytes))
+		req.SetPathValue("slug", "room-limit-test")
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		handler.Join(rr, req)
+		return rr
+	}
+
+	// First join succeeds
+	if rr := join(t, "User One"); rr.Code != http.StatusOK {
+		t.Fatalf("expected first join to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Second join is rejected despite the global cap of 20
+	rr := join(t, "User Two")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected status %d when room is full, got %d", http.StatusServiceUnavailable, rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "Room is full") {
+		t.Errorf("expected 'Room is full' in response, got %q", rr.Body.String())
+	}
+
+	// Raising the per-room limit lets more participants in
+	updateBody, _ := json.Marshal(map[string]interface{}{"maxParticipants": 2})
+	updateReq := httptest.NewRequest("PATCH", "/api/rooms/room-limit-test", bytes.NewReader(updateBody))
+	updateReq.SetPathValue("slug", "room-limit-test")
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateRR := httptest.NewRecorder()
+	handler.Update(updateRR, updateReq)
+	if updateRR.Code != http.StatusOK {
+		t.Fatalf("failed to update participant limit: %s", updateRR.Body.String())
+	}
+
+	if rr := join(t, "User Two"); rr.Code != http.StatusOK {
+		t.Errorf("expected join to succeed after raising limit, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 

@@ -28,6 +28,16 @@ type Room struct {
 	WatermarkLogoPath     *string `json:"watermarkLogoPath,omitempty"`
 	WatermarkLogoPosition string  `json:"watermarkLogoPosition"`
 	WatermarkOpacity      float64 `json:"watermarkOpacity"`
+	// WatermarkPosX/Y are the center of the watermark as a fraction (0-1) of
+	// the video width/height. Nil = legacy built-in placement.
+	WatermarkPosX *float64 `json:"watermarkPosX,omitempty"`
+	WatermarkPosY *float64 `json:"watermarkPosY,omitempty"`
+	// WatermarkScale multiplies the base text/logo size (0.25-3.0, 1.0 = default).
+	WatermarkScale float64 `json:"watermarkScale"`
+
+	// MaxParticipants overrides the global participant cap when set (1-100).
+	// Nil = use the global MaxParticipantsPerRoom default.
+	MaxParticipants *int `json:"maxParticipants,omitempty"`
 
 	// State
 	Status    RoomStatus `json:"status"`

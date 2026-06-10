@@ -842,3 +842,53 @@ func TestMaxICECandidates_Constant(t *testing.T) {
 		t.Error("MaxICECandidates should not be more than 1000")
 	}
 }
+
+// TestSFU_AddSubscriberICECandidate_BudgetResetsPerNegotiation is the
+// regression test for the "too many ICE candidates from subscriber" failures
+// seen on long sessions: the per-subscriber candidate counter never reset, so
+// TURN refreshes / ICE restarts eventually exhausted it and all later
+// candidates (including the ones needed for the ICE restart itself) were
+// rejected. The budget is now per-negotiation.
+func TestSFU_AddSubscriberICECandidate_BudgetResetsPerNegotiation(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	room := sfu.GetRoomTracks(roomSlug)
+
+	sub := &Subscriber{ID: "sub-1", done: make(chan struct{})}
+	room.AddSubscriber(sub)
+
+	candidate := webrtc.ICECandidateInit{Candidate: "candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host"}
+
+	// Exhaust the budget. remoteDescSet is false, so candidates are buffered
+	// and never touch the PeerConnection.
+	for i := 0; i < MaxICECandidates; i++ {
+		if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate); err != nil {
+			t.Fatalf("candidate %d unexpectedly rejected: %v", i, err)
+		}
+	}
+	if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate); err == nil {
+		t.Fatal("expected candidate over budget to be rejected")
+	}
+
+	// A new negotiation resets the budget; candidates flow again.
+	sub.resetICECandidateBudget()
+	if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate); err != nil {
+		t.Fatalf("candidate after budget reset unexpectedly rejected: %v", err)
+	}
+
+	// ...and the fresh budget is still bounded.
+	for i := 0; i < MaxICECandidates-1; i++ {
+		if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate); err != nil {
+			t.Fatalf("candidate %d of fresh budget unexpectedly rejected: %v", i, err)
+		}
+	}
+	if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate); err == nil {
+		t.Fatal("expected candidate over the fresh budget to be rejected")
+	}
+}
