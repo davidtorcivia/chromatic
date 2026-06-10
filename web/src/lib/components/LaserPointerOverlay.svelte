@@ -6,32 +6,22 @@
         getVideoContentRect,
     } from "$lib/video/coordinates";
     import {
-        pruneTrail,
-        trailAlpha,
+        midpointSlice,
+        flattenSlice,
+        fadeAlpha,
         smoothingFactor,
         rippleAt,
-        shouldAppendPoint,
-        adaptiveMinDistPx,
-        decimateOlderHalf,
-        splitLongSegments,
-        buildSplineSegments,
-        bucketTrailSegments,
-        trailStyle,
         subsampleBatch,
-        timestampBatch,
         TRAIL_FADE_MS,
-        TRAIL_HEAD_WIDTH,
-        TRAIL_TARGET_POINTS,
+        TRAIL_CLEAR_GRACE_MS,
+        TRAIL_BODY_WIDTH,
+        TRAIL_BODY_ALPHA,
         TRAIL_GLOW_WIDTH_RATIO,
         TRAIL_GLOW_ALPHA,
-        TRAIL_GLOW_OUTER_WIDTH_RATIO,
-        TRAIL_GLOW_OUTER_ALPHA,
-        TRAIL_CORE_WIDTH_RATIO,
-        TRAIL_CORE_ALPHA,
-        TRAIL_CORE_MIN_POS,
+        MIN_STAMP_DIST_PX,
         CURSOR_SEND_INTERVAL_MS,
-        type TrailPoint,
         type BatchPoint,
+        type QuadSlice,
     } from "$lib/video/laser";
 
     interface Cursor {
@@ -49,7 +39,12 @@
         targetY: number;
         active: boolean;
         lastUpdate: number;
-        trail: TrailPoint[];
+        // The last two stamped trail points (normalized coords) of the
+        // current stroke. Each new point stamps one midpoint-quadratic
+        // slice through prev1 onto the persistent trail canvas; the
+        // stroke itself lives in the canvas pixels, not in any list.
+        prev1: BatchPoint | null;
+        prev2: BatchPoint | null;
         // True for the sender's own cursor: driven directly by local
         // pointer events with zero network latency; server echoes for
         // this participantId are ignored.
@@ -83,12 +78,32 @@
     let lastQueuedPos: BatchPoint | null = null;
 
     // Cursor/effect state intentionally lives outside Svelte reactivity:
-    // everything is drawn imperatively on the canvas by a single RAF loop.
+    // everything is drawn imperatively on the canvases by a single RAF loop.
     const cursorMap = new Map<string, Cursor>();
     let ripples: Ripple[] = [];
 
-    let canvasEl = $state<HTMLCanvasElement | null>(null);
-    let ctx: CanvasRenderingContext2D | null = null;
+    // Two stacked canvases:
+    //  - trailCanvas (below): PERSISTENT decay layer. Slices are stamped
+    //    onto it exactly once as points arrive, and every RAF tick the
+    //    whole layer is faded with a destination-out fill. It is never
+    //    rebuilt from geometry, so per-frame cost is constant no matter
+    //    how long or fast the user draws.
+    //  - cursorCanvas (above): cleared and redrawn each frame with the
+    //    cursor dots, name labels, and release ripples (tiny constant cost).
+    let trailCanvas = $state<HTMLCanvasElement | null>(null);
+    let cursorCanvas = $state<HTMLCanvasElement | null>(null);
+    let trailCtx: CanvasRenderingContext2D | null = null;
+    let cursorCtx: CanvasRenderingContext2D | null = null;
+
+    // Decay-layer bookkeeping: when the layer last received a stamp and
+    // whether it might still hold visible pixels. Once a trail has fully
+    // faded (TRAIL_FADE_MS + TRAIL_CLEAR_GRACE_MS after the last stamp)
+    // the layer gets ONE full clearRect — destination-out is asymptotic
+    // and 8-bit alpha can leave faint ghosts — and the fade work stops,
+    // letting the RAF loop park when the cursor layer is also idle.
+    let trailHasContent = false;
+    let lastStampTime = 0;
+
     let rafId: number | null = null;
     let lastFrameTime = 0;
     let destroyed = false;
@@ -116,14 +131,24 @@
         }
     }
 
-    // Size the canvas backing store to the video content rect (DPR-aware)
+    // Size both canvas backing stores to the video content rect
+    // (DPR-aware). Setting width/height wipes canvas content, so the
+    // trail layer is cleared on resize by construction — stamped pixels
+    // are in canvas space and would be misplaced anyway; a momentary
+    // trail loss on resize is fine (cursors keep stamping fresh slices).
     $effect(() => {
         const rect = videoRect;
-        if (!canvasEl) return;
+        if (!trailCanvas || !cursorCanvas) return;
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        canvasEl.width = Math.max(1, Math.round(rect.width * dpr));
-        canvasEl.height = Math.max(1, Math.round(rect.height * dpr));
-        ctx = canvasEl.getContext("2d");
+        const bw = Math.max(1, Math.round(rect.width * dpr));
+        const bh = Math.max(1, Math.round(rect.height * dpr));
+        trailCanvas.width = bw;
+        trailCanvas.height = bh;
+        cursorCanvas.width = bw;
+        cursorCanvas.height = bh;
+        trailCtx = trailCanvas.getContext("2d");
+        cursorCtx = cursorCanvas.getContext("2d");
+        trailHasContent = false; // resize wiped the layer
         startRenderLoop(); // repaint at least once after a resize
     });
 
@@ -143,6 +168,7 @@
             endLocalStroke();
             sendCursorEnd();
         }
+        // No trail cleanup needed: the decay layer fades it out on its own.
     });
 
     onMount(() => {
@@ -238,6 +264,7 @@
                     ?.color ||
                 "#e63946";
             let cursor = cursorMap.get(data.participantId);
+            const wasActive = cursor?.active ?? false;
             if (!cursor) {
                 cursor = {
                     participantId: data.participantId,
@@ -248,39 +275,40 @@
                     targetX: head.x,
                     targetY: head.y,
                     active: data.active,
-                    lastUpdate: now - CURSOR_SEND_INTERVAL_MS,
-                    trail: [],
+                    lastUpdate: now,
+                    prev1: null,
+                    prev2: null,
                     local: false,
                 };
                 cursorMap.set(data.participantId, cursor);
-            } else if (!cursor.active && data.active) {
-                // Snap when a new stroke starts so the streak doesn't whip
-                // across the frame from the previous stroke's end point.
+            } else if (!wasActive && data.active) {
+                // Snap when a new stroke starts so the dot doesn't whip
+                // across the frame from the previous stroke's end point,
+                // and reset the stamp anchors so the new trail doesn't
+                // connect to the old one.
                 cursor.x = batch[0].x;
                 cursor.y = batch[0].y;
-                cursor.trail = [];
-                cursor.lastUpdate = now - CURSOR_SEND_INTERVAL_MS;
-            }
-
-            // Append the whole batch to the trail with timestamps spread
-            // across the send window, so fast flicks keep their dense real
-            // geometry and the age fade stays smooth along the batch.
-            if (data.active && !reducedMotion) {
-                const startT = Math.max(
-                    now - 2 * CURSOR_SEND_INTERVAL_MS,
-                    Math.min(cursor.lastUpdate, now)
-                );
-                const w = videoRect.width;
-                const h = videoRect.height;
-                for (const tp of timestampBatch(batch, startT, now)) {
-                    appendTrailPoint(cursor.trail, tp, w, h);
-                }
+                cursor.prev1 = null;
+                cursor.prev2 = null;
             }
 
             cursor.participantName = data.participantName;
             cursor.color = color;
+
+            // Stamp the received points onto the trail layer on arrival —
+            // the actual network geometry, in batch order. The final
+            // (active: false) message's points are stamped too, then the
+            // stroke is capped so the trail ends exactly at the release
+            // point.
+            if (!reducedMotion && (data.active || wasActive)) {
+                for (const p of batch) {
+                    stampCursorPoint(cursor, p.x, p.y);
+                }
+                if (!data.active) finishStroke(cursor);
+            }
+
             // The dot smooths toward the newest point; the batch path is
-            // already in the trail behind it.
+            // already stamped on the trail layer behind it.
             cursor.targetX = head.x;
             cursor.targetY = head.y;
             cursor.active = data.active;
@@ -293,7 +321,7 @@
         });
 
         // Clean up stale cursors every 500ms (covers dropped "end" messages).
-        // Trails fade within 2s, so anything idle for 3s has nothing left to draw.
+        // The dot disappears; the trail needs no cleanup — it just fades.
         const cleanupInterval = setInterval(() => {
             const now = Date.now();
             for (const [id, cursor] of cursorMap) {
@@ -347,21 +375,123 @@
         return out;
     }
 
-    // --- Trail recording ------------------------------------------------------
+    // --- Trail stamping -------------------------------------------------------
+    // Each new point (local coalesced sample or remote batch point) stamps
+    // ONE midpoint-quadratic slice onto the persistent trail canvas:
+    // from mid(prev2, prev1) through prev1 to mid(prev1, new). Adjacent
+    // slices share endpoints and tangents, so the stamped curve is
+    // G1-continuous at any speed, each slice is drawn exactly once, and
+    // there is no point list to prune, thin, or decimate — the two
+    // failure modes of the old renderer (stale pivot anchors, taper
+    // churn) cannot occur.
 
-    // Append one point to a trail with adaptive thinning (used by both
-    // local pointer events and incoming network batches). The minimum
-    // spacing grows as the trail fills (adaptiveMinDistPx) and crossing
-    // the target count decimates the older half, so sustained fast
-    // movement — spinning circles — settles at a bounded, roughly
-    // constant point count and the per-frame render cost stays flat.
-    function appendTrailPoint(trail: TrailPoint[], tp: TrailPoint, w: number, h: number) {
-        const last = trail[trail.length - 1];
-        if (!shouldAppendPoint(last, tp.x, tp.y, w, h, adaptiveMinDistPx(trail.length))) {
+    function trailDpr(): number {
+        return trailCanvas ? trailCanvas.width / Math.max(1, videoRect.width) : 1;
+    }
+
+    /** Stamp one slice (canvas px coords) in two passes: glow then body. */
+    function stampSlice(c: CanvasRenderingContext2D, color: string, s: QuadSlice) {
+        c.setTransform(trailDpr(), 0, 0, trailDpr(), 0, 0);
+        c.lineCap = "round";
+        c.lineJoin = "round";
+        c.strokeStyle = color;
+
+        // One path, stroked twice. Slices whose chord exceeds
+        // SLICE_MAX_CHORD_PX (fast flick) are subdivided by sampling the
+        // quadratic so no stamp reads as a single long rod.
+        c.beginPath();
+        c.moveTo(s.x0, s.y0);
+        const subdivided = flattenSlice(s);
+        if (subdivided) {
+            for (const p of subdivided) c.lineTo(p.x, p.y);
+        } else {
+            c.quadraticCurveTo(s.cx, s.cy, s.x1, s.y1);
+        }
+
+        // Glow pass: wide, faint, additive. The glow is the pure
+        // participant color at low alpha, so same-color overlap (shared
+        // caps, self-crossings while spinning circles) saturates toward
+        // the vivid hue — additive compositing cannot white-clip a
+        // single-hue source.
+        c.globalCompositeOperation = "lighter";
+        c.globalAlpha = TRAIL_GLOW_ALPHA;
+        c.lineWidth = TRAIL_BODY_WIDTH * TRAIL_GLOW_WIDTH_RATIO;
+        c.stroke();
+
+        // Body pass: normal width, high alpha, source-over — crossings
+        // (including other participants' trails) repaint cleanly instead
+        // of accumulating.
+        c.globalCompositeOperation = "source-over";
+        c.globalAlpha = TRAIL_BODY_ALPHA;
+        c.lineWidth = TRAIL_BODY_WIDTH;
+        c.stroke();
+
+        c.globalAlpha = 1;
+        trailHasContent = true;
+        lastStampTime = performance.now();
+    }
+
+    /**
+     * Feed one new trail point (normalized coords) for a cursor. The
+     * first point of a stroke only seeds the anchors; every subsequent
+     * point at least MIN_STAMP_DIST_PX away stamps one slice
+     * synchronously — zero latency for local samples, on-arrival for
+     * remote batches.
+     */
+    function stampCursorPoint(cursor: Cursor, x: number, y: number) {
+        const w = videoRect.width;
+        const h = videoRect.height;
+        if (!trailCtx || w <= 0 || h <= 0) return;
+
+        const p1 = cursor.prev1;
+        if (!p1) {
+            cursor.prev1 = { x, y };
             return;
         }
-        trail.push(tp);
-        if (trail.length > TRAIL_TARGET_POINTS) decimateOlderHalf(trail);
+        // Skip sub-pixel jitter so round caps don't pile up on one spot.
+        const dx = (x - p1.x) * w;
+        const dy = (y - p1.y) * h;
+        if (dx * dx + dy * dy < MIN_STAMP_DIST_PX * MIN_STAMP_DIST_PX) return;
+
+        const p2 = cursor.prev2 ?? p1; // first slice starts at prev1 itself
+        stampSlice(
+            trailCtx,
+            cursor.color,
+            midpointSlice(
+                { x: p2.x * w, y: p2.y * h },
+                { x: p1.x * w, y: p1.y * h },
+                { x: x * w, y: y * h }
+            )
+        );
+        cursor.prev2 = p1;
+        cursor.prev1 = { x, y };
+        startRenderLoop();
+    }
+
+    /**
+     * Cap a finished stroke: the last stamped slice ended at
+     * mid(prev2, prev1), so stamp the remaining half-segment up to the
+     * final point (midpointSlice with next === prev1 ends exactly
+     * there), then reset the anchors for the next stroke.
+     */
+    function finishStroke(cursor: Cursor) {
+        const w = videoRect.width;
+        const h = videoRect.height;
+        const p1 = cursor.prev1;
+        const p2 = cursor.prev2;
+        if (trailCtx && p1 && p2 && w > 0 && h > 0) {
+            stampSlice(
+                trailCtx,
+                cursor.color,
+                midpointSlice(
+                    { x: p2.x * w, y: p2.y * h },
+                    { x: p1.x * w, y: p1.y * h },
+                    { x: p1.x * w, y: p1.y * h }
+                )
+            );
+        }
+        cursor.prev1 = null;
+        cursor.prev2 = null;
     }
 
     // --- Local echo ---------------------------------------------------------
@@ -386,28 +516,20 @@
             targetY: 0,
             active: false,
             lastUpdate: Date.now(),
-            trail: [],
+            prev1: null,
+            prev2: null,
             local: true,
         };
         cursorMap.set(id, cursor);
         return cursor;
     }
 
-    function appendLocalBatch(cursor: Cursor, batch: BatchPoint[], e: PointerEvent) {
-        const now = Date.now();
-        const w = videoRect.width;
-        const h = videoRect.height;
-        // Anchor batch timestamps to real capture times: coalesced events
-        // share the dispatching event's clock, so map their offsets onto
-        // Date.now() (the trail clock).
-        const firstTs =
-            typeof e.getCoalescedEvents === "function"
-                ? (e.getCoalescedEvents()[0]?.timeStamp ?? e.timeStamp)
-                : e.timeStamp;
-        const span = Math.max(0, e.timeStamp - firstTs);
+    function appendLocalBatch(cursor: Cursor, batch: BatchPoint[]) {
+        // Stamp every coalesced sample synchronously on capture (zero
+        // latency, full input geometry).
         if (!reducedMotion) {
-            for (const tp of timestampBatch(batch, now - span, now)) {
-                appendTrailPoint(cursor.trail, tp, w, h);
+            for (const p of batch) {
+                stampCursorPoint(cursor, p.x, p.y);
             }
         }
         const head = batch[batch.length - 1];
@@ -417,22 +539,23 @@
         cursor.targetY = head.y;
         cursor.x = head.x;
         cursor.y = head.y;
-        cursor.lastUpdate = now;
+        cursor.lastUpdate = Date.now();
     }
 
     function beginLocalStroke(e: PointerEvent) {
         const cursor = localCursor();
         if (!cursor) return;
-        cursor.trail = [];
+        cursor.prev1 = null;
+        cursor.prev2 = null;
         cursor.active = true;
-        appendLocalBatch(cursor, coalescedCoords(e), e);
+        appendLocalBatch(cursor, coalescedCoords(e));
         startRenderLoop();
     }
 
     function extendLocalStroke(e: PointerEvent) {
         const cursor = localCursor();
         if (!cursor) return;
-        appendLocalBatch(cursor, coalescedCoords(e), e);
+        appendLocalBatch(cursor, coalescedCoords(e));
         startRenderLoop();
     }
 
@@ -443,6 +566,7 @@
         cursor.active = false;
         cursor.lastUpdate = Date.now();
         if (!reducedMotion) {
+            finishStroke(cursor);
             ripples.push({
                 x: cursor.targetX,
                 y: cursor.targetY,
@@ -500,6 +624,11 @@
     }
 
     // --- Rendering (single RAF loop, idles when there is nothing to draw) --
+    // Per-frame work is small and CONSTANT: one destination-out fillRect
+    // on the trail layer (while it has content) plus a full redraw of the
+    // tiny cursor layer. Trail geometry is never re-stroked here — slices
+    // were already stamped when their points arrived. The loop parks when
+    // there are no cursors/ripples AND the trail layer is clean.
 
     function startRenderLoop() {
         if (rafId !== null || destroyed) return;
@@ -512,24 +641,42 @@
         if (destroyed) return;
         const dt = Math.min(now - lastFrameTime, 100);
         lastFrameTime = now;
-        if (renderFrame(dt)) {
+        if (renderFrame(dt, now)) {
             rafId = requestAnimationFrame(frame);
         }
         // Otherwise the loop idles (no CPU burn on static content);
-        // incoming cursor messages or a resize restart it.
+        // pointer input, incoming cursor messages, or a resize restart it.
     }
 
     /** Draws one frame. Returns true if another frame is needed. */
-    function renderFrame(dt: number): boolean {
-        if (!ctx || !canvasEl) return false;
+    function renderFrame(dt: number, frameNow: number): boolean {
+        if (!cursorCtx || !cursorCanvas) return false;
 
         const w = videoRect.width;
         const h = videoRect.height;
-        const dpr = canvasEl.width / Math.max(1, w);
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.clearRect(0, 0, w, h);
+        const dpr = cursorCanvas.width / Math.max(1, w);
+        cursorCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        cursorCtx.clearRect(0, 0, w, h);
 
         if (w <= 0 || h <= 0) return false;
+
+        // Trail layer decay: one dt-scaled destination-out fill per frame
+        // (same wall-clock fade rate at 60Hz and 120Hz). Once the last
+        // stamp has fully faded, ONE clearRect removes any 8-bit alpha
+        // residue and the fade work stops entirely.
+        if (trailHasContent && trailCtx) {
+            trailCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            if (frameNow - lastStampTime > TRAIL_FADE_MS + TRAIL_CLEAR_GRACE_MS) {
+                trailCtx.globalCompositeOperation = "source-over";
+                trailCtx.clearRect(0, 0, w, h);
+                trailHasContent = false;
+            } else {
+                trailCtx.globalCompositeOperation = "destination-out";
+                trailCtx.fillStyle = `rgba(0, 0, 0, ${fadeAlpha(dt)})`;
+                trailCtx.fillRect(0, 0, w, h);
+                trailCtx.globalCompositeOperation = "source-over";
+            }
+        }
 
         const now = Date.now();
         let hasWork = false;
@@ -539,19 +686,19 @@
                 // Plain dots only: snap to target, no trails or glow
                 cursor.x = cursor.targetX;
                 cursor.y = cursor.targetY;
-                cursor.trail.length = 0;
                 if (cursor.active) {
-                    drawCursorDot(ctx, cursor, w, h, true);
+                    drawCursorDot(cursorCtx, cursor, w, h, true);
                     hasWork = true;
                 }
                 continue;
             }
 
             // The local cursor tracks the true pointer position with no
-            // smoothing (zero added latency). Remote cursors interpolate
-            // toward the newest batched network point so they glide at
-            // display refresh rate even with ~30Hz input; the dense batch
-            // path is already in the trail behind the dot.
+            // smoothing (zero added latency); the latest stamped slice
+            // ends at most half a sample behind it, under the dot. Remote
+            // cursors interpolate toward the newest batched network point
+            // so they glide at display refresh rate even with ~30Hz input;
+            // the batch path is already stamped on the trail layer.
             if (cursor.local) {
                 cursor.x = cursor.targetX;
                 cursor.y = cursor.targetY;
@@ -569,17 +716,8 @@
                 }
             }
 
-            // Trail points are appended at their source (local pointer
-            // events / incoming network batches), already thinned to >=2px.
-            pruneTrail(cursor.trail, now);
-
-            if (cursor.trail.length > 0) {
-                drawTrail(ctx, cursor, w, h, now);
-                hasWork = true;
-            }
-
             if (cursor.active) {
-                drawCursorDot(ctx, cursor, w, h, false);
+                drawCursorDot(cursorCtx, cursor, w, h, false);
                 hasWork = true;
             }
         }
@@ -590,166 +728,41 @@
         // the same arc reads the same and costs a fraction). A ring stroke
         // never overlaps itself, so 'lighter' is safe here at full alpha.
         if (ripples.length > 0) {
+            const c = cursorCtx;
             let keep = 0;
             for (const ripple of ripples) {
                 const v = rippleAt(now - ripple.start);
                 if (v.done) continue;
-                ctx.save();
-                ctx.globalCompositeOperation = "lighter";
-                ctx.beginPath();
-                ctx.arc(ripple.x * w, ripple.y * h, v.radius, 0, Math.PI * 2);
+                c.save();
+                c.globalCompositeOperation = "lighter";
+                c.beginPath();
+                c.arc(ripple.x * w, ripple.y * h, v.radius, 0, Math.PI * 2);
                 // Faint colored fill for a soft "ping"
-                ctx.globalAlpha = v.alpha * 0.12;
-                ctx.fillStyle = ripple.color;
-                ctx.fill();
+                c.globalAlpha = v.alpha * 0.12;
+                c.fillStyle = ripple.color;
+                c.fill();
                 // Wide faint halo ring (replaces the old shadowBlur glow)
-                ctx.globalAlpha = v.alpha * 0.28;
-                ctx.strokeStyle = ripple.color;
-                ctx.lineWidth = 7;
-                ctx.stroke();
+                c.globalAlpha = v.alpha * 0.28;
+                c.strokeStyle = ripple.color;
+                c.lineWidth = 7;
+                c.stroke();
                 // Main colored ring
-                ctx.globalAlpha = v.alpha;
-                ctx.lineWidth = 2.5;
-                ctx.stroke();
+                c.globalAlpha = v.alpha;
+                c.lineWidth = 2.5;
+                c.stroke();
                 // Thin white hot edge
-                ctx.globalAlpha = v.alpha * 0.35;
-                ctx.strokeStyle = "#fff";
-                ctx.lineWidth = 1;
-                ctx.stroke();
-                ctx.restore();
+                c.globalAlpha = v.alpha * 0.35;
+                c.strokeStyle = "#fff";
+                c.lineWidth = 1;
+                c.stroke();
+                c.restore();
                 ripples[keep++] = ripple;
             }
             ripples.length = keep;
             if (keep > 0) hasWork = true;
         }
 
-        return hasWork;
-    }
-
-    // Trail rendering: three passes over one centripetal Catmull-Rom
-    // spline that interpolates every recorded point (G1-continuous, so
-    // no visible angles at joints) and ends exactly at the live cursor.
-    //
-    // Per-frame cost is bounded and roughly constant: geometry is capped
-    // by adaptive thinning (~TRAIL_TARGET_POINTS live points), there is
-    // NO shadowBlur anywhere (its cost scales with path length and was
-    // the dominant frame cost on long trails), and the body taper is
-    // quantized into TRAIL_BODY_BUCKETS strokes instead of one stroke
-    // per segment — at most ~11 stroke calls per trail per frame.
-    //
-    //   1. GLOW  — 'lighter', TWO layered wide strokes of the whole
-    //      spline (one Path2D built once, stroked twice): a wide faint
-    //      outer halo plus a tighter brighter one. A single stroke never
-    //      overlaps itself, so additive compositing cannot white-clip.
-    //   2. BODY  — 'source-over', taper bucketed into at most
-    //      TRAIL_BODY_BUCKETS contiguous runs, each stroked as ONE path
-    //      with width/alpha from trailStyle at the run's midpoint
-    //      (~TRAIL_BODY_MAX_ALPHA at the head, fading to the tail).
-    //   3. CORE  — 'lighter', ONE thin near-white stroke over just the
-    //      head portion (pos >= TRAIL_CORE_MIN_POS) for the hot-laser
-    //      look; fades with the head's life after release.
-
-    // Scratch buffers reused across frames (consumed synchronously inside
-    // drawTrail) so a long live trail doesn't allocate a fresh points
-    // array + head object every RAF tick.
-    const scratchPoints: TrailPoint[] = [];
-    const scratchHead: TrailPoint = { x: 0, y: 0, t: 0 };
-
-    function drawTrail(
-        c: CanvasRenderingContext2D,
-        cursor: Cursor,
-        w: number,
-        h: number,
-        now: number
-    ) {
-        // Recorded points are thinned to >=2px spacing, so while pointing we
-        // append a virtual head at the live pointer position for the LOCAL
-        // cursor. The spline passes through it with a continuous tangent,
-        // so the streak meets the cursor dot without a kink. Remote trails
-        // already end at the newest real network point (the smoothed dot
-        // glides up to it), so they get no virtual head.
-        let points: TrailPoint[] = cursor.trail;
-        if (cursor.active && cursor.local) {
-            const last = points[points.length - 1];
-            if (!last || last.x !== cursor.x || last.y !== cursor.y) {
-                scratchPoints.length = 0;
-                for (const p of points) scratchPoints.push(p);
-                scratchHead.x = cursor.x;
-                scratchHead.y = cursor.y;
-                scratchHead.t = now;
-                scratchPoints.push(scratchHead);
-                points = scratchPoints;
-            }
-        }
-        if (points.length < 2) return;
-
-        // Fast flicks leave sparse 30Hz samples; subdivide long chords so
-        // the taper and age fade stay smooth along them.
-        const segs = buildSplineSegments(splitLongSegments(points, w, h));
-        if (segs.length === 0) return;
-        const headLife = trailAlpha(now - points[points.length - 1].t, TRAIL_FADE_MS);
-
-        c.save();
-        c.lineCap = "round";
-        c.lineJoin = "round";
-
-        // Full spline as one Path2D, built once and stroked by both glow
-        // layers.
-        const path = new Path2D();
-        path.moveTo(segs[0].x0 * w, segs[0].y0 * h);
-        for (const s of segs) {
-            path.bezierCurveTo(s.c1x * w, s.c1y * h, s.c2x * w, s.c2y * h, s.x1 * w, s.y1 * h);
-        }
-
-        // Pass 1: outer glow — two layered wide strokes, no shadowBlur.
-        c.globalCompositeOperation = "lighter";
-        c.strokeStyle = cursor.color;
-        c.globalAlpha = TRAIL_GLOW_OUTER_ALPHA * headLife;
-        c.lineWidth = TRAIL_HEAD_WIDTH * TRAIL_GLOW_OUTER_WIDTH_RATIO;
-        c.stroke(path);
-        c.globalAlpha = TRAIL_GLOW_ALPHA * headLife;
-        c.lineWidth = TRAIL_HEAD_WIDTH * TRAIL_GLOW_WIDTH_RATIO;
-        c.stroke(path);
-
-        // Pass 2: vivid body, oldest -> newest so the head draws on top.
-        // One stroke per bucket; adjacent buckets share an endpoint and
-        // the round caps cover the joints.
-        c.globalCompositeOperation = "source-over";
-        for (const bucket of bucketTrailSegments(segs)) {
-            const life = trailAlpha(now - bucket.t, TRAIL_FADE_MS);
-            const { width, alpha } = trailStyle(bucket.pos, life);
-            if (alpha <= 0.004 || width <= 0.05) continue;
-            c.globalAlpha = alpha;
-            c.lineWidth = width;
-            c.beginPath();
-            c.moveTo(segs[bucket.start].x0 * w, segs[bucket.start].y0 * h);
-            for (let i = bucket.start; i < bucket.end; i++) {
-                const s = segs[i];
-                c.bezierCurveTo(s.c1x * w, s.c1y * h, s.c2x * w, s.c2y * h, s.x1 * w, s.y1 * h);
-            }
-            c.stroke();
-        }
-
-        // Pass 3: hot white core at the head only.
-        const coreAlpha = TRAIL_CORE_ALPHA * headLife;
-        if (coreAlpha > 0.01) {
-            c.globalCompositeOperation = "lighter";
-            c.strokeStyle = "#fff";
-            c.globalAlpha = coreAlpha;
-            c.lineWidth = TRAIL_HEAD_WIDTH * TRAIL_CORE_WIDTH_RATIO;
-            let started = false;
-            c.beginPath();
-            for (const s of segs) {
-                if (s.pos < TRAIL_CORE_MIN_POS) continue;
-                if (!started) {
-                    c.moveTo(s.x0 * w, s.y0 * h);
-                    started = true;
-                }
-                c.bezierCurveTo(s.c1x * w, s.c1y * h, s.c2x * w, s.c2y * h, s.x1 * w, s.y1 * h);
-            }
-            if (started) c.stroke();
-        }
-        c.restore();
+        return hasWork || trailHasContent;
     }
 
     // Pre-rendered radial-gradient glow sprites, one per participant
@@ -853,7 +866,10 @@
     {#if showUsageHint}
         <div class="laser-hint">Laser enabled: click and drag on video to point</div>
     {/if}
-    <canvas bind:this={canvasEl} class="laser-canvas"></canvas>
+    <!-- Persistent decay layer (trails) below, per-frame layer (dots,
+         labels, ripples) above. -->
+    <canvas bind:this={trailCanvas} class="laser-canvas"></canvas>
+    <canvas bind:this={cursorCanvas} class="laser-canvas"></canvas>
 </div>
 
 <style>
