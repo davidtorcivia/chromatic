@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -136,6 +138,7 @@ type RoomHandler struct {
 	adminToken          string                // For validating admin joins (constant-time compared)
 	validateSession     SessionValidator      // Admin session cookie validation (join-as-host)
 	maxParticipants     int                   // Cap on non-ended participants per room
+	uploadPath          string                // Root of per-room upload dirs (for delete-with-files)
 	obsReconnectTimeout time.Duration
 	timerMu             sync.Mutex
 	streamEndTimers     map[string]*time.Timer
@@ -157,6 +160,7 @@ func NewRoomHandler(db *database.DB, cfg *config.Config, tokenSecret []byte) *Ro
 		waitingManager:      NewWaitingManager(),
 		adminToken:          cfg.AdminToken,
 		maxParticipants:     maxParticipants,
+		uploadPath:          cfg.UploadPath,
 		obsReconnectTimeout: cfg.OBSReconnectTimeout,
 		streamEndTimers:     make(map[string]*time.Timer),
 		openTimers:          make(map[string]*time.Timer),
@@ -919,9 +923,20 @@ func (h *RoomHandler) Update(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, room)
 }
 
-// Delete deletes a room
+// Delete deletes a room. With ?deleteFiles=true the room's uploaded files
+// (UPLOAD_PATH/{roomID}/, including thumbnails) are removed from disk as
+// well — the DB rows for files/messages/participants cascade either way.
 func (h *RoomHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
+	deleteFiles := r.URL.Query().Get("deleteFiles") == "true"
+
+	// Resolve the room ID before the row disappears — the upload directory
+	// is keyed by ID, not slug.
+	var roomID string
+	if err := h.db.QueryRow("SELECT id FROM rooms WHERE slug = ?", slug).Scan(&roomID); err != nil {
+		http.Error(w, "Room not found", http.StatusNotFound)
+		return
+	}
 
 	result, err := h.db.Exec("DELETE FROM rooms WHERE slug = ?", slug)
 	if err != nil {
@@ -933,6 +948,19 @@ func (h *RoomHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	if affected == 0 {
 		http.Error(w, "Room not found", http.StatusNotFound)
 		return
+	}
+
+	if deleteFiles && roomID != "" && h.uploadPath != "" {
+		dir := filepath.Join(h.uploadPath, roomID)
+		// Same containment rule as file serving: never unlink outside the
+		// upload root.
+		if isPathWithin(h.uploadPath, dir) {
+			if err := os.RemoveAll(dir); err != nil {
+				logger.Warn("Failed to remove room upload directory", "room_id", roomID, "error", err)
+			} else {
+				logger.Info("Removed room upload directory", "room_id", roomID, "room", slug)
+			}
+		}
 	}
 
 	h.cancelOpenTimer(slug)

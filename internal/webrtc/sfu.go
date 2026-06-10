@@ -146,6 +146,29 @@ type Subscriber struct {
 	// Scoped per negotiation: reset via resetICECandidateBudget whenever a
 	// new SDP negotiation begins.
 	iceCandidateCount int
+	// Pending renegotiation state. Tracks that could not be offered right away
+	// (another offer/answer exchange in flight, or signaling lock contention)
+	// are never dropped: they are either attached with needsRenegotiation set,
+	// or queued in pendingTracks, and flushed at the next point the signaling
+	// state returns to stable (FlushPendingRenegotiation).
+	// needsRenegotiation is guarded by SignalingMu; pendingTracks and
+	// OnRenegotiationNeeded are guarded by pendingMu so they can be recorded
+	// even while another goroutine holds SignalingMu.
+	needsRenegotiation    bool
+	pendingMu             sync.Mutex
+	pendingTracks         []*webrtc.TrackLocalStaticRTP
+	OnRenegotiationNeeded func(offerSDP string)
+}
+
+// pcHasTrack reports whether the peer connection already has a sender bound
+// to this exact track (prevents double-attach when an add is retried/queued).
+func pcHasTrack(pc *webrtc.PeerConnection, track webrtc.TrackLocal) bool {
+	for _, sender := range pc.GetSenders() {
+		if sender.Track() == track {
+			return true
+		}
+	}
+	return false
 }
 
 // resetICECandidateBudget resets the per-negotiation ICE candidate counter.
@@ -609,6 +632,10 @@ func (rt *RoomTracks) removeSubscriberLocked(id string) []*webrtc.PeerConnection
 		sub.OnICECandidate = nil
 		sub.pendingCandidates = nil
 		sub.candidateMu.Unlock()
+		sub.pendingMu.Lock()
+		sub.OnRenegotiationNeeded = nil
+		sub.pendingTracks = nil
+		sub.pendingMu.Unlock()
 		delete(rt.Subscribers, id)
 		// Track subscriber removal
 		metrics.Get().ActiveSubscribers.Add(-1)
@@ -862,6 +889,17 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 			sub.candidateMu.Unlock()
 		}
 	})
+
+	// Hold the (uncontended) signaling mutex from before the subscriber
+	// becomes visible in the map until the initial offer's local description
+	// is set. Without this, a concurrent voice/screen-share fan-out can find
+	// the subscriber, pass its own stable-state check, and race our
+	// CreateOffer/SetLocalDescription — pion then rejects one side with
+	// "invalid proposed signaling state transition" and that track is lost
+	// for this subscriber. Lock order (SignalingMu → room.mu) is safe: no
+	// path acquires SignalingMu while holding room.mu.
+	sub.SignalingMu.Lock()
+	defer sub.SignalingMu.Unlock()
 
 	// Atomic bind+insert: track reads, AddTrack calls and map insertion happen
 	// under a single critical section so BindIngestToRoom can't rewrite
@@ -1127,6 +1165,9 @@ func (s *SFU) HandleIceRestart(roomSlug, subscriberID, sdpOffer string) (string,
 		if err := sub.PeerConnection.SetLocalDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}); err != nil {
 			return "", fmt.Errorf("failed to rollback server offer for ICE restart: %w", err)
 		}
+		// Tracks from the rolled-back offer are still attached but were never
+		// negotiated — make sure a follow-up offer actually happens.
+		sub.needsRenegotiation = true
 	}
 
 	// Set the new offer from the client
@@ -1191,6 +1232,9 @@ func (s *SFU) HandleSubscriberOffer(roomSlug, subscriberID, sdpOffer string) (st
 		if err := sub.PeerConnection.SetLocalDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}); err != nil {
 			return "", false, fmt.Errorf("failed to rollback: %w", err)
 		}
+		// Tracks from the rolled-back offer are still attached but were never
+		// negotiated — flag them for the post-answer flush.
+		sub.needsRenegotiation = true
 		rolledBack = true
 	}
 
@@ -1667,16 +1711,17 @@ func (sub *Subscriber) trySignalingLock(timeout time.Duration) bool {
 }
 
 // addTrackAndRenegotiate adds a local relay track to a subscriber's peer
-// connection and creates a renegotiation offer. Transient failures (signaling
-// lock contention, signaling state not stable — e.g. a client mic offer in
-// flight) are retried with backoff instead of permanently dropping the track
-// for this subscriber. Retries abort early if the subscriber is removed or
-// its connection reaches a terminal state.
+// connection and creates a renegotiation offer. The track is NEVER dropped:
+// if another offer/answer exchange is in flight the track is attached anyway
+// (legal mid-negotiation) and a follow-up offer is pushed when signaling
+// settles; if the signaling lock can't be acquired the track is queued and
+// attached at the next flush point. Returns "" with nil error when the
+// renegotiation was deferred — the offer will be delivered via the
+// subscriber's OnRenegotiationNeeded callback instead.
 func (s *SFU) addTrackAndRenegotiate(sub *Subscriber, localTrack *webrtc.TrackLocalStaticRTP, label string) (string, error) {
 	const maxAttempts = 3
-	backoff := 500 * time.Millisecond
+	backoff := 250 * time.Millisecond
 
-	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if attempt > 1 {
 			select {
@@ -1687,71 +1732,193 @@ func (s *SFU) addTrackAndRenegotiate(sub *Subscriber, localTrack *webrtc.TrackLo
 			backoff *= 2
 		}
 
-		offerSDP, retryable, err := s.tryAddTrackAndRenegotiate(sub, localTrack)
+		offerSDP, deferred, retryable, err := s.tryAddTrackAndRenegotiate(sub, localTrack)
 		if err == nil {
+			if deferred {
+				log.Printf("Attached %s track to subscriber %s mid-negotiation; offer deferred to next stable state", label, sub.ID)
+				return "", nil
+			}
 			return offerSDP, nil
 		}
-		lastErr = err
 		if !retryable {
 			return "", err
 		}
-		log.Printf("Transient failure adding %s track to subscriber %s (attempt %d/%d): %v", label, sub.ID, attempt, maxAttempts, err)
+		log.Printf("Signaling lock busy adding %s track to subscriber %s (attempt %d/%d): %v", label, sub.ID, attempt, maxAttempts, err)
 	}
 
-	log.Printf("Giving up adding %s track to subscriber %s after %d attempts: %v", label, sub.ID, maxAttempts, lastErr)
-	return "", lastErr
+	// Persistent lock contention: queue the track so the next flush point
+	// (answer applied, renegotiation completed, ICE restart) attaches it.
+	sub.pendingMu.Lock()
+	sub.pendingTracks = append(sub.pendingTracks, localTrack)
+	sub.pendingMu.Unlock()
+	log.Printf("Queued %s track for subscriber %s after signaling lock contention", label, sub.ID)
+	// Best-effort async flush in case no further signaling traffic arrives.
+	go s.tryFlushPendingRenegotiation(sub, 5*time.Second)
+	return "", nil
 }
 
 // tryAddTrackAndRenegotiate performs a single attempt of the add-track +
-// renegotiate operation. The retryable result indicates whether the failure
-// is transient (lock contention or in-flight renegotiation) and worth retrying.
-func (s *SFU) tryAddTrackAndRenegotiate(sub *Subscriber, localTrack *webrtc.TrackLocalStaticRTP) (offerSDP string, retryable bool, err error) {
+// renegotiate operation. deferred=true means the track was attached but the
+// offer must wait for the in-flight negotiation to settle. retryable=true
+// (with err) means the signaling lock was busy and the caller should retry.
+func (s *SFU) tryAddTrackAndRenegotiate(sub *Subscriber, localTrack *webrtc.TrackLocalStaticRTP) (offerSDP string, deferred bool, retryable bool, err error) {
 	// Guard: don't touch a PC that is already closed/failed
 	connState := sub.PeerConnection.ConnectionState()
 	if connState == webrtc.PeerConnectionStateClosed || connState == webrtc.PeerConnectionStateFailed {
-		return "", false, fmt.Errorf("subscriber %s connection in terminal state: %s", sub.ID, connState)
+		return "", false, false, fmt.Errorf("subscriber %s connection in terminal state: %s", sub.ID, connState)
 	}
 
 	// Wait for the signaling mutex with a timeout. Another goroutine
 	// (e.g. HandleSubscriberOffer processing a client mic offer) may hold
 	// the lock, so we poll rather than block indefinitely.
 	if !sub.trySignalingLock(2 * time.Second) {
-		return "", true, fmt.Errorf("timed out waiting for signaling lock for subscriber %s", sub.ID)
+		return "", false, true, fmt.Errorf("timed out waiting for signaling lock for subscriber %s", sub.ID)
 	}
 	defer sub.SignalingMu.Unlock()
 
 	// After acquiring the lock, re-check connection state
 	connState = sub.PeerConnection.ConnectionState()
 	if connState == webrtc.PeerConnectionStateClosed || connState == webrtc.PeerConnectionStateFailed {
-		return "", false, fmt.Errorf("subscriber %s connection in terminal state: %s", sub.ID, connState)
+		return "", false, false, fmt.Errorf("subscriber %s connection in terminal state: %s", sub.ID, connState)
+	}
+
+	// Attach the shared relay track now — AddTrack is legal in any signaling
+	// state and pion fans out writes to all PCs that have added this track.
+	if !pcHasTrack(sub.PeerConnection, localTrack) {
+		if _, err := sub.PeerConnection.AddTrack(localTrack); err != nil {
+			return "", false, false, fmt.Errorf("failed to add track: %w", err)
+		}
 	}
 
 	// A non-stable signaling state means another offer/answer exchange is in
-	// flight; it should settle shortly, so this is retryable.
+	// flight. The track is attached; defer the offer to the next flush point
+	// instead of failing (the old behavior permanently lost the track).
 	if sub.PeerConnection.SignalingState() != webrtc.SignalingStateStable {
-		return "", true, fmt.Errorf("signaling state not stable for subscriber %s: %s", sub.ID, sub.PeerConnection.SignalingState())
-	}
-
-	// Add the shared relay track to the subscriber's peer connection.
-	// Pion fans out writes to all PCs that have added this track.
-	// Failures past this point are NOT retryable: the track may already be
-	// attached, and retrying would add it twice.
-	if _, err := sub.PeerConnection.AddTrack(localTrack); err != nil {
-		return "", false, fmt.Errorf("failed to add track: %w", err)
+		sub.needsRenegotiation = true
+		return "", true, false, nil
 	}
 
 	// Create renegotiation offer to notify subscriber of new track
 	offer, err := sub.PeerConnection.CreateOffer(nil)
 	if err != nil {
-		return "", false, fmt.Errorf("failed to create renegotiation offer: %w", err)
+		sub.needsRenegotiation = true
+		return "", false, false, fmt.Errorf("failed to create renegotiation offer: %w", err)
 	}
 
 	if err := sub.PeerConnection.SetLocalDescription(offer); err != nil {
-		return "", false, fmt.Errorf("failed to set local description: %w", err)
+		// Track is attached; mark for a follow-up offer so it isn't lost.
+		sub.needsRenegotiation = true
+		return "", false, false, fmt.Errorf("failed to set local description: %w", err)
 	}
 
 	// ICE candidates are trickled via the subscriber's OnICECandidate callback
-	return offer.SDP, false, nil
+	return offer.SDP, false, false, nil
+}
+
+// flushPendingRenegotiationLocked attaches any queued tracks and, if any
+// tracks were attached while signaling was busy, creates a follow-up
+// renegotiation offer and pushes it via OnRenegotiationNeeded.
+// Caller must hold sub.SignalingMu.
+func (sub *Subscriber) flushPendingRenegotiationLocked() {
+	connState := sub.PeerConnection.ConnectionState()
+	if connState == webrtc.PeerConnectionStateClosed || connState == webrtc.PeerConnectionStateFailed {
+		sub.pendingMu.Lock()
+		sub.pendingTracks = nil
+		sub.pendingMu.Unlock()
+		return
+	}
+
+	sub.pendingMu.Lock()
+	pending := sub.pendingTracks
+	sub.pendingTracks = nil
+	cb := sub.OnRenegotiationNeeded
+	sub.pendingMu.Unlock()
+
+	for _, t := range pending {
+		if pcHasTrack(sub.PeerConnection, t) {
+			continue
+		}
+		if _, err := sub.PeerConnection.AddTrack(t); err != nil {
+			log.Printf("Failed to attach queued track for subscriber %s: %v", sub.ID, err)
+			continue
+		}
+		sub.needsRenegotiation = true
+	}
+
+	if !sub.needsRenegotiation {
+		return
+	}
+	// Not stable yet — the next flush point (answer applied) will offer.
+	if sub.PeerConnection.SignalingState() != webrtc.SignalingStateStable {
+		return
+	}
+	// Callback not wired yet — flag stays set; flushed once it is wired.
+	if cb == nil {
+		return
+	}
+
+	offer, err := sub.PeerConnection.CreateOffer(nil)
+	if err != nil {
+		log.Printf("Failed to create flush renegotiation offer for subscriber %s: %v", sub.ID, err)
+		return
+	}
+	if err := sub.PeerConnection.SetLocalDescription(offer); err != nil {
+		log.Printf("Failed to set flush renegotiation offer for subscriber %s: %v", sub.ID, err)
+		return
+	}
+	sub.needsRenegotiation = false
+	log.Printf("Flushed pending renegotiation for subscriber %s", sub.ID)
+	// Deliver outside the signaling-critical path.
+	go cb(offer.SDP)
+}
+
+// tryFlushPendingRenegotiation acquires the signaling lock (bounded) and
+// flushes pending renegotiation work for a subscriber.
+func (s *SFU) tryFlushPendingRenegotiation(sub *Subscriber, lockTimeout time.Duration) {
+	if !sub.trySignalingLock(lockTimeout) {
+		return
+	}
+	defer sub.SignalingMu.Unlock()
+	sub.flushPendingRenegotiationLocked()
+}
+
+// FlushPendingRenegotiation flushes deferred track adds / renegotiations for
+// a subscriber. Handlers call this after a signaling exchange completes
+// (answer applied, client offer answered, ICE restart answered) so any tracks
+// attached mid-negotiation get their follow-up offer, in order, on the same
+// websocket as the exchange that unblocked them.
+func (s *SFU) FlushPendingRenegotiation(roomSlug, subscriberID string) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return
+	}
+	room.mu.RLock()
+	sub, ok := room.Subscribers[subscriberID]
+	room.mu.RUnlock()
+	if !ok {
+		return
+	}
+	s.tryFlushPendingRenegotiation(sub, 5*time.Second)
+}
+
+// SetSubscriberRenegotiationCallback registers the callback used to push
+// server-initiated renegotiation offers that were deferred while another
+// negotiation was in flight. Flushes immediately if work is already pending.
+func (s *SFU) SetSubscriberRenegotiationCallback(roomSlug, subscriberID string, cb func(offerSDP string)) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return
+	}
+	room.mu.RLock()
+	sub, ok := room.Subscribers[subscriberID]
+	room.mu.RUnlock()
+	if !ok {
+		return
+	}
+	sub.pendingMu.Lock()
+	sub.OnRenegotiationNeeded = cb
+	sub.pendingMu.Unlock()
+	go s.tryFlushPendingRenegotiation(sub, 5*time.Second)
 }
 
 // RenegotiateSubscriber creates a new offer for a subscriber after tracks have changed

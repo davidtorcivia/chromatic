@@ -133,6 +133,10 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	// Open a scheduled room ahead of time (auto-admits the countdown lobby)
 	adminMux.HandleFunc("POST /api/rooms/{slug}/open", roomHandler.OpenRoom)
 
+	// File review/moderation (admin)
+	adminMux.HandleFunc("GET /api/rooms/{slug}/files", fileHandler.ListRoomFiles)
+	adminMux.HandleFunc("DELETE /api/files/{id}", fileHandler.DeleteFile)
+
 	// Waiting Room (admin)
 	adminMux.HandleFunc("GET /api/rooms/{slug}/waiting", roomHandler.ListWaiting)
 	adminMux.HandleFunc("POST /api/rooms/{slug}/admit/{id}", roomHandler.AdmitParticipant)

@@ -2,7 +2,7 @@
     import { onMount, onDestroy } from "svelte";
     import { fade } from "svelte/transition";
     import { page } from "$app/stores";
-    import { rooms, streamKeys, appConfig, type Room, type StreamKey, type AppConfig } from "$lib/api/client";
+    import { rooms, streamKeys, appConfig, roomFiles, type Room, type StreamKey, type AppConfig, type RoomFile } from "$lib/api/client";
     import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
     import CopyField from "$lib/components/CopyField.svelte";
     import StatusBadge from "$lib/components/StatusBadge.svelte";
@@ -20,6 +20,10 @@
     let successMessage = $state("");
     let confirmEndOpen = $state(false);
     let confirmDeleteOpen = $state(false);
+    // Uploaded-files review (admin moderation)
+    let files = $state<RoomFile[]>([]);
+    let deleteRoomFiles = $state(true);
+    let fileToDelete = $state<RoomFile | null>(null);
 
     // Form fields (populated from room)
     let name = $state("");
@@ -143,6 +147,8 @@
                 await loadWaitingRoom();
                 pollInterval = setInterval(loadWaitingRoom, 5000);
             }
+
+            void loadFiles();
         } catch (e) {
             error = "Failed to load room";
             console.error(e);
@@ -163,6 +169,32 @@
         } catch (e) {
             console.error("Failed to load waiting room", e);
         }
+    }
+
+    async function loadFiles() {
+        try {
+            files = (await roomFiles.list(slug))?.files ?? [];
+        } catch (e) {
+            console.error("Failed to load room files", e);
+        }
+    }
+
+    async function handleDeleteFile() {
+        if (!fileToDelete) return;
+        const target = fileToDelete;
+        fileToDelete = null;
+        try {
+            await roomFiles.delete(target.id);
+            files = files.filter((f) => f.id !== target.id);
+        } catch (e: any) {
+            error = e.message || "Failed to delete file";
+        }
+    }
+
+    function formatBytes(bytes: number): string {
+        if (bytes < 1024) return `${bytes} B`;
+        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+        return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
     }
 
     // datetime-local <-> ISO conversion (datetime-local has no timezone; it
@@ -300,7 +332,7 @@
     async function handleDelete() {
         confirmDeleteOpen = false;
         try {
-            await rooms.delete(slug);
+            await rooms.delete(slug, deleteRoomFiles);
             window.location.href = "/admin/rooms";
         } catch (e: any) {
             error = e.message || "Failed to delete room";
@@ -439,6 +471,40 @@
                             {/each}
                         </ul>
                     {/if}
+                </div>
+            {/if}
+
+            <!-- Uploaded files (review/moderation) -->
+            {#if files.length > 0}
+                <div class="card files-card">
+                    <div class="card-header">
+                        <h3>Uploaded Files ({files.length})</h3>
+                    </div>
+                    <ul class="file-list">
+                        {#each files as file (file.id)}
+                            <li class="file-item">
+                                {#if file.thumbnailUrl}
+                                    <img class="file-thumb" src={file.thumbnailUrl} alt="" loading="lazy" />
+                                {:else}
+                                    <span class="file-thumb file-thumb-placeholder" aria-hidden="true">
+                                        {file.mimeType.startsWith("audio/") ? "♪" : "📄"}
+                                    </span>
+                                {/if}
+                                <div class="file-info">
+                                    <a class="file-name" href={file.url} target="_blank" rel="noopener">{file.originalName}</a>
+                                    <span class="file-meta">
+                                        {formatBytes(file.sizeBytes)} · {file.uploaderName} · {formatDate(new Date(file.createdAt).toISOString())}
+                                    </span>
+                                </div>
+                                <button
+                                    class="btn btn-secondary btn-sm file-delete"
+                                    onclick={() => (fileToDelete = file)}
+                                >
+                                    Delete
+                                </button>
+                            </li>
+                        {/each}
+                    </ul>
                 </div>
             {/if}
 
@@ -725,6 +791,10 @@
                 <div class="card danger-card">
                     <h3>Danger Zone</h3>
                     <p>Permanently delete this room and all its data.</p>
+                    <label class="delete-files-option">
+                        <input type="checkbox" bind:checked={deleteRoomFiles} />
+                        Also delete uploaded files and images from disk
+                    </label>
                     <button class="btn btn-danger" onclick={() => (confirmDeleteOpen = true)}>
                         Delete Room
                     </button>
@@ -753,11 +823,23 @@
 <ConfirmDialog
     open={confirmDeleteOpen}
     title="Delete this room?"
-    body="The room and all its data will be permanently deleted. This cannot be undone."
+    body={deleteRoomFiles
+        ? "The room, all its data, and every uploaded file will be permanently deleted. This cannot be undone."
+        : "The room and all its data will be permanently deleted (uploaded files stay on disk). This cannot be undone."}
     confirmLabel="Delete Room"
     danger
     onConfirm={handleDelete}
     onCancel={() => (confirmDeleteOpen = false)}
+/>
+
+<ConfirmDialog
+    open={fileToDelete !== null}
+    title="Delete this file?"
+    body={`"${fileToDelete?.originalName ?? ""}" will be removed from the room, including any chat messages that shared it. This cannot be undone.`}
+    confirmLabel="Delete File"
+    danger
+    onConfirm={handleDeleteFile}
+    onCancel={() => (fileToDelete = null)}
 />
 
 <style>
@@ -986,6 +1068,77 @@
 
     .danger-card {
         border: 1px solid var(--color-error);
+    }
+
+    .delete-files-option {
+        display: flex;
+        align-items: center;
+        gap: var(--space-xs);
+        margin-bottom: var(--space-md);
+        font-size: 0.875rem;
+        color: var(--color-text-muted);
+        cursor: pointer;
+    }
+
+    .file-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-xs);
+    }
+
+    .file-item {
+        display: flex;
+        align-items: center;
+        gap: var(--space-sm);
+        padding: var(--space-xs) 0;
+        border-bottom: 1px solid var(--color-border-subtle);
+    }
+    .file-item:last-child {
+        border-bottom: none;
+    }
+
+    .file-thumb {
+        width: 40px;
+        height: 40px;
+        object-fit: cover;
+        border-radius: var(--radius-sm);
+        flex-shrink: 0;
+        background: var(--color-surface);
+    }
+    .file-thumb-placeholder {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.1rem;
+        color: var(--color-text-subtle);
+    }
+
+    .file-info {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+    }
+    .file-name {
+        color: var(--color-text);
+        text-decoration: none;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .file-name:hover {
+        text-decoration: underline;
+    }
+    .file-meta {
+        font-size: 0.75rem;
+        color: var(--color-text-subtle);
+    }
+
+    .file-delete {
+        flex-shrink: 0;
     }
 
     .danger-card h3 {

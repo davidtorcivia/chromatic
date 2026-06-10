@@ -1,5 +1,7 @@
 // WebRTC Manager - handles peer connection for receiving stream and sending voice
 
+import { createMicChain, type MicChain } from '$lib/audio/mic-chain';
+
 // localStorage key for the preferred microphone input device. Read on every
 // getUserMedia call so the user's choice survives reloads and reconnects.
 export const MIC_DEVICE_STORAGE_KEY = 'chromatic_mic_device';
@@ -55,7 +57,13 @@ export interface WebRTCManagerOptions {
 export class WebRTCManager {
     private pc: RTCPeerConnection | null = null;
     private options: WebRTCManagerOptions;
+    // localStream holds the stream whose audio track is SENT — the processed
+    // output of the mic cleanup chain when available, the raw capture
+    // otherwise. rawMicStream always holds the actual device capture (the
+    // thing that must be stopped to release the mic / read deviceId from).
     private localStream: MediaStream | null = null;
+    private rawMicStream: MediaStream | null = null;
+    private micChain: MicChain | null = null;
     private audioSender: RTCRtpSender | null = null;
     private screenShareStream: MediaStream | null = null;
     private screenShareSender: RTCRtpSender | null = null;
@@ -479,16 +487,12 @@ export class WebRTCManager {
     async requestMicrophone(deviceId?: string | null): Promise<boolean> {
         try {
             const preferred = deviceId ?? getStoredMicDeviceId();
-            this.localStream = await navigator.mediaDevices.getUserMedia({
+            const raw = await navigator.mediaDevices.getUserMedia({
                 audio: micConstraints(preferred),
                 video: false
             });
 
-            // Respect current mic mute state so permission can be requested
-            // before we begin sending audio.
-            this.localStream.getAudioTracks().forEach(track => {
-                track.enabled = !this.isMicMuted;
-            });
+            await this.installMicStream(raw);
 
             console.log('Microphone access granted');
             return true;
@@ -498,33 +502,57 @@ export class WebRTCManager {
         }
     }
 
+    // Routes a fresh mic capture through the light cleanup chain (high-pass +
+    // soft gate) when available, falls back to the raw capture otherwise, and
+    // applies the current mute state to whichever stream will be sent.
+    private async installMicStream(raw: MediaStream): Promise<void> {
+        this.disposeMicChain();
+        this.rawMicStream = raw;
+        this.micChain = await createMicChain(raw);
+        this.localStream = this.micChain ? this.micChain.stream : raw;
+
+        // Respect current mic mute state so permission can be requested
+        // before we begin sending audio.
+        this.localStream.getAudioTracks().forEach(track => {
+            track.enabled = !this.isMicMuted;
+        });
+    }
+
+    private disposeMicChain(): void {
+        if (this.micChain) {
+            this.micChain.dispose();
+            this.micChain = null;
+        }
+    }
+
     // Switch the microphone input device: re-acquire the mic with the given
     // deviceId and swap the new track into the existing RTCRtpSender via
     // replaceTrack — same kind, same m-line, so NO renegotiation is needed.
     async setMicDevice(deviceId: string): Promise<boolean> {
         try {
-            const newStream = await navigator.mediaDevices.getUserMedia({
+            const newRaw = await navigator.mediaDevices.getUserMedia({
                 audio: micConstraints(deviceId, true),
                 video: false
             });
 
-            const newTrack = newStream.getAudioTracks()[0];
-            if (!newTrack) {
-                newStream.getTracks().forEach(t => t.stop());
+            if (newRaw.getAudioTracks().length === 0) {
+                newRaw.getTracks().forEach(t => t.stop());
                 return false;
             }
-            newTrack.enabled = !this.isMicMuted;
 
-            if (this.audioSender) {
+            const oldRaw = this.rawMicStream;
+            await this.installMicStream(newRaw);
+
+            const newTrack = this.localStream?.getAudioTracks()[0] ?? null;
+            if (this.audioSender && newTrack) {
                 await this.audioSender.replaceTrack(newTrack);
             }
 
             // Release the previous capture only after the swap succeeded so a
             // failed switch leaves the working mic untouched.
-            if (this.localStream && this.localStream !== newStream) {
-                this.localStream.getTracks().forEach(t => t.stop());
+            if (oldRaw && oldRaw !== newRaw) {
+                oldRaw.getTracks().forEach(t => t.stop());
             }
-            this.localStream = newStream;
 
             console.log('Switched microphone device:', deviceId);
             return true;
@@ -536,7 +564,7 @@ export class WebRTCManager {
 
     // deviceId of the currently captured microphone, if any.
     getCurrentMicDeviceId(): string | null {
-        const track = this.localStream?.getAudioTracks()[0];
+        const track = (this.rawMicStream ?? this.localStream)?.getAudioTracks()[0];
         if (!track) return null;
         try {
             return track.getSettings().deviceId ?? null;
@@ -831,6 +859,13 @@ export class WebRTCManager {
             this.localStream.getTracks().forEach(track => track.stop());
             this.localStream = null;
         }
+        // The processed stream above doesn't hold the device — stop the raw
+        // capture too so the browser's mic indicator goes away.
+        if (this.rawMicStream) {
+            this.rawMicStream.getTracks().forEach(track => track.stop());
+            this.rawMicStream = null;
+        }
+        this.disposeMicChain();
         this.audioSender = null;
 
         if (this.screenShareStream) {

@@ -51,6 +51,10 @@ export function createChatStore() {
         messages = msgs;
     }
 
+    function removeMessage(id: string) {
+        messages = messages.filter((m) => m.id !== id);
+    }
+
     function setVisible(visible: boolean) {
         isVisible = visible;
         if (visible) {
@@ -69,6 +73,7 @@ export function createChatStore() {
         get isVisible() { return isVisible; },
         addMessage,
         loadHistory,
+        removeMessage,
         setVisible,
         clear
     };

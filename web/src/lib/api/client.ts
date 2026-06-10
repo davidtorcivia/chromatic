@@ -157,14 +157,15 @@ export const rooms = {
     get: (slug: string) => apiGet<Room>(`/api/rooms/${slug}`),
     create: (data: Partial<Room>) => apiPost<Room>('/api/rooms', data),
     update: (slug: string, data: Partial<Room>) => apiPatch<Room>(`/api/rooms/${slug}`, data),
-    delete: (slug: string) => apiDelete(`/api/rooms/${slug}`),
+    delete: (slug: string, deleteFiles = false) =>
+        apiDelete(`/api/rooms/${slug}${deleteFiles ? '?deleteFiles=true' : ''}`),
     // Bulk delete: loops the single-room DELETE endpoint and reports which
     // slugs failed so callers can surface partial failures.
-    deleteMany: async (slugs: string[]): Promise<{ failed: string[] }> => {
+    deleteMany: async (slugs: string[], deleteFiles = false): Promise<{ failed: string[] }> => {
         const failed: string[] = [];
         for (const slug of slugs) {
             try {
-                await apiDelete(`/api/rooms/${slug}`);
+                await apiDelete(`/api/rooms/${slug}${deleteFiles ? '?deleteFiles=true' : ''}`);
             } catch {
                 failed.push(slug);
             }
@@ -206,6 +207,23 @@ export const rooms = {
         }
         return res.json();
     }
+};
+
+export interface RoomFile {
+    id: string;
+    originalName: string;
+    mimeType: string;
+    sizeBytes: number;
+    uploaderName: string;
+    createdAt: number;
+    url: string;
+    thumbnailUrl?: string;
+}
+
+// Admin file review/moderation (room settings)
+export const roomFiles = {
+    list: (slug: string) => apiGet<{ files: RoomFile[] }>(`/api/rooms/${slug}/files`),
+    delete: (fileId: string) => apiDelete(`/api/files/${fileId}`)
 };
 
 export const streamKeys = {

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"chromatic/internal/config"
 	"chromatic/internal/database"
@@ -305,6 +306,104 @@ func (h *FileHandler) Download(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`%s; filename="%s"`, disposition, sanitizeFilename(originalName)))
 
 	http.ServeFile(w, r, storedPath)
+}
+
+// ListRoomFiles returns every file uploaded to a room, newest first.
+// Admin-only (registered under the auth-protected mux) — used by the room
+// settings page to review and moderate attachments.
+func (h *FileHandler) ListRoomFiles(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+
+	var roomID string
+	if err := h.db.QueryRow("SELECT id FROM rooms WHERE slug = ?", slug).Scan(&roomID); err != nil {
+		http.Error(w, "Room not found", http.StatusNotFound)
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT f.id, f.original_name, f.mime_type, f.size_bytes, f.created_at,
+		       COALESCE(p.name, 'Unknown')
+		FROM files f
+		LEFT JOIN participants p ON p.id = f.uploader_id
+		WHERE f.room_id = ?
+		ORDER BY f.created_at DESC
+	`, roomID)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	files := []map[string]interface{}{}
+	for rows.Next() {
+		var (
+			id, name, mime, uploader string
+			size                     int64
+			createdAt                time.Time
+		)
+		if err := rows.Scan(&id, &name, &mime, &size, &createdAt, &uploader); err != nil {
+			continue
+		}
+		entry := map[string]interface{}{
+			"id":           id,
+			"originalName": name,
+			"mimeType":     mime,
+			"sizeBytes":    size,
+			"uploaderName": uploader,
+			"createdAt":    createdAt.UnixMilli(),
+			"url":          fmt.Sprintf("/api/files/%s", id),
+		}
+		if strings.HasPrefix(mime, "image/") {
+			entry["thumbnailUrl"] = fmt.Sprintf("/api/files/%s/thumbnail", id)
+		}
+		files = append(files, entry)
+	}
+
+	respondJSON(w, map[string]interface{}{"files": files})
+}
+
+// DeleteFile removes an uploaded file: disk file, thumbnail, DB row, and any
+// chat messages referencing it (so transcripts don't show dead attachments).
+// Admin-only (registered under the auth-protected mux).
+func (h *FileHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	var storedPath, roomID string
+	var thumbnailPath *string
+	err := h.db.QueryRow(`
+		SELECT stored_path, thumbnail_path, room_id FROM files WHERE id = ?
+	`, id).Scan(&storedPath, &thumbnailPath, &roomID)
+	if err != nil {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	// Containment checks mirror Download/Thumbnail: paths come from the DB
+	// and must resolve inside the upload root before we unlink anything.
+	if isPathWithin(h.cfg.UploadPath, storedPath) {
+		if err := os.Remove(storedPath); err != nil && !os.IsNotExist(err) {
+			logger.Warn("Failed to remove file from disk", "file_id", id, "error", err)
+		}
+	} else {
+		logger.Warn("Blocked file delete outside upload root", "file_id", id, "path", storedPath)
+	}
+	if thumbnailPath != nil && *thumbnailPath != "" && isPathWithin(h.cfg.UploadPath, *thumbnailPath) {
+		if err := os.Remove(*thumbnailPath); err != nil && !os.IsNotExist(err) {
+			logger.Warn("Failed to remove thumbnail from disk", "file_id", id, "error", err)
+		}
+	}
+
+	if _, err := h.db.Exec("DELETE FROM files WHERE id = ?", id); err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	// File chat messages store the file reference as JSON in content; remove
+	// them so reloaded transcripts don't render broken attachments.
+	h.db.Exec(`DELETE FROM messages WHERE room_id = ? AND type = 'file' AND content LIKE ?`,
+		roomID, `%"`+id+`"%`)
+
+	logger.Info("File deleted by admin", "file_id", id, "room_id", roomID)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // Thumbnail serves image thumbnails

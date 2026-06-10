@@ -424,8 +424,38 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 		})
 	})
 
+	// Wire the deferred-renegotiation push: tracks attached while another
+	// offer/answer exchange was in flight get their follow-up offer sent
+	// here once signaling settles, instead of being dropped.
+	h.sfu.SetSubscriberRenegotiationCallback(roomSlug, client.ID, func(sdp string) {
+		client.SendJSON("signal:renegotiate", map[string]interface{}{
+			"sdp": sdp,
+		})
+		logger.Debug("Sent deferred renegotiation offer", "participant_id", client.ID, "room", roomSlug)
+	})
+
 	logger.Debug("Sent WebRTC offer to client (trickle ICE)", "participant_id", client.ID, "room", roomSlug)
 	return true
+}
+
+// handleResubscribe forces a fresh subscriber for a client whose media path
+// failed beyond ICE-restart repair (e.g. dead TURN allocation). It reruns the
+// full subscription flow; CreateSubscriberConnection displaces the old
+// subscriber atomically (same as a rejoin), so voice relay state and the
+// client's WS session are untouched — only the media transport is rebuilt.
+func (h *WebSocketHandler) handleResubscribe(client *websocket.Client) {
+	roomSlug := client.RoomSlug
+	logger.Info("Client requested fresh subscription", "participant_id", client.ID, "room", roomSlug)
+
+	h.subMu.Lock()
+	st, ok := h.subStates[client]
+	h.subMu.Unlock()
+	if !ok {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.created = h.initiateSubscription(client, roomSlug)
 }
 
 // InitiateSubscriptionsForRoom sends WebRTC offers to clients in a room that
@@ -725,11 +755,15 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 		h.handleRenegotiateAnswer(client, msg.Payload)
 	case "signal:resync":
 		h.handleResync(client)
+	case "signal:resubscribe":
+		h.handleResubscribe(client)
 	case "signal:ice-servers-request":
 		h.handleICEServersRequest(client)
 	// Admin commands
 	case "admin:mute":
 		h.handleAdminMute(client, msg.Payload)
+	case "admin:delete-message":
+		h.handleAdminDeleteMessage(client, msg.Payload)
 	case "admin:kick":
 		h.handleAdminKick(client, msg.Payload)
 	case "admin:end-session":
@@ -984,24 +1018,12 @@ func (h *WebSocketHandler) handleSignalOffer(client *websocket.Client, payload j
 		"sdp": answer,
 	})
 
-	logger.Debug("Sent voice answer", "participant_id", client.ID)
+	logger.Debug("Sent voice answer", "participant_id", client.ID, "rolled_back", rolledBack)
 
-	// If we rolled back a server-initiated offer (voice renegotiation that collided
-	// with this client offer), re-trigger a renegotiation so the voice tracks that
-	// were already AddTrack'd are included in a new offer.
-	if rolledBack {
-		go func() {
-			offerSDP, err := h.sfu.RenegotiateSubscriber(client.RoomSlug, client.ID)
-			if err != nil {
-				logger.Warn("Failed to re-renegotiate after rollback", "participant_id", client.ID, "error", err)
-				return
-			}
-			client.SendJSON("signal:renegotiate", map[string]interface{}{
-				"sdp": offerSDP,
-			})
-			logger.Debug("Sent follow-up renegotiation after rollback", "participant_id", client.ID)
-		}()
-	}
+	// Flush any deferred renegotiation: tracks attached mid-negotiation or
+	// from a rolled-back server offer get their follow-up offer now, after
+	// the answer above, preserving message order on the websocket.
+	h.sfu.FlushPendingRenegotiation(client.RoomSlug, client.ID)
 }
 
 // forwardVoiceTrack forwards a participant's voice track to all other
@@ -1052,6 +1074,12 @@ func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID str
 				logger.Warn("Failed to add voice track to subscriber", "subscriber_id", c.ID, "source_id", voiceOwnerID, "error", err)
 				return
 			}
+			if offerSDP == "" {
+				// Track attached/queued mid-negotiation; the follow-up offer is
+				// pushed via the subscriber's renegotiation callback once the
+				// in-flight exchange settles.
+				return
+			}
 
 			c.SendJSON("signal:renegotiate", map[string]interface{}{
 				"sdp":           offerSDP,
@@ -1083,6 +1111,10 @@ func (h *WebSocketHandler) handleSignalAnswer(client *websocket.Client, payload 
 	}
 
 	logger.Debug("Set WebRTC answer from client", "participant_id", client.ID)
+
+	// Signaling is stable again — push any renegotiation that was deferred
+	// while this offer/answer exchange was in flight (e.g. voice tracks).
+	h.sfu.FlushPendingRenegotiation(client.RoomSlug, client.ID)
 }
 
 func (h *WebSocketHandler) handleSignalCandidate(client *websocket.Client, payload json.RawMessage) {
@@ -1136,6 +1168,10 @@ func (h *WebSocketHandler) handleIceRestart(client *websocket.Client, payload js
 	})
 
 	logger.Debug("Sent ICE restart answer", "participant_id", client.ID)
+
+	// If a server offer was rolled back to accept this restart, its tracks
+	// still need a follow-up offer — flush after the answer is sent.
+	h.sfu.FlushPendingRenegotiation(client.RoomSlug, client.ID)
 }
 
 func (h *WebSocketHandler) handleRenegotiateAnswer(client *websocket.Client, payload json.RawMessage) {
@@ -1156,6 +1192,10 @@ func (h *WebSocketHandler) handleRenegotiateAnswer(client *websocket.Client, pay
 	}
 
 	logger.Debug("Renegotiation completed", "participant_id", client.ID)
+
+	// Chain any renegotiation that queued up while this one was in flight
+	// (e.g. two speakers joined voice back-to-back).
+	h.sfu.FlushPendingRenegotiation(client.RoomSlug, client.ID)
 }
 
 // handleICEServersRequest returns a fresh set of ICE servers (including
@@ -1198,6 +1238,39 @@ func (h *WebSocketHandler) requireAdmin(client *websocket.Client, action string)
 		return false
 	}
 	return true
+}
+
+// handleAdminDeleteMessage removes a chat message from the persisted history
+// (moderation) and tells every connected client to drop it from their
+// transcript. File messages keep their uploaded file — admins manage those
+// separately from the room settings Files section.
+func (h *WebSocketHandler) handleAdminDeleteMessage(client *websocket.Client, payload json.RawMessage) {
+	if !h.requireAdmin(client, "delete-message") {
+		return
+	}
+
+	var data struct {
+		MessageID string `json:"messageId"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil || data.MessageID == "" {
+		return
+	}
+
+	res, err := h.db.Exec(`DELETE FROM messages
+		WHERE id = ? AND room_id = (SELECT id FROM rooms WHERE slug = ?)`,
+		data.MessageID, client.RoomSlug)
+	if err != nil {
+		logger.Error("Failed to delete chat message", "message_id", data.MessageID, "room", client.RoomSlug, "error", err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return
+	}
+
+	h.hub.BroadcastJSON(client.RoomSlug, "chat:message-deleted", map[string]interface{}{
+		"id": data.MessageID,
+	}, "")
+	logger.Info("Chat message deleted by admin", "message_id", data.MessageID, "room", client.RoomSlug, "admin_id", client.ID)
 }
 
 func (h *WebSocketHandler) handleAdminMute(client *websocket.Client, payload json.RawMessage) {
@@ -1542,6 +1615,11 @@ func (h *WebSocketHandler) forwardScreenShareTrack(roomSlug, participantID strin
 		offerSDP, err := h.sfu.AddScreenShareTrackToSubscriber(roomSlug, client.ID, participantID, relayTrack)
 		if err != nil {
 			logger.Warn("Failed to add screen share track to subscriber", "subscriber_id", client.ID, "source_id", participantID, "error", err)
+			continue
+		}
+		if offerSDP == "" {
+			// Attached/queued mid-negotiation; offer pushed via the
+			// subscriber's renegotiation callback when signaling settles.
 			continue
 		}
 

@@ -67,6 +67,13 @@
     let playNudgeAttempts = 0;
     const PLAY_NUDGE_MAX_ATTEMPTS = 3;
     const PLAY_NUDGE_INTERVAL_MS = 2500;
+    // Full re-subscription fallback: when ICE restart can't repair the media
+    // path (dead TURN allocation, server-side subscriber gone), ask the server
+    // for a brand-new subscriber instead of stranding the viewer.
+    const RESUBSCRIBE_MAX_ATTEMPTS = 3;
+    const CONNECTING_WATCHDOG_MS = 15000;
+    let resubscribeAttempts = $state(0);
+    let connectingWatchdog: ReturnType<typeof setTimeout> | null = null;
     // Controls auto-hide (ITEM 3)
     let isPointerOverControls = $state(false);
     let controlsHaveFocus = $state(false);
@@ -127,6 +134,9 @@
     let screenShareStream = $state<MediaStream | null>(null);
     let screenShareVideoEl = $state<HTMLVideoElement | null>(null);
     let pendingScreenShareRequest = $state<{participantId: string, name: string} | null>(null);
+    // Share was approved; waiting for the user's click to open the OS picker
+    // (getDisplayMedia must be called from a user gesture).
+    let shareApprovedPrompt = $state(false);
     // Local self-preview of the sharer's own capture (BUG 4)
     let selfShareStream = $state<MediaStream | null>(null);
     let selfShareVideoEl = $state<HTMLVideoElement | null>(null);
@@ -303,25 +313,23 @@
         });
 
         // Screen sharing messages
-        session.onMessage("screenshare:approved", async () => {
+        session.onMessage("screenshare:approved", () => {
             const wasRequested = screenShareRequested;
             screenShareRequested = false;
             // Approval can also arrive proactively (admin granting permanent
-            // permission from the participant list). Only start capture when
-            // the user actually asked to share right now.
+            // permission from the participant list). Only prompt when the
+            // user actually asked to share right now.
             if (!wasRequested) return;
-            const ok = await webrtcManager?.startScreenShare();
-            if (ok) {
-                screenShareActive = true;
-                selfShareStream = webrtcManager?.getScreenShareStream() ?? null;
-            } else {
-                screenShareActive = false;
-                selfShareStream = null;
-            }
+            // getDisplayMedia() requires transient activation (a fresh user
+            // gesture). This handler runs from a websocket message, so calling
+            // it here makes Chrome silently refuse and the picker never
+            // appears. Show a button instead — the click is the gesture.
+            shareApprovedPrompt = true;
         });
 
         session.onMessage("screenshare:denied", (payload: unknown) => {
             screenShareRequested = false;
+            shareApprovedPrompt = false;
             const data = payload as { reason?: string };
             console.log('Screen share denied:', data.reason || 'Request denied by admin');
         });
@@ -331,6 +339,10 @@
             screenShareParticipantId = data.participantId;
             screenShareParticipantName = data.name;
             pendingScreenShareRequest = null;
+            // Someone else grabbed the share slot while our prompt was up.
+            if (data.participantId !== sessionData?.participantId) {
+                shareApprovedPrompt = false;
+            }
         });
 
         session.onMessage("screenshare:stopped", () => {
@@ -404,6 +416,12 @@
             notifyChatMessage(msg);
         });
 
+        // Admin moderation: a message was removed from history server-side.
+        session.onMessage("chat:message-deleted", (payload: unknown) => {
+            const data = payload as { id: string };
+            if (data?.id) chatStore.removeMessage(data.id);
+        });
+
         // After a successful WS reconnect the server sends a fresh
         // room:state/iceServers/signal:offer sequence. Tear down all stale
         // per-connection state so it re-initializes cleanly instead of the
@@ -430,6 +448,7 @@
             screenShareStream = null;
             selfShareStream = null;
             pendingScreenShareRequest = null;
+            shareApprovedPrompt = false;
             streamPaused = false;
             streamError = null;
         });
@@ -440,6 +459,14 @@
         session.onMessage("signal:error", (payload: unknown) => {
             const data = payload as { code?: string; message?: string };
             console.error('Stream error from server:', data);
+            // Subscriber setup can fail transiently (e.g. TURN hiccup while
+            // building the server-side peer connection) — retry with backoff
+            // before telling the user to refresh.
+            if (data?.code === 'subscription-failed' && resubscribeAttempts < RESUBSCRIBE_MAX_ATTEMPTS) {
+                const delay = 2000 * (resubscribeAttempts + 1);
+                setTimeout(() => requestResubscribe('server subscription failure'), delay);
+                return;
+            }
             streamError = data?.message || 'Something interrupted the stream.';
         });
 
@@ -475,6 +502,10 @@
         window.removeEventListener("chromatic:tampering", handleTampering);
         navigator.mediaDevices?.removeEventListener?.("devicechange", refreshAudioDevices);
         clearMicPromptTimer();
+        if (connectingWatchdog) {
+            clearTimeout(connectingWatchdog);
+            connectingWatchdog = null;
+        }
         if (controlsTimer) {
             clearTimeout(controlsTimer);
             controlsTimer = null;
@@ -499,7 +530,9 @@
             onScreenShareTrack: handleScreenShareTrack,
             sendSignal: (type, payload) => session.send(type, payload),
             onIceRestartFailed: () => {
-                streamError = "We couldn't reach the stream after several attempts.";
+                // ICE restart couldn't repair the path — rebuild the whole
+                // subscription before declaring the stream unreachable.
+                requestResubscribe('ice restart failed');
             },
             onScreenShareEnded: () => {
                 screenShareActive = false;
@@ -665,7 +698,53 @@
         isVideoPlaying = true;
         needsPlayClick = false;
         clearKeyframeNudge();
+        // Media is flowing again — future failures get a fresh retry budget.
+        resubscribeAttempts = 0;
     }
+
+    // Ask the server for a brand-new subscriber (fresh offer/answer/ICE).
+    // Used when the current peer connection is beyond repair: ICE restart
+    // failed, keyframe nudges exhausted, or the viewer sat on "connecting"
+    // past the watchdog. Bounded so a genuinely unreachable network ends in
+    // a clear error instead of an infinite silent loop.
+    function requestResubscribe(reason: string): boolean {
+        if (resubscribeAttempts >= RESUBSCRIBE_MAX_ATTEMPTS) {
+            streamError = "We couldn't reach the stream after several attempts.";
+            return false;
+        }
+        resubscribeAttempts++;
+        console.warn(`Requesting fresh subscription (${reason}, attempt ${resubscribeAttempts}/${RESUBSCRIBE_MAX_ATTEMPTS})`);
+        // The frozen last frame must not read as "playing" — drop to the
+        // connecting overlay until the new subscriber delivers frames.
+        isVideoPlaying = false;
+        streamError = null;
+        // Stale/expired TURN credentials are a common reason the old path
+        // died; refresh them before the new peer connection is built.
+        session.send("signal:ice-servers-request", {});
+        session.send("signal:resubscribe", {});
+        return true;
+    }
+
+    // Watchdog for the "Connecting to the stream…" overlay: if the room is
+    // live but no frames render within the window (lost offer, failed ICE
+    // with no state transition, refresh during a TURN outage), escalate to a
+    // full re-subscription instead of sitting there forever.
+    $effect(() => {
+        if (overlayState === 'connecting') {
+            if (!connectingWatchdog) {
+                connectingWatchdog = setTimeout(function tick() {
+                    connectingWatchdog = null;
+                    if (overlayState !== 'connecting') return;
+                    if (requestResubscribe('stuck on connecting')) {
+                        connectingWatchdog = setTimeout(tick, CONNECTING_WATCHDOG_MS);
+                    }
+                }, CONNECTING_WATCHDOG_MS);
+            }
+        } else if (connectingWatchdog) {
+            clearTimeout(connectingWatchdog);
+            connectingWatchdog = null;
+        }
+    });
 
     // If the stream is bound but never starts rendering, the decoder is most
     // likely waiting on a keyframe that was lost in flight — ask the
@@ -676,7 +755,12 @@
         const tick = () => {
             playNudgeTimer = null;
             if (isVideoPlaying || !webrtcManager) return;
-            if (playNudgeAttempts >= PLAY_NUDGE_MAX_ATTEMPTS) return;
+            if (playNudgeAttempts >= PLAY_NUDGE_MAX_ATTEMPTS) {
+                // Keyframes alone aren't fixing it — the transport itself is
+                // likely dead. Escalate to a full re-subscription.
+                requestResubscribe('keyframe nudges exhausted');
+                return;
+            }
             playNudgeAttempts++;
             console.log(`Video not rendering yet, requesting keyframe (attempt ${playNudgeAttempts}/${PLAY_NUDGE_MAX_ATTEMPTS})`);
             webrtcManager.requestResync();
@@ -701,6 +785,11 @@
                 console.warn('Play still blocked:', err);
                 // Keep the play button visible so user can retry
             });
+            // The tap was a real user gesture, so if frames still don't
+            // render the problem is media, not autoplay policy — run the
+            // keyframe-nudge → resubscribe escalation rather than leaving
+            // the tap to silently do nothing.
+            scheduleKeyframeNudge();
         }
     }
 
@@ -855,6 +944,24 @@
         // Request to share
         screenShareRequested = true;
         session.send("screenshare:request", {});
+    }
+
+    // Open the OS share picker. Must be called directly from a click handler —
+    // getDisplayMedia needs the gesture's transient activation.
+    async function startApprovedShare() {
+        shareApprovedPrompt = false;
+        const ok = await webrtcManager?.startScreenShare();
+        if (ok) {
+            screenShareActive = true;
+            selfShareStream = webrtcManager?.getScreenShareStream() ?? null;
+        } else {
+            screenShareActive = false;
+            selfShareStream = null;
+        }
+    }
+
+    function dismissApprovedShare() {
+        shareApprovedPrompt = false;
     }
 
     function approveScreenShare() {
@@ -1208,6 +1315,11 @@
 
     function handleResync() {
         webrtcManager?.requestResync();
+        // Explicit user action: don't just ask for a keyframe, rebuild the
+        // subscription with a fresh retry budget. This is what "Reload
+        // stream" should mean when the transport is wedged.
+        resubscribeAttempts = 0;
+        requestResubscribe('user reload');
     }
 
     function toggleLaser() {
@@ -1669,6 +1781,16 @@
                     <div class="screenshare-approval-actions">
                         <button class="screenshare-approval-btn approve" onclick={approveScreenShare}>Approve</button>
                         <button class="screenshare-approval-btn deny" onclick={denyScreenShare}>Deny</button>
+                    </div>
+                </div>
+            {/if}
+
+            {#if shareApprovedPrompt}
+                <div class="screenshare-approval" transition:fly={{ y: 8, duration: 200 }}>
+                    <span class="screenshare-approval-text">Share approved — choose what to share</span>
+                    <div class="screenshare-approval-actions">
+                        <button class="screenshare-approval-btn approve" onclick={startApprovedShare}>Start sharing</button>
+                        <button class="screenshare-approval-btn deny" onclick={dismissApprovedShare}>Cancel</button>
                     </div>
                 </div>
             {/if}
@@ -2218,6 +2340,7 @@
         joinToken={sessionData?.token || ""}
         {participantColors}
         selfId={sessionData?.participantId || ""}
+        canModerate={isAdmin}
     />
     <BrowserToast />
 
@@ -2609,7 +2732,9 @@
         -webkit-backdrop-filter: blur(12px);
         border: 1px solid rgba(255,255,255,0.1);
         border-radius: var(--radius-md);
-        min-width: 280px;
+        /* Fixed compact width: admin row actions are overlaid on hover, so
+           they must not stretch the box; long names ellipsize instead. */
+        width: min(300px, calc(100vw - 2 * var(--space-lg)));
         max-height: 300px;
         overflow-y: auto;
         z-index: 50;
@@ -2621,6 +2746,7 @@
     }
 
     .participant-list-item {
+        position: relative;
         display: flex;
         align-items: center;
         gap: var(--space-sm);
@@ -2636,16 +2762,26 @@
         background: rgba(72, 182, 166, 0.1);
     }
 
-    /* Admin per-row actions, revealed on hover/focus */
+    /* Admin per-row actions: overlaid on the right edge on hover/focus so
+       they don't reserve row width and balloon the list. */
     .participant-actions {
+        position: absolute;
+        right: var(--space-sm);
+        top: 50%;
+        transform: translateY(-50%);
         display: flex;
         gap: var(--space-xs);
+        padding: 2px 4px;
+        background: rgba(10, 10, 10, 0.92);
+        border-radius: var(--radius-sm);
         opacity: 0;
+        pointer-events: none;
         transition: opacity 0.12s ease;
     }
     .participant-list-item:hover .participant-actions,
     .participant-list-item:focus-within .participant-actions {
         opacity: 1;
+        pointer-events: auto;
     }
     .participant-action {
         background: rgba(255, 255, 255, 0.08);

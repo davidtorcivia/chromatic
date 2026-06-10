@@ -13,6 +13,8 @@
         participantColors?: Record<string, string>;
         /** Own participant id, used to distinguish own messages. */
         selfId?: string;
+        /** Admins can delete messages (moderation). */
+        canModerate?: boolean;
     }
 
     let {
@@ -22,7 +24,12 @@
         joinToken,
         participantColors = {},
         selfId = "",
+        canModerate = false,
     }: Props = $props();
+
+    function deleteMessage(messageId: string) {
+        session.send("admin:delete-message", { messageId });
+    }
 
     // Allowed file types (must match backend)
     const ALLOWED_TYPES = [
@@ -224,6 +231,16 @@
                         <span class="chat-message-time"
                             >{formatTime(msg.timestamp)}</span
                         >
+                        {#if canModerate}
+                            <button
+                                class="chat-message-delete"
+                                onclick={() => deleteMessage(msg.id)}
+                                title="Delete message"
+                                aria-label="Delete message from {msg.participantName}"
+                            >
+                                <svg viewBox="0 0 24 24" fill="currentColor" width="12" height="12" aria-hidden="true"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                            </button>
+                        {/if}
                     </div>
                     {#if msg.type === "text"}
                         <div class="chat-message-content">{msg.content}</div>
@@ -382,6 +399,27 @@
     .chat-message-time {
         font-size: 0.6875rem;
         color: var(--color-text-subtle);
+    }
+
+    /* Moderation: revealed on message hover/focus to keep the transcript clean */
+    .chat-message-delete {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        background: none;
+        border: none;
+        padding: 2px;
+        color: var(--color-text-subtle);
+        cursor: pointer;
+        opacity: 0;
+        transition: opacity 0.12s ease, color 0.12s ease;
+    }
+    .chat-message:hover .chat-message-delete,
+    .chat-message:focus-within .chat-message-delete {
+        opacity: 1;
+    }
+    .chat-message-delete:hover {
+        color: var(--color-error);
     }
 
     .chat-message-content {

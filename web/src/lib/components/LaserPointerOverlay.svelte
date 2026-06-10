@@ -217,6 +217,13 @@
         videoElement.addEventListener("loadedmetadata", updateVideoRect);
         window.addEventListener("resize", updateVideoRect);
 
+        // Layout changes that don't fire window.resize — chat panel
+        // opening/closing, participant list, any flex reflow — also move and
+        // resize the video element. Without observing the element itself the
+        // overlay keeps the stale rect and every laser stamp lands offset.
+        const resizeObserver = new ResizeObserver(updateVideoRect);
+        resizeObserver.observe(videoElement);
+
         // Laser pointer only activates when explicitly enabled from the session controls.
         const handleVideoPointerDown = (e: PointerEvent) => {
             if (!enabled || e.pointerType === "touch" || e.button !== 0 || isPointing) return;
@@ -374,6 +381,7 @@
             motionQuery.removeEventListener("change", handleMotionChange);
             videoElement.removeEventListener("loadedmetadata", updateVideoRect);
             window.removeEventListener("resize", updateVideoRect);
+            resizeObserver.disconnect();
             videoElement.removeEventListener("pointerdown", handleVideoPointerDown);
             window.removeEventListener("pointermove", handleGlobalPointerMove);
             window.removeEventListener("pointerup", handleGlobalPointerUp);
