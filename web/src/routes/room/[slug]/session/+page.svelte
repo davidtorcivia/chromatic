@@ -714,6 +714,10 @@
         }
         resubscribeAttempts++;
         console.warn(`Requesting fresh subscription (${reason}, attempt ${resubscribeAttempts}/${RESUBSCRIBE_MAX_ATTEMPTS})`);
+        // Reset the keyframe-nudge cycle: without this the stale attempt
+        // counter immediately re-escalates on its next tick and the client
+        // tears down each fresh subscription ~2.5s after it connects.
+        clearKeyframeNudge();
         // The frozen last frame must not read as "playing" — drop to the
         // connecting overlay until the new subscriber delivers frames.
         isVideoPlaying = false;

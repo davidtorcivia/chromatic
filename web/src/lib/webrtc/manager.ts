@@ -153,18 +153,38 @@ export class WebRTCManager {
 
             this.options.sendSignal('signal:answer', { sdp: answer.sdp });
 
-            // If we have a pending mic stream and mic is enabled, add the
-            // track now and fire-and-forget a renegotiation. We must NOT
-            // await renegotiate() here because we're already inside
+            // Re-attach local senders that died with a replaced peer
+            // connection (fresh offer after reconnect/resubscribe), then
+            // fire-and-forget ONE renegotiation. We must NOT await
+            // renegotiate() here because we're already inside
             // enqueueSignaling — awaiting a nested enqueue would deadlock
             // the signaling queue.
+            let needsLocalRenegotiation = false;
+
             if (this.localStream && !this.audioSender && !this.isMicMuted) {
                 const audioTrack = this.localStream.getAudioTracks()[0];
                 if (audioTrack) {
                     this.audioSender = pc.addTrack(audioTrack, this.localStream);
-                    console.log('Added pending mic track after offer, scheduling renegotiation');
-                    this.renegotiate();
+                    console.log('Added pending mic track after offer');
+                    needsLocalRenegotiation = true;
                 }
+            }
+
+            // An active screen capture survives a PC rebuild (the browser
+            // keeps capturing and the UI shows "you're sharing"), but its
+            // sender belonged to the old PC — without re-adding it here the
+            // share silently stops reaching everyone else.
+            if (this.screenShareStream && !this.screenShareSender) {
+                const shareTrack = this.screenShareStream.getVideoTracks()[0];
+                if (shareTrack && shareTrack.readyState === 'live') {
+                    this.screenShareSender = pc.addTrack(shareTrack, this.screenShareStream);
+                    console.log('Re-added screen share track after peer connection rebuild');
+                    needsLocalRenegotiation = true;
+                }
+            }
+
+            if (needsLocalRenegotiation) {
+                this.renegotiate();
             }
         });
     }

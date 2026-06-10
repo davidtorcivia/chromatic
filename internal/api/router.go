@@ -69,6 +69,7 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	// admin role (dashboard "Join as host") — same validator the WebSocket
 	// handler uses.
 	roomHandler.SetSessionValidator(authHandler.ValidateSession)
+	fileHandler.SetSessionValidator(authHandler.ValidateSession)
 
 	// WS admin:waiting-approve/deny reuse the exact admit/deny logic the REST
 	// endpoints run (DB update + SSE notification + admin broadcast).

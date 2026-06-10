@@ -48,6 +48,9 @@ type FileHandler struct {
 	db           *database.DB
 	cfg          *config.Config
 	tokenManager *TokenManager
+	// Admin session cookie validation — lets the admin room-settings page
+	// view files/thumbnails without a participant join token.
+	validateSession SessionValidator
 }
 
 // NewFileHandler creates a new FileHandler
@@ -57,6 +60,21 @@ func NewFileHandler(db *database.DB, cfg *config.Config, tokenSecret []byte) *Fi
 		cfg:          cfg,
 		tokenManager: NewTokenManager(tokenSecret),
 	}
+}
+
+// SetSessionValidator wires the admin session cookie validator (same one the
+// room and websocket handlers use).
+func (h *FileHandler) SetSessionValidator(validator SessionValidator) {
+	h.validateSession = validator
+}
+
+// hasAdminSession reports whether the request carries a valid admin session cookie.
+func (h *FileHandler) hasAdminSession(r *http.Request) bool {
+	if h.validateSession == nil {
+		return false
+	}
+	c, err := r.Cookie(SessionCookieName)
+	return err == nil && c.Value != "" && h.validateSession(c.Value)
 }
 
 // isPathWithin reports whether target resolves to a location inside baseDir.
@@ -276,7 +294,7 @@ func (h *FileHandler) Download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := h.authorizeParticipant(r, roomSlug); err != nil {
+	if _, err := h.authorizeParticipant(r, roomSlug); err != nil && !h.hasAdminSession(r) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -424,7 +442,7 @@ func (h *FileHandler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := h.authorizeParticipant(r, roomSlug); err != nil {
+	if _, err := h.authorizeParticipant(r, roomSlug); err != nil && !h.hasAdminSession(r) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}

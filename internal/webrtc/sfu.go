@@ -1094,6 +1094,17 @@ func (s *SFU) SetSubscriberAnswer(roomSlug, subscriberID string, answer webrtc.S
 		}
 	}
 
+	// Diagnostic: a subscriber whose answer rejected the ingest's H.264
+	// profile gets silent black video (audio fine) — make that visible.
+	if sub.VideoSender != nil {
+		params := sub.VideoSender.GetParameters()
+		if len(params.Codecs) == 0 {
+			log.Printf("WARNING: subscriber %s negotiated NO video codec — video will be black", subscriberID)
+		} else {
+			log.Printf("Subscriber %s outbound video codec: %s %s", subscriberID, params.Codecs[0].MimeType, params.Codecs[0].SDPFmtpLine)
+		}
+	}
+
 	log.Printf("Set answer for subscriber %s (flushed %d buffered candidates)", subscriberID, len(pending))
 	return nil
 }
