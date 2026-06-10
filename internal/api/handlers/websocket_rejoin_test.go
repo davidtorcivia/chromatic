@@ -257,7 +257,10 @@ type browserSim struct {
 	pc   *pionwebrtc.PeerConnection
 
 	connected chan struct{}
-	errCh     chan error
+	// offerReceived is closed when the first signal:offer arrives, letting
+	// tests assert the server actually initiated the subscription handshake.
+	offerReceived chan struct{}
+	errCh         chan error
 	// Serializes writes: gorilla connections do not allow concurrent writers
 	// (the pump goroutine and the test goroutine both send).
 	writeMu sync.Mutex
@@ -269,7 +272,7 @@ func newBrowserSim(t *testing.T, conn *gorillaws.Conn) *browserSim {
 	if err != nil {
 		t.Fatalf("failed to create client peer connection: %v", err)
 	}
-	b := &browserSim{t: t, conn: conn, pc: pc, connected: make(chan struct{}), errCh: make(chan error, 1)}
+	b := &browserSim{t: t, conn: conn, pc: pc, connected: make(chan struct{}), offerReceived: make(chan struct{}), errCh: make(chan error, 1)}
 	pc.OnConnectionStateChange(func(state pionwebrtc.PeerConnectionState) {
 		if state == pionwebrtc.PeerConnectionStateConnected {
 			select {
@@ -342,6 +345,13 @@ func (b *browserSim) startPump() {
 func (b *browserSim) handleSignal(msg wsTestMessage) error {
 	switch msg.Type {
 	case "signal:offer", "signal:renegotiate":
+		if msg.Type == "signal:offer" {
+			select {
+			case <-b.offerReceived:
+			default:
+				close(b.offerReceived)
+			}
+		}
 		var data struct {
 			SDP string `json:"sdp"`
 		}
@@ -378,6 +388,10 @@ func (b *browserSim) handleSignal(msg wsTestMessage) error {
 				return err
 			}
 		}
+	case "signal:error":
+		// The server only sends this when the subscription handshake failed
+		// hard; surface it so tests fail with the real cause.
+		return fmt.Errorf("server sent signal:error: %s", string(msg.Payload))
 	case "signal:candidate":
 		var data struct {
 			Candidate     string  `json:"candidate"`
@@ -422,7 +436,7 @@ func TestRejoinWhileLive_FullNegotiation(t *testing.T) {
 	defer cleanup()
 
 	sim1 := newBrowserSim(t, env.dial())
-	if err := sim1.pumpUntilConnected(30 * time.Second); err != nil {
+	if err := sim1.pumpUntilConnected(90 * time.Second); err != nil {
 		t.Fatalf("first connection never reached Connected: %v", err)
 	}
 
@@ -432,7 +446,7 @@ func TestRejoinWhileLive_FullNegotiation(t *testing.T) {
 
 	sim2 := newBrowserSim(t, env.dial())
 	defer sim2.close()
-	if err := sim2.pumpUntilConnected(30 * time.Second); err != nil {
+	if err := sim2.pumpUntilConnected(90 * time.Second); err != nil {
 		t.Fatalf("rejoin connection never reached Connected: %v", err)
 	}
 

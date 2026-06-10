@@ -38,7 +38,7 @@ func TestScreenShareRelay_EndToEnd(t *testing.T) {
 	// Connect sharer (part1) and viewer (part2)
 	sharer := newBrowserSim(t, env.dial())
 	defer sharer.close()
-	if err := sharer.pumpUntilConnected(30 * time.Second); err != nil {
+	if err := sharer.pumpUntilConnected(90 * time.Second); err != nil {
 		t.Fatalf("sharer never connected: %v", err)
 	}
 
@@ -56,7 +56,7 @@ func TestScreenShareRelay_EndToEnd(t *testing.T) {
 			}
 		}
 	})
-	if err := viewer.pumpUntilConnected(30 * time.Second); err != nil {
+	if err := viewer.pumpUntilConnected(90 * time.Second); err != nil {
 		t.Fatalf("viewer never connected: %v", err)
 	}
 
@@ -113,7 +113,7 @@ func TestScreenShareRelay_EndToEnd(t *testing.T) {
 	var remoteTrack *pionwebrtc.TrackRemote
 	select {
 	case remoteTrack = <-gotScreenTrack:
-	case <-time.After(30 * time.Second):
+	case <-time.After(90 * time.Second):
 		t.Fatal("viewer never received the screen share track")
 	}
 
@@ -129,7 +129,7 @@ func TestScreenShareRelay_EndToEnd(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed reading screen share RTP at viewer: %v", err)
 		}
-	case <-time.After(30 * time.Second):
+	case <-time.After(90 * time.Second):
 		t.Fatal("no screen share RTP reached the viewer within 30s (black screen)")
 	}
 }

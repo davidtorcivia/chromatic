@@ -1532,36 +1532,38 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 		}
 	}
 
-	if roomStatus == "pending" {
-		// Notify all connected clients that room is live
-		if h.hub != nil {
+	if h.hub != nil {
+		if roomStatus == "pending" {
+			// Notify all connected clients that room is live
 			h.hub.BroadcastJSON(roomSlug, "room:live", map[string]interface{}{}, "")
-		}
-
-		// Initiate WebRTC subscriptions for all connected clients
-		if h.onRoomLive != nil {
-			h.onRoomLive(roomSlug)
-		}
-	} else {
-		if h.hub != nil {
+		} else {
 			h.hub.BroadcastJSON(roomSlug, "stream:resumed", map[string]interface{}{}, "")
 		}
+	}
 
-		// Renegotiate with subscribers that joined before the ingest started
-		// (they had no tracks and now need the new ones)
-		if h.sfu != nil && h.hub != nil {
-			for _, subID := range subsNeedingReneg {
-				offerSDP, err := h.sfu.RenegotiateSubscriber(roomSlug, subID)
-				if err != nil {
-					logger.Warn("Failed to renegotiate subscriber after ingest bind", "subscriber", subID, "error", err)
-					continue
-				}
-				h.hub.SendToJSON(roomSlug, subID, "signal:renegotiate", map[string]interface{}{
-					"sdp": offerSDP,
-				})
-				logger.Debug("Sent renegotiation offer to subscriber", "subscriber", subID, "room", roomSlug)
+	// Renegotiate with existing subscribers whose ingest tracks were freshly
+	// added by the bind (they had a subscriber but no tracks).
+	if h.sfu != nil && h.hub != nil {
+		for _, subID := range subsNeedingReneg {
+			offerSDP, err := h.sfu.RenegotiateSubscriber(roomSlug, subID)
+			if err != nil {
+				logger.Warn("Failed to renegotiate subscriber after ingest bind", "subscriber", subID, "error", err)
+				continue
 			}
+			h.hub.SendToJSON(roomSlug, subID, "signal:renegotiate", map[string]interface{}{
+				"sdp": offerSDP,
+			})
+			logger.Debug("Sent renegotiation offer to subscriber", "subscriber", subID, "room", roomSlug)
 		}
+	}
+
+	// Create subscribers + send offers for connected clients that have no SFU
+	// subscriber yet. Runs in BOTH branches: clients that connected before the
+	// ingest existed (room pending, or marked live during an OBS reconnect /
+	// after a server restart) could not subscribe at connect time and would
+	// otherwise never receive a signal:offer.
+	if h.onRoomLive != nil {
+		h.onRoomLive(roomSlug)
 	}
 
 	logger.Info("Room is now live", "room", roomSlug)

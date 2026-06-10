@@ -91,6 +91,20 @@ type IngestSession struct {
 	teardown func()
 }
 
+// NewIngestSession constructs an IngestSession with its internal lifecycle
+// state initialized. Callers outside this package (e.g. test harnesses that
+// simulate a WHIP publisher) must use this instead of a struct literal: the
+// teardown paths unconditionally close the done channel, which must be non-nil.
+func NewIngestSession(streamKeyToken string, pc *webrtc.PeerConnection, videoTrack, audioTrack *webrtc.TrackLocalStaticRTP) *IngestSession {
+	return &IngestSession{
+		StreamKeyToken: streamKeyToken,
+		PeerConnection: pc,
+		VideoTrack:     videoTrack,
+		AudioTrack:     audioTrack,
+		done:           make(chan struct{}),
+	}
+}
+
 // RoomTracks holds the tracks being distributed to a room
 type RoomTracks struct {
 	mu                       sync.RWMutex
@@ -791,6 +805,20 @@ func (s *SFU) GetRoomTracksForSlug(roomSlug string) *RoomTracks {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.rooms[roomSlug]
+}
+
+// HasSubscriber reports whether a subscriber with the given ID is currently
+// registered for the room. Used by the stream-start path to skip clients that
+// already completed (or are completing) the connect-time subscription flow.
+func (s *SFU) HasSubscriber(roomSlug, subscriberID string) bool {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return false
+	}
+	room.mu.RLock()
+	defer room.mu.RUnlock()
+	_, ok := room.Subscribers[subscriberID]
+	return ok
 }
 
 // CreateSubscriberConnection creates a new subscriber peer connection for a room.

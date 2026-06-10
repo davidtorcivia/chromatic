@@ -4,15 +4,17 @@ import {
     quadPoint,
     sliceChord,
     flattenSlice,
-    fadeAlpha,
+    fadeForAge,
+    bucketExpired,
+    pruneBuckets,
     smoothingFactor,
     easeOutCubic,
     rippleAt,
     subsampleBatch,
     MAX_BATCH_POINTS,
-    TRAIL_FADE_BASE_ALPHA,
-    FADE_REFERENCE_FRAME_MS,
     TRAIL_FADE_MS,
+    TRAIL_BUCKET_MS,
+    TRAIL_HOLD_MS,
     SLICE_MAX_CHORD_PX,
     RIPPLE_DURATION_MS,
     RIPPLE_START_RADIUS,
@@ -180,60 +182,154 @@ describe("flattenSlice", () => {
     });
 });
 
-describe("fadeAlpha", () => {
-    it("equals the base alpha at the 60fps reference frame", () => {
-        expect(fadeAlpha(FADE_REFERENCE_FRAME_MS)).toBeCloseTo(TRAIL_FADE_BASE_ALPHA, 12);
+describe("fadeForAge", () => {
+    it("holds FULL alpha through the hold window (no instant dimming)", () => {
+        expect(fadeForAge(0)).toBe(1);
+        expect(fadeForAge(TRAIL_HOLD_MS / 2)).toBe(1);
+        expect(fadeForAge(TRAIL_HOLD_MS)).toBe(1);
+        // Negative ages (clock skew) clamp to full alpha, never overshoot.
+        expect(fadeForAge(-50)).toBe(1);
     });
 
-    it("returns 0 for zero or negative dt", () => {
-        expect(fadeAlpha(0)).toBe(0);
-        expect(fadeAlpha(-16)).toBe(0);
+    it("reaches EXACTLY 0 at TRAIL_FADE_MS and stays 0 after (hard cutoff, no asymptote)", () => {
+        expect(fadeForAge(TRAIL_FADE_MS)).toBe(0);
+        expect(fadeForAge(TRAIL_FADE_MS + 1)).toBe(0);
+        expect(fadeForAge(TRAIL_FADE_MS * 10)).toBe(0);
     });
 
-    it("scales with dt so two 120Hz frames fade exactly like one 60Hz frame", () => {
-        const half = fadeAlpha(FADE_REFERENCE_FRAME_MS / 2);
-        const composed = 1 - (1 - half) * (1 - half);
-        expect(composed).toBeCloseTo(fadeAlpha(FADE_REFERENCE_FRAME_MS), 12);
-        expect(half).toBeLessThan(TRAIL_FADE_BASE_ALPHA);
-        expect(half).toBeGreaterThan(TRAIL_FADE_BASE_ALPHA / 2 - 1e-9);
-    });
-
-    it("stays in (0, 1] and grows monotonically with dt", () => {
-        let prev = 0;
-        for (const dt of [1, 8, 16.67, 33, 100, 1000]) {
-            const a = fadeAlpha(dt);
-            expect(a).toBeGreaterThan(prev);
-            expect(a).toBeLessThanOrEqual(1);
+    it("decreases strictly monotonically between hold and fade end", () => {
+        let prev = fadeForAge(TRAIL_HOLD_MS);
+        for (let age = TRAIL_HOLD_MS + 10; age <= TRAIL_FADE_MS; age += 10) {
+            const a = fadeForAge(age);
+            expect(a).toBeLessThan(prev);
+            expect(a).toBeGreaterThanOrEqual(0);
             prev = a;
         }
     });
 
-    it("fades a trail below visibility within TRAIL_FADE_MS of wall-clock time", () => {
-        // Simulate 60fps: residual alpha after TRAIL_FADE_MS of frames
-        const frames = Math.floor(TRAIL_FADE_MS / FADE_REFERENCE_FRAME_MS);
-        let residual = 1;
-        for (let i = 0; i < frames; i++) {
-            residual *= 1 - fadeAlpha(FADE_REFERENCE_FRAME_MS);
+    it("keeps the streak clearly visible at 1.2-1.5s and nearly gone by 1.9s (the tuned feel)", () => {
+        expect(fadeForAge(1200)).toBeGreaterThan(0.35);
+        expect(fadeForAge(1500)).toBeGreaterThan(0.15);
+        expect(fadeForAge(1900)).toBeLessThan(0.05);
+    });
+
+    it("is continuous at both boundaries (no visible pop entering or leaving the fade)", () => {
+        // Just past the hold: still essentially 1.
+        expect(fadeForAge(TRAIL_HOLD_MS + 1)).toBeGreaterThan(0.999);
+        // Just before the end: essentially 0 (smoothstep lands flat).
+        expect(fadeForAge(TRAIL_FADE_MS - 1)).toBeLessThan(0.001);
+    });
+
+    it("never changes by more than ~2% per 60Hz frame (continuous fade, no stepping)", () => {
+        const frameMs = 1000 / 60;
+        let maxDelta = 0;
+        for (let age = 0; age < TRAIL_FADE_MS; age += frameMs) {
+            const delta = fadeForAge(age) - fadeForAge(age + frameMs);
+            maxDelta = Math.max(maxDelta, delta);
         }
-        expect(residual).toBeLessThan(1 / 255);
+        // Max slope of 1 - smoothstep is 1.5/(fade - hold) per ms.
+        expect(maxDelta).toBeLessThan(0.02);
     });
 
-    it("reaches the same residual at any frame rate (wall-clock equivalence)", () => {
-        // 1s of fading: 120 frames at 120Hz vs 60 frames at 60Hz
-        const at = (frameMs: number, frames: number) => {
-            let residual = 1;
-            for (let i = 0; i < frames; i++) {
-                residual *= 1 - fadeAlpha(frameMs);
+    it("keeps the open bucket at full alpha (hold covers a whole bucket width)", () => {
+        // The component relies on this: an in-progress bucket is at most
+        // TRAIL_BUCKET_MS old when it rotates, so it always strokes at 1.
+        expect(TRAIL_HOLD_MS).toBeGreaterThanOrEqual(TRAIL_BUCKET_MS);
+        expect(fadeForAge(TRAIL_BUCKET_MS)).toBe(1);
+    });
+
+    it("respects custom fade/hold parameters", () => {
+        expect(fadeForAge(100, 1000, 100)).toBe(1);
+        expect(fadeForAge(550, 1000, 100)).toBeCloseTo(0.5, 12); // smoothstep midpoint
+        expect(fadeForAge(1000, 1000, 100)).toBe(0);
+    });
+
+    it("handles degenerate parameters (fade <= hold collapses to a step)", () => {
+        expect(fadeForAge(50, 100, 100)).toBe(1);
+        expect(fadeForAge(99, 100, 200)).toBe(1);
+        expect(fadeForAge(100, 100, 200)).toBe(0);
+    });
+});
+
+describe("bucketExpired", () => {
+    it("keeps a bucket open strictly within the bucket window", () => {
+        expect(bucketExpired(1000, 1000)).toBe(false);
+        expect(bucketExpired(1000, 1000 + TRAIL_BUCKET_MS - 1)).toBe(false);
+    });
+
+    it("closes the bucket once a full bucket width has elapsed", () => {
+        expect(bucketExpired(1000, 1000 + TRAIL_BUCKET_MS)).toBe(true);
+        expect(bucketExpired(1000, 1000 + TRAIL_BUCKET_MS * 5)).toBe(true);
+    });
+
+    it("respects a custom bucket width", () => {
+        expect(bucketExpired(0, 49, 50)).toBe(false);
+        expect(bucketExpired(0, 50, 50)).toBe(true);
+    });
+});
+
+describe("pruneBuckets", () => {
+    function buckets(...openedAts: number[]) {
+        return openedAts.map((openedAt) => ({ openedAt }));
+    }
+
+    it("drops buckets at or past the fade lifetime, keeps younger ones in order", () => {
+        const now = 10_000;
+        const list = buckets(
+            now - TRAIL_FADE_MS - 1, // gone
+            now - TRAIL_FADE_MS, // exactly at cutoff: gone (alpha is 0)
+            now - TRAIL_FADE_MS + 1, // still live
+            now - 500,
+            now
+        );
+        const out = pruneBuckets(list, now);
+        expect(out.map((b) => b.openedAt)).toEqual([
+            now - TRAIL_FADE_MS + 1,
+            now - 500,
+            now
+        ]);
+    });
+
+    it("compacts in place and returns the same array reference", () => {
+        const list = buckets(0, 5000);
+        const out = pruneBuckets(list, 5000);
+        expect(out).toBe(list);
+        expect(list).toHaveLength(1);
+        expect(list[0].openedAt).toBe(5000);
+    });
+
+    it("agrees with fadeForAge: every kept bucket has alpha > 0, every dropped one 0", () => {
+        const now = 50_000;
+        const ages = [0, 100, 1999, 2000, 2001, 7000];
+        const list = buckets(...ages.map((a) => now - a));
+        const kept = new Set(pruneBuckets([...list], now).map((b) => b.openedAt));
+        for (const b of list) {
+            if (kept.has(b.openedAt)) {
+                expect(fadeForAge(now - b.openedAt)).toBeGreaterThan(0);
+            } else {
+                expect(fadeForAge(now - b.openedAt)).toBe(0);
             }
-            return residual;
-        };
-        expect(at(1000 / 120, 120)).toBeCloseTo(at(1000 / 60, 60), 10);
+        }
     });
 
-    it("handles degenerate base values", () => {
-        expect(fadeAlpha(16, 0)).toBe(0);
-        expect(fadeAlpha(16, 1)).toBe(1);
-        expect(fadeAlpha(16, 2)).toBe(1);
+    it("bounds live buckets per cursor at ceil(fade/bucket) for a continuous stroke", () => {
+        // Simulate a long stroke: one bucket opens every TRAIL_BUCKET_MS
+        // for 10 seconds, pruned each step like the render loop does.
+        const list: { openedAt: number }[] = [];
+        let maxLive = 0;
+        for (let now = 0; now <= 10_000; now += TRAIL_BUCKET_MS) {
+            list.push({ openedAt: now });
+            pruneBuckets(list, now);
+            maxLive = Math.max(maxLive, list.length);
+        }
+        expect(maxLive).toBeLessThanOrEqual(Math.ceil(TRAIL_FADE_MS / TRAIL_BUCKET_MS));
+    });
+
+    it("handles empty input and a custom lifetime", () => {
+        expect(pruneBuckets([], 123)).toEqual([]);
+        const list = buckets(0, 400, 800);
+        pruneBuckets(list, 900, 500);
+        expect(list.map((b) => b.openedAt)).toEqual([800]);
     });
 });
 

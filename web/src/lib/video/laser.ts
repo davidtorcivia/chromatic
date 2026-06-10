@@ -1,16 +1,23 @@
 // Pure helpers for the laser pointer overlay: midpoint-quadratic trail
-// slices, dt-scaled decay-canvas fading, cursor smoothing, wire-format
+// slices, age-bucketed trail fading, cursor smoothing, wire-format
 // batching, and release-ripple animation. Kept free of DOM/canvas
 // dependencies so they can be unit tested.
 //
-// Trail architecture (decay canvas): the overlay keeps a persistent
-// trail canvas that is never fully redrawn. Each new cursor point
-// stamps ONE quadratic slice onto it (midpointSlice), and every RAF
-// tick the whole layer is faded toward transparent with a
-// destination-out fill (fadeAlpha). Adjacent slices share endpoints
-// and tangents, so the stamped curve is inherently continuous at any
-// speed, and per-frame cost is one fillRect plus a handful of stamps —
-// independent of how long the user has been drawing.
+// Trail architecture (age-bucketed immutable path redraw): each new
+// cursor point contributes ONE quadratic slice (midpointSlice) to the
+// cursor's CURRENT age bucket. A new bucket opens every TRAIL_BUCKET_MS;
+// once a bucket stops receiving slices it is immutable — its geometry
+// lives in a cached Path2D that is never rebuilt. Every RAF tick the
+// trail canvas is cleared and each live bucket is re-stroked at an
+// alpha computed purely from its age (fadeForAge): full alpha through a
+// short hold, then a smooth ease to exactly 0 at TRAIL_FADE_MS, when
+// the bucket is dropped. This gives an exact wall-clock fade duration,
+// a continuous-to-zero disappearance (no 8-bit destination-out
+// quantization stall, no residue ghost), and constant per-frame cost:
+// at most ceil(TRAIL_FADE_MS / TRAIL_BUCKET_MS) buckets per cursor,
+// two strokes each. Adjacent slices share endpoints and tangents —
+// including across bucket boundaries — so the chained curve is
+// continuous at any speed with no visible joint.
 
 /** One position sample inside a batched cursor message (normalized 0-1). */
 export interface BatchPoint {
@@ -35,30 +42,30 @@ export interface QuadSlice {
 // --- Tunables ---------------------------------------------------------------
 
 /**
- * Per-frame fade strength of the trail layer at a 60fps reference
- * frame (see fadeAlpha for the dt-scaled version). 0.05 leaves
- * 0.95^n of the trail after n frames: visually gone (< 1/255) in
- * ~1.8s of wall-clock time regardless of display refresh rate.
- */
-export const TRAIL_FADE_BASE_ALPHA = 0.05;
-
-/** Reference frame duration (ms) that TRAIL_FADE_BASE_ALPHA is tuned for. */
-export const FADE_REFERENCE_FRAME_MS = 1000 / 60;
-
-/**
- * Nominal wall-clock fade duration (ms). destination-out fading is
- * asymptotic, so this is the point where the trail is visually gone
- * (sub-1/255 residue at TRAIL_FADE_BASE_ALPHA), not a hard cutoff.
+ * Exact wall-clock lifetime (ms) of a trail bucket. fadeForAge reaches
+ * 0 precisely here (a hard cutoff, not an asymptote) and the overlay
+ * drops the bucket, so a trail is COMPLETELY gone TRAIL_FADE_MS after
+ * its last point was drawn — no residue, no ghost.
  */
 export const TRAIL_FADE_MS = 2000;
 
 /**
- * Extra grace (ms) past TRAIL_FADE_MS before the overlay does its one
- * full clearRect of the trail layer. 8-bit alpha can leave faint
- * ghosts that destination-out never quite removes; the explicit clear
- * wipes them and lets the RAF loop park (idle = zero work).
+ * Width (ms) of one age bucket. Smaller buckets give a finer-grained
+ * fade gradient along the trail at the cost of more Path2D strokes per
+ * frame; the cap is ceil(TRAIL_FADE_MS / TRAIL_BUCKET_MS) live buckets
+ * per cursor (~17 at the defaults). Adjacent buckets differ by one age
+ * step, so their alphas are nearly identical and the per-bucket fade
+ * reads as one smooth gradient.
  */
-export const TRAIL_CLEAR_GRACE_MS = 500;
+export const TRAIL_BUCKET_MS = 120;
+
+/**
+ * How long (ms) a bucket holds full alpha before easing toward 0. This
+ * is what makes the streak feel "bright then gone" instead of starting
+ * to dim the instant it is drawn. Must be >= TRAIL_BUCKET_MS so the
+ * still-open (in-progress) bucket always strokes at full alpha.
+ */
+export const TRAIL_HOLD_MS = 300;
 
 /**
  * Maximum on-screen chord length (px) of a single stamped slice. A
@@ -79,17 +86,18 @@ export const MIN_STAMP_DIST_PX = 1.5;
 export const TRAIL_BODY_WIDTH = 4;
 
 /**
- * Body-pass alpha. Stamped under 'source-over', so self-crossings
- * (spinning circles) repaint the same vivid color instead of
- * accumulating toward white.
+ * Body-pass alpha (multiplied by the bucket's fadeForAge). Stroked
+ * under 'source-over', so self-crossings (spinning circles) repaint
+ * the same vivid color instead of accumulating toward white.
  */
 export const TRAIL_BODY_ALPHA = 0.92;
 
 /**
- * Glow pass: one wide low-alpha stroke of the same slice, stamped
- * under 'lighter'. Each slice is stamped exactly once, and the glow is
- * the pure participant color, so same-color accumulation at crossings
- * and shared caps clamps toward the saturated hue — never white.
+ * Glow pass: one wide low-alpha stroke of the same bucket path,
+ * composited under 'lighter'. A single stroke() rasterizes the whole
+ * path once (in-bucket overlap cannot double-blend), and the glow is
+ * the pure participant color, so same-color accumulation across
+ * buckets and crossings clamps toward the saturated hue — never white.
  */
 export const TRAIL_GLOW_WIDTH_RATIO = 3; // x TRAIL_BODY_WIDTH
 export const TRAIL_GLOW_ALPHA = 0.2;
@@ -184,23 +192,65 @@ export function flattenSlice(
     return out;
 }
 
-// --- Decay-canvas fade ------------------------------------------------------
+// --- Age-bucketed fade --------------------------------------------------------
 
 /**
- * destination-out fill alpha for one frame of trail fading, scaled by
- * the actual frame duration so the trail fades at the same wall-clock
- * rate on any display: A = 1 - (1 - base)^(dt / 16.67ms). At 60fps
- * this is exactly `base`; at 120fps each frame fades half as hard;
- * after a long stall one big fill catches up.
+ * Trail alpha multiplier for a bucket of the given age (ms since the
+ * bucket opened). Perceptual curve: hold full alpha through holdMs,
+ * then ease to EXACTLY 0 at fadeMs with a smoothstep falloff
+ * (1 - u²(3 - 2u)). The curve is C1-continuous at both ends — flat
+ * leaving the hold and flat arriving at 0 — so the streak stays vivid
+ * briefly, dims smoothly, and vanishes without a visible pop. At the
+ * defaults the body is still clearly visible around 1.2-1.5s
+ * (~0.46 / ~0.21 of full alpha) and is gone at 2s.
  */
-export function fadeAlpha(
-    dtMs: number,
-    base: number = TRAIL_FADE_BASE_ALPHA,
-    referenceFrameMs: number = FADE_REFERENCE_FRAME_MS
+export function fadeForAge(
+    ageMs: number,
+    fadeMs: number = TRAIL_FADE_MS,
+    holdMs: number = TRAIL_HOLD_MS
 ): number {
-    if (dtMs <= 0 || base <= 0 || referenceFrameMs <= 0) return 0;
-    if (base >= 1) return 1;
-    return 1 - Math.pow(1 - base, dtMs / referenceFrameMs);
+    if (ageMs >= fadeMs) return 0;
+    if (ageMs <= holdMs || fadeMs <= holdMs) return 1;
+    const u = (ageMs - holdMs) / (fadeMs - holdMs);
+    return 1 - u * u * (3 - 2 * u);
+}
+
+/** Minimal shape of an age bucket as the bookkeeping helpers see it. */
+export interface AgedBucket {
+    /** performance.now()-style timestamp of the bucket's first slice. */
+    openedAt: number;
+}
+
+/**
+ * Whether a cursor's current bucket is too old to receive new slices:
+ * the next slice must open a fresh bucket. Buckets close by AGE (not by
+ * slice count) so the fade gradient along the trail is uniform in time.
+ */
+export function bucketExpired(
+    openedAt: number,
+    now: number,
+    bucketMs: number = TRAIL_BUCKET_MS
+): boolean {
+    return now - openedAt >= bucketMs;
+}
+
+/**
+ * Drop buckets that have fully faded (age >= fadeMs), compacting the
+ * array in place (returned for convenience). Keeps memory bounded at
+ * ceil(fadeMs / bucketMs) live buckets per cursor and keeps per-frame
+ * stroke cost constant. Order (oldest first) is preserved.
+ */
+export function pruneBuckets<T extends AgedBucket>(
+    buckets: T[],
+    now: number,
+    fadeMs: number = TRAIL_FADE_MS
+): T[] {
+    let keep = 0;
+    for (const b of buckets) {
+        if (now - b.openedAt < fadeMs) buckets[keep++] = b;
+    }
+    buckets.length = keep;
+    return buckets;
 }
 
 // --- Cursor dot smoothing ---------------------------------------------------

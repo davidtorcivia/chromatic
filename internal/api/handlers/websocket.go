@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"chromatic/internal/api/middleware"
@@ -40,6 +41,23 @@ type WebSocketHandler struct {
 	validateSession SessionValidator
 	waitingActions  WaitingActions
 	upgrader        gorillaws.Upgrader
+
+	// subMu guards subStates: per-connection subscription bookkeeping keyed by
+	// the *websocket.Client pointer (a page refresh creates a new Client and
+	// therefore fresh state, while the SFU replaces the same-ID subscriber).
+	subMu     sync.Mutex
+	subStates map[*websocket.Client]*subscriptionState
+}
+
+// subscriptionState serializes subscriber creation for one connected client.
+// Two paths can race to create the SFU subscriber + send the initial
+// signal:offer: the connect path (room already live) and the stream-start
+// path (client connected before the ingest existed). Holding mu across the
+// whole attempt and recording success in created guarantees the client ends
+// up with exactly one subscriber and one offer.
+type subscriptionState struct {
+	mu      sync.Mutex
+	created bool
 }
 
 // SetWaitingActions wires the shared waiting-room admit/deny implementation.
@@ -70,6 +88,7 @@ func NewWebSocketHandler(
 		originValidator: validator,
 		tokenManager:    NewTokenManager(tokenSecret),
 		validateSession: validateSession,
+		subStates:       make(map[*websocket.Client]*subscriptionState),
 	}
 
 	h.upgrader = gorillaws.Upgrader{
@@ -219,6 +238,13 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	}
 	client.Color = color
 
+	// Create the subscription state BEFORE registering with the hub so any
+	// client visible to the stream-start path (which iterates hub clients) has
+	// an entry. The entry is removed in the disconnect handler below.
+	h.subMu.Lock()
+	h.subStates[client] = &subscriptionState{}
+	h.subMu.Unlock()
+
 	// Register with hub
 	h.hub.Register(client)
 
@@ -241,9 +267,16 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 		},
 	}, client.ID)
 
-	// If room is live, initiate WebRTC subscription
-	if roomStatus == "live" {
-		go h.initiateSubscription(client, slug)
+	// If the stream is already up, initiate the WebRTC subscription. The room
+	// can be marked live in the DB while the SFU has no bound ingest yet (OBS
+	// reconnecting, or a server restart) — that is a normal pre-stream state:
+	// ensureSubscription defers, and the stream-start path creates the
+	// subscriber the moment the ingest binds. The SFU-side check additionally
+	// covers the race where the DB status was read as "pending" just before
+	// OnStreamStart committed: it runs after hub registration, so a client
+	// that misses the stream-start client snapshot sees the SFU live here.
+	if roomStatus == "live" || h.sfu.IsRoomLive(slug) {
+		go h.ensureSubscription(client, slug)
 	}
 
 	// Start write pump
@@ -255,6 +288,13 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 			h.handleMessage(c, msg)
 		},
 		func(c *websocket.Client) {
+			// This Client object is dead either way (replaced or disconnected),
+			// so drop its subscription state. Keyed by pointer, so a refresh
+			// replacement (a different Client) keeps its own entry.
+			h.subMu.Lock()
+			delete(h.subStates, c)
+			h.subMu.Unlock()
+
 			// Atomically unregister ONLY if this client is still current. If a
 			// new connection (page refresh) already replaced it, skip all
 			// cleanup — the participant is still in the room. The check and the
@@ -291,8 +331,50 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	)
 }
 
-// initiateSubscription starts the WebRTC subscription for a client
-func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSlug string) {
+// ensureSubscription runs the create-subscriber + send-offer flow for a
+// client exactly once. It is the single entry point shared by the connect
+// path (room already live) and the stream-start path (client connected before
+// the ingest existed). Attempts for one client are serialized and success is
+// recorded, so a client connecting at the same moment the stream starts never
+// receives two subscribers/offers; a pre-stream attempt (SFU room not live
+// yet) leaves the state unset so the stream-start path retries it.
+func (h *WebSocketHandler) ensureSubscription(client *websocket.Client, roomSlug string) {
+	h.subMu.Lock()
+	st, ok := h.subStates[client]
+	h.subMu.Unlock()
+	if !ok {
+		// Client already disconnected (state removed by the disconnect handler).
+		return
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.created && h.sfu.HasSubscriber(roomSlug, client.ID) {
+		// Already subscribed and the subscriber is still registered with the
+		// SFU — an ingest (re)bind reuses it via ReplaceTrack/renegotiation,
+		// so creating a replacement here would force a needless re-handshake.
+		return
+	}
+	if h.initiateSubscription(client, roomSlug) {
+		st.created = true
+	}
+}
+
+// initiateSubscription starts the WebRTC subscription for a client. Returns
+// true when a subscriber was created and the offer sent; false when the
+// attempt should be retried later (the stream isn't up yet, or subscriber
+// creation failed and the next stream-start may succeed).
+func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSlug string) bool {
+	// Pre-stream state: the SFU has no ingest tracks bound for this room yet
+	// (viewer connected before OBS started, OBS reconnecting, or a server
+	// restart). This is normal, not an error — the stream-start path runs this
+	// flow again for clients without a subscriber once the ingest binds.
+	if !h.sfu.IsRoomLive(roomSlug) {
+		logger.Debug("Stream not started yet; deferring subscriber creation until ingest binds",
+			"participant_id", client.ID, "room", roomSlug)
+		return false
+	}
+
 	// Create subscriber connection and get offer (no ICE candidates yet — trickle ICE)
 	pc, offerSDP, err := h.sfu.CreateSubscriberConnection(roomSlug, client.ID)
 	if err != nil {
@@ -303,7 +385,7 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 			"code":    "subscription-failed",
 			"message": "Failed to initialize stream. Please refresh the page to retry.",
 		})
-		return
+		return false
 	}
 
 	// Listen for inbound tracks from this participant (voice audio + screen share video)
@@ -343,16 +425,21 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 	})
 
 	logger.Debug("Sent WebRTC offer to client (trickle ICE)", "participant_id", client.ID, "room", roomSlug)
+	return true
 }
 
-// InitiateSubscriptionsForRoom sends WebRTC offers to all clients in a room
-// Called when a room goes live
+// InitiateSubscriptionsForRoom sends WebRTC offers to clients in a room that
+// don't have an SFU subscriber yet. Called from the stream-start path AFTER
+// BindIngestToRoom, so viewers/hosts who connected before OBS started get
+// their offer the moment the stream goes live. Clients that already hold a
+// live subscriber are skipped — the ingest bind rebinds their tracks in place
+// (ReplaceTrack) or queues them for renegotiation.
 func (h *WebSocketHandler) InitiateSubscriptionsForRoom(roomSlug string) {
 	clients := h.hub.GetRoomClients(roomSlug)
 	for _, client := range clients {
-		go h.initiateSubscription(client, roomSlug)
+		go h.ensureSubscription(client, roomSlug)
 	}
-	logger.Info("Initiated subscriptions for room", "room", roomSlug, "client_count", len(clients))
+	logger.Info("Ensured subscriptions for room", "room", roomSlug, "client_count", len(clients))
 }
 
 // sendRoomState sends the initial room state to a newly connected client

@@ -8,12 +8,12 @@
     import {
         midpointSlice,
         flattenSlice,
-        fadeAlpha,
+        fadeForAge,
+        bucketExpired,
+        pruneBuckets,
         smoothingFactor,
         rippleAt,
         subsampleBatch,
-        TRAIL_FADE_MS,
-        TRAIL_CLEAR_GRACE_MS,
         TRAIL_BODY_WIDTH,
         TRAIL_BODY_ALPHA,
         TRAIL_GLOW_WIDTH_RATIO,
@@ -41,10 +41,17 @@
         lastUpdate: number;
         // The last two stamped trail points (normalized coords) of the
         // current stroke. Each new point stamps one midpoint-quadratic
-        // slice through prev1 onto the persistent trail canvas; the
-        // stroke itself lives in the canvas pixels, not in any list.
+        // slice through prev1 into the cursor's current age bucket.
+        // These anchors persist across bucket rotation, so the chained
+        // curve continues seamlessly across bucket boundaries (bucket
+        // N+1's first slice starts exactly where bucket N's last ended).
         prev1: BatchPoint | null;
         prev2: BatchPoint | null;
+        // The bucket currently receiving this cursor's slices, or null
+        // between strokes. Rotated (closed, new one opened) when it is
+        // older than TRAIL_BUCKET_MS; the closed bucket then lives only
+        // in trailBuckets, immutable, until its fade ends.
+        bucket: TrailBucket | null;
         // True for the sender's own cursor: driven directly by local
         // pointer events with zero network latency; server echoes for
         // this participantId are ignored.
@@ -56,6 +63,19 @@
         y: number;
         color: string;
         start: number;
+    }
+
+    // One age bucket of trail geometry. Slices stamped within a
+    // TRAIL_BUCKET_MS window accumulate into the Path2D (canvas-px
+    // coordinates, built once, never rebuilt); after the window closes
+    // the bucket is immutable. Each frame the bucket is stroked twice
+    // (glow + body — the glow is just a wider stroke of the same path)
+    // at an alpha derived purely from its age, and it is dropped
+    // entirely once fadeForAge reaches 0.
+    interface TrailBucket {
+        openedAt: number; // performance.now() of the first slice
+        color: string;
+        path: Path2D;
     }
 
     interface Props {
@@ -83,11 +103,13 @@
     let ripples: Ripple[] = [];
 
     // Two stacked canvases:
-    //  - trailCanvas (below): PERSISTENT decay layer. Slices are stamped
-    //    onto it exactly once as points arrive, and every RAF tick the
-    //    whole layer is faded with a destination-out fill. It is never
-    //    rebuilt from geometry, so per-frame cost is constant no matter
-    //    how long or fast the user draws.
+    //  - trailCanvas (below): cleared and redrawn each frame from the
+    //    live age buckets — at most ~ceil(TRAIL_FADE_MS/TRAIL_BUCKET_MS)
+    //    cached Path2D strokes (x2 passes) per cursor, a constant cost
+    //    no matter how long or fast the user draws. No destination-out
+    //    anywhere: each bucket's alpha comes from its age, reaches
+    //    exactly 0, and the bucket is dropped — no quantization stall,
+    //    no residue ghost.
     //  - cursorCanvas (above): cleared and redrawn each frame with the
     //    cursor dots, name labels, and release ripples (tiny constant cost).
     let trailCanvas = $state<HTMLCanvasElement | null>(null);
@@ -95,14 +117,15 @@
     let trailCtx: CanvasRenderingContext2D | null = null;
     let cursorCtx: CanvasRenderingContext2D | null = null;
 
-    // Decay-layer bookkeeping: when the layer last received a stamp and
-    // whether it might still hold visible pixels. Once a trail has fully
-    // faded (TRAIL_FADE_MS + TRAIL_CLEAR_GRACE_MS after the last stamp)
-    // the layer gets ONE full clearRect — destination-out is asymptotic
-    // and 8-bit alpha can leave faint ghosts — and the fade work stops,
-    // letting the RAF loop park when the cursor layer is also idle.
-    let trailHasContent = false;
-    let lastStampTime = 0;
+    // All live trail buckets across every cursor (each carries its own
+    // color), oldest first so newer strokes paint on top. A bucket
+    // enters when a cursor opens it, becomes immutable when the cursor
+    // rotates past it, and leaves via pruneBuckets when fully faded.
+    const trailBuckets: TrailBucket[] = [];
+    // True while the trail canvas may hold pixels, so the render loop
+    // knows to clear it exactly once after the last bucket fades, then
+    // park (idle = zero work).
+    let trailDirty = false;
 
     let rafId: number | null = null;
     let lastFrameTime = 0;
@@ -132,10 +155,10 @@
     }
 
     // Size both canvas backing stores to the video content rect
-    // (DPR-aware). Setting width/height wipes canvas content, so the
-    // trail layer is cleared on resize by construction — stamped pixels
-    // are in canvas space and would be misplaced anyway; a momentary
-    // trail loss on resize is fine (cursors keep stamping fresh slices).
+    // (DPR-aware). Setting width/height wipes canvas content, and the
+    // bucket paths are in canvas space so they would be misplaced at the
+    // new size — drop them all; a momentary trail loss on resize is fine
+    // (cursors keep stamping fresh slices into new buckets).
     $effect(() => {
         const rect = videoRect;
         if (!trailCanvas || !cursorCanvas) return;
@@ -148,9 +171,19 @@
         cursorCanvas.height = bh;
         trailCtx = trailCanvas.getContext("2d");
         cursorCtx = cursorCanvas.getContext("2d");
-        trailHasContent = false; // resize wiped the layer
+        dropAllBuckets(); // canvas-space geometry is invalid at the new size
+        trailDirty = false; // resize wiped the layer
         startRenderLoop(); // repaint at least once after a resize
     });
+
+    /** Forget every bucket (resize): open ones too, so no cursor keeps
+     *  stamping into a path that is no longer drawn. */
+    function dropAllBuckets() {
+        trailBuckets.length = 0;
+        for (const cursor of cursorMap.values()) {
+            cursor.bucket = null;
+        }
+    }
 
     $effect(() => {
         videoElement.style.cursor = enabled ? "crosshair" : "";
@@ -168,7 +201,7 @@
             endLocalStroke();
             sendCursorEnd();
         }
-        // No trail cleanup needed: the decay layer fades it out on its own.
+        // No trail cleanup needed: the live buckets fade out on their own.
     });
 
     onMount(() => {
@@ -278,6 +311,7 @@
                     lastUpdate: now,
                     prev1: null,
                     prev2: null,
+                    bucket: null,
                     local: false,
                 };
                 cursorMap.set(data.participantId, cursor);
@@ -290,6 +324,7 @@
                 cursor.y = batch[0].y;
                 cursor.prev1 = null;
                 cursor.prev2 = null;
+                cursor.bucket = null; // new stroke, new bucket
             }
 
             cursor.participantName = data.participantName;
@@ -377,71 +412,61 @@
 
     // --- Trail stamping -------------------------------------------------------
     // Each new point (local coalesced sample or remote batch point) stamps
-    // ONE midpoint-quadratic slice onto the persistent trail canvas:
-    // from mid(prev2, prev1) through prev1 to mid(prev1, new). Adjacent
-    // slices share endpoints and tangents, so the stamped curve is
-    // G1-continuous at any speed, each slice is drawn exactly once, and
-    // there is no point list to prune, thin, or decimate — the two
-    // failure modes of the old renderer (stale pivot anchors, taper
-    // churn) cannot occur.
+    // ONE midpoint-quadratic slice — from mid(prev2, prev1) through prev1
+    // to mid(prev1, new) — into the cursor's CURRENT age bucket's Path2D.
+    // Adjacent slices share endpoints and tangents (including across
+    // bucket boundaries: the prev1/prev2 anchors persist through
+    // rotation), so the chained curve is G1-continuous at any speed,
+    // each slice's geometry is built exactly once, and there is no point
+    // list to prune, thin, or decimate. Rendering happens in renderFrame
+    // by stroking the cached bucket paths at their age-derived alpha.
 
     function trailDpr(): number {
         return trailCanvas ? trailCanvas.width / Math.max(1, videoRect.width) : 1;
     }
 
-    /** Stamp one slice (canvas px coords) in two passes: glow then body. */
-    function stampSlice(c: CanvasRenderingContext2D, color: string, s: QuadSlice) {
-        c.setTransform(trailDpr(), 0, 0, trailDpr(), 0, 0);
-        c.lineCap = "round";
-        c.lineJoin = "round";
-        c.strokeStyle = color;
+    /** The bucket currently accepting slices for this cursor, opening a
+     *  fresh one when there is none or the current one's window closed
+     *  (it then becomes immutable and just fades out). */
+    function openBucket(cursor: Cursor, now: number): TrailBucket {
+        let bucket = cursor.bucket;
+        if (!bucket || bucketExpired(bucket.openedAt, now) || bucket.color !== cursor.color) {
+            bucket = { openedAt: now, color: cursor.color, path: new Path2D() };
+            trailBuckets.push(bucket);
+            cursor.bucket = bucket;
+        }
+        return bucket;
+    }
 
-        // One path, stroked twice. Slices whose chord exceeds
-        // SLICE_MAX_CHORD_PX (fast flick) are subdivided by sampling the
-        // quadratic so no stamp reads as a single long rod.
-        c.beginPath();
-        c.moveTo(s.x0, s.y0);
+    /** Append one slice (canvas px coords) to a bucket's cached path. */
+    function addSliceToBucket(bucket: TrailBucket, s: QuadSlice) {
+        const path = bucket.path;
+        // Each slice is its own subpath; consecutive slices share their
+        // boundary point exactly, and the round caps/joins close the
+        // seam, so the stroked result reads as one continuous curve.
+        path.moveTo(s.x0, s.y0);
+        // Slices whose chord exceeds SLICE_MAX_CHORD_PX (fast flick) are
+        // subdivided by sampling the quadratic so no stamp reads as a
+        // single long rod.
         const subdivided = flattenSlice(s);
         if (subdivided) {
-            for (const p of subdivided) c.lineTo(p.x, p.y);
+            for (const p of subdivided) path.lineTo(p.x, p.y);
         } else {
-            c.quadraticCurveTo(s.cx, s.cy, s.x1, s.y1);
+            path.quadraticCurveTo(s.cx, s.cy, s.x1, s.y1);
         }
-
-        // Glow pass: wide, faint, additive. The glow is the pure
-        // participant color at low alpha, so same-color overlap (shared
-        // caps, self-crossings while spinning circles) saturates toward
-        // the vivid hue — additive compositing cannot white-clip a
-        // single-hue source.
-        c.globalCompositeOperation = "lighter";
-        c.globalAlpha = TRAIL_GLOW_ALPHA;
-        c.lineWidth = TRAIL_BODY_WIDTH * TRAIL_GLOW_WIDTH_RATIO;
-        c.stroke();
-
-        // Body pass: normal width, high alpha, source-over — crossings
-        // (including other participants' trails) repaint cleanly instead
-        // of accumulating.
-        c.globalCompositeOperation = "source-over";
-        c.globalAlpha = TRAIL_BODY_ALPHA;
-        c.lineWidth = TRAIL_BODY_WIDTH;
-        c.stroke();
-
-        c.globalAlpha = 1;
-        trailHasContent = true;
-        lastStampTime = performance.now();
     }
 
     /**
      * Feed one new trail point (normalized coords) for a cursor. The
      * first point of a stroke only seeds the anchors; every subsequent
-     * point at least MIN_STAMP_DIST_PX away stamps one slice
-     * synchronously — zero latency for local samples, on-arrival for
-     * remote batches.
+     * point at least MIN_STAMP_DIST_PX away stamps one slice into the
+     * cursor's current bucket synchronously — zero latency for local
+     * samples, on-arrival for remote batches.
      */
     function stampCursorPoint(cursor: Cursor, x: number, y: number) {
         const w = videoRect.width;
         const h = videoRect.height;
-        if (!trailCtx || w <= 0 || h <= 0) return;
+        if (w <= 0 || h <= 0) return;
 
         const p1 = cursor.prev1;
         if (!p1) {
@@ -454,9 +479,8 @@
         if (dx * dx + dy * dy < MIN_STAMP_DIST_PX * MIN_STAMP_DIST_PX) return;
 
         const p2 = cursor.prev2 ?? p1; // first slice starts at prev1 itself
-        stampSlice(
-            trailCtx,
-            cursor.color,
+        addSliceToBucket(
+            openBucket(cursor, performance.now()),
             midpointSlice(
                 { x: p2.x * w, y: p2.y * h },
                 { x: p1.x * w, y: p1.y * h },
@@ -472,17 +496,17 @@
      * Cap a finished stroke: the last stamped slice ended at
      * mid(prev2, prev1), so stamp the remaining half-segment up to the
      * final point (midpointSlice with next === prev1 ends exactly
-     * there), then reset the anchors for the next stroke.
+     * there), then reset the anchors and close the bucket — it becomes
+     * immutable and simply fades out with age.
      */
     function finishStroke(cursor: Cursor) {
         const w = videoRect.width;
         const h = videoRect.height;
         const p1 = cursor.prev1;
         const p2 = cursor.prev2;
-        if (trailCtx && p1 && p2 && w > 0 && h > 0) {
-            stampSlice(
-                trailCtx,
-                cursor.color,
+        if (p1 && p2 && w > 0 && h > 0) {
+            addSliceToBucket(
+                openBucket(cursor, performance.now()),
                 midpointSlice(
                     { x: p2.x * w, y: p2.y * h },
                     { x: p1.x * w, y: p1.y * h },
@@ -492,6 +516,7 @@
         }
         cursor.prev1 = null;
         cursor.prev2 = null;
+        cursor.bucket = null;
     }
 
     // --- Local echo ---------------------------------------------------------
@@ -518,6 +543,7 @@
             lastUpdate: Date.now(),
             prev1: null,
             prev2: null,
+            bucket: null,
             local: true,
         };
         cursorMap.set(id, cursor);
@@ -624,11 +650,12 @@
     }
 
     // --- Rendering (single RAF loop, idles when there is nothing to draw) --
-    // Per-frame work is small and CONSTANT: one destination-out fillRect
-    // on the trail layer (while it has content) plus a full redraw of the
-    // tiny cursor layer. Trail geometry is never re-stroked here — slices
-    // were already stamped when their points arrived. The loop parks when
-    // there are no cursors/ripples AND the trail layer is clean.
+    // Per-frame work is small and CONSTANT: clear the trail layer and
+    // stroke each live bucket's cached Path2D twice (glow + body) at its
+    // age-derived alpha — bounded at ~ceil(TRAIL_FADE_MS/TRAIL_BUCKET_MS)
+    // buckets per cursor — plus a full redraw of the tiny cursor layer.
+    // Bucket geometry is never rebuilt here. The loop parks when there
+    // are no cursors/ripples AND no live buckets (after one final clear).
 
     function startRenderLoop() {
         if (rafId !== null || destroyed) return;
@@ -660,22 +687,42 @@
 
         if (w <= 0 || h <= 0) return false;
 
-        // Trail layer decay: one dt-scaled destination-out fill per frame
-        // (same wall-clock fade rate at 60Hz and 120Hz). Once the last
-        // stamp has fully faded, ONE clearRect removes any 8-bit alpha
-        // residue and the fade work stops entirely.
-        if (trailHasContent && trailCtx) {
-            trailCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-            if (frameNow - lastStampTime > TRAIL_FADE_MS + TRAIL_CLEAR_GRACE_MS) {
-                trailCtx.globalCompositeOperation = "source-over";
-                trailCtx.clearRect(0, 0, w, h);
-                trailHasContent = false;
-            } else {
-                trailCtx.globalCompositeOperation = "destination-out";
-                trailCtx.fillStyle = `rgba(0, 0, 0, ${fadeAlpha(dt)})`;
-                trailCtx.fillRect(0, 0, w, h);
-                trailCtx.globalCompositeOperation = "source-over";
+        // Trail layer: clear, drop fully-faded buckets, then re-stroke
+        // each surviving bucket's cached path at its age-derived alpha
+        // (glow pass then body pass). Alpha comes from wall-clock age, so
+        // the fade duration is exact at any refresh rate and reaches
+        // exactly 0 — the final clear leaves zero residue, ever.
+        pruneBuckets(trailBuckets, frameNow);
+        if (trailCtx && (trailDirty || trailBuckets.length > 0)) {
+            const tc = trailCtx;
+            tc.setTransform(trailDpr(), 0, 0, trailDpr(), 0, 0);
+            tc.clearRect(0, 0, w, h);
+            tc.lineCap = "round";
+            tc.lineJoin = "round";
+            for (const bucket of trailBuckets) {
+                const fade = fadeForAge(frameNow - bucket.openedAt);
+                if (fade <= 0) continue;
+                tc.strokeStyle = bucket.color;
+                // Glow pass: wide, faint, additive. The glow is the pure
+                // participant color at low alpha, so same-color overlap
+                // (crossings, spun circles) saturates toward the vivid
+                // hue — additive compositing cannot white-clip a
+                // single-hue source.
+                tc.globalCompositeOperation = "lighter";
+                tc.globalAlpha = TRAIL_GLOW_ALPHA * fade;
+                tc.lineWidth = TRAIL_BODY_WIDTH * TRAIL_GLOW_WIDTH_RATIO;
+                tc.stroke(bucket.path);
+                // Body pass: normal width, high alpha, source-over —
+                // crossings (including other participants' trails)
+                // repaint cleanly instead of accumulating.
+                tc.globalCompositeOperation = "source-over";
+                tc.globalAlpha = TRAIL_BODY_ALPHA * fade;
+                tc.lineWidth = TRAIL_BODY_WIDTH;
+                tc.stroke(bucket.path);
             }
+            tc.globalAlpha = 1;
+            tc.globalCompositeOperation = "source-over";
+            trailDirty = trailBuckets.length > 0;
         }
 
         const now = Date.now();
@@ -762,7 +809,7 @@
             if (keep > 0) hasWork = true;
         }
 
-        return hasWork || trailHasContent;
+        return hasWork || trailBuckets.length > 0;
     }
 
     // Pre-rendered radial-gradient glow sprites, one per participant
@@ -866,8 +913,8 @@
     {#if showUsageHint}
         <div class="laser-hint">Laser enabled: click and drag on video to point</div>
     {/if}
-    <!-- Persistent decay layer (trails) below, per-frame layer (dots,
-         labels, ripples) above. -->
+    <!-- Trail layer (age-bucketed paths, redrawn each frame) below,
+         cursor layer (dots, labels, ripples) above. -->
     <canvas bind:this={trailCanvas} class="laser-canvas"></canvas>
     <canvas bind:this={cursorCanvas} class="laser-canvas"></canvas>
 </div>
