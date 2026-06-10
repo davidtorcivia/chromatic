@@ -10,6 +10,9 @@ services:
       - DATABASE_PATH=/data/chromatic.db
       - UPLOAD_PATH=/data/files
       - LOGO_PATH=/data/logos
+      # TEMPORARY: pion internal debug logging to diagnose the Chrome
+      # zero-video-packets issue (bind/send decisions). Remove after.
+      - PION_LOG_DEBUG=all
       - ADMIN_TOKEN=${ADMIN_TOKEN}
       - PUBLIC_URL=${PUBLIC_URL}
       - TURN_MODE=${TURN_MODE:-external}

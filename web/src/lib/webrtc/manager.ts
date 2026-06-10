@@ -645,34 +645,11 @@ export class WebRTCManager {
         }
     }
 
-    // Chrome wedges its own re-offers ("Failed to apply demuxer criteria")
-    // when it expands m-line codec lists with codecs the SFU never offered
-    // (AV1/H265/RTX claim payload types that collide across the BUNDLE).
-    // Pinning every transceiver to the SFU's codec set keeps payload-type
-    // maps consistent so re-offers stay valid.
-    private pinCodecPreferences(): void {
-        if (!this.pc) return;
-        for (const t of this.pc.getTransceivers()) {
-            if (typeof t.setCodecPreferences !== 'function') return;
-            const kind = t.receiver?.track?.kind;
-            if (kind !== 'video' && kind !== 'audio') continue;
-            try {
-                const caps = RTCRtpReceiver.getCapabilities(kind);
-                if (!caps) continue;
-                const allowed = caps.codecs.filter((c) => {
-                    const m = c.mimeType.toLowerCase();
-                    return kind === 'video'
-                        ? m === 'video/h264' || m === 'video/vp8'
-                        : m === 'audio/opus';
-                });
-                if (allowed.length > 0) {
-                    t.setCodecPreferences(allowed);
-                }
-            } catch {
-                // Preference setting is best-effort; the offer may still work.
-            }
-        }
-    }
+    // NOTE: do NOT call setCodecPreferences on the transceivers before
+    // re-offering. It was tried as a fix for Chrome's "demuxer criteria"
+    // re-offer crash, but rewriting the recvonly video m-line's codec set in
+    // the client re-offer made pion stop sending video to that subscriber
+    // entirely (Firefox host went black after its mic renegotiation).
 
     // Renegotiate the connection after adding tracks. Returns whether the
     // offer actually went out — errors used to be swallowed here, which let
@@ -692,7 +669,6 @@ export class WebRTCManager {
                     await this.pc.setLocalDescription({ type: 'rollback' });
                 }
 
-                this.pinCodecPreferences();
                 const offer = await this.pc.createOffer();
                 await this.pc.setLocalDescription(offer);
 

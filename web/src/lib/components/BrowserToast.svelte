@@ -115,7 +115,10 @@
         align-items: flex-start;
         gap: 0.75rem;
         padding: 1rem 1.25rem;
-        max-width: 400px;
+        /* Hug the content so the close button sits right after the text
+           instead of floating in dead space at a fixed width. */
+        width: fit-content;
+        max-width: min(420px, 92vw);
         /* No background/border — floats over the dark UI; a soft text
            shadow keeps it readable over video. */
         text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
