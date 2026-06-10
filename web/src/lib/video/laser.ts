@@ -47,7 +47,7 @@ export interface QuadSlice {
  * drops the bucket, so a trail is COMPLETELY gone TRAIL_FADE_MS after
  * its last point was drawn — no residue, no ghost.
  */
-export const TRAIL_FADE_MS = 2000;
+export const TRAIL_FADE_MS = 3000;
 
 /**
  * Width (ms) of one age bucket. Smaller buckets give a finer-grained

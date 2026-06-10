@@ -208,9 +208,9 @@ describe("fadeForAge", () => {
     });
 
     it("keeps the streak clearly visible at 1.2-1.5s and nearly gone by 1.9s (the tuned feel)", () => {
-        expect(fadeForAge(1200)).toBeGreaterThan(0.35);
-        expect(fadeForAge(1500)).toBeGreaterThan(0.15);
-        expect(fadeForAge(1900)).toBeLessThan(0.05);
+        expect(fadeForAge(1800)).toBeGreaterThan(0.35);
+        expect(fadeForAge(2250)).toBeGreaterThan(0.15);
+        expect(fadeForAge(2850)).toBeLessThan(0.05);
     });
 
     it("is continuous at both boundaries (no visible pop entering or leaving the fade)", () => {
