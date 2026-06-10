@@ -39,8 +39,8 @@ USER chromatic
 
 EXPOSE 3000
 
-# Health check for container orchestration
+# Health check for container orchestration (PORT-aware)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:3000/health || exit 1
+    CMD curl -f "http://localhost:${PORT:-3000}/health" || exit 1
 
 CMD ["./chromatic"]
