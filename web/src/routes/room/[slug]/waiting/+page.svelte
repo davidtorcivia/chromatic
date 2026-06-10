@@ -1,7 +1,9 @@
 <script lang="ts">
     import { onMount, onDestroy } from "svelte";
+    import { fade, fly } from "svelte/transition";
     import { page } from "$app/stores";
     import { rooms } from "$lib/api/client";
+    import StateCard from "$lib/components/StateCard.svelte";
 
     const slug = $page.params.slug!;
 
@@ -16,6 +18,20 @@
     let eventSource: EventSource | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout>;
     let reconnectAttempts = $state(0);
+
+    // After a minute of waiting, acknowledge the wait with a second line.
+    const LONG_WAIT_MS = 60000;
+    let waitedLong = $state(false);
+    let longWaitTimer: ReturnType<typeof setTimeout>;
+
+    // Smooth exit: fade the page out before navigating into the session.
+    const EXIT_FADE_MS = 400;
+    let isLeaving = $state(false);
+    let exitTimer: ReturnType<typeof setTimeout>;
+
+    const prefersReducedMotion =
+        typeof window !== "undefined" &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
     // Get session data from storage
     let sessionData: {
@@ -44,6 +60,10 @@
                 // Non-fatal: fall back to generic copy
             });
 
+        longWaitTimer = setTimeout(() => {
+            waitedLong = true;
+        }, LONG_WAIT_MS);
+
         // Connect to SSE endpoint for push notifications
         connectSSE();
     });
@@ -55,7 +75,32 @@
         if (reconnectTimer) {
             clearTimeout(reconnectTimer);
         }
+        if (longWaitTimer) {
+            clearTimeout(longWaitTimer);
+        }
+        if (exitTimer) {
+            clearTimeout(exitTimer);
+        }
     });
+
+    // Presentational exit choreography: show the "You're in" card for a
+    // beat, fade the page out, then navigate — the session page fades in on
+    // top of the same dark background, so the handoff reads as one motion.
+    function enterSession() {
+        if (isLeaving) return;
+        status = "admitted";
+        eventSource?.close();
+        if (prefersReducedMotion) {
+            window.location.href = `/room/${slug}/session`;
+            return;
+        }
+        exitTimer = setTimeout(() => {
+            isLeaving = true;
+            exitTimer = setTimeout(() => {
+                window.location.href = `/room/${slug}/session`;
+            }, EXIT_FADE_MS);
+        }, 600);
+    }
 
     // Calculate delay with exponential backoff and jitter
     function getReconnectDelay(): number {
@@ -96,10 +141,8 @@
                 const data = JSON.parse(event.data);
 
                 if (data.event === "admitted") {
-                    status = "admitted";
-                    eventSource?.close();
-                    // Redirect to session
-                    window.location.href = `/room/${slug}/session`;
+                    // Redirect to session (with exit choreography)
+                    enterSession();
                 } else if (data.event === "ended") {
                     status = "ended";
                     eventSource?.close();
@@ -145,9 +188,8 @@
             }
 
             if (result.isAdmitted) {
-                status = "admitted";
-                // Redirect to session
-                window.location.href = `/room/${slug}/session`;
+                // Redirect to session (with exit choreography)
+                enterSession();
                 return;
             }
 
@@ -194,53 +236,72 @@
     <title>Waiting Room | Chromatic</title>
 </svelte:head>
 
-<main class="waiting-page">
+<main class="waiting-page" class:leaving={isLeaving}>
     <div class="waiting-content" aria-live="polite">
         {#if status === "waiting"}
-            <div class="waiting-card">
-                <div class="waiting-pulse" aria-hidden="true"></div>
-                <h1>Waiting to join {roomName || "the session"}</h1>
-                <p>The host will let you in soon.</p>
-                <p class="muted">Please keep this page open.</p>
-                <button class="btn btn-secondary" onclick={handleLeave}>
-                    Leave Waiting Room
+            <div class="waiting-card" in:fly={{ y: 8, duration: prefersReducedMotion ? 0 : 200 }}>
+                <div class="wordmark">Chromatic</div>
+                <div class="waiting-pulse" aria-hidden="true">
+                    <span class="pulse-core"></span>
+                    <span class="pulse-ring"></span>
+                </div>
+                <h1>{roomName || "Your session"}</h1>
+                <p class="waiting-line">The host will let you in shortly.</p>
+                <div class="waiting-secondary-slot">
+                    {#key waitedLong}
+                        <p
+                            class="waiting-secondary"
+                            transition:fade={{ duration: prefersReducedMotion ? 0 : 200 }}
+                        >
+                            {waitedLong
+                                ? "Still waiting — the host has been notified."
+                                : "Keep this page open."}
+                        </p>
+                    {/key}
+                </div>
+                <button class="btn btn-secondary waiting-leave" onclick={handleLeave}>
+                    Leave waiting room
                 </button>
             </div>
         {:else if status === "admitted"}
-            <div class="waiting-card">
-                <div class="success-icon">&#10003;</div>
-                <h1>You've been admitted!</h1>
-                <p>Redirecting to the session...</p>
+            <div in:fade={{ duration: prefersReducedMotion ? 0 : 200 }}>
+                <StateCard
+                    icon="check"
+                    tone="success"
+                    title="You're in"
+                    body="Taking you to the session…"
+                />
             </div>
         {:else if status === "ended"}
-            <div class="waiting-card">
-                <h1>Session Ended</h1>
-                <p>This session has ended before you could join.</p>
-                <button class="btn btn-primary" onclick={handleLeave}>
-                    Return Home
-                </button>
+            <div in:fade={{ duration: prefersReducedMotion ? 0 : 200 }}>
+                <StateCard
+                    icon="ended"
+                    title="This session has ended"
+                    body="The review wrapped up before you could join. Check with your host if you were expecting to be let in."
+                >
+                    <button class="btn btn-primary" onclick={handleLeave}>
+                        Back to room page
+                    </button>
+                </StateCard>
             </div>
         {:else if status === "connection_failed"}
-            <div class="waiting-card error">
-                <div class="error-icon">!</div>
-                <h1>Connection Lost</h1>
-                <p>{error}</p>
-                <div class="button-group">
+            <div in:fade={{ duration: prefersReducedMotion ? 0 : 200 }}>
+                <StateCard icon="error" tone="error" title="Connection lost" body={error}>
                     <button class="btn btn-primary" onclick={handleRetry}>
-                        Try Again
+                        Try again
                     </button>
                     <button class="btn btn-secondary" onclick={handleLeave}>
                         Leave
                     </button>
-                </div>
+                </StateCard>
             </div>
         {:else if status === "error"}
-            <div class="waiting-card error">
-                <h1>Unable to Join</h1>
-                <p>{error}</p>
-                <button class="btn btn-primary" onclick={handleLeave}>
-                    Return to Room
-                </button>
+            <div in:fade={{ duration: prefersReducedMotion ? 0 : 200 }}>
+                <StateCard icon="error" tone="error" title="Unable to join" body={error}>
+                    <button class="btn btn-primary" onclick={handleLeave}>
+                        Back to room page
+                    </button>
+                </StateCard>
             </div>
         {/if}
     </div>
@@ -249,11 +310,28 @@
 <style>
     .waiting-page {
         min-height: 100vh;
+        min-height: 100dvh;
         display: flex;
         align-items: center;
         justify-content: center;
         padding: var(--space-lg);
-        background: var(--color-bg);
+        padding-top: calc(var(--space-lg) + env(safe-area-inset-top, 0px));
+        padding-bottom: calc(var(--space-lg) + env(safe-area-inset-bottom, 0px));
+        background:
+            radial-gradient(
+                ellipse 70% 45% at 50% 0%,
+                rgba(72, 182, 166, 0.05),
+                transparent 70%
+            ),
+            var(--color-bg);
+        opacity: 1;
+        transition: opacity 400ms ease;
+    }
+
+    /* Exit choreography into the session */
+    .waiting-page.leaving {
+        opacity: 0;
+        pointer-events: none;
     }
 
     .waiting-content {
@@ -262,79 +340,103 @@
     }
 
     .waiting-card {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
         background: var(--color-surface);
         border-radius: var(--radius-lg);
         padding: var(--space-xl);
         text-align: center;
         border: 1px solid var(--color-border);
+        box-shadow: var(--shadow-md);
+    }
+
+    .waiting-card .wordmark {
+        margin-bottom: var(--space-xl);
     }
 
     .waiting-card h1 {
-        font-size: 1.5rem;
-        margin-bottom: var(--space-md);
+        font-size: clamp(1.375rem, 5vw, 1.625rem);
+        letter-spacing: -0.015em;
+        text-wrap: balance;
+        margin-bottom: var(--space-sm);
         color: var(--color-text);
     }
 
-    .waiting-card p {
+    .waiting-line {
         color: var(--color-text-muted);
-        margin-bottom: var(--space-md);
+        font-size: var(--text-body);
+        margin: 0;
     }
 
-    .waiting-card p.muted {
-        font-size: 0.875rem;
+    /* Grid-stacked slot so the two secondary lines crossfade in place
+       without the card height jumping. */
+    .waiting-secondary-slot {
+        display: grid;
+        place-items: center;
+        min-height: 1.5rem;
+        margin-top: var(--space-xs);
         margin-bottom: var(--space-lg);
+        width: 100%;
     }
 
-    /* Soft pulse instead of a generic spinner */
+    .waiting-secondary-slot > * {
+        grid-area: 1 / 1;
+    }
+
+    .waiting-secondary {
+        margin: 0;
+        font-size: var(--text-meta);
+        color: var(--color-text-subtle);
+    }
+
+    .waiting-leave {
+        min-height: 40px;
+    }
+
+    /* Soft pulse: a calm core with a slow expanding halo */
     .waiting-pulse {
-        width: 16px;
-        height: 16px;
-        margin: 0 auto var(--space-lg);
+        position: relative;
+        width: 14px;
+        height: 14px;
+        margin-bottom: var(--space-xl);
+    }
+
+    .pulse-core {
+        position: absolute;
+        inset: 0;
         border-radius: 50%;
         background: var(--color-primary);
-        animation: waiting-pulse 2s ease-in-out infinite;
+        animation: waiting-pulse 2.4s ease-in-out infinite;
+    }
+
+    .pulse-ring {
+        position: absolute;
+        inset: 0;
+        border-radius: 50%;
+        border: 1px solid var(--color-primary);
+        opacity: 0;
+        animation: waiting-ring 2.4s ease-out infinite;
     }
 
     @keyframes waiting-pulse {
-        0%, 100% { opacity: 0.35; transform: scale(0.8); }
+        0%, 100% { opacity: 0.45; transform: scale(0.85); }
         50% { opacity: 1; transform: scale(1); }
     }
 
-    .success-icon {
-        width: 60px;
-        height: 60px;
-        margin: 0 auto var(--space-lg);
-        background: var(--color-success);
-        border-radius: 50%;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 2rem;
-        color: white;
+    @keyframes waiting-ring {
+        0% { opacity: 0.5; transform: scale(1); }
+        70%, 100% { opacity: 0; transform: scale(2.6); }
     }
 
-    .waiting-card.error h1 {
-        color: var(--color-error);
-    }
+    @media (max-width: 480px) {
+        .waiting-page {
+            padding-left: var(--space-md);
+            padding-right: var(--space-md);
+        }
 
-    .error-icon {
-        width: 60px;
-        height: 60px;
-        margin: 0 auto var(--space-lg);
-        background: var(--color-error);
-        border-radius: 50%;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 2rem;
-        font-weight: bold;
-        color: white;
-    }
-
-    .button-group {
-        display: flex;
-        gap: var(--space-sm);
-        justify-content: center;
-        margin-top: var(--space-lg);
+        .waiting-card {
+            padding: var(--space-xl) var(--space-lg);
+        }
     }
 </style>

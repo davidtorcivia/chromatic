@@ -6,13 +6,16 @@ import {
     easeOutCubic,
     rippleAt,
     shouldAppendPoint,
-    buildTrailSlices,
+    splitLongSegments,
+    buildSplineSegments,
     trailStyle,
     TRAIL_FADE_MS,
     TRAIL_MAX_POINTS,
     TRAIL_MIN_DIST_PX,
+    TRAIL_MAX_SEG_PX,
     TRAIL_HEAD_WIDTH,
-    TRAIL_MAX_ALPHA,
+    TRAIL_BODY_MAX_ALPHA,
+    TRAIL_TAIL_ALPHA_RATIO,
     RIPPLE_DURATION_MS,
     RIPPLE_START_RADIUS,
     RIPPLE_END_RADIUS,
@@ -152,88 +155,180 @@ describe("shouldAppendPoint", () => {
     });
 });
 
-describe("buildTrailSlices", () => {
+describe("splitLongSegments", () => {
+    function p(x: number, y: number, t: number): TrailPoint {
+        return { x, y, t };
+    }
+    const W = 1000;
+    const H = 500;
+
+    it("returns the same array reference when no chord is too long", () => {
+        // 10px apart on a 1000px-wide video, well under the 24px default
+        const pts = [p(0.5, 0.5, 0), p(0.51, 0.5, 10), p(0.52, 0.5, 20)];
+        expect(splitLongSegments(pts, W, H)).toBe(pts);
+    });
+
+    it("handles trivial inputs", () => {
+        const single = [p(0.5, 0.5, 0)];
+        expect(splitLongSegments([], W, H)).toEqual([]);
+        expect(splitLongSegments(single, W, H)).toBe(single);
+    });
+
+    it("splits a long chord so every piece is at most maxSegPx", () => {
+        // 100px horizontal jump -> needs ceil(100/24) = 5 pieces
+        const pts = [p(0.5, 0.5, 0), p(0.6, 0.5, 100)];
+        const out = splitLongSegments(pts, W, H);
+        expect(out).not.toBe(pts);
+        expect(out).toHaveLength(6); // 2 originals + 4 inserted
+        for (let i = 1; i < out.length; i++) {
+            const dx = (out[i].x - out[i - 1].x) * W;
+            const dy = (out[i].y - out[i - 1].y) * H;
+            expect(Math.hypot(dx, dy)).toBeLessThanOrEqual(TRAIL_MAX_SEG_PX + 1e-9);
+        }
+    });
+
+    it("preserves original points and interpolates position and time linearly", () => {
+        const pts = [p(0.1, 0.2, 0), p(0.2, 0.2, 100)];
+        const out = splitLongSegments(pts, W, H, 25); // 100px chord -> 4 pieces
+        expect(out[0]).toEqual(pts[0]);
+        expect(out[out.length - 1]).toEqual(pts[1]);
+        expect(out).toHaveLength(5);
+        expect(out[1].x).toBeCloseTo(0.125);
+        expect(out[1].y).toBeCloseTo(0.2);
+        expect(out[1].t).toBeCloseTo(25);
+        expect(out[2].t).toBeCloseTo(50);
+    });
+
+    it("measures chords in pixel space", () => {
+        // Same normalized delta: ~23px on a 2300px-wide video (no split),
+        // ~48px on a 4800px-wide video (split)
+        const pts = [p(0.5, 0.5, 0), p(0.51, 0.5, 10)];
+        expect(splitLongSegments(pts, 2300, H)).toBe(pts);
+        expect(splitLongSegments(pts, 4800, H).length).toBeGreaterThan(2);
+    });
+});
+
+describe("buildSplineSegments", () => {
     function p(x: number, y: number, t: number): TrailPoint {
         return { x, y, t };
     }
 
     it("returns [] for fewer than 2 points", () => {
-        expect(buildTrailSlices([])).toEqual([]);
-        expect(buildTrailSlices([p(0.1, 0.2, 100)])).toEqual([]);
+        expect(buildSplineSegments([])).toEqual([]);
+        expect(buildSplineSegments([p(0.1, 0.2, 100)])).toEqual([]);
     });
 
-    it("produces a single straight slice for 2 points", () => {
-        const slices = buildTrailSlices([p(0, 0, 100), p(0.4, 0.2, 200)]);
-        expect(slices).toHaveLength(1);
-        const s = slices[0];
+    it("produces a single straight segment for 2 points", () => {
+        const segs = buildSplineSegments([p(0, 0, 100), p(0.4, 0.2, 200)]);
+        expect(segs).toHaveLength(1);
+        const s = segs[0];
         expect(s.x0).toBe(0);
         expect(s.y0).toBe(0);
         expect(s.x1).toBe(0.4);
         expect(s.y1).toBe(0.2);
-        // Degenerate quadratic: control point on the segment midpoint
-        expect(s.cx).toBeCloseTo(0.2);
-        expect(s.cy).toBeCloseTo(0.1);
+        // Control points sit on the chord (collinear) at 1/3 and 2/3
+        expect(s.c1x).toBeCloseTo(0.4 / 3);
+        expect(s.c1y).toBeCloseTo(0.2 / 3);
+        expect(s.c2x).toBeCloseTo((0.4 * 2) / 3);
+        expect(s.c2y).toBeCloseTo((0.2 * 2) / 3);
         expect(s.t).toBe(200);
         expect(s.pos).toBe(1);
     });
 
-    it("starts at the oldest point and ends exactly at the head", () => {
+    it("interpolates every input point: segment i runs points[i] -> points[i+1]", () => {
         const pts = [p(0, 0, 0), p(0.2, 0.1, 10), p(0.5, 0.5, 20), p(0.9, 0.4, 30)];
-        const slices = buildTrailSlices(pts);
-        expect(slices[0].x0).toBe(0);
-        expect(slices[0].y0).toBe(0);
-        const last = slices[slices.length - 1];
-        expect(last.x1).toBe(0.9);
-        expect(last.y1).toBe(0.4);
-    });
-
-    it("chains continuously: each slice starts where the previous ended", () => {
-        const pts = [p(0, 0, 0), p(0.2, 0.1, 10), p(0.5, 0.5, 20), p(0.9, 0.4, 30), p(1, 1, 40)];
-        const slices = buildTrailSlices(pts);
-        for (let i = 1; i < slices.length; i++) {
-            expect(slices[i].x0).toBeCloseTo(slices[i - 1].x1, 12);
-            expect(slices[i].y0).toBeCloseTo(slices[i - 1].y1, 12);
+        const segs = buildSplineSegments(pts);
+        expect(segs).toHaveLength(3);
+        for (let i = 0; i < segs.length; i++) {
+            expect(segs[i].x0).toBe(pts[i].x);
+            expect(segs[i].y0).toBe(pts[i].y);
+            expect(segs[i].x1).toBe(pts[i + 1].x);
+            expect(segs[i].y1).toBe(pts[i + 1].y);
         }
     });
 
-    it("uses recorded points as control points and midpoints as joints", () => {
-        const pts = [p(0, 0, 0), p(0.4, 0.2, 10), p(0.8, 0.6, 20)];
-        const slices = buildTrailSlices(pts);
-        // tail stub + 1 middle + head stub
-        expect(slices).toHaveLength(3);
-        const mid = slices[1];
-        // Middle slice runs midpoint -> midpoint, curving through p1
-        expect(mid.x0).toBeCloseTo((0 + 0.4) / 2);
-        expect(mid.y0).toBeCloseTo((0 + 0.2) / 2);
-        expect(mid.cx).toBe(0.4);
-        expect(mid.cy).toBe(0.2);
-        expect(mid.x1).toBeCloseTo((0.4 + 0.8) / 2);
-        expect(mid.y1).toBeCloseTo((0.2 + 0.6) / 2);
+    it("is tangent-continuous at interior joints (no angles)", () => {
+        const pts = [p(0, 0, 0), p(0.2, 0.1, 10), p(0.5, 0.5, 20), p(0.9, 0.4, 30), p(1, 0.8, 40)];
+        const segs = buildSplineSegments(pts);
+        for (let i = 1; i < segs.length; i++) {
+            // Incoming direction at the joint: end point minus its second
+            // control point; outgoing: first control point minus start point.
+            const inX = segs[i - 1].x1 - segs[i - 1].c2x;
+            const inY = segs[i - 1].y1 - segs[i - 1].c2y;
+            const outX = segs[i].c1x - segs[i].x0;
+            const outY = segs[i].c1y - segs[i].y0;
+            const cross = inX * outY - inY * outX;
+            const dot = inX * outX + inY * outY;
+            const scale = Math.hypot(inX, inY) * Math.hypot(outX, outY);
+            expect(scale).toBeGreaterThan(0);
+            expect(Math.abs(cross) / scale).toBeLessThan(1e-9); // parallel
+            expect(dot).toBeGreaterThan(0); // same direction
+        }
+    });
+
+    it("keeps collinear points on the straight line (no wobble)", () => {
+        const pts = [p(0.1, 0.3, 0), p(0.2, 0.3, 10), p(0.35, 0.3, 20), p(0.6, 0.3, 30)];
+        const segs = buildSplineSegments(pts);
+        for (const s of segs) {
+            expect(s.c1y).toBeCloseTo(0.3, 12);
+            expect(s.c2y).toBeCloseTo(0.3, 12);
+            // Control points stay between the segment endpoints (no overshoot)
+            expect(s.c1x).toBeGreaterThanOrEqual(s.x0);
+            expect(s.c1x).toBeLessThanOrEqual(s.x1);
+            expect(s.c2x).toBeGreaterThanOrEqual(s.x0);
+            expect(s.c2x).toBeLessThanOrEqual(s.x1);
+        }
+    });
+
+    it("skips degenerate zero-length chords without producing NaN", () => {
+        const pts = [p(0.1, 0.1, 0), p(0.1, 0.1, 10), p(0.5, 0.5, 20)];
+        const segs = buildSplineSegments(pts);
+        expect(segs).toHaveLength(1);
+        for (const s of segs) {
+            for (const v of [s.x0, s.y0, s.c1x, s.c1y, s.c2x, s.c2y, s.x1, s.y1]) {
+                expect(Number.isFinite(v)).toBe(true);
+            }
+        }
     });
 
     it("has monotonically increasing pos ending at 1 and non-decreasing t", () => {
-        const pts = [p(0, 0, 0), p(0.1, 0, 10), p(0.2, 0, 20), p(0.3, 0, 30), p(0.4, 0, 40)];
-        const slices = buildTrailSlices(pts);
-        for (let i = 1; i < slices.length; i++) {
-            expect(slices[i].pos).toBeGreaterThan(slices[i - 1].pos);
-            expect(slices[i].t).toBeGreaterThanOrEqual(slices[i - 1].t);
+        const pts = [p(0, 0, 0), p(0.1, 0.02, 10), p(0.2, 0.05, 20), p(0.3, 0.01, 30), p(0.4, 0, 40)];
+        const segs = buildSplineSegments(pts);
+        for (let i = 1; i < segs.length; i++) {
+            expect(segs[i].pos).toBeGreaterThan(segs[i - 1].pos);
+            expect(segs[i].t).toBeGreaterThanOrEqual(segs[i - 1].t);
         }
-        expect(slices[0].pos).toBeGreaterThan(0);
-        expect(slices[slices.length - 1].pos).toBe(1);
+        expect(segs[0].pos).toBeGreaterThan(0);
+        expect(segs[segs.length - 1].pos).toBe(1);
+    });
+
+    it("composes with splitLongSegments for fast flicks", () => {
+        // One huge jump: split first, then spline through the dense points
+        const pts = [p(0.1, 0.1, 0), p(0.9, 0.8, 33)];
+        const dense = splitLongSegments(pts, 1920, 1080);
+        const segs = buildSplineSegments(dense);
+        expect(segs.length).toBeGreaterThan(10);
+        expect(segs[0].x0).toBe(0.1);
+        const last = segs[segs.length - 1];
+        expect(last.x1).toBe(0.9);
+        expect(last.y1).toBe(0.8);
+        expect(last.pos).toBe(1);
     });
 });
 
 describe("trailStyle", () => {
-    it("is full width and capped alpha at a fresh head", () => {
+    it("is full width and vivid (near-opaque) at a fresh head", () => {
         const v = trailStyle(1, 1);
         expect(v.width).toBe(TRAIL_HEAD_WIDTH);
-        expect(v.alpha).toBe(TRAIL_MAX_ALPHA);
+        expect(v.alpha).toBe(TRAIL_BODY_MAX_ALPHA);
+        expect(v.alpha).toBeGreaterThanOrEqual(0.85);
     });
 
-    it("pinches to zero at the tail", () => {
+    it("pinches width to zero at the tail and tapers alpha down", () => {
         const v = trailStyle(0, 1);
         expect(v.width).toBe(0);
-        expect(v.alpha).toBe(0);
+        expect(v.alpha).toBeCloseTo(TRAIL_BODY_MAX_ALPHA * TRAIL_TAIL_ALPHA_RATIO);
+        expect(v.alpha).toBeLessThan(0.25);
     });
 
     it("is invisible once life expires", () => {
@@ -242,15 +337,15 @@ describe("trailStyle", () => {
         expect(v.alpha).toBe(0);
     });
 
-    it("never exceeds the additive-safe alpha cap", () => {
+    it("never exceeds the head alpha and clamps out-of-range inputs", () => {
         for (const pos of [0, 0.25, 0.5, 0.75, 1]) {
             for (const life of [0, 0.5, 1]) {
-                expect(trailStyle(pos, life).alpha).toBeLessThanOrEqual(TRAIL_MAX_ALPHA);
+                expect(trailStyle(pos, life).alpha).toBeLessThanOrEqual(TRAIL_BODY_MAX_ALPHA);
             }
         }
-        // Clamps out-of-range inputs too
-        expect(trailStyle(5, 5).alpha).toBe(TRAIL_MAX_ALPHA);
-        expect(trailStyle(-1, 1).alpha).toBe(0);
+        expect(trailStyle(5, 5).alpha).toBe(TRAIL_BODY_MAX_ALPHA);
+        expect(trailStyle(5, 5).width).toBe(TRAIL_HEAD_WIDTH);
+        expect(trailStyle(-1, 1).width).toBe(0);
     });
 
     it("tapers monotonically with position and life", () => {

@@ -150,7 +150,11 @@
             participantName = sessionData.name;
         }
 
-        await unlockAudio();
+        // Fire-and-forget: without a user gesture (e.g. after F5) audio
+        // unlock can't complete until the user interacts — it must NEVER
+        // block the connection flow below (this await once hung the whole
+        // session page on reload).
+        void unlockAudio();
 
         // Clean up any stale WebRTC state from a previous mount (e.g. page refresh)
         cleanupWebRTC();
@@ -393,7 +397,7 @@
         session.onMessage("signal:error", (payload: unknown) => {
             const data = payload as { code?: string; message?: string };
             console.error('Stream error from server:', data);
-            streamError = data?.message || 'Stream error. Please refresh the page.';
+            streamError = data?.message || 'Something interrupted the stream.';
         });
 
         // Connect only after handlers are registered so early messages aren't dropped.
@@ -452,7 +456,7 @@
             onScreenShareTrack: handleScreenShareTrack,
             sendSignal: (type, payload) => session.send(type, payload),
             onIceRestartFailed: () => {
-                streamError = "Connection failed. The stream could not be reached. Please try refreshing the page.";
+                streamError = "We couldn't reach the stream after several attempts.";
             },
             onScreenShareEnded: () => {
                 screenShareActive = false;
@@ -538,12 +542,12 @@
         streamError = null;
 
         if (!videoElement) {
-            streamError = "Video player not ready. Please refresh the page.";
+            streamError = "The video player didn't load correctly.";
             return;
         }
 
         if (!event.streams || event.streams.length === 0 || !event.streams[0]) {
-            streamError = "Stream not available. The host may need to restart streaming.";
+            streamError = "The stream isn't available right now — the host may need to restart it.";
             return;
         }
 
@@ -579,7 +583,7 @@
             startStatsPolling();
         } catch (err) {
             console.error('Failed to attach stream:', err);
-            streamError = "Failed to display stream. Please try refreshing the page.";
+            streamError = "The stream couldn't be displayed.";
             hasStream = false;
         }
     }
@@ -1469,60 +1473,80 @@
         {#if overlayState === 'needs-click'}
             <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
                 <div class="stream-card">
-                    <button class="play-btn" aria-label="Play stream" onclick={handlePlayClick}>
-                        <svg viewBox="0 0 24 24" fill="currentColor" width="48" height="48"><path d="M8 5v14l11-7z"/></svg>
+                    <button class="play-btn" aria-label="Start watching" onclick={handlePlayClick}>
+                        <svg viewBox="0 0 24 24" fill="currentColor" width="44" height="44"><path d="M8 5v14l11-7z"/></svg>
                     </button>
-                    <p>Tap to play stream</p>
+                    <h2 class="stream-card-title">Tap to start watching</h2>
+                    <p class="stream-card-body">The stream is ready — your browser just needs one tap to begin playback.</p>
                 </div>
             </div>
         {:else if overlayState === 'error'}
-            <div class="stream-status-overlay error" transition:fade={{ duration: 150 }}>
+            <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
                 <div class="stream-card">
-                    <div class="error-icon">!</div>
-                    <p class="error-message">{streamError}</p>
+                    <div class="stream-card-icon error" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22"><path d="M11 7h2v6h-2zM11 15h2v2h-2z"/><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>
+                    </div>
+                    <h2 class="stream-card-title">Stream unavailable</h2>
+                    <p class="stream-card-body">{streamError}</p>
                     <button class="btn btn-primary" onclick={() => window.location.reload()}>
-                        Refresh Page
+                        Refresh page
                     </button>
                 </div>
             </div>
         {:else if overlayState === 'connection-lost'}
-            <div class="stream-status-overlay error" transition:fade={{ duration: 150 }}>
+            <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
                 <div class="stream-card">
-                    <div class="error-icon">!</div>
-                    <p class="error-message">Connection to the session was lost.</p>
+                    <div class="stream-card-icon error" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22"><path d="M11 7h2v6h-2zM11 15h2v2h-2z"/><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>
+                    </div>
+                    <h2 class="stream-card-title">Connection lost</h2>
+                    <p class="stream-card-body">We couldn't reach the session. Refresh the page to reconnect.</p>
                     <button class="btn btn-primary" onclick={() => window.location.reload()}>
-                        Refresh Page
+                        Refresh page
                     </button>
                 </div>
             </div>
         {:else if overlayState === 'reconnecting'}
             <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
                 <div class="stream-card">
-                    <span class="pulse-dot" aria-hidden="true"></span>
-                    <p>Reconnecting to the session...</p>
-                    <p class="stream-subtext">Attempt {session.state.reconnectAttempt} — hang tight.</p>
+                    <div class="connect-dots" aria-hidden="true"><span></span><span></span><span></span></div>
+                    <h2 class="stream-card-title">Reconnecting</h2>
+                    <p class="stream-card-body">Restoring your connection to the session…</p>
+                    <p class="stream-card-meta">Attempt {session.state.reconnectAttempt}</p>
                 </div>
             </div>
         {:else if overlayState === 'paused'}
             <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
                 <div class="stream-card">
-                    <div class="paused-icon">
-                        <svg viewBox="0 0 24 24" fill="currentColor" width="48" height="48"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+                    <div class="stream-card-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
                     </div>
-                    <p>Stream paused</p>
-                    <p class="stream-subtext">Waiting for host to reconnect...</p>
+                    <h2 class="stream-card-title">Stream paused</h2>
+                    <p class="stream-card-body">The host's connection was interrupted — the stream will resume automatically.</p>
                 </div>
             </div>
         {:else if overlayState === 'waiting' || overlayState === 'connecting'}
-            <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
-                <div class="stream-card">
-                    <h2 class="stream-card-title">{roomState?.name || "Session"}</h2>
-                    <span class="pulse-dot" aria-hidden="true"></span>
-                    <p>
-                        {overlayState === 'connecting'
-                            ? "Connecting to stream..."
-                            : "The host hasn't started streaming yet — you'll connect automatically."}
-                    </p>
+            <!-- Branded connecting scrim: crossfades its copy as the state
+                 machine moves waiting → connecting, then fades out over
+                 ~400ms once frames are rendering. -->
+            <div
+                class="stream-status-overlay connect-scrim"
+                in:fade={{ duration: 150 }}
+                out:fade={{ duration: prefersReducedMotion ? 0 : 400 }}
+            >
+                <div class="connect-stage">
+                    <div class="wordmark">Chromatic</div>
+                    <h2 class="connect-room">{roomState?.name || "Session"}</h2>
+                    <div class="connect-dots" aria-hidden="true"><span></span><span></span><span></span></div>
+                    <div class="connect-copy" aria-live="polite">
+                        {#key overlayState}
+                            <p transition:fade={{ duration: prefersReducedMotion ? 0 : 200 }}>
+                                {overlayState === 'connecting'
+                                    ? "Connecting to the stream…"
+                                    : "Waiting for the host to start streaming"}
+                            </p>
+                        {/key}
+                    </div>
                 </div>
             </div>
         {/if}
@@ -1544,8 +1568,8 @@
                     {#if micPromptState === "requesting"}
                         <div class="mic-spinner" aria-hidden="true"></div>
                         <div class="mic-prompt-copy">
-                            <p class="mic-prompt-title">Connecting your microphone...</p>
-                            <p class="mic-prompt-text">Allow browser mic access so you can talk right away.</p>
+                            <p class="mic-prompt-title">Connecting your microphone…</p>
+                            <p class="mic-prompt-text">Allow microphone access in your browser to talk with the room.</p>
                         </div>
                     {:else if micPromptState === "granted"}
                         <div class="mic-prompt-copy">
@@ -1553,12 +1577,12 @@
                         </div>
                     {:else}
                         <div class="mic-prompt-copy">
-                            <p class="mic-prompt-title">Microphone access is blocked</p>
-                            <p class="mic-prompt-text">Enable your mic to join voice chat.</p>
+                            <p class="mic-prompt-title">Microphone is blocked</p>
+                            <p class="mic-prompt-text">You can watch and listen — enable your mic anytime to speak.</p>
                         </div>
                         <div class="mic-prompt-actions">
-                            <button class="mic-prompt-btn primary" onclick={retryMicConnection}>Enable Mic</button>
-                            <button class="mic-prompt-btn" onclick={dismissMicPrompt}>Continue Muted</button>
+                            <button class="mic-prompt-btn primary" onclick={retryMicConnection}>Enable microphone</button>
+                            <button class="mic-prompt-btn" onclick={dismissMicPrompt}>Continue muted</button>
                         </div>
                     {/if}
                 </div>
@@ -2033,7 +2057,7 @@
                     <h2 id="end-state-title">{endState.title}</h2>
                     <p>{endState.body}</p>
                     <button class="btn btn-primary" onclick={leaveToRoomPage}>
-                        Back to room page
+                        Back to the room page
                     </button>
                 </div>
             </div>
@@ -2117,49 +2141,116 @@
         pointer-events: auto;
     }
 
+    /* Consistent card anatomy for paused / reconnecting / error states */
     .stream-card {
         display: flex;
         flex-direction: column;
         align-items: center;
         gap: var(--space-md);
-        max-width: 380px;
+        width: min(92vw, 380px);
         padding: var(--space-xl);
         text-align: center;
-        background: rgba(12, 12, 14, 0.72);
+        background: rgba(14, 14, 16, 0.78);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
         border: 1px solid rgba(255, 255, 255, 0.08);
         border-radius: var(--radius-lg);
+        box-shadow: var(--shadow-lg);
     }
     .stream-card p { margin: 0; }
     .stream-card-title {
         margin: 0;
+        font-family: var(--font-display);
         font-size: 1.125rem;
         font-weight: 600;
+        letter-spacing: -0.01em;
         color: var(--color-text);
     }
-    .pulse-dot {
-        width: 10px;
-        height: 10px;
-        border-radius: 50%;
-        background: var(--color-text-muted);
-        animation: pulse-dot 2s ease-in-out infinite;
+    .stream-card-body {
+        font-size: var(--text-body);
+        line-height: 1.55;
+        color: var(--color-text-muted);
+        max-width: 34ch;
     }
-    @keyframes pulse-dot {
-        0%, 100% { opacity: 0.3; transform: scale(0.85); }
-        50% { opacity: 1; transform: scale(1); }
+    .stream-card-meta {
+        font-size: var(--text-meta);
+        color: var(--color-text-subtle);
+    }
+    .stream-card-icon {
+        width: 48px;
+        height: 48px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--color-neutral-bg);
+        color: var(--color-text-muted);
+    }
+    .stream-card-icon.error {
+        background: var(--color-error-bg);
+        color: var(--color-error);
     }
 
-    .stream-status-overlay .paused-icon { color: var(--color-text-muted); }
-    .stream-status-overlay .stream-subtext { font-size: 0.875rem; color: var(--color-text-subtle); }
-    .stream-status-overlay.error { gap: var(--space-lg); }
-    .stream-status-overlay .error-icon {
-        width: 60px; height: 60px;
-        background: var(--color-error);
-        border-radius: 50%;
-        display: flex; align-items: center; justify-content: center;
-        font-size: 2rem; font-weight: bold; color: white;
+    /* Branded connecting scrim (waiting/connecting) */
+    .stream-status-overlay.connect-scrim {
+        background:
+            radial-gradient(
+                ellipse 60% 40% at 50% 35%,
+                rgba(72, 182, 166, 0.05),
+                transparent 70%
+            ),
+            rgba(10, 10, 12, 0.94);
     }
-    .stream-status-overlay .error-message {
-        color: var(--color-text); font-size: 1rem; text-align: center; max-width: 300px;
+    .connect-stage {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: var(--space-md);
+        padding: var(--space-xl);
+        text-align: center;
+        max-width: min(92vw, 480px);
+    }
+    .connect-room {
+        margin: 0;
+        font-family: var(--font-display);
+        font-size: clamp(1.375rem, 4vw, 1.75rem);
+        font-weight: 600;
+        letter-spacing: -0.015em;
+        text-wrap: balance;
+        color: var(--color-text);
+    }
+    .connect-copy {
+        display: grid;
+        place-items: center;
+        min-height: 1.5rem;
+        width: 100%;
+    }
+    .connect-copy > p {
+        grid-area: 1 / 1;
+        margin: 0;
+        font-size: var(--text-body);
+        color: var(--color-text-muted);
+        white-space: nowrap;
+    }
+
+    /* Three-dot progress shared by the scrim and the reconnecting card */
+    .connect-dots {
+        display: flex;
+        gap: 6px;
+        padding: var(--space-xs) 0;
+    }
+    .connect-dots span {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--color-text-muted);
+        animation: connect-dot 1.4s ease-in-out infinite;
+    }
+    .connect-dots span:nth-child(2) { animation-delay: 0.2s; }
+    .connect-dots span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes connect-dot {
+        0%, 80%, 100% { opacity: 0.25; transform: scale(0.8); }
+        40% { opacity: 1; transform: scale(1); }
     }
 
     .play-btn {
@@ -2170,14 +2261,21 @@
         color: white;
         cursor: pointer;
         display: flex; align-items: center; justify-content: center;
-        transition: transform 0.2s ease, background 0.2s ease;
+        padding-left: 6px; /* optical centering of the triangle */
+        box-shadow: 0 0 0 8px rgba(72, 182, 166, 0.12);
+        transition: transform 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
     }
-    .play-btn:hover { transform: scale(1.1); background: var(--color-primary-hover); }
+    .play-btn:hover {
+        transform: scale(1.06);
+        background: var(--color-primary-hover);
+        box-shadow: 0 0 0 12px rgba(72, 182, 166, 0.16);
+    }
+    .play-btn:active { transform: scale(0.98); }
 
     /* All top banners share one stack so they never overlap */
     .banner-stack {
         position: absolute;
-        top: 18px;
+        top: calc(18px + env(safe-area-inset-top, 0px));
         left: 50%;
         transform: translateX(-50%);
         z-index: 25;
@@ -2191,26 +2289,28 @@
         pointer-events: auto;
     }
 
+    /* True-neutral surface so the banner sits quietly above the connecting
+       scrim instead of fighting it; status reads from the border tint only. */
     .mic-prompt {
-        width: min(92vw, 460px);
+        width: min(92vw, 440px);
         display: flex;
         flex-direction: column;
         gap: var(--space-sm);
         padding: var(--space-sm) var(--space-md);
         border-radius: var(--radius-md);
-        background: rgba(6, 18, 32, 0.92);
-        border: 1px solid rgba(72, 182, 166, 0.35);
+        background: rgba(14, 14, 16, 0.92);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        border: 1px solid rgba(255, 255, 255, 0.12);
         color: var(--color-text);
         box-shadow: var(--shadow-lg);
         pointer-events: auto;
     }
     .mic-prompt.success {
-        border-color: rgba(16, 185, 129, 0.5);
-        background: rgba(7, 36, 28, 0.92);
+        border-color: rgba(47, 191, 113, 0.45);
     }
     .mic-prompt.error {
-        border-color: rgba(239, 68, 68, 0.55);
-        background: rgba(44, 9, 9, 0.95);
+        border-color: rgba(239, 90, 90, 0.5);
     }
     .mic-prompt-copy {
         display: flex;
@@ -2219,7 +2319,7 @@
     }
     .mic-prompt-title {
         margin: 0;
-        font-size: 0.95rem;
+        font-size: 0.875rem;
         font-weight: 600;
         color: #fff;
     }
@@ -3105,8 +3205,10 @@
         gap: var(--space-sm);
         padding: var(--space-sm) var(--space-md);
         border-radius: var(--radius-md);
-        background: rgba(6, 18, 32, 0.92);
-        border: 1px solid rgba(72, 182, 166, 0.35);
+        background: rgba(14, 14, 16, 0.92);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        border: 1px solid rgba(255, 255, 255, 0.14);
         color: #fff;
         box-shadow: var(--shadow-lg);
         pointer-events: auto;
@@ -3173,6 +3275,10 @@
     /* Icon-only controls on small phones so all buttons fit a 375px screen */
     @media (max-width: 480px) {
         .controls-overlay { padding-left: var(--space-sm); padding-right: var(--space-sm); }
+        .stream-card { padding: var(--space-lg); }
+        .connect-stage { padding: var(--space-lg); }
+        .connect-copy > p { white-space: normal; }
+        .end-state-card { padding: var(--space-lg); }
         .control-label { display: none; }
         .control-bar { gap: 2px; }
         .control-btn {

@@ -11,10 +11,16 @@
         smoothingFactor,
         rippleAt,
         shouldAppendPoint,
-        buildTrailSlices,
+        splitLongSegments,
+        buildSplineSegments,
         trailStyle,
         TRAIL_FADE_MS,
         TRAIL_HEAD_WIDTH,
+        TRAIL_GLOW_WIDTH_RATIO,
+        TRAIL_GLOW_ALPHA,
+        TRAIL_CORE_WIDTH_RATIO,
+        TRAIL_CORE_ALPHA,
+        TRAIL_CORE_MIN_POS,
         type TrailPoint,
     } from "$lib/video/laser";
 
@@ -394,23 +400,36 @@
             }
         }
 
-        // Release ripples (multiple may coexist)
+        // Release ripples (multiple may coexist). Same vivid treatment as
+        // the trail: full-alpha colored ring with a colored glow and a thin
+        // white hot edge. A ring stroke never overlaps itself, so 'lighter'
+        // is safe here at full alpha.
         if (ripples.length > 0) {
             const remaining: Ripple[] = [];
             for (const ripple of ripples) {
                 const v = rippleAt(now - ripple.start);
                 if (v.done) continue;
                 ctx.save();
+                ctx.globalCompositeOperation = "lighter";
+                ctx.beginPath();
+                ctx.arc(ripple.x * w, ripple.y * h, v.radius, 0, Math.PI * 2);
+                // Faint colored fill for a soft "ping"
+                ctx.globalAlpha = v.alpha * 0.12;
+                ctx.fillStyle = ripple.color;
+                ctx.fill();
+                // Main colored ring with glow
                 ctx.globalAlpha = v.alpha;
                 ctx.strokeStyle = ripple.color;
                 ctx.lineWidth = 2.5;
-                ctx.beginPath();
-                ctx.arc(ripple.x * w, ripple.y * h, v.radius, 0, Math.PI * 2);
+                ctx.shadowColor = ripple.color;
+                ctx.shadowBlur = 10;
                 ctx.stroke();
-                // Subtle inner fill for a softer "ping"
-                ctx.globalAlpha = v.alpha * 0.15;
-                ctx.fillStyle = ripple.color;
-                ctx.fill();
+                ctx.shadowBlur = 0;
+                // Thin white hot edge
+                ctx.globalAlpha = v.alpha * 0.35;
+                ctx.strokeStyle = "#fff";
+                ctx.lineWidth = 1;
+                ctx.stroke();
                 ctx.restore();
                 remaining.push(ripple);
             }
@@ -421,6 +440,22 @@
         return hasWork;
     }
 
+    // Trail rendering: three passes over one centripetal Catmull-Rom
+    // spline that interpolates every recorded point (G1-continuous, so
+    // no visible angles at joints) and ends exactly at the live cursor.
+    //
+    //   1. GLOW  — 'lighter', ONE stroke of the whole spline at
+    //      TRAIL_GLOW_WIDTH_RATIO x head width, TRAIL_GLOW_ALPHA, with a
+    //      colored shadow blur. A single stroke never overlaps itself,
+    //      so additive compositing cannot white-clip here.
+    //   2. BODY  — 'source-over', per-segment strokes tapering in width
+    //      and alpha (trailStyle) from ~TRAIL_BODY_MAX_ALPHA at the head
+    //      to the tail. Normal alpha compositing means the overlapping
+    //      round caps between adjacent segments only saturate the
+    //      participant color — full vivid alpha without clipping.
+    //   3. CORE  — 'lighter', ONE thin near-white stroke over just the
+    //      head portion (pos >= TRAIL_CORE_MIN_POS) for the hot-laser
+    //      look; fades with the head's life after release.
     function drawTrail(
         c: CanvasRenderingContext2D,
         cursor: Cursor,
@@ -429,8 +464,9 @@
         now: number
     ) {
         // Recorded points are thinned to >=2px spacing, so while pointing we
-        // append a virtual head at the live (smoothed) position to keep the
-        // streak attached to the cursor dot.
+        // append a virtual head at the live (smoothed) position. The spline
+        // passes through it with a continuous tangent, so the streak meets
+        // the cursor dot without a kink.
         let points: TrailPoint[] = cursor.trail;
         if (cursor.active) {
             const last = points[points.length - 1];
@@ -440,38 +476,34 @@
         }
         if (points.length < 2) return;
 
-        const slices = buildTrailSlices(points);
+        // Fast flicks leave sparse 30Hz samples; subdivide long chords so
+        // the taper and age fade stay smooth along them.
+        const segs = buildSplineSegments(splitLongSegments(points, w, h));
+        if (segs.length === 0) return;
         const headLife = trailAlpha(now - points[points.length - 1].t, TRAIL_FADE_MS);
 
         c.save();
-        // Additive compositing for the laser feel, kept restrained because
-        // this overlays color-critical video. Per-slice alpha is capped at
-        // TRAIL_MAX_ALPHA: round caps mean at most two adjacent slices
-        // overlap, so the additive sum stays bounded by the participant's
-        // color instead of clipping every channel to white.
-        c.globalCompositeOperation = "lighter";
-        c.strokeStyle = cursor.color;
         c.lineCap = "round";
         c.lineJoin = "round";
 
-        // Glow pass: one stroke of the entire smoothed path. A single
-        // stroke never overlaps itself, so the halo stays perfectly even.
-        c.globalAlpha = 0.14 * headLife;
-        c.lineWidth = TRAIL_HEAD_WIDTH * 1.9;
+        // Pass 1: outer glow.
+        c.globalCompositeOperation = "lighter";
+        c.strokeStyle = cursor.color;
+        c.globalAlpha = TRAIL_GLOW_ALPHA * headLife;
+        c.lineWidth = TRAIL_HEAD_WIDTH * TRAIL_GLOW_WIDTH_RATIO;
         c.shadowColor = cursor.color;
-        c.shadowBlur = 6;
+        c.shadowBlur = 8;
         c.beginPath();
-        c.moveTo(slices[0].x0 * w, slices[0].y0 * h);
-        for (const s of slices) {
-            c.quadraticCurveTo(s.cx * w, s.cy * h, s.x1 * w, s.y1 * h);
+        c.moveTo(segs[0].x0 * w, segs[0].y0 * h);
+        for (const s of segs) {
+            c.bezierCurveTo(s.c1x * w, s.c1y * h, s.c2x * w, s.c2y * h, s.x1 * w, s.y1 * h);
         }
         c.stroke();
         c.shadowBlur = 0;
 
-        // Core pass: newest -> oldest, each slice a quadratic through the
-        // segment midpoints, width and alpha tapering smoothly head -> tail.
-        for (let i = slices.length - 1; i >= 0; i--) {
-            const s = slices[i];
+        // Pass 2: vivid body, oldest -> newest so the head draws on top.
+        c.globalCompositeOperation = "source-over";
+        for (const s of segs) {
             const life = trailAlpha(now - s.t, TRAIL_FADE_MS);
             const { width, alpha } = trailStyle(s.pos, life);
             if (alpha <= 0.004 || width <= 0.05) continue;
@@ -479,8 +511,28 @@
             c.lineWidth = width;
             c.beginPath();
             c.moveTo(s.x0 * w, s.y0 * h);
-            c.quadraticCurveTo(s.cx * w, s.cy * h, s.x1 * w, s.y1 * h);
+            c.bezierCurveTo(s.c1x * w, s.c1y * h, s.c2x * w, s.c2y * h, s.x1 * w, s.y1 * h);
             c.stroke();
+        }
+
+        // Pass 3: hot white core at the head only.
+        const coreAlpha = TRAIL_CORE_ALPHA * headLife;
+        if (coreAlpha > 0.01) {
+            c.globalCompositeOperation = "lighter";
+            c.strokeStyle = "#fff";
+            c.globalAlpha = coreAlpha;
+            c.lineWidth = TRAIL_HEAD_WIDTH * TRAIL_CORE_WIDTH_RATIO;
+            let started = false;
+            c.beginPath();
+            for (const s of segs) {
+                if (s.pos < TRAIL_CORE_MIN_POS) continue;
+                if (!started) {
+                    c.moveTo(s.x0 * w, s.y0 * h);
+                    started = true;
+                }
+                c.bezierCurveTo(s.c1x * w, s.c1y * h, s.c2x * w, s.c2y * h, s.x1 * w, s.y1 * h);
+            }
+            if (started) c.stroke();
         }
         c.restore();
     }
@@ -496,19 +548,25 @@
         const py = cursor.y * h;
 
         c.save();
-        if (!plain) {
-            // Soft, tasteful glow
-            c.shadowColor = cursor.color;
-            c.shadowBlur = 8;
-        }
         c.fillStyle = cursor.color;
         c.beginPath();
-        c.arc(px, py, 5, 0, Math.PI * 2);
+        c.arc(px, py, 5.5, 0, Math.PI * 2);
+        if (plain) {
+            // Reduced motion: flat dot, no glow
+            c.fill();
+        } else {
+            // Colored glow, filled twice so the halo reads on dark footage
+            c.shadowColor = cursor.color;
+            c.shadowBlur = 12;
+            c.fill();
+            c.fill();
+            c.shadowBlur = 0;
+        }
+        // Subtle white-hot center for the classic laser look
+        c.fillStyle = "rgba(255, 255, 255, 0.92)";
+        c.beginPath();
+        c.arc(px, py, 2.2, 0, Math.PI * 2);
         c.fill();
-        c.shadowBlur = 0;
-        c.strokeStyle = "rgba(255, 255, 255, 0.95)";
-        c.lineWidth = 2;
-        c.stroke();
         c.restore();
 
         // Name label below the dot

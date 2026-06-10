@@ -866,7 +866,7 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 
 	// Create participant
 	participantID := generateID()
-	color := assignColor(participantID)
+	color := h.assignRoomColor(roomID, participantID)
 	isAdmitted := isAdmin || !waitingRoom // Admins bypass the waiting room
 	role := "viewer"
 	if isAdmin {
@@ -1234,18 +1234,54 @@ func generateID() string {
 	return hex.EncodeToString(bytes)
 }
 
+// High-visibility participant colors: bright, saturated, maximally separated
+// hues that read clearly as laser pointers over dark, color-critical footage.
 var cursorColors = []string{
-	"#e63946", "#f4a261", "#2a9d8f", "#264653",
-	"#e76f51", "#8338ec", "#ff006e", "#3a86ff",
+	"#ff3b30", // red
+	"#00e5ff", // cyan
+	"#ffd60a", // yellow
+	"#30d158", // green
+	"#ff2d92", // pink
+	"#ff9500", // orange
+	"#4da3ff", // blue
+	"#bf5af2", // purple
 }
 
+// assignColor is the hash-based fallback used when every palette color is
+// already taken in the room (or the lookup fails).
 func assignColor(id string) string {
-	// Simple hash-based color assignment
 	hash := 0
 	for _, c := range id {
 		hash = (hash*31 + int(c)) % len(cursorColors)
 	}
 	return cursorColors[hash]
+}
+
+// assignRoomColor picks the first palette color not already in use in the
+// room, so concurrent participants get maximally distinct colors instead of
+// hash-collision repeats. Falls back to hash assignment once the palette is
+// exhausted.
+func (h *RoomHandler) assignRoomColor(roomID, participantID string) string {
+	rows, err := h.db.Query(`SELECT color FROM participants WHERE room_id = ?`, roomID)
+	if err != nil {
+		return assignColor(participantID)
+	}
+	defer rows.Close()
+
+	used := make(map[string]bool)
+	for rows.Next() {
+		var c string
+		if rows.Scan(&c) == nil {
+			used[c] = true
+		}
+	}
+
+	for _, c := range cursorColors {
+		if !used[c] {
+			return c
+		}
+	}
+	return assignColor(participantID)
 }
 
 func respondJSON(w http.ResponseWriter, data interface{}) {
