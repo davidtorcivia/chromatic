@@ -121,7 +121,32 @@ export const rooms = {
     create: (data: Partial<Room>) => apiPost<Room>('/api/rooms', data),
     update: (slug: string, data: Partial<Room>) => apiPatch<Room>(`/api/rooms/${slug}`, data),
     delete: (slug: string) => apiDelete(`/api/rooms/${slug}`),
+    // Bulk delete: loops the single-room DELETE endpoint and reports which
+    // slugs failed so callers can surface partial failures.
+    deleteMany: async (slugs: string[]): Promise<{ failed: string[] }> => {
+        const failed: string[] = [];
+        for (const slug of slugs) {
+            try {
+                await apiDelete(`/api/rooms/${slug}`);
+            } catch {
+                failed.push(slug);
+            }
+        }
+        return { failed };
+    },
     end: (slug: string) => apiPost(`/api/rooms/${slug}/end`),
+    // Bulk end: loops the single-room end endpoint, reporting failures.
+    endMany: async (slugs: string[]): Promise<{ failed: string[] }> => {
+        const failed: string[] = [];
+        for (const slug of slugs) {
+            try {
+                await apiPost(`/api/rooms/${slug}/end`);
+            } catch {
+                failed.push(slug);
+            }
+        }
+        return { failed };
+    },
     info: (slug: string) => apiGet<RoomInfo>(`/api/rooms/${slug}/info`),
     join: (slug: string, name: string, password?: string, adminToken?: string) =>
         apiPost<{ participantId: string; token: string; isAdmitted: boolean; waitingRoom: boolean; color: string; name: string; role: 'admin' | 'viewer' }>(

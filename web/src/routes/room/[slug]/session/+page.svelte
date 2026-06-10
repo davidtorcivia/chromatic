@@ -77,6 +77,9 @@
     let screenShareStream = $state<MediaStream | null>(null);
     let screenShareVideoEl = $state<HTMLVideoElement | null>(null);
     let pendingScreenShareRequest = $state<{participantId: string, name: string} | null>(null);
+    // Local self-preview of the sharer's own capture (BUG 4)
+    let selfShareStream = $state<MediaStream | null>(null);
+    let selfShareVideoEl = $state<HTMLVideoElement | null>(null);
 
     // Get session data from storage
     let sessionData = $state<{
@@ -100,6 +103,14 @@
         const storedName = localStorage.getItem('chromatic_name');
         if (storedName) {
             participantName = storedName;
+        }
+        // The join token is signed over the name used at join time; that name
+        // is stored with the session payload. Prefer it over the global
+        // localStorage name, which a later join (other room/tab) may have
+        // overwritten — a mismatch made the WS upgrade fail on refresh and
+        // the page hang on "the host hasn't started streaming yet".
+        if (sessionData?.name) {
+            participantName = sessionData.name;
         }
 
         await unlockAudio();
@@ -204,7 +215,7 @@
                 isMicEnabled = false;
                 micAutoEnablePending = false;
                 webrtcManager?.setMicEnabled(false);
-                session.send("media:toggle", { audio: false });
+                setSelfAudio(false);
             }
         });
 
@@ -239,12 +250,19 @@
 
         // Screen sharing messages
         session.onMessage("screenshare:approved", async () => {
+            const wasRequested = screenShareRequested;
             screenShareRequested = false;
+            // Approval can also arrive proactively (admin granting permanent
+            // permission from the participant list). Only start capture when
+            // the user actually asked to share right now.
+            if (!wasRequested) return;
             const ok = await webrtcManager?.startScreenShare();
             if (ok) {
                 screenShareActive = true;
+                selfShareStream = webrtcManager?.getScreenShareStream() ?? null;
             } else {
                 screenShareActive = false;
+                selfShareStream = null;
             }
         });
 
@@ -262,10 +280,17 @@
         });
 
         session.onMessage("screenshare:stopped", () => {
+            // If WE were the sharer (e.g. an admin stopped or revoked our
+            // share), also stop the local capture so the browser's
+            // "sharing this screen" indicator goes away.
+            if (screenShareActive) {
+                webrtcManager?.stopScreenShare();
+            }
             screenShareActive = false;
             screenShareParticipantId = null;
             screenShareParticipantName = null;
             screenShareStream = null;
+            selfShareStream = null;
         });
 
         session.onMessage("screenshare:pending", (payload: unknown) => {
@@ -317,6 +342,7 @@
             screenShareParticipantId = null;
             screenShareParticipantName = null;
             screenShareStream = null;
+            selfShareStream = null;
             pendingScreenShareRequest = null;
             streamPaused = false;
             streamError = null;
@@ -368,13 +394,26 @@
             },
             onScreenShareEnded: () => {
                 screenShareActive = false;
+                selfShareStream = null;
                 session.send("screenshare:stop", {});
             }
         });
 
         console.log('WebRTC manager initialized');
-        session.send("media:toggle", { audio: false });
+        setSelfAudio(false);
         void startAutoMicConnection();
+    }
+
+    // Broadcasts the local mic state AND mirrors it into our own participant
+    // entry — media:toggle broadcasts exclude the sender, so without this the
+    // presence dots/list would show our own mic state stale.
+    function setSelfAudio(enabled: boolean) {
+        session.send("media:toggle", { audio: enabled });
+        if (session.state.room && sessionData) {
+            session.state.room.participants = session.state.room.participants.map(p =>
+                p.id === sessionData!.participantId ? { ...p, audioEnabled: enabled } : p
+            );
+        }
     }
 
     function clearMicPromptTimer() {
@@ -402,7 +441,7 @@
             micPromptState = "denied";
             micAutoEnablePending = false;
             isMicEnabled = false;
-            session.send("media:toggle", { audio: false });
+            setSelfAudio(false);
             return;
         }
 
@@ -417,7 +456,7 @@
         micAutoEnablePending = false;
         isMicEnabled = true;
         webrtcManager.setMicEnabled(true);
-        session.send("media:toggle", { audio: true });
+        setSelfAudio(true);
         micPromptState = "granted";
         hideMicPromptLater();
     }
@@ -636,6 +675,7 @@
             // Stop sharing
             webrtcManager?.stopScreenShare();
             screenShareActive = false;
+            selfShareStream = null;
             session.send("screenshare:stop", {});
             return;
         }
@@ -667,7 +707,17 @@
         if (screenShareActive) {
             webrtcManager?.stopScreenShare();
             screenShareActive = false;
+            selfShareStream = null;
         }
+    }
+
+    // Persistent screen share permission controls (admin, BUG 3)
+    function allowParticipantShare(participantId: string) {
+        session.send("admin:screenshare-approve", { participantId });
+    }
+
+    function revokeParticipantShare(participantId: string) {
+        session.send("admin:screenshare-revoke", { participantId });
     }
 
     function startVADMonitoring() {
@@ -839,7 +889,7 @@
                 micAutoEnablePending = false;
                 isMicEnabled = true;
                 webrtcManager.setMicEnabled(true);
-                session.send("media:toggle", { audio: true });
+                setSelfAudio(true);
                 micPromptState = "granted";
                 hideMicPromptLater();
                 return;
@@ -851,7 +901,7 @@
 
         isMicEnabled = !isMicEnabled;
         webrtcManager.setMicEnabled(isMicEnabled);
-        session.send("media:toggle", { audio: isMicEnabled });
+        setSelfAudio(isMicEnabled);
         if (isMicEnabled) {
             micPromptState = "granted";
             hideMicPromptLater();
@@ -964,6 +1014,12 @@
     let connectionQuality = $derived(
         currentRtt === null ? null : currentRtt < 100 ? "good" : currentRtt < 300 ? "fair" : "poor"
     );
+    // Surface WS connection trouble instead of leaving the misleading
+    // "host hasn't started streaming" copy up forever (BUG 1 UX).
+    let isReconnecting = $derived(session.state.reconnecting && !session.state.connected);
+    let connectionLost = $derived(
+        !session.state.connected && !session.state.reconnecting && session.state.error !== null
+    );
     // Map of participant id → display color, used to tint chat author names
     let participantColors = $derived(
         Object.fromEntries(
@@ -988,6 +1044,21 @@
             el.srcObject = stream;
             el.play().catch(err => {
                 console.warn('Failed to autoplay screen share video:', err);
+            });
+            return () => {
+                el.srcObject = null;
+            };
+        }
+    });
+
+    // Bind the sharer's own capture to the self-preview PiP (BUG 4).
+    $effect(() => {
+        const el = selfShareVideoEl;
+        const stream = selfShareStream;
+        if (el && stream) {
+            el.srcObject = stream;
+            el.play().catch(err => {
+                console.warn('Failed to autoplay self share preview:', err);
             });
             return () => {
                 el.srcObject = null;
@@ -1065,6 +1136,24 @@
                     </button>
                 </div>
             </div>
+        {:else if connectionLost}
+            <div class="stream-status-overlay error" transition:fade={{ duration: 150 }}>
+                <div class="stream-card">
+                    <div class="error-icon">!</div>
+                    <p class="error-message">Connection to the session was lost.</p>
+                    <button class="btn btn-primary" onclick={() => window.location.reload()}>
+                        Refresh Page
+                    </button>
+                </div>
+            </div>
+        {:else if isReconnecting}
+            <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
+                <div class="stream-card">
+                    <span class="pulse-dot" aria-hidden="true"></span>
+                    <p>Reconnecting to the session...</p>
+                    <p class="stream-subtext">Attempt {session.state.reconnectAttempt} — hang tight.</p>
+                </div>
+            </div>
         {:else if streamPaused}
             <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
                 <div class="stream-card">
@@ -1132,6 +1221,24 @@
             <div class="top-bar">
                 <div class="room-name">{roomState?.name || "Session"}</div>
                 <div class="top-bar-right">
+                    <!-- Compact presence row: one dot per participant, ring
+                         glows in their color while speaking, slash = muted -->
+                    {#if participants.length > 1}
+                        <div class="presence-row" aria-hidden="true">
+                            {#each participants.slice(0, 8) as p (p.id)}
+                                <span
+                                    class="presence-dot"
+                                    class:speaking={speakingParticipants.has(p.id)}
+                                    class:muted={!p.audioEnabled}
+                                    style="--participant-color: {p.color}"
+                                    title="{p.name}{p.audioEnabled ? '' : ' (muted)'}"
+                                >{p.name.charAt(0).toUpperCase()}</span>
+                            {/each}
+                            {#if participants.length > 8}
+                                <span class="presence-overflow">+{participants.length - 8}</span>
+                            {/if}
+                        </div>
+                    {/if}
                     <button
                         class="participant-count"
                         onclick={toggleParticipantList}
@@ -1373,8 +1480,13 @@
                     <div
                         class="participant-list-item"
                         class:speaking={speakingParticipants.has(p.id)}
+                        style="--participant-color: {p.color}"
                     >
-                        <span class="participant-list-avatar" style="background-color: {p.color}">
+                        <span
+                            class="participant-list-avatar"
+                            class:speaking={speakingParticipants.has(p.id)}
+                            style="background-color: {p.color}"
+                        >
                             {p.name.charAt(0).toUpperCase()}
                         </span>
                         <span class="participant-list-name">
@@ -1392,11 +1504,30 @@
                             </span>
                         {:else if p.audioEnabled}
                             <span class="mic-on-indicator" title="Mic on">
-                                <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" opacity="0.5"/></svg>
+                                <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/></svg>
+                            </span>
+                        {:else}
+                            <span class="mic-muted-indicator" title="Mic muted">
+                                <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"/></svg>
                             </span>
                         {/if}
                         {#if isAdmin && p.id !== sessionData?.participantId}
                             <span class="participant-actions">
+                                {#if p.role !== 'admin'}
+                                    {#if p.canScreenshare}
+                                        <button
+                                            class="participant-action"
+                                            onclick={() => revokeParticipantShare(p.id)}
+                                            title="Revoke {p.name}'s screen share permission"
+                                        >Revoke share</button>
+                                    {:else}
+                                        <button
+                                            class="participant-action"
+                                            onclick={() => allowParticipantShare(p.id)}
+                                            title="Allow {p.name} to share their screen without asking"
+                                        >Allow share</button>
+                                    {/if}
+                                {/if}
                                 <button
                                     class="participant-action"
                                     onclick={() => muteParticipant(p.id)}
@@ -1411,6 +1542,24 @@
                         {/if}
                     </div>
                 {/each}
+            </div>
+        {/if}
+
+        <!-- Self-preview of the local screen share (BUG 4) -->
+        {#if selfShareStream}
+            <div class="self-share-pip" transition:fly={{ y: 12, duration: 200 }}>
+                <video bind:this={selfShareVideoEl} autoplay playsinline muted>
+                    <track kind="captions" />
+                </video>
+                <div class="self-share-bar">
+                    <span class="self-share-label">
+                        <span class="self-share-dot" aria-hidden="true"></span>
+                        You're sharing
+                    </span>
+                    <button class="self-share-stop" onclick={toggleScreenShare} title="Stop sharing your screen">
+                        Stop
+                    </button>
+                </div>
             </div>
         {/if}
 
@@ -1673,6 +1822,12 @@
     }
     .controls-overlay.visible { opacity: 1; visibility: visible; }
     .controls-overlay.visible > * { pointer-events: auto; }
+    .controls-overlay .top-bar,
+    .controls-overlay .bottom-bar {
+        transition: transform var(--transition-normal);
+    }
+    .controls-overlay:not(.visible) .top-bar { transform: translateY(-6px); }
+    .controls-overlay:not(.visible) .bottom-bar { transform: translateY(6px); }
 
     .top-bar {
         display: flex;
@@ -1688,14 +1843,21 @@
 
     .room-name {
         font-weight: 600;
-        background: rgba(0, 0, 0, 0.6);
-        padding: var(--space-sm) var(--space-md);
+        font-size: 0.875rem;
+        letter-spacing: 0.01em;
+        background: rgba(10, 10, 12, 0.55);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        padding: 8px 16px;
         border-radius: var(--radius-md);
     }
 
     .latency-display {
         font-size: 0.75rem; font-family: monospace;
-        background: rgba(0, 0, 0, 0.6);
+        background: rgba(10, 10, 12, 0.55);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
         padding: var(--space-xs) var(--space-sm);
         border-radius: var(--radius-sm);
         border: 1px solid transparent;
@@ -1705,15 +1867,17 @@
     .latency-display.bad { color: var(--color-error); border-color: var(--color-error); }
 
     .participant-count {
-        display: flex; align-items: center; gap: 4px;
+        display: flex; align-items: center; gap: 6px;
         font-size: 0.875rem;
         color: var(--color-text-muted);
-        background: rgba(0, 0, 0, 0.6);
-        padding: var(--space-sm) var(--space-md);
+        background: rgba(10, 10, 12, 0.55);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        padding: 8px 16px;
         border-radius: var(--radius-md);
-        border: 1px solid transparent;
+        border: 1px solid rgba(255, 255, 255, 0.08);
         cursor: pointer;
-        transition: all 0.15s ease;
+        transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
     }
     .participant-count:hover { border-color: rgba(255,255,255,0.2); }
     .participant-count.active { border-color: var(--color-primary); color: var(--color-primary); }
@@ -1823,9 +1987,141 @@
         color: var(--color-text-subtle);
         display: flex; align-items: center;
     }
+    .mic-muted-indicator {
+        color: var(--color-error);
+        opacity: 0.85;
+        display: flex; align-items: center;
+    }
+    /* Avatar ring glows in the participant's own color while speaking */
+    .participant-list-avatar {
+        box-shadow: 0 0 0 0 transparent;
+        transition: box-shadow 0.2s ease;
+    }
+    .participant-list-avatar.speaking {
+        box-shadow:
+            0 0 0 2px rgba(0, 0, 0, 0.6),
+            0 0 0 4px var(--participant-color, var(--color-success)),
+            0 0 10px var(--participant-color, var(--color-success));
+    }
     @keyframes pulse-speaking {
         0%, 100% { opacity: 1; }
         50% { opacity: 0.5; }
+    }
+
+    /* Compact always-visible presence row (BUG 5) */
+    .presence-row {
+        display: flex;
+        align-items: center;
+        padding: 6px 8px;
+        gap: 0;
+        background: rgba(10, 10, 12, 0.55);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: var(--radius-full);
+    }
+    .presence-dot {
+        width: 1.5rem;
+        height: 1.5rem;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 0.625rem;
+        font-weight: 600;
+        color: #fff;
+        background-color: var(--participant-color, #555);
+        border: 2px solid rgba(0, 0, 0, 0.55);
+        margin-left: -6px;
+        position: relative;
+        transition: box-shadow 0.2s ease, opacity 0.2s ease;
+    }
+    .presence-dot:first-child { margin-left: 0; }
+    .presence-dot.speaking {
+        z-index: 1;
+        box-shadow:
+            0 0 0 2px var(--participant-color, var(--color-success)),
+            0 0 8px var(--participant-color, var(--color-success));
+    }
+    .presence-dot.muted { opacity: 0.55; }
+    .presence-dot.muted::after {
+        content: "";
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 130%;
+        height: 1.5px;
+        background: var(--color-error);
+        transform: translate(-50%, -50%) rotate(-45deg);
+        border-radius: 1px;
+    }
+    .presence-overflow {
+        margin-left: 4px;
+        font-size: 0.625rem;
+        font-weight: 600;
+        color: var(--color-text-muted);
+    }
+
+    /* Sharer's local self-preview (BUG 4): small fixed PiP above the control
+       bar, bottom-right, never captures the picture area. */
+    .self-share-pip {
+        position: absolute;
+        right: var(--space-lg);
+        bottom: 112px;
+        width: 240px;
+        z-index: 24;
+        border-radius: var(--radius-md);
+        overflow: hidden;
+        background: rgba(10, 10, 12, 0.85);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    }
+    .self-share-pip video {
+        display: block;
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        object-fit: contain;
+        background: #000;
+    }
+    .self-share-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-sm);
+        padding: 6px 8px;
+        background: rgba(255, 255, 255, 0.04);
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .self-share-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.6875rem;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        color: var(--color-text);
+    }
+    .self-share-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--color-success);
+        animation: pulse-speaking 1.6s infinite;
+    }
+    .self-share-stop {
+        border: 1px solid rgba(239, 68, 68, 0.45);
+        background: rgba(239, 68, 68, 0.14);
+        color: var(--color-error);
+        border-radius: var(--radius-sm);
+        font-size: 0.6875rem;
+        font-weight: 600;
+        padding: 3px 10px;
+        cursor: pointer;
+        transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    .self-share-stop:hover {
+        background: rgba(239, 68, 68, 0.28);
+        border-color: rgba(239, 68, 68, 0.7);
     }
 
     /* 3-column grid keeps the control bar truly centered */
@@ -1847,15 +2143,17 @@
         display: inline-flex;
         align-items: center;
         gap: 6px;
-        font-size: 0.75rem;
+        font-size: 0.6875rem;
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.06em;
-        color: #fff;
-        background: rgba(0, 0, 0, 0.6);
-        padding: var(--space-xs) var(--space-sm);
+        color: rgba(255, 255, 255, 0.85);
+        background: rgba(10, 10, 12, 0.55);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        padding: 4px 10px;
         border-radius: var(--radius-full);
-        border: 1px solid rgba(255, 255, 255, 0.15);
+        border: 1px solid rgba(255, 255, 255, 0.1);
     }
     .live-dot {
         width: 8px;
@@ -1873,7 +2171,10 @@
         height: 14px;
         padding: var(--space-xs) var(--space-sm);
         box-sizing: content-box;
-        background: rgba(0, 0, 0, 0.6);
+        background: rgba(10, 10, 12, 0.55);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        border: 1px solid rgba(255, 255, 255, 0.08);
         border-radius: var(--radius-sm);
     }
     .signal-bar {
@@ -1983,12 +2284,18 @@
     /* ========== CONTROL BAR - Large, obvious, user-friendly ========== */
     .control-bar {
         display: flex;
-        gap: var(--space-sm);
-        background: rgba(0, 0, 0, 0.75);
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
-        padding: var(--space-sm) var(--space-md);
-        border-radius: 1rem;
+        gap: 8px;
+        background: linear-gradient(
+            to bottom,
+            rgba(16, 16, 18, 0.55),
+            rgba(8, 8, 10, 0.7)
+        );
+        backdrop-filter: blur(18px);
+        -webkit-backdrop-filter: blur(18px);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+        padding: 8px;
+        border-radius: 16px;
     }
 
     .control-btn {
@@ -1997,12 +2304,12 @@
         align-items: center;
         gap: 4px;
         padding: 10px 16px;
-        background: rgba(255, 255, 255, 0.08);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 12px;
-        color: #fff;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 10px;
+        color: rgba(255, 255, 255, 0.92);
         cursor: pointer;
-        transition: all 0.15s ease;
+        transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
         position: relative;
         min-width: 64px;
     }
@@ -2241,6 +2548,8 @@
         .control-btn svg { width: 20px; height: 20px; }
         .control-label { font-size: 0.5625rem; }
         .active-speaker-indicator { bottom: 80px; }
+        .self-share-pip { width: 180px; bottom: 96px; right: var(--space-sm); }
+        .presence-row { display: none; }
         .video-wrapper.split-active { flex-direction: column; }
         .video-wrapper.split-active .video-container { flex: 1; }
         .split-screenshare { flex: 1; }

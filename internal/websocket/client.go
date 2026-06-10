@@ -27,7 +27,7 @@ func (c *Client) ReadPumpWithDisconnect(handler func(*Client, Message), onDiscon
 		c.Conn.Close()
 	}()
 
-	c.Conn.SetReadLimit(maxMessageSize)
+	c.Conn.SetReadLimit(maxSignalingMessageSize)
 	c.Conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.Conn.SetPongHandler(func(string) error {
 		c.Conn.SetReadDeadline(time.Now().Add(pongWait))

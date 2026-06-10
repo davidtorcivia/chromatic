@@ -14,6 +14,38 @@ import (
 	"chromatic/internal/websocket"
 )
 
+// spaHandler serves the SvelteKit build output with an index.html fallback
+// for client-side routes. Cache-Control headers prevent browsers from serving
+// stale HTML that references old hashed assets after a deploy:
+//   - /_app/immutable/* files are content-hashed, so they can be cached forever
+//   - everything else (index.html fallback, page HTML, favicons) is no-cache,
+//     forcing revalidation; ETag/Last-Modified keep that cheap (304s)
+func spaHandler(staticRoot string) http.Handler {
+	staticDir := http.Dir(staticRoot)
+	fileServer := http.FileServer(staticDir)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if path != "" {
+			if file, err := staticDir.Open(path); err == nil {
+				defer file.Close()
+				if info, err := file.Stat(); err == nil && !info.IsDir() {
+					if strings.HasPrefix(r.URL.Path, "/_app/immutable/") {
+						w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+					} else {
+						w.Header().Set("Cache-Control", "no-cache")
+					}
+					fileServer.ServeHTTP(w, r)
+					return
+				}
+			}
+		}
+		// SPA fallback: index.html must never be cached as immutable, even
+		// when the request path looked like a hashed asset.
+		w.Header().Set("Cache-Control", "no-cache")
+		http.ServeFile(w, r, filepath.Join(staticRoot, "index.html"))
+	})
+}
+
 // NewRouter creates the HTTP router with all routes configured
 func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websocket.Hub) http.Handler {
 	mux := http.NewServeMux()
@@ -122,21 +154,7 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	mux.HandleFunc("GET /api/rooms/{slug}/waiting/events/{id}", roomHandler.WaitingEvents)
 
 	// Static files (SvelteKit build) with SPA fallback
-	staticDir := http.Dir("./static")
-	fileServer := http.FileServer(staticDir)
-	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, "/")
-		if path != "" {
-			if file, err := staticDir.Open(path); err == nil {
-				defer file.Close()
-				if info, err := file.Stat(); err == nil && !info.IsDir() {
-					fileServer.ServeHTTP(w, r)
-					return
-				}
-			}
-		}
-		http.ServeFile(w, r, filepath.Join("static", "index.html"))
-	}))
+	mux.Handle("/", spaHandler("static"))
 
 	// Apply global middleware
 	var handler http.Handler = mux

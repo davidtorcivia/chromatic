@@ -698,6 +698,11 @@ export class WebRTCManager {
         }
     }
 
+    // Local screen capture stream (for the sharer's self-preview panel)
+    getScreenShareStream(): MediaStream | null {
+        return this.screenShareStream;
+    }
+
     // Stop screen sharing
     stopScreenShare(): void {
         const needsRenegotiation = this.screenShareSender != null && this.pc != null;

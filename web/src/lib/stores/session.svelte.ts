@@ -2,11 +2,16 @@
 
 import type { Participant } from '$lib/api/client';
 
+// Participant state as delivered over the session WebSocket. Extends the
+// REST Participant shape with the persistent screen share approval flag
+// (BUG 3) so admin UIs can render per-row allow/revoke state.
+export type SessionParticipant = Participant & { canScreenshare?: boolean };
+
 export interface RoomState {
     slug: string;
     name: string;
     isLive: boolean;
-    participants: Participant[];
+    participants: SessionParticipant[];
     // Watermark configuration
     watermarkMode: 'none' | 'text' | 'logo' | 'both';
     watermarkText?: string;
@@ -168,7 +173,7 @@ export function createSessionStore() {
                         watermarkLogoPosition?: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
                         watermarkOpacity?: number;
                     };
-                    participants: Participant[];
+                    participants: SessionParticipant[];
                     isLive: boolean;
                     iceServers: RTCIceServer[];
                     screenShare?: { participantId: string; name: string } | null;
@@ -208,7 +213,7 @@ export function createSessionStore() {
                 break;
 
             case 'participant:joined':
-                const joinedData = msg.payload as { participant: Participant };
+                const joinedData = msg.payload as { participant: SessionParticipant };
                 if (state.room) {
                     state.room.participants = [...state.room.participants, joinedData.participant];
                 }
@@ -227,7 +232,7 @@ export function createSessionStore() {
                 break;
 
             case 'participant:updated':
-                const updatedData = msg.payload as { participant: Partial<Participant> & { id: string } };
+                const updatedData = msg.payload as { participant: Partial<SessionParticipant> & { id: string } };
                 if (state.room) {
                     state.room.participants = state.room.participants.map(p =>
                         p.id === updatedData.participant.id ? { ...p, ...updatedData.participant } : p

@@ -1219,42 +1219,135 @@
                             <section class="card">
                                 <h3>OBS settings (critical)</h3>
                                 <p class="section-description">
-                                    These settings keep latency under control.
+                                    Requires OBS 30 or newer (WHIP output).
+                                    Late joiners wait for the next keyframe, so
+                                    the keyframe interval matters most.
                                 </p>
-                                <ul class="obs-list">
+                                <ol class="obs-steps">
                                     <li>
-                                        <span>Service</span>
-                                        <strong>WHIP</strong>
+                                        <span class="obs-step-title">
+                                            Settings &rarr; Stream
+                                        </span>
+                                        <ul class="obs-settings">
+                                            <li>
+                                                <span>Service</span>
+                                                <strong>WHIP</strong>
+                                            </li>
+                                            <li>
+                                                <span>Server</span>
+                                                <strong>WHIP URL (left)</strong>
+                                            </li>
+                                            <li>
+                                                <span>Bearer Token</span>
+                                                <strong
+                                                    >empty (key is in the
+                                                    URL)</strong
+                                                >
+                                            </li>
+                                        </ul>
                                     </li>
                                     <li>
-                                        <span>Profile</span>
-                                        <strong>Baseline</strong>
+                                        <span class="obs-step-title">
+                                            Settings &rarr; Output &mdash; set
+                                            Output Mode to Advanced, Streaming
+                                            tab
+                                        </span>
+                                        <ul class="obs-settings">
+                                            <li>
+                                                <span>Encoder</span>
+                                                <strong
+                                                    >x264 or hardware H.264
+                                                    (NVENC / AMF / QSV)</strong
+                                                >
+                                            </li>
+                                            <li>
+                                                <span>Rate Control</span>
+                                                <strong>CBR</strong>
+                                            </li>
+                                            <li>
+                                                <span>Bitrate</span>
+                                                <strong
+                                                    >8000&ndash;10000 Kbps for
+                                                    1080p</strong
+                                                >
+                                            </li>
+                                            <li>
+                                                <span>Keyframe Interval</span>
+                                                <strong
+                                                    >1 s (2 s max) &mdash;
+                                                    faster viewer join</strong
+                                                >
+                                            </li>
+                                            <li>
+                                                <span>Profile</span>
+                                                <strong
+                                                    >baseline (required; Main /
+                                                    High are rejected)</strong
+                                                >
+                                            </li>
+                                            <li>
+                                                <span>Tune (x264)</span>
+                                                <strong>zerolatency</strong>
+                                            </li>
+                                            <li>
+                                                <span>B-frames (hardware)</span>
+                                                <strong>0</strong>
+                                            </li>
+                                        </ul>
                                     </li>
                                     <li>
-                                        <span>B-frames</span>
-                                        <strong>0</strong>
+                                        <span class="obs-step-title">
+                                            Settings &rarr; Video
+                                        </span>
+                                        <ul class="obs-settings">
+                                            <li>
+                                                <span>Output Resolution</span>
+                                                <strong>1920x1080</strong>
+                                            </li>
+                                            <li>
+                                                <span>FPS</span>
+                                                <strong
+                                                    >24 or 30, matching your
+                                                    footage</strong
+                                                >
+                                            </li>
+                                        </ul>
                                     </li>
                                     <li>
-                                        <span>Keyframe interval</span>
-                                        <strong>2 seconds</strong>
+                                        <span class="obs-step-title">
+                                            Settings &rarr; Advanced &rarr;
+                                            Video
+                                        </span>
+                                        <ul class="obs-settings">
+                                            <li>
+                                                <span>Color Format</span>
+                                                <strong>NV12</strong>
+                                            </li>
+                                            <li>
+                                                <span>Color Space</span>
+                                                <strong>Rec. 709</strong>
+                                            </li>
+                                            <li>
+                                                <span>Color Range</span>
+                                                <strong>Limited</strong>
+                                            </li>
+                                        </ul>
+                                        <p class="hint">
+                                            SDR Rec.709 limited matches how
+                                            browsers render video, keeping
+                                            review color accurate.
+                                        </p>
                                     </li>
-                                    <li>
-                                        <span>Tune</span>
-                                        <strong>zerolatency</strong>
-                                    </li>
-                                    <li>
-                                        <span>Bitrate</span>
-                                        <strong>6000-10000 Kbps</strong>
-                                    </li>
-                                </ul>
+                                </ol>
                                 <label class="check-item check-item-alt">
                                     <input
                                         type="checkbox"
                                         bind:checked={obsConfirmed}
                                     />
                                     <span>
-                                        OBS configured with WHIP URL and
-                                        B-frames set to 0
+                                        OBS configured per the steps above
+                                        (WHIP URL, baseline profile, 1 s
+                                        keyframes)
                                     </span>
                                 </label>
                             </section>
@@ -1781,7 +1874,6 @@
         width: 100%;
         border-collapse: collapse;
         font-size: 0.875rem;
-        table-layout: fixed;
     }
 
     .test-results-table th,
@@ -1789,19 +1881,17 @@
         padding: var(--space-sm);
         text-align: left;
         border-bottom: 1px solid var(--color-border);
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
+        vertical-align: top;
     }
 
-    .test-results-table td:first-child {
-        overflow: hidden;
-    }
-
+    /* Let long TURN URLs wrap instead of being cut off */
     .test-results-table td:first-child code {
         display: block;
-        overflow: hidden;
-        text-overflow: ellipsis;
+        word-break: break-all;
+    }
+
+    .test-results-table .status-pill {
+        white-space: nowrap;
     }
 
     .test-results-table th {
@@ -1891,24 +1981,48 @@
         white-space: nowrap;
     }
 
-    .obs-list {
-        list-style: none;
+    .obs-steps {
+        list-style: decimal;
+        padding-left: var(--space-lg);
         display: grid;
-        gap: var(--space-sm);
+        gap: var(--space-md);
         margin-bottom: var(--space-md);
-    }
-
-    .obs-list li {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: var(--space-xs) 0;
-        border-bottom: 1px solid var(--color-border-subtle);
         font-size: 0.875rem;
     }
 
-    .obs-list li:last-child {
+    .obs-step-title {
+        display: block;
+        font-weight: 600;
+        margin-bottom: var(--space-xs);
+    }
+
+    .obs-settings {
+        list-style: none;
+        padding: 0;
+        display: grid;
+    }
+
+    .obs-settings li {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: var(--space-md);
+        padding: var(--space-xs) 0;
+        border-bottom: 1px solid var(--color-border-subtle);
+    }
+
+    .obs-settings li:last-child {
         border-bottom: none;
+    }
+
+    .obs-settings li span {
+        color: var(--color-text-muted);
+        flex-shrink: 0;
+    }
+
+    .obs-settings li strong {
+        font-weight: 500;
+        text-align: right;
     }
 
     .slug-preview {

@@ -866,10 +866,12 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 	}
 
 	// Add active screen share track so late joiners see it immediately
+	screenShareActive := false
 	if room.ScreenShareParticipantID != "" && room.ScreenShareParticipantID != subscriberID && room.ScreenShareLocalTrack != nil {
 		if _, addErr := pc.AddTrack(room.ScreenShareLocalTrack); addErr != nil {
 			log.Printf("Failed to add screen share track to subscriber %s: %v", subscriberID, addErr)
 		} else {
+			screenShareActive = true
 			log.Printf("Added existing screen share track to subscriber %s", subscriberID)
 		}
 	}
@@ -901,6 +903,13 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 
 	// Request a keyframe from the ingest so the new subscriber can decode immediately
 	go s.RequestKeyframe(roomSlug)
+	// Likewise for an in-progress screen share: a viewer attaching to the
+	// relay mid-stream sits on black until the sharer produces a keyframe,
+	// so nudge the sharer with a PLI right away (the interval PLI
+	// interceptor provides the ongoing cadence).
+	if screenShareActive {
+		go s.RequestScreenShareKeyframe(roomSlug)
+	}
 
 	// Handle connection state — only remove on terminal states.
 	// "disconnected" is transient and can recover via ICE restart from the client.

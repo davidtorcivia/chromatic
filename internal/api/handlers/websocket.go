@@ -112,8 +112,15 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if tokenPayload.Name != name {
-		http.Error(w, "Token not valid for this name", http.StatusForbidden)
-		return
+		// The display name was bound into the signed token at join time and is
+		// authoritative. The query-string name can drift (the client caches the
+		// last-used name in localStorage, which another join may overwrite), and
+		// a page refresh mid-session must never hard-fail on a stale cached
+		// name — that left viewers stuck on the "waiting for stream" screen
+		// with the WebSocket reconnect loop failing forever.
+		logger.Debug("WebSocket name differs from token; using token name",
+			"room", slug, "query_name", name, "token_name", tokenPayload.Name)
+		name = tokenPayload.Name
 	}
 
 	// Use participant ID from the validated token
@@ -138,11 +145,12 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	// Look up participant to determine role and verify admission
 	var role, color string
 	var isAdmitted bool
+	var canScreenshare bool
 	err = h.db.QueryRow(`
-		SELECT role, COALESCE(color, ''), is_admitted
+		SELECT role, COALESCE(color, ''), is_admitted, COALESCE(can_screenshare, FALSE)
 		FROM participants
 		WHERE id = ? AND room_id = ?
-	`, participantID, roomID).Scan(&role, &color, &isAdmitted)
+	`, participantID, roomID).Scan(&role, &color, &isAdmitted, &canScreenshare)
 
 	if err != nil {
 		// Participant not found - this shouldn't happen with valid tokens
@@ -207,12 +215,13 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	// Notify others of new participant
 	h.hub.BroadcastJSON(slug, "participant:joined", map[string]interface{}{
 		"participant": map[string]interface{}{
-			"id":           client.ID,
-			"name":         client.Name,
-			"role":         client.Role,
-			"color":        client.Color,
-			"audioEnabled": client.AudioEnabled(),
-			"videoEnabled": client.VideoEnabled(),
+			"id":             client.ID,
+			"name":           client.Name,
+			"role":           client.Role,
+			"color":          client.Color,
+			"audioEnabled":   client.AudioEnabled(),
+			"videoEnabled":   client.VideoEnabled(),
+			"canScreenshare": canScreenshare || isAdmin,
 		},
 	}, client.ID)
 
@@ -230,9 +239,14 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 			h.handleMessage(c, msg)
 		},
 		func(c *websocket.Client) {
-			// If this client was replaced by a new connection (page refresh),
-			// skip all cleanup — the participant is still in the room.
-			if !h.hub.IsCurrentClient(c) {
+			// Atomically unregister ONLY if this client is still current. If a
+			// new connection (page refresh) already replaced it, skip all
+			// cleanup — the participant is still in the room. The check and the
+			// removal must be one atomic step: a separate check-then-cleanup
+			// races with the replacement registering, and the stale
+			// participant:left broadcast would remove a present participant
+			// from everyone's UI.
+			if !h.hub.UnregisterIfCurrent(c) {
 				logger.Info("Client replaced (page refresh), skipping cleanup", "participant_id", c.ID, "name", c.Name, "room", c.RoomSlug)
 				return
 			}
@@ -353,17 +367,36 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 
 	isLive = roomStatus == "live"
 
+	// Persistent screen share approvals (admins are implicitly allowed)
+	canShare := make(map[string]bool)
+	if rows, err := h.db.Query(`
+		SELECT p.id, COALESCE(p.can_screenshare, FALSE)
+		FROM participants p
+		JOIN rooms r ON r.id = p.room_id
+		WHERE r.slug = ?
+	`, slug); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			var allowed bool
+			if rows.Scan(&id, &allowed) == nil {
+				canShare[id] = allowed
+			}
+		}
+	}
+
 	// Get participants
 	participants := h.hub.GetRoomClients(slug)
 	participantData := make([]map[string]interface{}, 0)
 	for _, p := range participants {
 		participantData = append(participantData, map[string]interface{}{
-			"id":           p.ID,
-			"name":         p.Name,
-			"role":         p.Role,
-			"color":        p.Color,
-			"audioEnabled": p.AudioEnabled(),
-			"videoEnabled": p.VideoEnabled(),
+			"id":             p.ID,
+			"name":           p.Name,
+			"role":           p.Role,
+			"color":          p.Color,
+			"audioEnabled":   p.AudioEnabled(),
+			"videoEnabled":   p.VideoEnabled(),
+			"canScreenshare": canShare[p.ID] || p.IsAdmin,
 		})
 	}
 
@@ -523,6 +556,8 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 		h.handleScreenShareApprove(client, msg.Payload)
 	case "admin:screenshare-deny":
 		h.handleScreenShareDeny(client, msg.Payload)
+	case "admin:screenshare-revoke":
+		h.handleScreenShareRevoke(client, msg.Payload)
 	case "screenshare:stop":
 		h.handleScreenShareStop(client)
 	default:
@@ -643,9 +678,10 @@ func (h *WebSocketHandler) handleCursor(client *websocket.Client, payload json.R
 	}
 
 	var data struct {
-		X      float64 `json:"x"`
-		Y      float64 `json:"y"`
-		Active bool    `json:"active"`
+		X       float64 `json:"x"`
+		Y       float64 `json:"y"`
+		Active  bool    `json:"active"`
+		Release bool    `json:"release"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return
@@ -674,6 +710,7 @@ func (h *WebSocketHandler) handleCursor(client *websocket.Client, payload json.R
 		"x":               data.X,
 		"y":               data.Y,
 		"active":          data.Active,
+		"release":         data.Release && !data.Active,
 	}, "")
 }
 
@@ -1035,6 +1072,14 @@ func (h *WebSocketHandler) handleScreenShareRequest(client *websocket.Client) {
 		return
 	}
 
+	// Previously-approved participants skip the admin prompt entirely:
+	// approval is persistent (can_screenshare) until explicitly revoked.
+	if h.participantCanScreenshare(client.RoomSlug, client.ID) {
+		client.SendJSON("screenshare:approved", map[string]interface{}{})
+		logger.Debug("Screen share auto-approved (persistent approval)", "participant_id", client.ID, "room", client.RoomSlug)
+		return
+	}
+
 	// Find admin(s) in the room and send pending request
 	clients := h.hub.GetRoomClients(client.RoomSlug)
 	for _, c := range clients {
@@ -1046,6 +1091,37 @@ func (h *WebSocketHandler) handleScreenShareRequest(client *websocket.Client) {
 		}
 	}
 	logger.Debug("Screen share request sent to admin", "participant_id", client.ID, "room", client.RoomSlug)
+}
+
+// participantCanScreenshare reports whether the participant holds a
+// persistent screen share approval.
+func (h *WebSocketHandler) participantCanScreenshare(roomSlug, participantID string) bool {
+	var allowed bool
+	err := h.db.QueryRow(`
+		SELECT COALESCE(p.can_screenshare, FALSE)
+		FROM participants p
+		JOIN rooms r ON r.id = p.room_id
+		WHERE p.id = ? AND r.slug = ?
+	`, participantID, roomSlug).Scan(&allowed)
+	return err == nil && allowed
+}
+
+// setParticipantScreenshare persists the screen share approval flag and
+// broadcasts the updated participant state so admin UIs stay in sync.
+func (h *WebSocketHandler) setParticipantScreenshare(roomSlug, participantID string, allowed bool) {
+	if _, err := h.db.Exec(`
+		UPDATE participants SET can_screenshare = ?
+		WHERE id = ? AND room_id = (SELECT id FROM rooms WHERE slug = ?)
+	`, allowed, participantID, roomSlug); err != nil {
+		logger.Error("Failed to persist screen share approval", "participant_id", participantID, "room", roomSlug, "error", err)
+		return
+	}
+	h.hub.BroadcastJSON(roomSlug, "participant:updated", map[string]interface{}{
+		"participant": map[string]interface{}{
+			"id":             participantID,
+			"canScreenshare": allowed,
+		},
+	}, "")
 }
 
 // handleScreenShareApprove processes admin approval of a screen share request
@@ -1061,7 +1137,12 @@ func (h *WebSocketHandler) handleScreenShareApprove(client *websocket.Client, pa
 		return
 	}
 
-	// Check no active screen share
+	// Persist the approval: once granted it sticks until explicitly revoked,
+	// so the participant never has to re-prompt the admin.
+	h.setParticipantScreenshare(client.RoomSlug, data.ParticipantID, true)
+
+	// Only trigger an immediate capture when nobody else is sharing — the
+	// permission itself is recorded either way.
 	roomTracks := h.sfu.GetRoomTracksForSlug(client.RoomSlug)
 	if roomTracks != nil {
 		roomTracks.RLockVoiceTracks()
@@ -1075,6 +1156,44 @@ func (h *WebSocketHandler) handleScreenShareApprove(client *websocket.Client, pa
 	// Send approval to the requester
 	h.hub.SendToJSON(client.RoomSlug, data.ParticipantID, "screenshare:approved", map[string]interface{}{})
 	logger.Info("Screen share approved", "participant_id", data.ParticipantID, "admin", client.ID, "room", client.RoomSlug)
+}
+
+// handleScreenShareRevoke clears a participant's persistent screen share
+// approval and stops their active share, if any.
+func (h *WebSocketHandler) handleScreenShareRevoke(client *websocket.Client, payload json.RawMessage) {
+	if !h.requireAdmin(client, "screenshare-revoke") {
+		return
+	}
+
+	var data struct {
+		ParticipantID string `json:"participantId"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return
+	}
+
+	h.setParticipantScreenshare(client.RoomSlug, data.ParticipantID, false)
+
+	// If the participant is currently sharing, tear the share down.
+	roomTracks := h.sfu.GetRoomTracksForSlug(client.RoomSlug)
+	if roomTracks != nil {
+		roomTracks.RLockVoiceTracks()
+		sharerID := roomTracks.ScreenShareParticipantID
+		roomTracks.RUnlockVoiceTracks()
+		if sharerID == data.ParticipantID {
+			affected := h.sfu.RemoveScreenShareTrack(client.RoomSlug)
+			h.hub.BroadcastJSON(client.RoomSlug, "screenshare:stopped", map[string]interface{}{}, "")
+			for _, subID := range affected {
+				go h.renegotiateSubscriber(client.RoomSlug, subID)
+			}
+		}
+	}
+
+	// Clear any pending request UI on the target.
+	h.hub.SendToJSON(client.RoomSlug, data.ParticipantID, "screenshare:denied", map[string]interface{}{
+		"reason": "Screen share permission was revoked",
+	})
+	logger.Info("Screen share permission revoked", "participant_id", data.ParticipantID, "admin", client.ID, "room", client.RoomSlug)
 }
 
 // handleScreenShareDeny processes admin denial of a screen share request

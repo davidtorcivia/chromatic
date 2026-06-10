@@ -301,7 +301,7 @@
                             class="range-input"
                             min="0.1"
                             max="1"
-                            step="0.1"
+                            step="0.01"
                             bind:value={watermarkOpacity}
                         />
                     </div>

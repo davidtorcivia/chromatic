@@ -65,6 +65,9 @@ type Participant struct {
 	JoinedAt     time.Time `json:"joinedAt"`
 	AudioEnabled bool      `json:"audioEnabled"`
 	VideoEnabled bool      `json:"videoEnabled"`
+	// CanScreenshare records a persistent admin approval for screen sharing.
+	// Admins are implicitly allowed regardless of this flag.
+	CanScreenshare bool `json:"canScreenshare"`
 }
 
 // ParticipantRole defines the role of a participant

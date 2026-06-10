@@ -21,8 +21,18 @@ const (
 	// Send pings to peer with this period (must be less than pongWait)
 	pingPeriod = (pongWait * 9) / 10
 
-	// Maximum message size allowed from peer
-	maxMessageSize = 8192
+	// Maximum message size allowed from peer.
+	//
+	// This must comfortably fit WebRTC SDP offers/answers: a renegotiation
+	// offer from a browser that is receiving the program stream, sending a
+	// mic track, receiving several voice relay tracks AND adding a screen
+	// share m-line routinely exceeds 8 KB (each m-line carries codec fmtp
+	// lines, rtx mappings and ICE candidates). With the old 8 KB limit the
+	// server killed the sharer's connection the moment it sent the
+	// screen-share offer, which surfaced as "screen share goes black".
+	// Chat payloads are validated separately (2000 chars max), so a larger
+	// frame limit does not loosen chat constraints.
+	maxSignalingMessageSize = 256 * 1024
 )
 
 // Hub manages all room-based WebSocket connections
@@ -161,10 +171,11 @@ func (c *Client) AllowChatMessage() bool {
 	return c.chatRateLimiter.Allow()
 }
 
-// InitCursorRateLimiter initializes the cursor update rate limiter
-// 20 updates per second per client
+// InitCursorRateLimiter initializes the cursor update rate limiter.
+// Clients send at ~30Hz while pointing plus a final release message;
+// 40/sec leaves headroom without letting a client flood the room.
 func (c *Client) InitCursorRateLimiter() {
-	c.cursorRateLimiter = NewRateLimiter(20, time.Second)
+	c.cursorRateLimiter = NewRateLimiter(40, time.Second)
 }
 
 // AllowCursor checks if the client can send another cursor update
@@ -286,6 +297,41 @@ func (h *Hub) Register(client *Client) {
 // Unregister removes a client from the hub
 func (h *Hub) Unregister(client *Client) {
 	h.unregisterClient(client)
+}
+
+// UnregisterIfCurrent atomically removes the client from the hub ONLY if it
+// is still the active client for its participant ID, and reports whether it
+// was removed. Disconnect handlers use this so the "was I replaced by a page
+// refresh?" check and the removal are a single atomic step — checking with
+// IsCurrentClient and cleaning up afterwards is a TOCTOU race where a
+// reconnecting client could register in between, causing the stale handler to
+// broadcast participant:left for a participant that is actually present.
+func (h *Hub) UnregisterIfCurrent(client *Client) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Always release the client's pumps regardless of currency.
+	defer client.closeOnce.Do(func() {
+		close(client.Done)
+	})
+
+	room, ok := h.rooms[client.RoomSlug]
+	if !ok {
+		return false
+	}
+	current, ok := room.Clients[client.ID]
+	if !ok || current != client {
+		return false
+	}
+	delete(room.Clients, client.ID)
+	metrics.Get().ActiveWebsockets.Add(-1)
+	log.Printf("Client %s (%s) left room %s", client.ID, client.Name, client.RoomSlug)
+
+	if len(room.Clients) == 0 {
+		delete(h.rooms, client.RoomSlug)
+		metrics.Get().ActiveRooms.Add(-1)
+	}
+	return true
 }
 
 // Broadcast sends a message to all clients in a room.

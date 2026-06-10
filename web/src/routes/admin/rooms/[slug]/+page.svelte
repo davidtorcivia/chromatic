@@ -161,7 +161,7 @@
         confirmDeleteOpen = false;
         try {
             await rooms.delete(slug);
-            window.location.href = "/admin";
+            window.location.href = "/admin/rooms";
         } catch (e: any) {
             error = e.message || "Failed to delete room";
         }
@@ -281,10 +281,34 @@
                     {#if room.streamKeyId}
                         <div class="stream-info">
                             <CopyField label="WHIP URL" value={getWhipUrl()} />
-                            <p class="stream-hint">
-                                In OBS: Settings &rarr; Stream &rarr; Service: WHIP &rarr;
-                                paste the URL above into <strong>Server</strong> and leave <strong>Bearer Token empty</strong>.
-                            </p>
+                            <p class="stream-hint">How to set up OBS (30+):</p>
+                            <ol class="obs-steps">
+                                <li>
+                                    <strong>Settings &rarr; Stream:</strong>
+                                    Service <strong>WHIP</strong>, Server = the WHIP URL above,
+                                    Bearer Token <strong>empty</strong> (the stream key is in the URL).
+                                </li>
+                                <li>
+                                    <strong>Settings &rarr; Output</strong> (Output Mode: Advanced, Streaming tab):
+                                    Encoder <strong>x264</strong> or hardware H.264 (NVENC/AMF/QSV),
+                                    Rate Control <strong>CBR</strong>,
+                                    Bitrate <strong>8000&ndash;10000 Kbps</strong>,
+                                    Keyframe Interval <strong>1 s</strong> (2 s max &mdash; viewers join on the next keyframe),
+                                    Profile <strong>baseline</strong> (required &mdash; Main/High are rejected),
+                                    Tune <strong>zerolatency</strong>, B-frames <strong>0</strong>.
+                                </li>
+                                <li>
+                                    <strong>Settings &rarr; Video:</strong>
+                                    Output 1920x1080 at 24 or 30 fps to match your footage.
+                                </li>
+                                <li>
+                                    <strong>Settings &rarr; Advanced &rarr; Video:</strong>
+                                    Color Format <strong>NV12</strong>,
+                                    Color Space <strong>Rec. 709</strong>,
+                                    Color Range <strong>Limited</strong>
+                                    &mdash; matches browser rendering for accurate review color.
+                                </li>
+                            </ol>
                         </div>
                     {:else}
                         <p class="empty-state">
@@ -414,7 +438,7 @@
                             class="range-input"
                             min="0.1"
                             max="1"
-                            step="0.1"
+                            step="0.01"
                             bind:value={watermarkOpacity}
                         />
                     </div>
@@ -606,7 +630,22 @@
     .stream-hint {
         font-size: var(--text-meta);
         color: var(--color-text-subtle);
+        margin: var(--space-md) 0 0;
+    }
+
+    .obs-steps {
+        list-style: decimal;
+        padding-left: var(--space-lg);
         margin: var(--space-sm) 0 0;
+        display: grid;
+        gap: var(--space-sm);
+        font-size: var(--text-meta);
+        color: var(--color-text-muted);
+    }
+
+    .obs-steps strong {
+        color: var(--color-text);
+        font-weight: 600;
     }
 
     .form-group {

@@ -685,6 +685,7 @@
         padding: var(--space-sm);
         text-align: left;
         border-bottom: 1px solid var(--color-border);
+        vertical-align: top;
     }
 
     .test-results-table th {
@@ -699,6 +700,7 @@
         background: var(--color-surface-elevated);
         padding: 0.1em 0.3em;
         border-radius: var(--radius-sm);
+        word-break: break-all;
     }
 
     .error-text {
