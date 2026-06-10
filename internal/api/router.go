@@ -30,8 +30,8 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	streamKeyHandler := handlers.NewStreamKeyHandler(db)
 	fileHandler := handlers.NewFileHandler(db, cfg, tokenSecret)
 	configHandler := handlers.NewConfigHandler(db, cfg, sfu)
-	wsHandler := handlers.NewWebSocketHandler(db, hub, sfu, cfg.AllowedOrigins, cfg.ProductionMode, tokenSecret)
 	authHandler := handlers.NewAuthHandler(db, cfg.AdminToken, cfg.ProductionMode)
+	wsHandler := handlers.NewWebSocketHandler(db, hub, sfu, cfg.AllowedOrigins, cfg.ProductionMode, tokenSecret, authHandler.ValidateSession)
 
 	// Wire up room live callback to initiate WebRTC subscriptions
 	roomHandler.SetOnRoomLive(wsHandler.InitiateSubscriptionsForRoom)
@@ -57,11 +57,13 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 		ValidateSession: authHandler.ValidateSession,
 	}
 
-	// Health check
+	// Health check (public — used by load balancers and Caddy)
 	mux.HandleFunc("GET /health", handlers.HealthCheck)
 
-	// Prometheus metrics endpoint (requires admin session cookie or bearer
-	// token — Prometheus can scrape with an Authorization header)
+	// Prometheus metrics — behind the same admin auth as /api. Prometheus can
+	// scrape with `Authorization: Bearer <admin-token>` (or a proxy that
+	// injects the cookie). Leaving /metrics unauthenticated leaks operational
+	// counters.
 	mux.Handle("GET /metrics", middleware.RequireAuth(authConfig)(http.HandlerFunc(metrics.Handler())))
 
 	// Auth endpoints (no auth required) - login rate limited: 5 per minute per IP
@@ -155,7 +157,7 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	handler = middleware.RateLimiter(rateLimitConfig)(handler)
 
 	// Security headers
-	handler = middleware.SecurityHeaders(handler)
+	handler = middleware.SecurityHeaders(cfg.ProductionMode)(handler)
 
 	// Request logging
 	handler = middleware.RequestLogger(handler)

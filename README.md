@@ -21,7 +21,7 @@ Chromatic enables real-time color-critical streaming from DaVinci Resolve via OB
 ### Security & Access Control
 - **Waiting room**: Approve participants before they join
 - **Password protection**: Secure rooms with passwords
-- **Watermarking**: Text and logo watermarks with tamper detection
+- **Watermarking**: Overlay text and logo watermarks on the client (visual deterrent — a determined viewer with DevTools can hide overlays; burned-in watermarking would require server-side re-encode)
 - **Session management**: Persistent sessions, kick/mute controls
 
 ### Operations
@@ -213,10 +213,11 @@ See [DEPLOYMENT.md#turn-modes](DEPLOYMENT.md#turn-modes) for exact configuration
 
 ### Prometheus Metrics
 
-Prometheus-compatible metrics at `/metrics`:
+Prometheus-compatible metrics at `/metrics`. **Authentication is required** —
+scrape with `Authorization: Bearer $ADMIN_TOKEN`:
 
 ```bash
-curl https://stream.yourdomain.com/metrics
+curl -H "Authorization: Bearer $ADMIN_TOKEN" https://stream.yourdomain.com/metrics
 ```
 
 Key metrics:

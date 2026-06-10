@@ -83,6 +83,63 @@ func TestHub_UnregisterClient(t *testing.T) {
 	}
 }
 
+// Regression test: after a viewer reconnects (new Client with same ID replaces
+// old in the hub), the old ReadPump's deferred Unregister must not evict the
+// live replacement from the room map. This was the classic "viewer hangs on
+// reconnect" bug — the old connection's teardown killed the new session.
+func TestHub_UnregisterIgnoresStaleClient(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+	defer stopHub(hub)
+
+	oldC := newTestClient("p1", "Alice", "test-room", hub)
+	hub.Register(oldC)
+	time.Sleep(5 * time.Millisecond)
+
+	newC := newTestClient("p1", "Alice", "test-room", hub)
+	hub.Register(newC)
+	time.Sleep(5 * time.Millisecond)
+
+	// Map should now hold newC, and oldC's Done must have been closed by
+	// registerClient's replacement logic so its pumps exit. (Send is
+	// intentionally never closed — SendJSON/Broadcast select on it and a
+	// closed Send would panic concurrent producers; Done is the teardown
+	// signal.)
+	got := hub.GetClient("test-room", "p1")
+	if got != newC {
+		t.Fatalf("expected new client in hub after rejoin, got %p", got)
+	}
+	select {
+	case <-oldC.Done:
+		// Good — old client was told to shut down.
+	default:
+		t.Fatal("old client's Done channel was not closed on replacement")
+	}
+
+	// Now simulate the old client's stale Unregister firing — must be a no-op
+	// against the map, and must not tear down newC.
+	hub.Unregister(oldC)
+	time.Sleep(5 * time.Millisecond)
+
+	if hub.GetClient("test-room", "p1") != newC {
+		t.Fatal("stale Unregister evicted the live replacement client")
+	}
+	select {
+	case <-newC.Done:
+		t.Fatal("new client's Done was incorrectly closed by stale Unregister")
+	default:
+		// Good — new client is still live.
+	}
+	select {
+	case _, ok := <-newC.Send:
+		if !ok {
+			t.Fatal("new client's Send was incorrectly closed by stale Unregister")
+		}
+	default:
+		// Good — Send is still open.
+	}
+}
+
 func TestHub_MultipleClients(t *testing.T) {
 	hub := NewHub()
 	go hub.Run()

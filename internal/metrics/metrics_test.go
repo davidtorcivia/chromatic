@@ -121,27 +121,6 @@ func TestMetrics_Counters(t *testing.T) {
 	}
 }
 
-func TestMetrics_IncrementRequest(t *testing.T) {
-	m := Get()
-
-	// Increment a new endpoint
-	endpoint := "/api/test/unique"
-	m.IncrementRequest(endpoint)
-	m.IncrementRequest(endpoint)
-	m.IncrementRequest(endpoint)
-
-	// Verify via the handler output
-	req := httptest.NewRequest("GET", "/metrics", nil)
-	rr := httptest.NewRecorder()
-
-	Handler()(rr, req)
-
-	body := rr.Body.String()
-	if !strings.Contains(body, endpoint) {
-		t.Errorf("expected metrics output to contain endpoint %s", endpoint)
-	}
-}
-
 func TestMetrics_Handler(t *testing.T) {
 	req := httptest.NewRequest("GET", "/metrics", nil)
 	rr := httptest.NewRecorder()

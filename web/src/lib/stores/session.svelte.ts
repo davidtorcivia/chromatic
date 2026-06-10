@@ -253,6 +253,8 @@ export function createSessionStore() {
     }
 
     // Registers a handler for a message type. Returns an unsubscribe function.
+    // Components should call the returned dispose in onDestroy — otherwise
+    // handlers accumulate across navigations and fire with stale closures.
     function onMessage(type: string, handler: (payload: unknown) => void): () => void {
         const handlers = messageHandlers.get(type);
         if (handlers) {
@@ -299,6 +301,8 @@ export function createSessionStore() {
             ws.close(1000);
             ws = null;
         }
+        // Purge any handlers captured from the previous lifecycle so a fresh
+        // connect() starts with a clean slate.
         messageHandlers.clear();
         reconnectCallbacks.clear();
         state.connected = false;

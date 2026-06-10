@@ -44,17 +44,42 @@ export class WebRTCManager {
     // Enqueue an async signaling operation so SDP changes are serialized.
     private enqueueSignaling<T>(fn: () => Promise<T>): Promise<T> {
         const task = this.signalingQueue.then(fn, fn);
-        // Keep the queue moving regardless of success/failure
-        this.signalingQueue = task.then(() => {}, () => {});
+        // Keep the queue moving regardless of success/failure. Log rejections
+        // so they're not swallowed silently — previously a thrown op would
+        // disappear and the next op would run on possibly-stale PC state with
+        // no trace in the console.
+        this.signalingQueue = task.then(
+            () => {},
+            (err) => {
+                console.error('Signaling queue task failed:', err);
+            }
+        );
         return task;
     }
 
-    // Handle incoming SDP offer from server
+    // Handle incoming SDP offer from server. `signal:offer` is semantically a
+    // FRESH subscription (server just spun up a new SFU subscriber for us),
+    // distinct from `signal:renegotiate` which modifies an existing session.
+    // So if we already have a peer connection here, it's stale — tear it down
+    // before accepting the new one. This is what unblocks viewers hanging on
+    // reconnect: the old WS closed, the server replaced our subscriber, and
+    // we must mirror that by abandoning the old PC.
     async handleOffer(sdp: string): Promise<void> {
         return this.enqueueSignaling(async () => {
             console.log('Handling WebRTC offer');
 
-            // Create peer connection if not exists
+            if (this.pc) {
+                const state = this.pc.connectionState;
+                const sig = this.pc.signalingState;
+                // If we're partway through a fresh handshake (no local description
+                // yet), reuse the pc. Otherwise assume this is a reconnect-initiated
+                // fresh session and rebuild.
+                if (state !== 'new' || sig !== 'stable') {
+                    console.log('Resetting stale peer connection before fresh offer', { state, sig });
+                    this.resetPeerConnection();
+                }
+            }
+
             if (!this.pc) {
                 this.createPeerConnection();
             }
@@ -71,23 +96,15 @@ export class WebRTCManager {
             }
 
             // Set remote description (the offer from server)
-            const offer: RTCSessionDescriptionInit = {
-                type: 'offer',
-                sdp: sdp
-            };
-
+            const offer: RTCSessionDescriptionInit = { type: 'offer', sdp };
             await pc.setRemoteDescription(offer);
             console.log('Set remote description');
 
-            // Create answer
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             console.log('Created and set local description (answer)');
 
-            // Send answer back to server
-            this.options.sendSignal('signal:answer', {
-                sdp: answer.sdp
-            });
+            this.options.sendSignal('signal:answer', { sdp: answer.sdp });
 
             // If we have a pending mic stream and mic is enabled, add the
             // track now and fire-and-forget a renegotiation. We must NOT
@@ -103,6 +120,36 @@ export class WebRTCManager {
                 }
             }
         });
+    }
+
+    // resetPeerConnection tears down the existing RTCPeerConnection without
+    // touching localStream (the mic may still be granted) or the signaling
+    // queue. Used on fresh-offer arrival when the old PC is stale.
+    private resetPeerConnection(): void {
+        if (this.connectionLostTimeout) {
+            clearTimeout(this.connectionLostTimeout);
+            this.connectionLostTimeout = null;
+        }
+        if (this.iceRestartTimeout) {
+            clearTimeout(this.iceRestartTimeout);
+            this.iceRestartTimeout = null;
+        }
+        this.clearVoiceOfferWatchdog();
+        this.voiceOfferRetries = 0;
+        this.iceRestartPending = false;
+        this.iceRestartAttempted = false;
+        this.audioSender = null;
+        // The screen-share sender belonged to the old PC; the capture stream
+        // (if any) is left running so the caller can decide whether to re-share.
+        this.screenShareSender = null;
+        if (this.pc) {
+            try {
+                this.pc.close();
+            } catch {
+                // already closed
+            }
+            this.pc = null;
+        }
     }
 
     // Handle ICE candidate from server (if server sends any)
@@ -199,8 +246,15 @@ export class WebRTCManager {
 
             // Handle connection failures
             if (state === 'disconnected') {
-                // Give it some time to recover before triggering ICE restart
+                // Always clear any existing timer before starting a new one —
+                // rapid state oscillation (dis/connected/dis) otherwise leaves
+                // stale timers that trigger unnecessary ICE restarts after the
+                // connection has already recovered.
+                if (this.connectionLostTimeout) {
+                    clearTimeout(this.connectionLostTimeout);
+                }
                 this.connectionLostTimeout = setTimeout(() => {
+                    this.connectionLostTimeout = null;
                     if (this.pc?.connectionState === 'disconnected') {
                         console.log('Connection still disconnected, attempting ICE restart');
                         this.performIceRestart();
@@ -237,6 +291,10 @@ export class WebRTCManager {
                     clearTimeout(this.connectionLostTimeout);
                     this.connectionLostTimeout = null;
                 }
+                if (this.iceRestartTimeout) {
+                    clearTimeout(this.iceRestartTimeout);
+                    this.iceRestartTimeout = null;
+                }
                 this.iceRestartPending = false;
                 this.iceRestartAttempted = false;
             }
@@ -251,7 +309,13 @@ export class WebRTCManager {
         };
     }
 
-    // Perform ICE restart to recover from connection issues
+    // Perform ICE restart to recover from connection issues.
+    //
+    // If the answer never arrives (dropped WS, server restart mid-flight) the
+    // connection-state machine won't clear iceRestartPending — without the
+    // timeout below, the flag would stay true forever and every subsequent
+    // restart attempt would be a no-op, leaving the viewer stranded.
+    private iceRestartTimeout: ReturnType<typeof setTimeout> | null = null;
     async performIceRestart(): Promise<void> {
         if (!this.pc || this.iceRestartPending) {
             return;
@@ -263,6 +327,17 @@ export class WebRTCManager {
         this.clearVoiceOfferWatchdog();
         console.log('Performing ICE restart...');
         this.options.onIceRestart?.();
+
+        if (this.iceRestartTimeout) {
+            clearTimeout(this.iceRestartTimeout);
+        }
+        this.iceRestartTimeout = setTimeout(() => {
+            this.iceRestartTimeout = null;
+            if (this.iceRestartPending) {
+                console.warn('ICE restart answer not received within 15s; clearing pending flag to allow retry');
+                this.iceRestartPending = false;
+            }
+        }, 15000);
 
         return this.enqueueSignaling(async () => {
             if (!this.pc) return;
@@ -285,6 +360,10 @@ export class WebRTCManager {
                 console.error('Failed to perform ICE restart:', err);
                 this.iceRestartPending = false;
                 this.iceRestartAttempted = false;
+                if (this.iceRestartTimeout) {
+                    clearTimeout(this.iceRestartTimeout);
+                    this.iceRestartTimeout = null;
+                }
             }
         });
     }
@@ -293,6 +372,30 @@ export class WebRTCManager {
     requestResync(): void {
         console.log('Requesting stream resync (keyframe)');
         this.options.sendSignal('signal:resync', {});
+    }
+
+    // Apply a fresh set of ICE servers to the live peer connection AND to the
+    // stored options (so a subsequent resetPeerConnection rebuilds with the
+    // fresh credentials, not the originals).
+    //
+    // Cloudflare TURN credentials have a default 1 h TTL; long grading
+    // sessions outlive that. The active ICE allocation keeps working on
+    // its already-authenticated session, but any future ICE restart needs
+    // valid creds — without this, an ICE restart on a >1 h session would
+    // gather with expired credentials and fail.
+    //
+    // pc.setConfiguration only affects subsequent gathering; it does not
+    // disrupt the running media relay.
+    updateICEServers(iceServers: RTCIceServer[]): void {
+        this.options = { ...this.options, iceServers };
+        if (this.pc) {
+            try {
+                this.pc.setConfiguration({ iceServers });
+                console.log('Refreshed ICE servers on live peer connection');
+            } catch (err) {
+                console.warn('setConfiguration with fresh ICE servers failed:', err);
+            }
+        }
     }
 
     // Get current connection state
@@ -628,6 +731,10 @@ export class WebRTCManager {
         if (this.connectionLostTimeout) {
             clearTimeout(this.connectionLostTimeout);
             this.connectionLostTimeout = null;
+        }
+        if (this.iceRestartTimeout) {
+            clearTimeout(this.iceRestartTimeout);
+            this.iceRestartTimeout = null;
         }
 
         if (this.localStream) {

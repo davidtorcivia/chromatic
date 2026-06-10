@@ -46,6 +46,26 @@ type SFU struct {
 // to prevent memory exhaustion from ICE candidate flooding attacks
 const MaxICECandidates = 50
 
+// iceGatherTimeout bounds how long we wait for ICE gathering to complete before
+// returning the SDP with whatever candidates we already have. Host/srflx
+// candidates gather quickly and are usually sufficient; relay candidates can
+// trickle later. Without this cap a hung STUN/TURN server freezes the
+// handshake indefinitely (and a WHIP response could blow past client/server
+// write timeouts).
+const iceGatherTimeout = 3 * time.Second
+
+// waitForICEGather blocks until ICE gathering completes or the timeout fires.
+// It logs (but does not fail) on timeout — the SDP typed so far is still
+// shippable and we'd rather ship a slightly degraded candidate set than hang.
+func waitForICEGather(pc *webrtc.PeerConnection) {
+	done := webrtc.GatheringCompletePromise(pc)
+	select {
+	case <-done:
+	case <-time.After(iceGatherTimeout):
+		log.Printf("ICE gathering timed out after %s; proceeding with current candidates", iceGatherTimeout)
+	}
+}
+
 // IngestSession represents an active OBS WHIP connection
 type IngestSession struct {
 	StreamKeyToken    string
@@ -73,6 +93,7 @@ type RoomTracks struct {
 	VideoTrack               *webrtc.TrackLocalStaticRTP
 	AudioTrack               *webrtc.TrackLocalStaticRTP
 	Subscribers              map[string]*Subscriber
+	VoiceSessions            map[string]*VoiceSession               // Participant voice connections (also hosts the server-side mute gate)
 	VoiceRemoteTracks        map[string]*webrtc.TrackRemote         // Active voice remote tracks keyed by participant ID
 	VoiceLocalTracks         map[string]*webrtc.TrackLocalStaticRTP // Relay local tracks for voice fan-out
 	IngestPC                 *webrtc.PeerConnection                 // Reference to ingest PC for PLI requests
@@ -326,23 +347,59 @@ func (s *SFU) GetIngest(streamKeyToken string) *IngestSession {
 	return s.ingests[streamKeyToken]
 }
 
-// SetIngest registers an ingest session
+// SetIngest registers an ingest session. If an ingest with the same token
+// already exists (OBS reconnect before the old PC's teardown callback fired),
+// the old session is torn down first so its PC doesn't hold resources and so
+// its stale OnConnectionStateChange callback can't remove the replacement.
+// The old PC is closed outside s.mu — pion state callbacks re-enter SFU locks.
 func (s *SFU) SetIngest(streamKeyToken string, session *IngestSession) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	prev, replaced := s.ingests[streamKeyToken]
 	s.ingests[streamKeyToken] = session
+	s.mu.Unlock()
+
+	if replaced && prev != nil {
+		log.Printf("Replacing existing ingest for key %s... (OBS reconnect)", streamKeyToken[:min(8, len(streamKeyToken))])
+		prev.closeOnce.Do(func() { close(prev.done) })
+		if prev.PeerConnection != nil {
+			_ = prev.PeerConnection.Close()
+		}
+	}
 }
 
-// RemoveIngest removes an ingest session
+// RemoveIngest removes an ingest session unconditionally (used for explicit
+// teardown paths).
 func (s *SFU) RemoveIngest(streamKeyToken string) {
+	s.removeIngestIf(streamKeyToken, nil)
+}
+
+// removeIngestIfSame removes the ingest only when the current map entry
+// matches the given expected session. Prevents a stale Failed/Closed callback
+// from a replaced ingest from killing the new one.
+func (s *SFU) removeIngestIfSame(streamKeyToken string, expected *IngestSession) {
+	s.removeIngestIf(streamKeyToken, expected)
+}
+
+func (s *SFU) removeIngestIf(streamKeyToken string, expected *IngestSession) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if session, ok := s.ingests[streamKeyToken]; ok {
-		// Use sync.Once to prevent double-close panic
-		session.closeOnce.Do(func() {
-			close(session.done)
-		})
-		delete(s.ingests, streamKeyToken)
+	session, ok := s.ingests[streamKeyToken]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	if expected != nil && session != expected {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.ingests, streamKeyToken)
+	s.mu.Unlock()
+
+	// Close outside the lock — pion state callbacks re-enter SFU locks.
+	session.closeOnce.Do(func() {
+		close(session.done)
+	})
+	if session.PeerConnection != nil {
+		_ = session.PeerConnection.Close()
 	}
 }
 
@@ -405,6 +462,15 @@ func (s *SFU) Shutdown() {
 			}
 		}
 		room.Subscribers = make(map[string]*Subscriber)
+		for _, vs := range room.VoiceSessions {
+			vs.closeOnce.Do(func() {
+				close(vs.done)
+			})
+			if vs.PeerConnection != nil {
+				pcs = append(pcs, vs.PeerConnection)
+			}
+		}
+		room.VoiceSessions = nil
 		for id, ch := range room.voiceRelayDone {
 			close(ch)
 			delete(room.voiceRelayDone, id)
@@ -454,55 +520,58 @@ func (rt *RoomTracks) AddSubscriber(sub *Subscriber) {
 	}
 }
 
-// RemoveSubscriberIfMatch removes a subscriber only if the current subscriber
+// removeSubscriberIfSame removes a subscriber only if the current subscriber
 // in the map is the same instance as `expected`. This prevents a stale
-// OnConnectionStateChange callback from removing a replacement subscriber
-// that was created during a reconnect.
+// OnConnectionStateChange callback from a replaced (rejoin) subscriber from
+// tearing down the live replacement — which is exactly what caused viewers
+// to hang indefinitely on reconnect.
 //
 // The pointer check and removal happen under a single write lock to prevent
 // a TOCTOU race where AddSubscriber replaces the subscriber between the check
 // and the removal.
-func (rt *RoomTracks) RemoveSubscriberIfMatch(id string, expected *Subscriber) {
+func (rt *RoomTracks) removeSubscriberIfSame(id string, expected *Subscriber) {
 	rt.mu.Lock()
 	current, ok := rt.Subscribers[id]
 	if !ok || current != expected {
 		rt.mu.Unlock()
 		return
 	}
-	pc := rt.removeSubscriberLocked(id)
+	pcs := rt.removeSubscriberLocked(id)
 	rt.mu.Unlock()
 
 	// Close outside the lock — pion state callbacks re-enter rt.mu.
-	if pc != nil {
+	for _, pc := range pcs {
 		pc.Close()
 	}
 }
 
-// RemoveSubscriber removes a subscriber from a room
+// RemoveSubscriber removes a subscriber from a room unconditionally.
 func (rt *RoomTracks) RemoveSubscriber(id string) {
 	rt.mu.Lock()
-	pc := rt.removeSubscriberLocked(id)
+	pcs := rt.removeSubscriberLocked(id)
 	rt.mu.Unlock()
 
 	// Close outside the lock — pion state callbacks re-enter rt.mu.
-	if pc != nil {
+	for _, pc := range pcs {
 		pc.Close()
 	}
 }
 
 // removeSubscriberLocked performs subscriber removal. Caller must hold rt.mu
-// write lock and is responsible for closing the returned PeerConnection AFTER
+// write lock and is responsible for closing the returned PeerConnections AFTER
 // releasing the lock (pion fires OnConnectionStateChange callbacks during
-// Close that call back into rt.mu, e.g. via RemoveSubscriberIfMatch).
-func (rt *RoomTracks) removeSubscriberLocked(id string) *webrtc.PeerConnection {
-	var pc *webrtc.PeerConnection
+// Close that call back into rt.mu, e.g. via removeSubscriberIfSame).
+func (rt *RoomTracks) removeSubscriberLocked(id string) []*webrtc.PeerConnection {
+	var pcs []*webrtc.PeerConnection
 	if sub, ok := rt.Subscribers[id]; ok {
 		// Use sync.Once to prevent double-close panic
 		sub.closeOnce.Do(func() {
 			close(sub.done)
 		})
 		// Hand the PeerConnection back to the caller for closing.
-		pc = sub.PeerConnection
+		if sub.PeerConnection != nil {
+			pcs = append(pcs, sub.PeerConnection)
+		}
 		// Clear ICE callback to release references to the client
 		sub.candidateMu.Lock()
 		sub.OnICECandidate = nil
@@ -513,6 +582,15 @@ func (rt *RoomTracks) removeSubscriberLocked(id string) *webrtc.PeerConnection {
 		metrics.Get().ActiveSubscribers.Add(-1)
 	}
 	// Clean up any voice state owned by this participant and stop its relay.
+	if vs, ok := rt.VoiceSessions[id]; ok {
+		vs.closeOnce.Do(func() {
+			close(vs.done)
+		})
+		if vs.PeerConnection != nil {
+			pcs = append(pcs, vs.PeerConnection)
+		}
+		delete(rt.VoiceSessions, id)
+	}
 	delete(rt.VoiceRemoteTracks, id)
 	delete(rt.VoiceLocalTracks, id)
 	if ch, ok := rt.voiceRelayDone[id]; ok {
@@ -529,18 +607,7 @@ func (rt *RoomTracks) removeSubscriberLocked(id string) *webrtc.PeerConnection {
 			rt.screenShareDone = nil
 		}
 	}
-	return pc
-}
-
-// BroadcastTrack sends track data to all subscribers
-func (rt *RoomTracks) BroadcastTrack(track *webrtc.TrackLocalStaticRTP, data []byte) error {
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-
-	// Write to all subscribers
-	// Note: In production, you'd use track.WriteRTP for proper RTP handling
-	_, err := track.Write(data)
-	return err
+	return pcs
 }
 
 // BindIngestToRoom binds an ingest session's tracks to a room for distribution.
@@ -718,26 +785,9 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 		return nil, "", fmt.Errorf("room not found: %s", roomSlug)
 	}
 
-	room.mu.RLock()
-	videoTrack := room.VideoTrack
-	audioTrack := room.AudioTrack
-	// Collect existing voice relay tracks so they are included in the initial
-	// offer. This avoids a separate renegotiation that would race with the
-	// initial offer-answer exchange and corrupt the signaling state.
-	var voiceRelayTracks []*webrtc.TrackLocalStaticRTP
-	for pid, track := range room.VoiceLocalTracks {
-		if pid != subscriberID {
-			voiceRelayTracks = append(voiceRelayTracks, track)
-		}
-	}
-	// Include active screen share track for late joiners
-	var screenShareTrack *webrtc.TrackLocalStaticRTP
-	if room.ScreenShareParticipantID != "" && room.ScreenShareParticipantID != subscriberID && room.ScreenShareLocalTrack != nil {
-		screenShareTrack = room.ScreenShareLocalTrack
-	}
-	room.mu.RUnlock()
-
-	// Create peer connection
+	// Create the peer connection outside the lock — NewPeerConnection is a
+	// non-trivial construction and we don't want to block BindIngestToRoom or
+	// other subscribers while it runs.
 	pc, err := s.CreatePeerConnection()
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to create peer connection: %w", err)
@@ -767,47 +817,87 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 		}
 	})
 
+	// Atomic bind+insert: track reads, AddTrack calls and map insertion happen
+	// under a single critical section so BindIngestToRoom can't rewrite
+	// room.VideoTrack/AudioTrack between us reading the current tracks and our
+	// AddTrack calls — otherwise the new subscriber could end up bound to a
+	// just-replaced (dormant) ingest track and stay frozen until the next OBS
+	// reconnect. Any BindIngestToRoom that runs after us will find the
+	// subscriber in the map and rebind via ReplaceTrack; any that ran before us
+	// already committed the tracks we read here.
+	room.mu.Lock()
+
 	// Add video track if available
-	if videoTrack != nil {
-		sender, err := pc.AddTrack(videoTrack)
-		if err != nil {
+	if room.VideoTrack != nil {
+		sender, addErr := pc.AddTrack(room.VideoTrack)
+		if addErr != nil {
+			room.mu.Unlock()
 			pc.Close()
-			return nil, "", fmt.Errorf("failed to add video track: %w", err)
+			return nil, "", fmt.Errorf("failed to add video track: %w", addErr)
 		}
 		sub.VideoSender = sender
 		log.Printf("Added video track to subscriber %s", subscriberID)
 	}
 
 	// Add audio track if available
-	if audioTrack != nil {
-		sender, err := pc.AddTrack(audioTrack)
-		if err != nil {
+	if room.AudioTrack != nil {
+		sender, addErr := pc.AddTrack(room.AudioTrack)
+		if addErr != nil {
+			room.mu.Unlock()
 			pc.Close()
-			return nil, "", fmt.Errorf("failed to add audio track: %w", err)
+			return nil, "", fmt.Errorf("failed to add audio track: %w", addErr)
 		}
 		sub.AudioSender = sender
 		log.Printf("Added audio track to subscriber %s", subscriberID)
 	}
 
-	// Add existing voice relay tracks so subscriber can hear them immediately
-	for _, voiceTrack := range voiceRelayTracks {
-		if _, err := pc.AddTrack(voiceTrack); err != nil {
-			log.Printf("Failed to add voice relay track to subscriber %s: %v", subscriberID, err)
+	// Add existing voice relay tracks so they are included in the initial
+	// offer. This avoids a separate renegotiation that would race with the
+	// initial offer-answer exchange and corrupt the signaling state.
+	for pid, voiceTrack := range room.VoiceLocalTracks {
+		if pid == subscriberID {
+			continue
+		}
+		if _, addErr := pc.AddTrack(voiceTrack); addErr != nil {
+			log.Printf("Failed to add voice relay track for %s to subscriber %s: %v", pid, subscriberID, addErr)
 		} else {
 			log.Printf("Added existing voice relay track to subscriber %s", subscriberID)
 		}
 	}
 
 	// Add active screen share track so late joiners see it immediately
-	if screenShareTrack != nil {
-		if _, err := pc.AddTrack(screenShareTrack); err != nil {
-			log.Printf("Failed to add screen share track to subscriber %s: %v", subscriberID, err)
+	if room.ScreenShareParticipantID != "" && room.ScreenShareParticipantID != subscriberID && room.ScreenShareLocalTrack != nil {
+		if _, addErr := pc.AddTrack(room.ScreenShareLocalTrack); addErr != nil {
+			log.Printf("Failed to add screen share track to subscriber %s: %v", subscriberID, addErr)
 		} else {
 			log.Printf("Added existing screen share track to subscriber %s", subscriberID)
 		}
 	}
 
-	room.AddSubscriber(sub)
+	// Displace any prior subscriber holding this ID (rejoin). Same semantics
+	// as AddSubscriber, inlined so the insert is part of the critical section.
+	var oldPC *webrtc.PeerConnection
+	if old, exists := room.Subscribers[subscriberID]; exists {
+		log.Printf("Replacing existing subscriber %s (rejoin); tearing down prior PC", subscriberID)
+		old.closeOnce.Do(func() {
+			close(old.done)
+		})
+		oldPC = old.PeerConnection
+		old.candidateMu.Lock()
+		old.OnICECandidate = nil
+		old.pendingCandidates = nil
+		old.candidateMu.Unlock()
+		// Metric unchanged — replacement cancels the old one out.
+	} else {
+		metrics.Get().ActiveSubscribers.Add(1)
+	}
+	room.Subscribers[subscriberID] = sub
+	room.mu.Unlock()
+
+	// Close the displaced PC outside the lock — pion state callbacks re-enter rt.mu.
+	if oldPC != nil {
+		oldPC.Close()
+	}
 
 	// Request a keyframe from the ingest so the new subscriber can decode immediately
 	go s.RequestKeyframe(roomSlug)
@@ -821,23 +911,25 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 		switch state {
 		case webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed:
-			room.RemoveSubscriberIfMatch(subscriberID, sub)
+			room.removeSubscriberIfSame(subscriberID, sub)
 		}
 	})
 
-	// Create offer
+	// Create offer. Error paths use identity-checked removal so a concurrent
+	// rejoin that already replaced us isn't torn down by our cleanup; pc.Close
+	// is idempotent and covers the case where we were already replaced.
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
+		room.removeSubscriberIfSame(subscriberID, sub)
 		pc.Close()
-		room.RemoveSubscriber(subscriberID)
 		return nil, "", fmt.Errorf("failed to create offer: %w", err)
 	}
 
 	// Set local description — starts ICE gathering in the background.
 	// Candidates are buffered and sent via trickle ICE (no blocking wait).
 	if err := pc.SetLocalDescription(offer); err != nil {
+		room.removeSubscriberIfSame(subscriberID, sub)
 		pc.Close()
-		room.RemoveSubscriber(subscriberID)
 		return nil, "", fmt.Errorf("failed to set local description: %w", err)
 	}
 
@@ -968,6 +1060,18 @@ func (s *SFU) HandleIceRestart(roomSlug, subscriberID, sdpOffer string) (string,
 	sub.SignalingMu.Lock()
 	defer sub.SignalingMu.Unlock()
 
+	// If the server is still waiting on an answer for a prior renegotiation
+	// offer, Pion refuses SetRemoteDescription(offer) with an "offer collision"
+	// error and the ICE restart is silently lost. Roll the server's offer back
+	// so we can accept the client's restart — any tracks from that offer are
+	// still attached to the PC and will re-emerge in a follow-up renegotiation.
+	if sub.PeerConnection.SignalingState() == webrtc.SignalingStateHaveLocalOffer {
+		log.Printf("ICE restart arrived during pending server offer; rolling back for subscriber %s", subscriberID)
+		if err := sub.PeerConnection.SetLocalDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}); err != nil {
+			return "", fmt.Errorf("failed to rollback server offer for ICE restart: %w", err)
+		}
+	}
+
 	// Set the new offer from the client
 	offer := webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
@@ -1081,6 +1185,171 @@ func (s *SFU) IsRoomLive(roomSlug string) bool {
 	return room.VideoTrack != nil || room.AudioTrack != nil
 }
 
+// VoiceSession represents a participant's voice connection
+type VoiceSession struct {
+	ParticipantID  string
+	PeerConnection *webrtc.PeerConnection
+	AudioTrack     *webrtc.TrackLocalStaticRTP
+	done           chan struct{}
+	closeOnce      sync.Once
+	// Muted is the server-enforced gate for this participant's voice RTP.
+	// When true, the voice relay forwarder drops incoming packets instead of
+	// writing them to the local track — so admin:mute is effective even if a
+	// malicious client ignores the client-side mute request.
+	Muted atomic.Bool
+}
+
+// HandleVoiceOffer processes an offer from a client wanting to send voice audio
+// over a dedicated peer connection. Returns the SDP answer to send back.
+// (The primary voice path is the subscriber PC; this remains for clients that
+// negotiate a standalone voice PC.)
+func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP string, onTrack func(participantID string, track *webrtc.TrackRemote)) (string, error) {
+	// Create a peer connection
+	pc, err := s.CreatePeerConnection()
+	if err != nil {
+		return "", fmt.Errorf("failed to create peer connection: %w", err)
+	}
+
+	// Set the handler for when we receive the audio track
+	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		log.Printf("Received voice track from %s: %s", participantID, track.Kind())
+		if track.Kind() == webrtc.RTPCodecTypeAudio {
+			onTrack(participantID, track)
+		}
+	})
+
+	// Set the remote description (the offer)
+	offer := webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer,
+		SDP:  offerSDP,
+	}
+	if err := pc.SetRemoteDescription(offer); err != nil {
+		pc.Close()
+		return "", fmt.Errorf("failed to set remote description: %w", err)
+	}
+
+	// Create answer
+	answer, err := pc.CreateAnswer(nil)
+	if err != nil {
+		pc.Close()
+		return "", fmt.Errorf("failed to create answer: %w", err)
+	}
+
+	// Set local description
+	if err := pc.SetLocalDescription(answer); err != nil {
+		pc.Close()
+		return "", fmt.Errorf("failed to set local description: %w", err)
+	}
+
+	// Wait for ICE gathering (bounded — see iceGatherTimeout).
+	waitForICEGather(pc)
+
+	// Store the voice session. If the participant already had one (rejoin),
+	// close the old PC first so its terminal-state callback can't later tear
+	// down the replacement.
+	newSession := &VoiceSession{
+		ParticipantID:  participantID,
+		PeerConnection: pc,
+		done:           make(chan struct{}),
+	}
+	room := s.GetRoomTracks(roomSlug)
+	room.mu.Lock()
+	if room.VoiceSessions == nil {
+		room.VoiceSessions = make(map[string]*VoiceSession)
+	}
+	prev, replaced := room.VoiceSessions[participantID]
+	room.VoiceSessions[participantID] = newSession
+	room.mu.Unlock()
+
+	if replaced && prev != nil {
+		log.Printf("Replacing existing voice session for %s (rejoin)", participantID)
+		prev.closeOnce.Do(func() { close(prev.done) })
+		if prev.PeerConnection != nil {
+			_ = prev.PeerConnection.Close()
+		}
+	}
+
+	// Handle connection state. Only act on terminal states — "disconnected" is
+	// transient and can recover. Identity-check so a zombie callback from a
+	// previously-replaced session can't delete the current one.
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		log.Printf("Voice connection state for %s: %s", participantID, state)
+		switch state {
+		case webrtc.PeerConnectionStateFailed,
+			webrtc.PeerConnectionStateClosed:
+			s.removeVoiceSessionIfSame(roomSlug, participantID, newSession)
+		}
+	})
+
+	ld := pc.LocalDescription()
+	if ld == nil {
+		pc.Close()
+		return "", fmt.Errorf("local description nil after gather")
+	}
+	return ld.SDP, nil
+}
+
+// RemoveVoiceSession removes a voice session
+func (s *SFU) RemoveVoiceSession(roomSlug, participantID string) {
+	s.removeVoiceSessionIfSame(roomSlug, participantID, nil)
+}
+
+// removeVoiceSessionIfSame removes the participant's voice session only when
+// the map entry matches the given expected session. Prevents a zombie callback
+// from a replaced (rejoin) session from tearing down the live replacement.
+// If expected is nil, removal is unconditional (used for explicit cleanup).
+func (s *SFU) removeVoiceSessionIfSame(roomSlug, participantID string, expected *VoiceSession) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return
+	}
+
+	room.mu.Lock()
+	session, ok := room.VoiceSessions[participantID]
+	if !ok {
+		room.mu.Unlock()
+		return
+	}
+	if expected != nil && session != expected {
+		room.mu.Unlock()
+		return
+	}
+	delete(room.VoiceSessions, participantID)
+	delete(room.VoiceRemoteTracks, participantID)
+	delete(room.VoiceLocalTracks, participantID)
+	// Stop the relay goroutine for this participant, if any.
+	if ch, ok := room.voiceRelayDone[participantID]; ok {
+		close(ch)
+		delete(room.voiceRelayDone, participantID)
+	}
+	room.mu.Unlock()
+
+	session.closeOnce.Do(func() {
+		close(session.done)
+	})
+	if session.PeerConnection != nil {
+		_ = session.PeerConnection.Close()
+	}
+	log.Printf("Removed voice session for %s from room %s", participantID, roomSlug)
+}
+
+// SetVoiceMuted toggles the server-side mute flag for a participant's voice
+// relay. The relay forwarder drops incoming RTP packets while muted, so the
+// effect is immediate and can't be circumvented by a client that ignores the
+// admin:muted broadcast.
+func (s *SFU) SetVoiceMuted(roomSlug, participantID string, muted bool) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return
+	}
+	room.mu.RLock()
+	session := room.VoiceSessions[participantID]
+	room.mu.RUnlock()
+	if session != nil {
+		session.Muted.Store(muted)
+	}
+}
+
 // StoreVoiceRemoteTrack stores the remote track reference for forwarding to late joiners
 func (s *SFU) StoreVoiceRemoteTrack(roomSlug, participantID string, track *webrtc.TrackRemote) {
 	room := s.GetRoomTracksForSlug(roomSlug)
@@ -1145,23 +1414,24 @@ func (s *SFU) GetActiveVoiceSessions(roomSlug string) []string {
 	return ids
 }
 
-// CreateVoiceRelayTrack creates a single local relay track for a voice source and
-// starts one goroutine to forward RTP packets from the remote track. Writing to
-// a TrackLocalStaticRTP fans out to all PeerConnections it has been added to,
-// so we only need one reader per remote track.
-func (s *SFU) CreateVoiceRelayTrack(roomSlug, participantID string, remoteTrack *webrtc.TrackRemote) (*webrtc.TrackLocalStaticRTP, error) {
+// CreateVoiceRelayTrack returns the shared local relay track for a voice
+// source, creating it on first use. On subsequent calls (speaker rejoin), the
+// EXISTING local track is reused and only the forwarding goroutine is swapped
+// to read from the new remote track. This is important: if we created a new
+// local track on every rejoin, every subscriber would accumulate a dormant
+// sender (bound to the old track) plus a new one — leaking transceivers over
+// time and forcing unnecessary renegotiations.
+//
+// The second return value reports whether a NEW relay was created; the caller
+// uses this to decide whether to fan the track out to subscribers (new) or
+// skip that step (reuse — subscribers' existing senders already carry it).
+//
+// Writing to a TrackLocalStaticRTP fans out to all PeerConnections it has been
+// added to, so we only need one reader per remote track.
+func (s *SFU) CreateVoiceRelayTrack(roomSlug, participantID string, remoteTrack *webrtc.TrackRemote) (*webrtc.TrackLocalStaticRTP, bool, error) {
 	room := s.GetRoomTracksForSlug(roomSlug)
 	if room == nil {
-		return nil, fmt.Errorf("room not found: %s", roomSlug)
-	}
-
-	localTrack, err := webrtc.NewTrackLocalStaticRTP(
-		remoteTrack.Codec().RTPCodecCapability,
-		fmt.Sprintf("voice-%s", participantID),
-		fmt.Sprintf("voice-stream-%s", participantID),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create relay track: %w", err)
+		return nil, false, fmt.Errorf("room not found: %s", roomSlug)
 	}
 
 	done := make(chan struct{})
@@ -1170,12 +1440,45 @@ func (s *SFU) CreateVoiceRelayTrack(roomSlug, participantID string, remoteTrack 
 	if room.VoiceLocalTracks == nil {
 		room.VoiceLocalTracks = make(map[string]*webrtc.TrackLocalStaticRTP)
 	}
-	room.VoiceLocalTracks[participantID] = localTrack
+	existing, reused := room.VoiceLocalTracks[participantID]
+	var localTrack *webrtc.TrackLocalStaticRTP
+	if reused {
+		localTrack = existing
+	} else {
+		created, err := webrtc.NewTrackLocalStaticRTP(
+			remoteTrack.Codec().RTPCodecCapability,
+			fmt.Sprintf("voice-%s", participantID),
+			fmt.Sprintf("voice-stream-%s", participantID),
+		)
+		if err != nil {
+			room.mu.Unlock()
+			return nil, false, fmt.Errorf("failed to create relay track: %w", err)
+		}
+		localTrack = created
+		room.VoiceLocalTracks[participantID] = localTrack
+	}
+	// Capture the Muted flag pointer now so the forwarder doesn't need a map
+	// lookup per packet. The voice usually arrives over the subscriber PC, so
+	// there may be no VoiceSession yet — create a placeholder to host the
+	// server-side mute gate (SetVoiceMuted looks it up here).
+	if room.VoiceSessions == nil {
+		room.VoiceSessions = make(map[string]*VoiceSession)
+	}
+	vs := room.VoiceSessions[participantID]
+	if vs == nil {
+		vs = &VoiceSession{
+			ParticipantID: participantID,
+			done:          make(chan struct{}),
+		}
+		room.VoiceSessions[participantID] = vs
+	}
+	mutedFlag := &vs.Muted
 	if room.voiceRelayDone == nil {
 		room.voiceRelayDone = make(map[string]chan struct{})
 	}
 	// Stop any previous relay goroutine for this participant before
-	// replacing it (e.g. mic restarted) so it can't leak.
+	// replacing it (e.g. mic restarted or speaker rejoined) so it can't leak
+	// and there's no duplicate writer to the shared local track.
 	if prev, ok := room.voiceRelayDone[participantID]; ok {
 		close(prev)
 	}
@@ -1184,10 +1487,14 @@ func (s *SFU) CreateVoiceRelayTrack(roomSlug, participantID string, remoteTrack 
 
 	// Single forwarding goroutine — reads from the remote track once
 	// and writes to the local track, which fans out to all bound PCs.
-	go relayTrackLoop(remoteTrack, localTrack, done, "Voice", participantID)
+	go relayTrackLoop(remoteTrack, localTrack, done, mutedFlag, "Voice", participantID)
 
-	log.Printf("Created voice relay track for %s in room %s", participantID, roomSlug)
-	return localTrack, nil
+	if reused {
+		log.Printf("Rebound voice relay for %s in room %s (speaker rejoin)", participantID, roomSlug)
+	} else {
+		log.Printf("Created voice relay track for %s in room %s", participantID, roomSlug)
+	}
+	return localTrack, !reused, nil
 }
 
 // relayTrackLoop forwards RTP packets from a remote track to a local relay
@@ -1195,7 +1502,11 @@ func (s *SFU) CreateVoiceRelayTrack(roomSlug, participantID string, remoteTrack 
 // read deadline lets the loop observe cancellation even when no packets
 // arrive (e.g. when PeerConnection closure is delayed), so the goroutine
 // cannot leak.
-func relayTrackLoop(remoteTrack *webrtc.TrackRemote, localTrack *webrtc.TrackLocalStaticRTP, done <-chan struct{}, label, participantID string) {
+//
+// If muted is non-nil, packets are dropped while it is set: this is the
+// server-enforced admin mute gate, effective even if a malicious client
+// ignores the client-side mute request.
+func relayTrackLoop(remoteTrack *webrtc.TrackRemote, localTrack *webrtc.TrackLocalStaticRTP, done <-chan struct{}, muted *atomic.Bool, label, participantID string) {
 	buf := make([]byte, 1500)
 	for {
 		select {
@@ -1214,6 +1525,11 @@ func relayTrackLoop(remoteTrack *webrtc.TrackRemote, localTrack *webrtc.TrackLoc
 			}
 			log.Printf("%s relay read ended for %s: %v", label, participantID, err)
 			return
+		}
+		// Server-enforced mute gate. Dropping packets here keeps the
+		// admin:mute contract honest.
+		if muted != nil && muted.Load() {
+			continue
 		}
 		if _, err := localTrack.Write(buf[:n]); err != nil {
 			log.Printf("%s relay write error for %s: %v", label, participantID, err)
@@ -1483,7 +1799,7 @@ func (s *SFU) CreateScreenShareRelayTrack(roomSlug, participantID string, remote
 
 	// Single forwarding goroutine — reads from the remote track once
 	// and writes to the local track, which fans out to all bound PCs.
-	go relayTrackLoop(remoteTrack, localTrack, done, "Screen share", participantID)
+	go relayTrackLoop(remoteTrack, localTrack, done, nil, "Screen share", participantID)
 
 	log.Printf("Created screen share relay track for %s in room %s", participantID, roomSlug)
 	return localTrack, nil

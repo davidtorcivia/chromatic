@@ -19,7 +19,7 @@
     let videoElement = $state<HTMLVideoElement | null>(null);
     let isChatOpen = $state(false);
     let isControlsVisible = $state(true);
-    let controlsTimer: ReturnType<typeof setTimeout>;
+    let controlsTimer: ReturnType<typeof setTimeout> | null = null;
     let participantName = $state("Viewer");
     let webrtcManager: WebRTCManager | null = null;
     let audioDuckingManager: AudioDuckingManager | null = null;
@@ -42,6 +42,11 @@
     let participantListEl = $state<HTMLDivElement | null>(null);
     let currentRtt = $state<number | null>(null);
     let statsInterval: ReturnType<typeof setInterval> | null = null;
+    // Cloudflare TURN credentials default to a 1 h TTL; long color-grading
+    // sessions (4–8 h) outlive that. Refresh every 30 min over the existing
+    // WebSocket so any ICE restart later always has fresh creds to gather
+    // with. The live media allocation is unaffected by the refresh.
+    let iceServerRefreshInterval: ReturnType<typeof setInterval> | null = null;
     let streamVolume = $state(1.0);
     let voiceVolume = $state(1.0);
     let showVolumeControls = $state(false);
@@ -51,6 +56,8 @@
     let isLaserEnabled = $state(false);
     let showParticipantList = $state(false);
     let speakingParticipants = $state<Set<string>>(new Set());
+    // VAD analysers share the page's AudioContext; only the analyser/source
+    // nodes are per-track. The context is torn down on page destroy.
     let voiceAnalysers = new Map<string, { analyser: AnalyserNode; source: MediaStreamAudioSourceNode }>();
     // Participants with a live (or pending) voice analyser registration. Used
     // to detect "participant left while the async analyser setup was in
@@ -103,11 +110,21 @@
         // Clear any stale message handlers from a previous session
         session.clearHandlers();
 
-        // Handle ICE servers from room state
+        // Handle ICE servers from room state (initial delivery in room:state)
         session.onMessage("iceServers", (servers: unknown) => {
             iceServers = servers as RTCIceServer[];
             console.log('Received ICE servers:', iceServers);
             initializeWebRTC();
+            // Start the periodic refresh only once we have a live manager.
+            startICEServerRefresh();
+        });
+
+        // Handle refreshed ICE servers (periodic credential rotation)
+        session.onMessage("signal:ice-servers", (payload: unknown) => {
+            const data = payload as { iceServers?: RTCIceServer[] };
+            if (!data?.iceServers) return;
+            iceServers = data.iceServers;
+            webrtcManager?.updateICEServers(data.iceServers);
         });
 
         // Handle WebRTC offer from server
@@ -256,10 +273,12 @@
             pendingScreenShareRequest = data;
         });
 
-        // Clean up voice resources when a participant leaves
+        // Release per-participant audio graph (VAD + ducking) when someone
+        // leaves the room — otherwise their analyser/source nodes and GainNode
+        // stay connected to the shared AudioContext and the graph grows with churn.
         session.onMessage("participant:left", (payload: unknown) => {
             const data = payload as { participantId: string };
-            cleanupParticipantVoice(data.participantId);
+            if (data?.participantId) cleanupParticipantVoice(data.participantId);
         });
 
         // Chat handlers live here (always active) rather than in ChatPanel,
@@ -303,6 +322,15 @@
             streamError = null;
         });
 
+        // Server-reported signaling failure (e.g. subscriber setup failed).
+        // Surface it as a stream error so the user knows to refresh instead
+        // of sitting on "Connecting…" forever.
+        session.onMessage("signal:error", (payload: unknown) => {
+            const data = payload as { code?: string; message?: string };
+            console.error('Stream error from server:', data);
+            streamError = data?.message || 'Stream error. Please refresh the page.';
+        });
+
         // Connect only after handlers are registered so early messages aren't dropped.
         session.connect(slug, sessionData!.token, participantName);
 
@@ -320,7 +348,10 @@
         closeAudioContext();
         window.removeEventListener("chromatic:tampering", handleTampering);
         clearMicPromptTimer();
-        clearTimeout(controlsTimer);
+        if (controlsTimer) {
+            clearTimeout(controlsTimer);
+            controlsTimer = null;
+        }
     });
 
     function initializeWebRTC() {
@@ -469,10 +500,15 @@
 
     function startStatsPolling() {
         if (statsInterval) return;
+        let inFlight = false;
         statsInterval = setInterval(async () => {
-            if (webrtcManager) {
+            if (!webrtcManager || inFlight) return;
+            inFlight = true;
+            try {
                 const stats = await webrtcManager.getStats();
                 currentRtt = stats.rtt ?? null;
+            } finally {
+                inFlight = false;
             }
         }, 2000);
     }
@@ -484,11 +520,32 @@
         }
     }
 
+    function startICEServerRefresh() {
+        if (iceServerRefreshInterval) return;
+        // 30 min — well under Cloudflare's 1 h TTL minus the 60 s skew the
+        // server applies, so creds are always fresh when gathered.
+        const THIRTY_MIN = 30 * 60 * 1000;
+        iceServerRefreshInterval = setInterval(() => {
+            session.send("signal:ice-servers-request", {});
+        }, THIRTY_MIN);
+    }
+
+    function stopICEServerRefresh() {
+        if (iceServerRefreshInterval) {
+            clearInterval(iceServerRefreshInterval);
+            iceServerRefreshInterval = null;
+        }
+    }
+
     function handleVoiceTrack(participantId: string, track: MediaStreamTrack) {
         if (audioDuckingManager) {
             audioDuckingManager.addVoiceTrack(participantId, track);
         } else {
-            // Buffer track for when audioDuckingManager is created
+            // Buffer track for when audioDuckingManager is created — voice
+            // relay tracks can arrive in the initial offer before the main
+            // video/audio track has triggered handleTrack (which creates
+            // audioDuckingManager). Without this buffer, early joiners miss
+            // voice until the next renegotiation.
             pendingVoiceTracks.set(participantId, track);
         }
 
@@ -516,10 +573,12 @@
                 return;
             }
 
-            // Replace any previous analyser for this participant
+            // Replace any previous analyser for this participant (e.g. a
+            // reconnect delivered a fresh track) so we don't leak graph nodes
+            // and so the VAD reflects the new source.
             const existing = voiceAnalysers.get(participantId);
             if (existing) {
-                existing.source.disconnect();
+                try { existing.source.disconnect(); } catch { /* already gone */ }
             }
             voiceAnalysers.set(participantId, { analyser, source });
 
@@ -550,11 +609,26 @@
         activeVoicePids.delete(participantId);
         const entry = voiceAnalysers.get(participantId);
         if (entry) {
-            entry.source.disconnect();
+            try {
+                entry.source.disconnect();
+            } catch {
+                // Already disconnected or destroyed.
+            }
             voiceAnalysers.delete(participantId);
         }
         pendingVoiceTracks.delete(participantId);
         audioDuckingManager?.removeVoiceTrack(participantId);
+        // Stop the VAD loop when the last analyser is gone
+        if (voiceAnalysers.size === 0 && vadFrame) {
+            cancelAnimationFrame(vadFrame);
+            vadFrame = null;
+        }
+        // Drop any lingering speaking indicator for the departed participant
+        if (speakingParticipants.has(participantId)) {
+            const next = new Set(speakingParticipants);
+            next.delete(participantId);
+            speakingParticipants = next;
+        }
     }
 
     function toggleScreenShare() {
@@ -642,18 +716,26 @@
 
     function cleanupWebRTC() {
         stopStatsPolling();
+        stopICEServerRefresh();
         if (vadFrame) {
             cancelAnimationFrame(vadFrame);
             vadFrame = null;
         }
-        // Disconnect voice analyser source nodes before clearing
+        // Disconnect voice analyser source nodes explicitly so they release
+        // their MediaStream source and let the browser GC the tracks;
+        // otherwise the graph stays wired until the shared AudioContext closes.
         for (const entry of voiceAnalysers.values()) {
-            entry.source.disconnect();
+            try {
+                entry.source.disconnect();
+            } catch {
+                // Already disconnected.
+            }
         }
         voiceAnalysers.clear();
         // Cancel any in-flight async analyser setups
         activeVoicePids.clear();
         pendingVoiceTracks.clear();
+        speakingParticipants = new Set();
         if (webrtcManager) {
             webrtcManager.close();
             webrtcManager = null;
@@ -664,6 +746,10 @@
         micAutoEnablePending = false;
         clearMicPromptTimer();
         micPromptState = "hidden";
+        if (controlsTimer) {
+            clearTimeout(controlsTimer);
+            controlsTimer = null;
+        }
     }
 
     function handleTampering() {
@@ -683,7 +769,7 @@
     }
 
     function startControlsTimer() {
-        clearTimeout(controlsTimer);
+        if (controlsTimer) clearTimeout(controlsTimer);
         isControlsVisible = true;
         controlsTimer = setTimeout(() => {
             if (!showParticipantList) {
@@ -846,7 +932,10 @@
         if (e.pointerType !== "touch" || isLaserEnabled) return;
         e.stopPropagation();
         if (isControlsVisible) {
-            clearTimeout(controlsTimer);
+            if (controlsTimer) {
+                clearTimeout(controlsTimer);
+                controlsTimer = null;
+            }
             isControlsVisible = false;
         } else {
             startControlsTimer();

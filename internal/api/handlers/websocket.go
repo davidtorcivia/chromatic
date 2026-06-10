@@ -19,6 +19,9 @@ import (
 	pionwebrtc "github.com/pion/webrtc/v4"
 )
 
+// SessionValidator validates an admin session ID and returns true if still active.
+type SessionValidator func(sessionID string) bool
+
 // WebSocketHandler handles WebSocket connections
 type WebSocketHandler struct {
 	db              *database.DB
@@ -26,11 +29,24 @@ type WebSocketHandler struct {
 	sfu             *webrtc.SFU
 	originValidator *middleware.OriginValidator
 	tokenManager    *TokenManager
+	validateSession SessionValidator
 	upgrader        gorillaws.Upgrader
 }
 
-// NewWebSocketHandler creates a new WebSocketHandler
-func NewWebSocketHandler(db *database.DB, hub *websocket.Hub, sfu *webrtc.SFU, allowedOrigins []string, productionMode bool, tokenSecret []byte) *WebSocketHandler {
+// NewWebSocketHandler creates a new WebSocketHandler.
+// tokenSecret is the derived secret used to sign/verify join tokens (never
+// the raw admin token). validateSession is used to check the admin session
+// cookie on upgrade and again on each privileged action so that a mid-session
+// logout drops privileges.
+func NewWebSocketHandler(
+	db *database.DB,
+	hub *websocket.Hub,
+	sfu *webrtc.SFU,
+	allowedOrigins []string,
+	productionMode bool,
+	tokenSecret []byte,
+	validateSession SessionValidator,
+) *WebSocketHandler {
 	validator := middleware.NewOriginValidator(allowedOrigins, productionMode)
 
 	h := &WebSocketHandler{
@@ -39,6 +55,7 @@ func NewWebSocketHandler(db *database.DB, hub *websocket.Hub, sfu *webrtc.SFU, a
 		sfu:             sfu,
 		originValidator: validator,
 		tokenManager:    NewTokenManager(tokenSecret),
+		validateSession: validateSession,
 	}
 
 	h.upgrader = gorillaws.Upgrader{
@@ -67,6 +84,19 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "Missing token or name", http.StatusBadRequest)
 		return
 	}
+
+	// Admin status comes from the httpOnly session cookie set by POST
+	// /api/auth/login, or from the participant's DB role (assigned at join
+	// time when a valid admin token was provided in the join request body).
+	// Never accept a long-lived credential in the URL (logs / browser
+	// history / referrer).
+	var adminSessionID string
+	if h.validateSession != nil {
+		if c, err := r.Cookie(SessionCookieName); err == nil && c.Value != "" && h.validateSession(c.Value) {
+			adminSessionID = c.Value
+		}
+	}
+	isAdminAuth := adminSessionID != ""
 
 	// Validate the signed token
 	tokenPayload, err := h.tokenManager.ValidateToken(token)
@@ -135,20 +165,24 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Create client
-	// Admin status comes from the participant's role in the database; the
-	// role is assigned at join time when a valid admin token is provided in
-	// the join request body (never via URL query params, which get logged).
-	isAdmin := role == "admin"
+	// Admin if authenticated via a valid admin session cookie OR the
+	// participant's role in the database is admin (assigned at join time when
+	// a valid admin token was provided in the join request body).
+	isAdmin := isAdminAuth || role == "admin"
+	if isAdminAuth && role != "admin" {
+		role = "admin"
+	}
 	client := &websocket.Client{
-		ID:       participantID,
-		Name:     name,
-		Role:     role,
-		RoomSlug: slug,
-		Hub:      h.hub,
-		Conn:     conn,
-		Send:     make(chan []byte, 256),
-		Done:     make(chan struct{}),
-		IsAdmin:  isAdmin,
+		ID:             participantID,
+		Name:           name,
+		Role:           role,
+		RoomSlug:       slug,
+		Hub:            h.hub,
+		Conn:           conn,
+		Send:           make(chan []byte, 256),
+		Done:           make(chan struct{}),
+		IsAdmin:        isAdmin,
+		AdminSessionID: adminSessionID,
 	}
 	client.SetAudioEnabled(false)
 	client.SetVideoEnabled(true)
@@ -233,6 +267,12 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 	pc, offerSDP, err := h.sfu.CreateSubscriberConnection(roomSlug, client.ID)
 	if err != nil {
 		logger.Error("Failed to create subscriber connection", "participant_id", client.ID, "room", roomSlug, "error", err)
+		// Tell the client the handshake failed so it can surface an error and
+		// offer a retry instead of sitting on "Connecting…" forever.
+		client.SendJSON("signal:error", map[string]interface{}{
+			"code":    "subscription-failed",
+			"message": "Failed to initialize stream. Please refresh the page to retry.",
+		})
 		return
 	}
 
@@ -378,16 +418,21 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 	})
 }
 
-// sendChatHistory sends persisted chat messages to a newly connected client
+// sendChatHistory sends the most recent persisted chat messages to a newly
+// connected client. We fetch the tail via DESC+LIMIT and reverse in memory so
+// the client sees oldest-first; older messages beyond chatHistoryLimit are
+// considered archive-only. A large room with 10k messages would otherwise
+// block each new joiner on a full scan.
 func (h *WebSocketHandler) sendChatHistory(client *websocket.Client, slug string) {
+	const chatHistoryLimit = 50
 	rows, err := h.db.Query(`
 		SELECT m.id, m.participant_id, p.name, m.type, m.content, m.created_at
 		FROM messages m
 		JOIN participants p ON p.id = m.participant_id
 		WHERE m.room_id = (SELECT id FROM rooms WHERE slug = ?)
-		ORDER BY m.created_at ASC
-		LIMIT 200
-	`, slug)
+		ORDER BY m.created_at DESC
+		LIMIT ?
+	`, slug, chatHistoryLimit)
 	if err != nil {
 		logger.Warn("Failed to load chat history", "room", slug, "error", err)
 		return
@@ -421,6 +466,11 @@ func (h *WebSocketHandler) sendChatHistory(client *websocket.Client, slug string
 		}
 
 		messages = append(messages, msg)
+	}
+
+	// Rows came back newest-first so the client receives oldest-first.
+	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
+		messages[i], messages[j] = messages[j], messages[i]
 	}
 
 	if len(messages) > 0 {
@@ -457,6 +507,8 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 		h.handleRenegotiateAnswer(client, msg.Payload)
 	case "signal:resync":
 		h.handleResync(client)
+	case "signal:ice-servers-request":
+		h.handleICEServersRequest(client)
 	// Admin commands
 	case "admin:mute":
 		h.handleAdminMute(client, msg.Payload)
@@ -696,34 +748,38 @@ func (h *WebSocketHandler) handleSignalOffer(client *websocket.Client, payload j
 	}
 }
 
-// forwardVoiceTrack forwards a participant's voice track to all other participants in the room.
-// It creates a single relay local track that reads from the remote track once and fans out
-// writes to all subscriber PCs, preventing the multi-reader bug.
+// forwardVoiceTrack forwards a participant's voice track to all other
+// participants in the room. On first arrival for a given speaker it creates
+// a shared relay local track and fans it out to every subscriber with a
+// renegotiation. On subsequent arrivals (speaker rejoins) the relay track is
+// reused — subscribers' existing senders are already bound to it, so no fan-
+// out or renegotiation is needed; we only rebind the forwarding goroutine.
 func (h *WebSocketHandler) forwardVoiceTrack(roomSlug, participantID string, track *pionwebrtc.TrackRemote) {
 	logger.Debug("Forwarding voice track", "participant_id", participantID, "room", roomSlug)
 
-	// Store the remote track reference
 	h.sfu.StoreVoiceRemoteTrack(roomSlug, participantID, track)
 
-	// Create a single relay track that reads from the remote track once
-	// and fans out writes to all subscriber PCs via Pion's internal binding.
-	relayTrack, err := h.sfu.CreateVoiceRelayTrack(roomSlug, participantID, track)
+	relayTrack, isNew, err := h.sfu.CreateVoiceRelayTrack(roomSlug, participantID, track)
 	if err != nil {
 		logger.Error("Failed to create voice relay track", "participant_id", participantID, "error", err)
 		return
 	}
 
-	// Add the relay track to all other subscribers
-	h.forwardVoiceTrackToClients(roomSlug, participantID, relayTrack, "")
-
-	// Request a keyframe after voice renegotiation. The SDP renegotiation
-	// can cause some browsers (Firefox) to briefly reset the video decoder,
-	// and a fresh IDR frame helps them recover immediately.
-	h.sfu.RequestKeyframe(roomSlug)
+	if isNew {
+		// First time seeing this speaker — AddTrack on every subscriber and
+		// trigger a renegotiation so the browser creates a receiver for it.
+		h.forwardVoiceTrackToClients(roomSlug, participantID, relayTrack, "")
+		// A fresh renegotiation can stall Firefox's video decoder briefly;
+		// a PLI nudges it to recover immediately.
+		h.sfu.RequestKeyframe(roomSlug)
+	}
 }
 
-// forwardVoiceTrackToClients adds a shared voice relay track to clients in the room.
-// If targetClientID is non-empty, only that specific client receives the track.
+// forwardVoiceTrackToClients adds a shared voice relay track to clients in
+// the room. If targetClientID is non-empty, only that specific client
+// receives the track. Each subscriber is handled in its own goroutine so a
+// slow / renegotiating subscriber doesn't block voice fan-out to everyone
+// else (small rooms, 2–8 viewers per the product spec).
 func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID string, localTrack *pionwebrtc.TrackLocalStaticRTP, targetClientID string) {
 	clients := h.hub.GetRoomClients(roomSlug)
 	for _, client := range clients {
@@ -731,21 +787,23 @@ func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID str
 			continue // Don't send to self
 		}
 		if targetClientID != "" && client.ID != targetClientID {
-			continue // Only send to specific target
-		}
-
-		offerSDP, err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, client.ID, voiceOwnerID, localTrack)
-		if err != nil {
-			logger.Warn("Failed to add voice track to subscriber", "subscriber_id", client.ID, "source_id", voiceOwnerID, "error", err)
 			continue
 		}
 
-		client.SendJSON("signal:renegotiate", map[string]interface{}{
-			"sdp":           offerSDP,
-			"participantId": voiceOwnerID,
-		})
+		go func(c *websocket.Client) {
+			offerSDP, err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, c.ID, voiceOwnerID, localTrack)
+			if err != nil {
+				logger.Warn("Failed to add voice track to subscriber", "subscriber_id", c.ID, "source_id", voiceOwnerID, "error", err)
+				return
+			}
 
-		logger.Debug("Sent renegotiation offer for voice track", "subscriber_id", client.ID, "source_id", voiceOwnerID)
+			c.SendJSON("signal:renegotiate", map[string]interface{}{
+				"sdp":           offerSDP,
+				"participantId": voiceOwnerID,
+			})
+
+			logger.Debug("Sent renegotiation offer for voice track", "subscriber_id", c.ID, "source_id", voiceOwnerID)
+		}(client)
 	}
 }
 
@@ -844,13 +902,50 @@ func (h *WebSocketHandler) handleRenegotiateAnswer(client *websocket.Client, pay
 	logger.Debug("Renegotiation completed", "participant_id", client.ID)
 }
 
+// handleICEServersRequest returns a fresh set of ICE servers (including
+// refreshed Cloudflare TURN credentials). Long sessions (4–8 h for color
+// grading) outlive the 1 h default Cloudflare TTL; clients periodically
+// request fresh creds so that any ICE restart that happens later gathers
+// with valid credentials instead of hanging.
+func (h *WebSocketHandler) handleICEServersRequest(client *websocket.Client) {
+	servers := h.sfu.GetICEServers()
+	client.SendJSON("signal:ice-servers", map[string]interface{}{
+		"iceServers": servers,
+	})
+	logger.Debug("Sent refreshed ICE servers", "participant_id", client.ID, "count", len(servers))
+}
+
 func (h *WebSocketHandler) handleResync(client *websocket.Client) {
+	// No-op when the room has no live ingest — PLI to a nonexistent receiver
+	// is wasted work, and avoids log spam if a client spams resync while the
+	// publisher is offline.
+	if !h.sfu.IsRoomLive(client.RoomSlug) {
+		logger.Debug("Ignoring resync request for inactive room", "participant_id", client.ID, "room", client.RoomSlug)
+		return
+	}
 	logger.Debug("Processing resync/keyframe request", "participant_id", client.ID, "room", client.RoomSlug)
 	h.sfu.RequestKeyframe(client.RoomSlug)
 }
 
-func (h *WebSocketHandler) handleAdminMute(client *websocket.Client, payload json.RawMessage) {
+// requireAdmin returns true if the client is still a valid admin right now.
+// It re-checks the session cookie captured at upgrade time so a mid-session
+// logout immediately revokes admin powers. Callers should log & return on false.
+func (h *WebSocketHandler) requireAdmin(client *websocket.Client, action string) bool {
 	if !client.IsAdmin {
+		return false
+	}
+	if client.AdminSessionID != "" && h.validateSession != nil && !h.validateSession(client.AdminSessionID) {
+		logger.Warn("Admin session revoked mid-connection; denying action",
+			"action", action, "participant_id", client.ID, "room", client.RoomSlug)
+		client.IsAdmin = false
+		client.AdminSessionID = ""
+		return false
+	}
+	return true
+}
+
+func (h *WebSocketHandler) handleAdminMute(client *websocket.Client, payload json.RawMessage) {
+	if !h.requireAdmin(client, "mute") {
 		return
 	}
 
@@ -861,13 +956,20 @@ func (h *WebSocketHandler) handleAdminMute(client *websocket.Client, payload jso
 		return
 	}
 
+	// Gate voice RTP at the server — admin:muted as a broadcast-only hint is
+	// advisory, and a malicious client could simply ignore it and keep
+	// sending. Flipping the relay's mute flag drops the packets regardless
+	// of what the client chooses to do.
+	h.sfu.SetVoiceMuted(client.RoomSlug, data.ParticipantID, true)
+
 	h.hub.BroadcastJSON(client.RoomSlug, "admin:muted", map[string]interface{}{
 		"participantId": data.ParticipantID,
 	}, "")
+	logger.Info("Admin mute", "by", client.ID, "target", data.ParticipantID, "room", client.RoomSlug)
 }
 
 func (h *WebSocketHandler) handleAdminKick(client *websocket.Client, payload json.RawMessage) {
-	if !client.IsAdmin {
+	if !h.requireAdmin(client, "kick") {
 		return
 	}
 
@@ -889,10 +991,12 @@ func (h *WebSocketHandler) handleAdminKick(client *websocket.Client, payload jso
 	if target := h.hub.GetClient(client.RoomSlug, data.ParticipantID); target != nil {
 		target.Conn.Close()
 	}
+
+	logger.Info("Admin kick", "by", client.ID, "target", data.ParticipantID, "room", client.RoomSlug)
 }
 
 func (h *WebSocketHandler) handleAdminEndSession(client *websocket.Client) {
-	if !client.IsAdmin {
+	if !h.requireAdmin(client, "end-session") {
 		return
 	}
 
@@ -946,7 +1050,7 @@ func (h *WebSocketHandler) handleScreenShareRequest(client *websocket.Client) {
 
 // handleScreenShareApprove processes admin approval of a screen share request
 func (h *WebSocketHandler) handleScreenShareApprove(client *websocket.Client, payload json.RawMessage) {
-	if !client.IsAdmin {
+	if !h.requireAdmin(client, "screenshare-approve") {
 		return
 	}
 
@@ -975,7 +1079,7 @@ func (h *WebSocketHandler) handleScreenShareApprove(client *websocket.Client, pa
 
 // handleScreenShareDeny processes admin denial of a screen share request
 func (h *WebSocketHandler) handleScreenShareDeny(client *websocket.Client, payload json.RawMessage) {
-	if !client.IsAdmin {
+	if !h.requireAdmin(client, "screenshare-deny") {
 		return
 	}
 

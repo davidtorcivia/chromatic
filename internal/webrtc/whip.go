@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"chromatic/internal/metrics"
 
@@ -69,11 +68,12 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 		return
 	}
 
-	// Check if already streaming with this key
-	if h.sfu.GetIngest(token) != nil {
-		http.Error(w, "Stream key already in use", http.StatusConflict)
-		return
-	}
+	// If an existing ingest is holding this stream key (typically an OBS
+	// instance reconnecting before its prior PC timed out), replace it rather
+	// than returning 409 — the new OBS connection IS the canonical sender.
+	// SetIngest below will close the old PC; subscriber connections keep
+	// their senders and will be rebound via BindIngestToRoom when the new PC
+	// reaches Connected.
 
 	// Read SDP offer
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1MB limit
@@ -99,9 +99,16 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 		return
 	}
 
-	// Create local tracks for forwarding
+	// Create local tracks for forwarding.
+	// The capability here must match what the MediaEngine registered in NewSFU
+	// (H.264 PM=1 Constrained Baseline, Opus 48k stereo) so Pion's rewriter can
+	// route RTP cleanly without probing for a compatible codec on first packet.
 	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264},
+		webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeH264,
+			ClockRate:   90000,
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+		},
 		"video",
 		"chromatic-stream",
 	)
@@ -113,7 +120,12 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 	}
 
 	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+		webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeOpus,
+			ClockRate:   48000,
+			Channels:    2,
+			SDPFmtpLine: "minptime=10;useinbandfec=1",
+		},
 		"audio",
 		"chromatic-stream",
 	)
@@ -148,28 +160,31 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 			return
 		}
 
-		// Forward RTP packets
+		// Forward RTP packets. Exits when the peer connection closes (Read/Write
+		// returns an error) or when session teardown closes session.done, whose
+		// PC.Close() cascades to ErrClosedPipe on the next Write.
 		go func() {
 			buf := make([]byte, 1500)
 			for {
+				n, _, err := remoteTrack.Read(buf)
+				if err != nil {
+					if err != io.EOF {
+						log.Printf("Error reading from remote track: %v", err)
+					}
+					return
+				}
+				// Non-blocking done-check so a teardown between Read and Write
+				// aborts promptly instead of writing into a dead pipe.
 				select {
 				case <-session.done:
 					return
 				default:
-					n, _, err := remoteTrack.Read(buf)
-					if err != nil {
-						if err != io.EOF {
-							log.Printf("Error reading from remote track: %v", err)
-						}
-						return
+				}
+				if _, err := localTrack.Write(buf[:n]); err != nil {
+					if err != io.ErrClosedPipe {
+						log.Printf("Error writing to local track: %v", err)
 					}
-
-					if _, err := localTrack.Write(buf[:n]); err != nil {
-						if err != io.ErrClosedPipe {
-							log.Printf("Error writing to local track: %v", err)
-						}
-						return
-					}
+					return
 				}
 			}
 		}()
@@ -178,6 +193,9 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 	// Teardown runs exactly once per session across Failed/Closed state
 	// callbacks and explicit DELETE requests, preventing duplicate
 	// stream-end broadcasts and negative ingest metrics.
+	// removeIngestIfSame is used (rather than RemoveIngest) so that if OBS has
+	// already reconnected and a fresh ingest session is live under this token,
+	// a stale callback on the old PC doesn't delete the replacement.
 	var teardownOnce sync.Once
 	session.teardown = func() {
 		teardownOnce.Do(func() {
@@ -185,7 +203,7 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 			if session.everConnected.Load() {
 				metrics.Get().ActiveWHIPIngests.Add(-1)
 			}
-			h.sfu.RemoveIngest(token)
+			h.sfu.removeIngestIfSame(token, session)
 			// Only notify stream end if the stream actually started;
 			// otherwise viewers would see a spurious "stream ended" for a
 			// session that never connected.
@@ -250,24 +268,36 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 	}
 
 	// Register the session before waiting for ICE gathering so trickle-ICE
-	// PATCH requests arriving during gathering can find it.
+	// PATCH requests arriving during gathering can find it. SetIngest also
+	// closes any previous ingest holding this stream key (OBS reconnect).
 	h.sfu.SetIngest(token, session)
 
-	// Bound the wait for ICE gathering. Host/srflx candidates gather quickly
-	// and are sufficient for OBS-to-server connectivity; a slow TURN server
-	// must not stall the WHIP response past client/server write timeouts.
-	gatherComplete := webrtc.GatheringCompletePromise(pc)
-	select {
-	case <-gatherComplete:
-	case <-time.After(3 * time.Second):
-		log.Printf("ICE gathering incomplete after 3s for key %s..., responding with partial candidates", token[:8])
+	// Bound the wait for ICE gathering (see iceGatherTimeout). Host/srflx
+	// candidates gather quickly and are sufficient for OBS-to-server
+	// connectivity; a slow TURN server must not stall the WHIP response past
+	// client/server write timeouts.
+	waitForICEGather(pc)
+
+	// Snapshot the answer SDP. LocalDescription can return nil if the peer
+	// connection is closed between SetLocalDescription and here; capture the
+	// string while we know it's valid.
+	localDesc := pc.LocalDescription()
+	if localDesc == nil {
+		pc.Close()
+		h.sfu.removeIngestIfSame(token, session)
+		log.Printf("LocalDescription unexpectedly nil after gather")
+		http.Error(w, "Failed to finalize answer", http.StatusInternalServerError)
+		return
 	}
+	answerSDP := localDesc.SDP
 
 	// Return the answer
 	w.Header().Set("Content-Type", "application/sdp")
 	w.Header().Set("Location", r.URL.String())
 	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte(pc.LocalDescription().SDP))
+	if _, err := w.Write([]byte(answerSDP)); err != nil {
+		log.Printf("Failed to write WHIP answer: %v", err)
+	}
 
 	log.Printf("WHIP session established for key: %s...", token[:8])
 }
@@ -405,13 +435,11 @@ func extractProfileLevelID(sdp string) string {
 		}
 
 		params := strings.Split(parts[1], ";")
+		const key = "profile-level-id="
 		for _, param := range params {
 			param = strings.TrimSpace(param)
-			if strings.HasPrefix(strings.ToLower(param), "profile-level-id=") {
-				parts := strings.SplitN(param, "=", 2)
-				if len(parts) == 2 {
-					return parts[1]
-				}
+			if len(param) > len(key) && strings.EqualFold(param[:len(key)], key) {
+				return param[len(key):]
 			}
 		}
 	}

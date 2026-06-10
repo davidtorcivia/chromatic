@@ -512,41 +512,47 @@ func FileUploadRateLimiter(trustedProxies []string) func(http.Handler) http.Hand
 	})
 }
 
-// SecurityHeaders adds security-related HTTP headers
-func SecurityHeaders(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Prevent clickjacking
-		w.Header().Set("X-Frame-Options", "DENY")
+// SecurityHeaders adds security-related HTTP headers.
+// In production mode, connect-src is restricted to same-origin only.
+func SecurityHeaders(productionMode bool) func(http.Handler) http.Handler {
+	// Build the CSP once.
+	// Notes:
+	// - In production, connect-src 'self' covers same-origin WebSocket in
+	//   all modern browsers; ws:/wss: wildcards would allow exfiltration to
+	//   any WebSocket origin. WebRTC (turn:) is not governed by connect-src.
+	//   In development we additionally allow ws:/wss: so the Vite dev server
+	//   and cross-port local WebSocket connections keep working.
+	// - script-src keeps 'unsafe-inline' because SvelteKit's hydration
+	//   inline script requires it; removing it would break the app.
+	// - Fonts are self-hosted, so no CDN origins are allowlisted.
+	connectSrc := "'self'"
+	if !productionMode {
+		connectSrc = "'self' ws: wss:"
+	}
+	csp := "default-src 'self'; " +
+		"script-src 'self' 'unsafe-inline'; " +
+		"style-src 'self' 'unsafe-inline'; " +
+		"font-src 'self'; " +
+		"img-src 'self' data: blob:; " +
+		"media-src 'self' blob:; " +
+		"connect-src " + connectSrc + "; " +
+		"frame-ancestors 'none';"
 
-		// Prevent MIME type sniffing
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-
-		// XSS protection (legacy but still useful)
-		w.Header().Set("X-XSS-Protection", "1; mode=block")
-
-		// Referrer policy
-		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-
-		// Content Security Policy
-		// Notes:
-		// - connect-src 'self' covers same-origin WebSocket in all modern
-		//   browsers; ws:/wss: wildcards would allow exfiltration to any
-		//   WebSocket origin. WebRTC (turn:) is not governed by connect-src.
-		// - script-src keeps 'unsafe-inline' because SvelteKit's hydration
-		//   inline script requires it; removing it would break the app.
-		w.Header().Set("Content-Security-Policy",
-			"default-src 'self'; "+
-				"script-src 'self' 'unsafe-inline'; "+
-				"style-src 'self' 'unsafe-inline'; "+
-				"font-src 'self'; "+
-				"img-src 'self' data: blob:; "+
-				"media-src 'self' blob:; "+
-				"connect-src 'self'; "+
-				"frame-ancestors 'none';")
-
-		// Permissions Policy (limit browser features)
-		w.Header().Set("Permissions-Policy", "geolocation=(), payment=(), usb=()")
-
-		next.ServeHTTP(w, r)
-	})
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Prevent clickjacking
+			w.Header().Set("X-Frame-Options", "DENY")
+			// Prevent MIME type sniffing
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			// XSS protection (legacy but still useful)
+			w.Header().Set("X-XSS-Protection", "1; mode=block")
+			// Referrer policy
+			w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+			// Content Security Policy
+			w.Header().Set("Content-Security-Policy", csp)
+			// Permissions Policy (limit browser features)
+			w.Header().Set("Permissions-Policy", "geolocation=(), payment=(), usb=()")
+			next.ServeHTTP(w, r)
+		})
+	}
 }

@@ -66,6 +66,11 @@ type Client struct {
 	audioEnabled bool
 	videoEnabled bool
 
+	// AdminSessionID is the value of the admin session cookie captured at upgrade
+	// time. It's used to re-validate admin privileges on each privileged action
+	// so that mid-session logout revokes them. Empty for non-admin clients.
+	AdminSessionID string
+
 	// Rate limiting for chat messages (30 per minute)
 	chatRateLimiter *RateLimiter
 	// Rate limiting for cursor updates (20 per second)
@@ -205,13 +210,16 @@ func (h *Hub) registerClient(client *Client) {
 			Clients: make(map[string]*Client),
 		}
 		h.rooms[client.RoomSlug] = room
-		// Track new active room
 		metrics.Get().ActiveRooms.Add(1)
 	}
 
-	// If an old client with the same ID exists (e.g. page refresh), close it
-	// so its ReadPump exits cleanly. The old client's onDisconnect handler
-	// will see that it was replaced and skip cleanup.
+	// If an old client with the same ID exists (viewer reconnecting with the
+	// same participant token before the old ReadPump noticed the drop, e.g. a
+	// page refresh), close it so its pumps exit cleanly. Otherwise the old
+	// ReadPump's eventual Unregister would delete *this* client from the map.
+	// The old client's onDisconnect handler will see that it was replaced and
+	// skip cleanup. Done (not Send) is closed: Send is never closed so that
+	// concurrent SendJSON/Broadcast calls can never panic on a closed channel.
 	if old, exists := room.Clients[client.ID]; exists {
 		log.Printf("Replacing existing client %s (%s) in room %s (reconnect)", old.ID, old.Name, client.RoomSlug)
 		old.closeOnce.Do(func() {
@@ -220,7 +228,7 @@ func (h *Hub) registerClient(client *Client) {
 		if old.Conn != nil {
 			old.Conn.Close()
 		}
-		// Don't increment metrics — we're replacing, not adding
+		// Net websocket count unchanged — the replacement cancels out.
 	} else {
 		// Track WebSocket connections
 		metrics.Get().ActiveWebsockets.Add(1)
@@ -234,30 +242,39 @@ func (h *Hub) unregisterClient(client *Client) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if room, ok := h.rooms[client.RoomSlug]; ok {
-		// Only remove if the current client in the map is this exact instance.
-		// On page refresh, registerClient replaces the old client with a new one;
-		// when the old client's ReadPump exits and calls Unregister, we must NOT
-		// remove the replacement client.
-		if current, ok := room.Clients[client.ID]; ok && current == client {
-			delete(room.Clients, client.ID)
-			// Track WebSocket disconnection
-			metrics.Get().ActiveWebsockets.Add(-1)
-			log.Printf("Client %s (%s) left room %s", client.ID, client.Name, client.RoomSlug)
+	// Always close the client's Done channel regardless of whether it was still
+	// current, so its pumps exit. Send is intentionally never closed — WritePump
+	// selects on Done to exit, and leaving Send open avoids send-on-closed-channel
+	// panics in broadcast/SendJSON.
+	defer client.closeOnce.Do(func() {
+		close(client.Done)
+	})
 
-			// Clean up empty rooms
-			if len(room.Clients) == 0 {
-				delete(h.rooms, client.RoomSlug)
-				// Track room closure
-				metrics.Get().ActiveRooms.Add(-1)
-			}
-		}
-		// Always close the client's Done channel regardless of whether it was still current.
-		// Send is intentionally never closed — WritePump selects on Done to exit, and
-		// leaving Send open avoids send-on-closed-channel panics in broadcast/SendJSON.
-		client.closeOnce.Do(func() {
-			close(client.Done)
-		})
+	room, ok := h.rooms[client.RoomSlug]
+	if !ok {
+		return
+	}
+	current, ok := room.Clients[client.ID]
+	if !ok {
+		return
+	}
+	// Only delete if the map entry still points at THIS client instance. On
+	// page refresh, registerClient replaces the old client with a new one; when
+	// the old client's ReadPump exits and calls Unregister, we must NOT remove
+	// the live replacement.
+	if current != client {
+		log.Printf("Stale unregister for %s ignored (replaced by newer connection)", client.ID)
+		return
+	}
+	delete(room.Clients, client.ID)
+	// Track WebSocket disconnection
+	metrics.Get().ActiveWebsockets.Add(-1)
+	log.Printf("Client %s (%s) left room %s", client.ID, client.Name, client.RoomSlug)
+
+	// Clean up empty rooms
+	if len(room.Clients) == 0 {
+		delete(h.rooms, client.RoomSlug)
+		metrics.Get().ActiveRooms.Add(-1)
 	}
 }
 
