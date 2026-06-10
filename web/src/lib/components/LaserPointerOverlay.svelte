@@ -11,15 +11,21 @@
         smoothingFactor,
         rippleAt,
         shouldAppendPoint,
+        adaptiveMinDistPx,
+        decimateOlderHalf,
         splitLongSegments,
         buildSplineSegments,
+        bucketTrailSegments,
         trailStyle,
         subsampleBatch,
         timestampBatch,
         TRAIL_FADE_MS,
         TRAIL_HEAD_WIDTH,
+        TRAIL_TARGET_POINTS,
         TRAIL_GLOW_WIDTH_RATIO,
         TRAIL_GLOW_ALPHA,
+        TRAIL_GLOW_OUTER_WIDTH_RATIO,
+        TRAIL_GLOW_OUTER_ALPHA,
         TRAIL_CORE_WIDTH_RATIO,
         TRAIL_CORE_ALPHA,
         TRAIL_CORE_MIN_POS,
@@ -267,10 +273,7 @@
                 const w = videoRect.width;
                 const h = videoRect.height;
                 for (const tp of timestampBatch(batch, startT, now)) {
-                    const last = cursor.trail[cursor.trail.length - 1];
-                    if (shouldAppendPoint(last, tp.x, tp.y, w, h)) {
-                        cursor.trail.push(tp);
-                    }
+                    appendTrailPoint(cursor.trail, tp, w, h);
                 }
             }
 
@@ -344,6 +347,23 @@
         return out;
     }
 
+    // --- Trail recording ------------------------------------------------------
+
+    // Append one point to a trail with adaptive thinning (used by both
+    // local pointer events and incoming network batches). The minimum
+    // spacing grows as the trail fills (adaptiveMinDistPx) and crossing
+    // the target count decimates the older half, so sustained fast
+    // movement — spinning circles — settles at a bounded, roughly
+    // constant point count and the per-frame render cost stays flat.
+    function appendTrailPoint(trail: TrailPoint[], tp: TrailPoint, w: number, h: number) {
+        const last = trail[trail.length - 1];
+        if (!shouldAppendPoint(last, tp.x, tp.y, w, h, adaptiveMinDistPx(trail.length))) {
+            return;
+        }
+        trail.push(tp);
+        if (trail.length > TRAIL_TARGET_POINTS) decimateOlderHalf(trail);
+    }
+
     // --- Local echo ---------------------------------------------------------
     // The sender's own laser renders with zero network latency: pointer
     // events drive the local cursor/trail/ripple directly through the same
@@ -387,10 +407,7 @@
         const span = Math.max(0, e.timeStamp - firstTs);
         if (!reducedMotion) {
             for (const tp of timestampBatch(batch, now - span, now)) {
-                const last = cursor.trail[cursor.trail.length - 1];
-                if (shouldAppendPoint(last, tp.x, tp.y, w, h)) {
-                    cursor.trail.push(tp);
-                }
+                appendTrailPoint(cursor.trail, tp, w, h);
             }
         }
         const head = batch[batch.length - 1];
@@ -568,11 +585,12 @@
         }
 
         // Release ripples (multiple may coexist). Same vivid treatment as
-        // the trail: full-alpha colored ring with a colored glow and a thin
-        // white hot edge. A ring stroke never overlaps itself, so 'lighter'
-        // is safe here at full alpha.
+        // the trail: full-alpha colored ring with a layered-stroke glow and
+        // a thin white hot edge (no shadowBlur — a wide low-alpha stroke of
+        // the same arc reads the same and costs a fraction). A ring stroke
+        // never overlaps itself, so 'lighter' is safe here at full alpha.
         if (ripples.length > 0) {
-            const remaining: Ripple[] = [];
+            let keep = 0;
             for (const ripple of ripples) {
                 const v = rippleAt(now - ripple.start);
                 if (v.done) continue;
@@ -584,24 +602,25 @@
                 ctx.globalAlpha = v.alpha * 0.12;
                 ctx.fillStyle = ripple.color;
                 ctx.fill();
-                // Main colored ring with glow
-                ctx.globalAlpha = v.alpha;
+                // Wide faint halo ring (replaces the old shadowBlur glow)
+                ctx.globalAlpha = v.alpha * 0.28;
                 ctx.strokeStyle = ripple.color;
-                ctx.lineWidth = 2.5;
-                ctx.shadowColor = ripple.color;
-                ctx.shadowBlur = 10;
+                ctx.lineWidth = 7;
                 ctx.stroke();
-                ctx.shadowBlur = 0;
+                // Main colored ring
+                ctx.globalAlpha = v.alpha;
+                ctx.lineWidth = 2.5;
+                ctx.stroke();
                 // Thin white hot edge
                 ctx.globalAlpha = v.alpha * 0.35;
                 ctx.strokeStyle = "#fff";
                 ctx.lineWidth = 1;
                 ctx.stroke();
                 ctx.restore();
-                remaining.push(ripple);
+                ripples[keep++] = ripple;
             }
-            ripples = remaining;
-            if (ripples.length > 0) hasWork = true;
+            ripples.length = keep;
+            if (keep > 0) hasWork = true;
         }
 
         return hasWork;
@@ -611,18 +630,31 @@
     // spline that interpolates every recorded point (G1-continuous, so
     // no visible angles at joints) and ends exactly at the live cursor.
     //
-    //   1. GLOW  — 'lighter', ONE stroke of the whole spline at
-    //      TRAIL_GLOW_WIDTH_RATIO x head width, TRAIL_GLOW_ALPHA, with a
-    //      colored shadow blur. A single stroke never overlaps itself,
-    //      so additive compositing cannot white-clip here.
-    //   2. BODY  — 'source-over', per-segment strokes tapering in width
-    //      and alpha (trailStyle) from ~TRAIL_BODY_MAX_ALPHA at the head
-    //      to the tail. Normal alpha compositing means the overlapping
-    //      round caps between adjacent segments only saturate the
-    //      participant color — full vivid alpha without clipping.
+    // Per-frame cost is bounded and roughly constant: geometry is capped
+    // by adaptive thinning (~TRAIL_TARGET_POINTS live points), there is
+    // NO shadowBlur anywhere (its cost scales with path length and was
+    // the dominant frame cost on long trails), and the body taper is
+    // quantized into TRAIL_BODY_BUCKETS strokes instead of one stroke
+    // per segment — at most ~11 stroke calls per trail per frame.
+    //
+    //   1. GLOW  — 'lighter', TWO layered wide strokes of the whole
+    //      spline (one Path2D built once, stroked twice): a wide faint
+    //      outer halo plus a tighter brighter one. A single stroke never
+    //      overlaps itself, so additive compositing cannot white-clip.
+    //   2. BODY  — 'source-over', taper bucketed into at most
+    //      TRAIL_BODY_BUCKETS contiguous runs, each stroked as ONE path
+    //      with width/alpha from trailStyle at the run's midpoint
+    //      (~TRAIL_BODY_MAX_ALPHA at the head, fading to the tail).
     //   3. CORE  — 'lighter', ONE thin near-white stroke over just the
     //      head portion (pos >= TRAIL_CORE_MIN_POS) for the hot-laser
     //      look; fades with the head's life after release.
+
+    // Scratch buffers reused across frames (consumed synchronously inside
+    // drawTrail) so a long live trail doesn't allocate a fresh points
+    // array + head object every RAF tick.
+    const scratchPoints: TrailPoint[] = [];
+    const scratchHead: TrailPoint = { x: 0, y: 0, t: 0 };
+
     function drawTrail(
         c: CanvasRenderingContext2D,
         cursor: Cursor,
@@ -640,7 +672,13 @@
         if (cursor.active && cursor.local) {
             const last = points[points.length - 1];
             if (!last || last.x !== cursor.x || last.y !== cursor.y) {
-                points = [...points, { x: cursor.x, y: cursor.y, t: now }];
+                scratchPoints.length = 0;
+                for (const p of points) scratchPoints.push(p);
+                scratchHead.x = cursor.x;
+                scratchHead.y = cursor.y;
+                scratchHead.t = now;
+                scratchPoints.push(scratchHead);
+                points = scratchPoints;
             }
         }
         if (points.length < 2) return;
@@ -655,32 +693,40 @@
         c.lineCap = "round";
         c.lineJoin = "round";
 
-        // Pass 1: outer glow.
+        // Full spline as one Path2D, built once and stroked by both glow
+        // layers.
+        const path = new Path2D();
+        path.moveTo(segs[0].x0 * w, segs[0].y0 * h);
+        for (const s of segs) {
+            path.bezierCurveTo(s.c1x * w, s.c1y * h, s.c2x * w, s.c2y * h, s.x1 * w, s.y1 * h);
+        }
+
+        // Pass 1: outer glow — two layered wide strokes, no shadowBlur.
         c.globalCompositeOperation = "lighter";
         c.strokeStyle = cursor.color;
+        c.globalAlpha = TRAIL_GLOW_OUTER_ALPHA * headLife;
+        c.lineWidth = TRAIL_HEAD_WIDTH * TRAIL_GLOW_OUTER_WIDTH_RATIO;
+        c.stroke(path);
         c.globalAlpha = TRAIL_GLOW_ALPHA * headLife;
         c.lineWidth = TRAIL_HEAD_WIDTH * TRAIL_GLOW_WIDTH_RATIO;
-        c.shadowColor = cursor.color;
-        c.shadowBlur = 8;
-        c.beginPath();
-        c.moveTo(segs[0].x0 * w, segs[0].y0 * h);
-        for (const s of segs) {
-            c.bezierCurveTo(s.c1x * w, s.c1y * h, s.c2x * w, s.c2y * h, s.x1 * w, s.y1 * h);
-        }
-        c.stroke();
-        c.shadowBlur = 0;
+        c.stroke(path);
 
         // Pass 2: vivid body, oldest -> newest so the head draws on top.
+        // One stroke per bucket; adjacent buckets share an endpoint and
+        // the round caps cover the joints.
         c.globalCompositeOperation = "source-over";
-        for (const s of segs) {
-            const life = trailAlpha(now - s.t, TRAIL_FADE_MS);
-            const { width, alpha } = trailStyle(s.pos, life);
+        for (const bucket of bucketTrailSegments(segs)) {
+            const life = trailAlpha(now - bucket.t, TRAIL_FADE_MS);
+            const { width, alpha } = trailStyle(bucket.pos, life);
             if (alpha <= 0.004 || width <= 0.05) continue;
             c.globalAlpha = alpha;
             c.lineWidth = width;
             c.beginPath();
-            c.moveTo(s.x0 * w, s.y0 * h);
-            c.bezierCurveTo(s.c1x * w, s.c1y * h, s.c2x * w, s.c2y * h, s.x1 * w, s.y1 * h);
+            c.moveTo(segs[bucket.start].x0 * w, segs[bucket.start].y0 * h);
+            for (let i = bucket.start; i < bucket.end; i++) {
+                const s = segs[i];
+                c.bezierCurveTo(s.c1x * w, s.c1y * h, s.c2x * w, s.c2y * h, s.x1 * w, s.y1 * h);
+            }
             c.stroke();
         }
 
@@ -706,6 +752,38 @@
         c.restore();
     }
 
+    // Pre-rendered radial-gradient glow sprites, one per participant
+    // color. drawImage of a small offscreen canvas replaces the old
+    // shadowBlur halo (which re-blurred the dot every frame); the sprite
+    // is rasterized once and reused forever.
+    const glowSprites = new Map<string, HTMLCanvasElement>();
+    const GLOW_SPRITE_SIZE = 64; // backing store px
+    const DOT_GLOW_RADIUS = 18; // on-screen halo radius px
+
+    function getGlowSprite(color: string): HTMLCanvasElement {
+        let sprite = glowSprites.get(color);
+        if (sprite) return sprite;
+        sprite = document.createElement("canvas");
+        sprite.width = GLOW_SPRITE_SIZE;
+        sprite.height = GLOW_SPRITE_SIZE;
+        const g = sprite.getContext("2d")!;
+        const half = GLOW_SPRITE_SIZE / 2;
+        // Soft alpha falloff in white, then tint with the participant
+        // color via source-in (keeps destination alpha, takes source
+        // color) — works for any CSS color string without parsing it.
+        const grad = g.createRadialGradient(half, half, 0, half, half, half);
+        grad.addColorStop(0, "rgba(255, 255, 255, 0.55)");
+        grad.addColorStop(0.4, "rgba(255, 255, 255, 0.22)");
+        grad.addColorStop(1, "rgba(255, 255, 255, 0)");
+        g.fillStyle = grad;
+        g.fillRect(0, 0, GLOW_SPRITE_SIZE, GLOW_SPRITE_SIZE);
+        g.globalCompositeOperation = "source-in";
+        g.fillStyle = color;
+        g.fillRect(0, 0, GLOW_SPRITE_SIZE, GLOW_SPRITE_SIZE);
+        glowSprites.set(color, sprite);
+        return sprite;
+    }
+
     function drawCursorDot(
         c: CanvasRenderingContext2D,
         cursor: Cursor,
@@ -717,20 +795,18 @@
         const py = cursor.y * h;
 
         c.save();
+        if (!plain) {
+            // Colored glow halo: one cheap drawImage of the cached sprite
+            // so the dot reads on dark footage (no shadowBlur).
+            const r = DOT_GLOW_RADIUS;
+            c.globalCompositeOperation = "lighter";
+            c.drawImage(getGlowSprite(cursor.color), px - r, py - r, r * 2, r * 2);
+            c.globalCompositeOperation = "source-over";
+        }
         c.fillStyle = cursor.color;
         c.beginPath();
         c.arc(px, py, 5.5, 0, Math.PI * 2);
-        if (plain) {
-            // Reduced motion: flat dot, no glow
-            c.fill();
-        } else {
-            // Colored glow, filled twice so the halo reads on dark footage
-            c.shadowColor = cursor.color;
-            c.shadowBlur = 12;
-            c.fill();
-            c.fill();
-            c.shadowBlur = 0;
-        }
+        c.fill();
         // Subtle white-hot center for the classic laser look
         c.fillStyle = "rgba(255, 255, 255, 0.92)";
         c.beginPath();

@@ -6,24 +6,31 @@ import {
     easeOutCubic,
     rippleAt,
     shouldAppendPoint,
+    adaptiveMinDistPx,
+    decimateOlderHalf,
     splitLongSegments,
     buildSplineSegments,
+    bucketTrailSegments,
     trailStyle,
     subsampleBatch,
     timestampBatch,
     MAX_BATCH_POINTS,
     TRAIL_FADE_MS,
     TRAIL_MAX_POINTS,
+    TRAIL_TARGET_POINTS,
     TRAIL_MIN_DIST_PX,
+    TRAIL_ADAPTIVE_MAX_DIST_PX,
     TRAIL_MAX_SEG_PX,
     TRAIL_HEAD_WIDTH,
     TRAIL_BODY_MAX_ALPHA,
     TRAIL_TAIL_ALPHA_RATIO,
+    TRAIL_BODY_BUCKETS,
     RIPPLE_DURATION_MS,
     RIPPLE_START_RADIUS,
     RIPPLE_END_RADIUS,
     type TrailPoint,
-    type BatchPoint
+    type BatchPoint,
+    type SplineSegment
 } from "./laser";
 
 function pt(t: number): TrailPoint {
@@ -156,6 +163,123 @@ describe("shouldAppendPoint", () => {
         const last: TrailPoint = { x: 0.5, y: 0.5, t: 0 };
         expect(shouldAppendPoint(last, 0.503, 0.5, W, H, 10)).toBe(false);
         expect(shouldAppendPoint(last, 0.503, 0.5, W, H, 3)).toBe(true);
+    });
+});
+
+describe("adaptiveMinDistPx", () => {
+    it("returns the base distance at or below the target count", () => {
+        expect(adaptiveMinDistPx(0)).toBe(TRAIL_MIN_DIST_PX);
+        expect(adaptiveMinDistPx(1)).toBe(TRAIL_MIN_DIST_PX);
+        expect(adaptiveMinDistPx(TRAIL_TARGET_POINTS)).toBe(TRAIL_MIN_DIST_PX);
+    });
+
+    it("grows once the trail exceeds the target", () => {
+        const over = adaptiveMinDistPx(TRAIL_TARGET_POINTS + 1);
+        expect(over).toBeGreaterThan(TRAIL_MIN_DIST_PX);
+        expect(adaptiveMinDistPx(TRAIL_TARGET_POINTS * 2)).toBeGreaterThan(over);
+    });
+
+    it("ramps quadratically with the overflow ratio", () => {
+        expect(adaptiveMinDistPx(180, 2, 90, 1000)).toBeCloseTo(2 * 4); // 2x over -> 4x base
+        expect(adaptiveMinDistPx(270, 2, 90, 1000)).toBeCloseTo(2 * 9); // 3x over -> 9x base
+    });
+
+    it("is monotonically non-decreasing in trail length", () => {
+        let prev = 0;
+        for (let len = 0; len <= TRAIL_MAX_POINTS * 3; len++) {
+            const d = adaptiveMinDistPx(len);
+            expect(d).toBeGreaterThanOrEqual(prev);
+            prev = d;
+        }
+    });
+
+    it("clamps to the maximum distance", () => {
+        expect(adaptiveMinDistPx(10_000)).toBe(TRAIL_ADAPTIVE_MAX_DIST_PX);
+        expect(adaptiveMinDistPx(100, 2, 90, 3)).toBeLessThanOrEqual(3);
+    });
+
+    it("never exceeds the max even when the base does", () => {
+        expect(adaptiveMinDistPx(10, 50, 90, 24)).toBe(24);
+    });
+});
+
+describe("decimateOlderHalf", () => {
+    function pts(n: number): TrailPoint[] {
+        return Array.from({ length: n }, (_, i) => ({ x: i, y: i, t: i }));
+    }
+
+    it("returns the same (mutated) array", () => {
+        const points = pts(10);
+        expect(decimateOlderHalf(points)).toBe(points);
+    });
+
+    it("leaves trails too short to halve untouched", () => {
+        for (const n of [0, 1, 2, 3]) {
+            const points = pts(n);
+            decimateOlderHalf(points);
+            expect(points).toHaveLength(n);
+        }
+    });
+
+    it("drops every other point in the older half only", () => {
+        const points = pts(10); // older half = indices 0..4
+        decimateOlderHalf(points);
+        // keeps 0, 2, 4 from the older half plus all of 5..9
+        expect(points.map((p) => p.t)).toEqual([0, 2, 4, 5, 6, 7, 8, 9]);
+    });
+
+    it("always keeps the tail point and the entire newer half", () => {
+        const points = pts(91);
+        const newerHalf = points.slice(45).map((p) => p.t);
+        decimateOlderHalf(points);
+        expect(points[0].t).toBe(0);
+        expect(points.slice(-newerHalf.length).map((p) => p.t)).toEqual(newerHalf);
+    });
+
+    it("preserves chronological order", () => {
+        const points = pts(50);
+        decimateOlderHalf(points);
+        for (let i = 1; i < points.length; i++) {
+            expect(points[i].t).toBeGreaterThan(points[i - 1].t);
+        }
+    });
+
+    it("reduces an over-target trail by roughly a quarter", () => {
+        const points = pts(TRAIL_TARGET_POINTS + 1);
+        decimateOlderHalf(points);
+        expect(points.length).toBeLessThanOrEqual(TRAIL_TARGET_POINTS - 20);
+        expect(points.length).toBeGreaterThanOrEqual(TRAIL_TARGET_POINTS / 2);
+    });
+});
+
+describe("adaptive thinning integration (sustained fast circles)", () => {
+    it("settles at a bounded trail length, never an ever-denser one", () => {
+        const W = 1280;
+        const H = 720;
+        const trail: TrailPoint[] = [];
+        // Mirrors the component's appendTrailPoint.
+        const append = (x: number, y: number, t: number) => {
+            const last = trail[trail.length - 1];
+            if (shouldAppendPoint(last, x, y, W, H, adaptiveMinDistPx(trail.length))) {
+                trail.push({ x, y, t });
+                if (trail.length > TRAIL_TARGET_POINTS) decimateOlderHalf(trail);
+            }
+        };
+        // Spin 3 revolutions/sec on a 200px-radius circle, sampled at
+        // 240Hz for 4 seconds (well past the 2s fade window).
+        let maxLen = 0;
+        for (let i = 0; i < 960; i++) {
+            const t = (i * 1000) / 240;
+            const ang = (2 * Math.PI * 3 * t) / 1000;
+            append(0.5 + (200 / W) * Math.cos(ang), 0.5 + (200 / H) * Math.sin(ang), t);
+            pruneTrail(trail, t);
+            maxLen = Math.max(maxLen, trail.length);
+        }
+        // Bounded: never exceeds the soft target (+1 transient) or hard cap
+        expect(maxLen).toBeLessThanOrEqual(TRAIL_TARGET_POINTS + 1);
+        expect(maxLen).toBeLessThanOrEqual(TRAIL_MAX_POINTS);
+        // Still a real streak at steady state, not thinned to nothing
+        expect(trail.length).toBeGreaterThan(20);
     });
 });
 
@@ -317,6 +441,89 @@ describe("buildSplineSegments", () => {
         expect(last.x1).toBe(0.9);
         expect(last.y1).toBe(0.8);
         expect(last.pos).toBe(1);
+    });
+});
+
+describe("bucketTrailSegments", () => {
+    function seg(pos: number, t: number): SplineSegment {
+        return { x0: 0, y0: 0, c1x: 0, c1y: 0, c2x: 0, c2y: 0, x1: 0, y1: 0, t, pos };
+    }
+
+    function segs(n: number): SplineSegment[] {
+        return Array.from({ length: n }, (_, i) => seg((i + 1) / n, i * 10));
+    }
+
+    it("returns [] for empty input or a non-positive bucket count", () => {
+        expect(bucketTrailSegments([])).toEqual([]);
+        expect(bucketTrailSegments(segs(5), 0)).toEqual([]);
+    });
+
+    it("never produces more than the requested bucket count", () => {
+        expect(bucketTrailSegments(segs(3)).length).toBe(3);
+        expect(bucketTrailSegments(segs(TRAIL_BODY_BUCKETS)).length).toBe(TRAIL_BODY_BUCKETS);
+        expect(bucketTrailSegments(segs(300)).length).toBe(TRAIL_BODY_BUCKETS);
+        expect(bucketTrailSegments(segs(50), 4).length).toBe(4);
+    });
+
+    it("gives each segment its own bucket when there are few segments", () => {
+        const s = segs(3);
+        const buckets = bucketTrailSegments(s);
+        expect(buckets).toHaveLength(3);
+        for (let i = 0; i < 3; i++) {
+            expect(buckets[i].start).toBe(i);
+            expect(buckets[i].end).toBe(i + 1);
+            // Exact per-segment taper is reproduced
+            expect(buckets[i].pos).toBe(s[i].pos);
+            expect(buckets[i].t).toBe(s[i].t);
+        }
+    });
+
+    it("covers all segments contiguously with no gaps or overlaps", () => {
+        for (const n of [8, 9, 17, 100, 257]) {
+            const buckets = bucketTrailSegments(segs(n));
+            expect(buckets[0].start).toBe(0);
+            for (let i = 1; i < buckets.length; i++) {
+                expect(buckets[i].start).toBe(buckets[i - 1].end);
+            }
+            expect(buckets[buckets.length - 1].end).toBe(n);
+        }
+    });
+
+    it("splits into near-equal runs", () => {
+        const buckets = bucketTrailSegments(segs(100));
+        for (const b of buckets) {
+            const size = b.end - b.start;
+            expect(size).toBeGreaterThanOrEqual(12);
+            expect(size).toBeLessThanOrEqual(13);
+        }
+    });
+
+    it("takes pos/t from a segment inside the bucket, increasing toward the head", () => {
+        const s = segs(64);
+        const buckets = bucketTrailSegments(s);
+        for (let i = 0; i < buckets.length; i++) {
+            const b = buckets[i];
+            expect(b.pos).toBeGreaterThanOrEqual(s[b.start].pos);
+            expect(b.pos).toBeLessThanOrEqual(s[b.end - 1].pos);
+            expect(b.t).toBeGreaterThanOrEqual(s[b.start].t);
+            expect(b.t).toBeLessThanOrEqual(s[b.end - 1].t);
+            if (i > 0) {
+                expect(b.pos).toBeGreaterThan(buckets[i - 1].pos);
+                expect(b.t).toBeGreaterThan(buckets[i - 1].t);
+            }
+        }
+    });
+
+    it("composes with buildSplineSegments output", () => {
+        const pts: TrailPoint[] = Array.from({ length: 40 }, (_, i) => ({
+            x: 0.1 + i * 0.02,
+            y: 0.5 + 0.1 * Math.sin(i / 3),
+            t: i * 16
+        }));
+        const spline = buildSplineSegments(pts);
+        const buckets = bucketTrailSegments(spline);
+        expect(buckets.length).toBe(TRAIL_BODY_BUCKETS);
+        expect(buckets[buckets.length - 1].end).toBe(spline.length);
     });
 });
 

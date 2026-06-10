@@ -17,8 +17,21 @@ export interface BatchPoint {
 /** How long a trail point remains visible before fully fading out. */
 export const TRAIL_FADE_MS = 2000;
 
-/** Hard cap on stored trail points per cursor (safety bound). */
-export const TRAIL_MAX_POINTS = 256;
+/**
+ * Hard cap on stored trail points per cursor (safety backstop).
+ * Adaptive thinning (adaptiveMinDistPx + decimateOlderHalf) keeps live
+ * trails near TRAIL_TARGET_POINTS, well under this.
+ */
+export const TRAIL_MAX_POINTS = 128;
+
+/**
+ * Soft target for live trail length. Appending past this triggers
+ * older-half decimation, and the minimum recording distance scales up
+ * as a trail approaches/exceeds it (adaptiveMinDistPx), so sustained
+ * fast movement (e.g. spinning circles) settles at a bounded,
+ * constant-cost streak instead of an ever-denser one.
+ */
+export const TRAIL_TARGET_POINTS = 90;
 
 /** Release ripple animation parameters. */
 export const RIPPLE_DURATION_MS = 600;
@@ -52,6 +65,14 @@ export const TRAIL_HEAD_WIDTH = 4;
 export const TRAIL_MAX_SEG_PX = 24;
 
 /**
+ * Upper bound for the adaptive minimum recording distance. Matches
+ * TRAIL_MAX_SEG_PX so that even maximally thinned trails render smooth:
+ * splitLongSegments only has to subdivide chords that decimation (not
+ * thinning) widened past this.
+ */
+export const TRAIL_ADAPTIVE_MAX_DIST_PX = TRAIL_MAX_SEG_PX;
+
+/**
  * Body-pass styling. The body is stroked under 'source-over' (not
  * additive), so overlapping round caps between adjacent sub-strokes
  * merely saturate the participant color instead of clipping to white —
@@ -62,12 +83,25 @@ export const TRAIL_BODY_MAX_ALPHA = 0.95;
 export const TRAIL_TAIL_ALPHA_RATIO = 0.18;
 
 /**
- * Glow-pass styling: one single stroke of the whole spline under
- * 'lighter'. A single stroke never overlaps itself, so this is safe at
- * any alpha; it stays low because it is a halo, not the body.
+ * Number of width/alpha steps the body taper is quantized into. Each
+ * bucket is stroked as ONE path instead of one stroke per segment, so
+ * the body pass costs at most this many stroke calls per trail per
+ * frame. Banding at 8 steps along a fading streak is imperceptible.
+ */
+export const TRAIL_BODY_BUCKETS = 8;
+
+/**
+ * Glow-pass styling: two layered wide strokes of the whole spline under
+ * 'lighter' (an inner brighter halo plus a wider faint one) approximate
+ * the soft glow that shadowBlur used to provide at a fraction of the
+ * cost — shadowBlur scales with path length and dominated frame time on
+ * long trails. A single stroke never overlaps itself, so additive
+ * compositing cannot white-clip here.
  */
 export const TRAIL_GLOW_WIDTH_RATIO = 2.6; // x TRAIL_HEAD_WIDTH
 export const TRAIL_GLOW_ALPHA = 0.22;
+export const TRAIL_GLOW_OUTER_WIDTH_RATIO = 4.6; // x TRAIL_HEAD_WIDTH
+export const TRAIL_GLOW_OUTER_ALPHA = 0.1;
 
 /**
  * Hot-core pass: a thin near-white single stroke over just the head
@@ -188,6 +222,50 @@ export function shouldAppendPoint(
     const dx = (x - last.x) * width;
     const dy = (y - last.y) * height;
     return dx * dx + dy * dy >= minDistPx * minDistPx;
+}
+
+/**
+ * Minimum recording distance scaled by current trail density. At or
+ * below the target point count it is the base distance; above it the
+ * distance ramps quadratically with the overflow ratio (clamped to
+ * `max`), so a trail that is filling up demands progressively more
+ * spacing from new points. Sustained fast movement therefore
+ * self-limits at a roughly constant point count instead of densifying
+ * forever.
+ */
+export function adaptiveMinDistPx(
+    trailLength: number,
+    base: number = TRAIL_MIN_DIST_PX,
+    target: number = TRAIL_TARGET_POINTS,
+    max: number = TRAIL_ADAPTIVE_MAX_DIST_PX
+): number {
+    if (target <= 0 || trailLength <= target) return Math.min(base, max);
+    const ratio = trailLength / target;
+    const d = base * ratio * ratio;
+    return d > max ? max : d;
+}
+
+/**
+ * Drop every other point in the older (tail) half of a trail, in
+ * place, keeping the tail endpoint and the entire newer half. Returns
+ * the same array. Called when a trail grows past TRAIL_TARGET_POINTS:
+ * the oldest, most-faded portion loses density nobody can see while
+ * the bright head keeps its full geometry, and the trail length drops
+ * by ~25% in O(n) with no allocation.
+ */
+export function decimateOlderHalf(points: TrailPoint[]): TrailPoint[] {
+    const n = points.length;
+    const half = n >> 1;
+    if (half < 2) return points;
+    let w = 0;
+    for (let i = 0; i < half; i += 2) {
+        points[w++] = points[i];
+    }
+    for (let i = half; i < n; i++) {
+        points[w++] = points[i];
+    }
+    points.length = w;
+    return points;
 }
 
 /**
@@ -341,6 +419,45 @@ export function buildSplineSegments(points: TrailPoint[]): SplineSegment[] {
     }
 
     return segs;
+}
+
+/**
+ * One contiguous run of spline segments that the body pass strokes as
+ * a single path with a single width/alpha. `pos` and `t` come from the
+ * run's middle segment and feed trailStyle/trailAlpha for the bucket.
+ */
+export interface TrailBucket {
+    /** First segment index in the run (inclusive). */
+    start: number;
+    /** One past the last segment index (exclusive). */
+    end: number;
+    pos: number;
+    t: number;
+}
+
+/**
+ * Split the segment chain into at most `numBuckets` contiguous,
+ * near-equal runs for the body pass. Quantizing the taper into ~8
+ * steps replaces one stroke call per segment (potentially hundreds per
+ * frame) with one per bucket; the steps are imperceptible along a
+ * fading streak. With fewer segments than buckets each segment gets
+ * its own bucket, which reproduces the exact per-segment taper.
+ */
+export function bucketTrailSegments(
+    segs: SplineSegment[],
+    numBuckets: number = TRAIL_BODY_BUCKETS
+): TrailBucket[] {
+    const n = segs.length;
+    if (n === 0 || numBuckets <= 0) return [];
+    const count = Math.min(numBuckets, n);
+    const out: TrailBucket[] = new Array(count);
+    for (let b = 0; b < count; b++) {
+        const start = Math.floor((b * n) / count);
+        const end = Math.floor(((b + 1) * n) / count);
+        const mid = (start + end - 1) >> 1;
+        out[b] = { start, end, pos: segs[mid].pos, t: segs[mid].t };
+    }
+    return out;
 }
 
 /**
