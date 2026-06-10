@@ -536,6 +536,9 @@
                 // subscription before declaring the stream unreachable.
                 requestResubscribe('ice restart failed');
             },
+            onNegotiationWedged: () => {
+                requestResubscribe('local renegotiation wedged');
+            },
             onScreenShareEnded: () => {
                 screenShareActive = false;
                 selfShareStream = null;
@@ -1631,6 +1634,11 @@
                 <video bind:this={screenShareVideoEl} autoplay playsinline muted>
                     <track kind="captions" />
                 </video>
+
+                {#if screenShareVideoEl}
+                    <LaserPointerOverlay videoElement={screenShareVideoEl} enabled={isLaserEnabled} surface="share" />
+                {/if}
+
                 <div class="split-screenshare-label">
                     {#if screenShareStream}
                         <span>{screenShareParticipantName || "Screen"}'s screen</span>

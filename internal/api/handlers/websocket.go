@@ -942,9 +942,15 @@ func (h *WebSocketHandler) handleCursor(client *websocket.Client, payload json.R
 		Y       *float64 `json:"y"`
 		Active  bool     `json:"active"`
 		Release bool     `json:"release"`
+		// Which video the pointer is on: "video" (main stream, default)
+		// or "share" (screen-share pane).
+		Surface string `json:"surface"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return
+	}
+	if data.Surface != "share" {
+		data.Surface = "video"
 	}
 
 	raw := data.Points
@@ -987,6 +993,7 @@ func (h *WebSocketHandler) handleCursor(client *websocket.Client, payload json.R
 		"y":               lastY,
 		"active":          data.Active,
 		"release":         data.Release && !data.Active,
+		"surface":         data.Surface,
 	}, "")
 }
 

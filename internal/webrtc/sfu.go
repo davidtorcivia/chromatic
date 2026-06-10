@@ -1139,19 +1139,50 @@ func (s *SFU) SetSubscriberAnswer(roomSlug, subscriberID string, answer webrtc.S
 		}
 	}
 
-	// Diagnostic: a subscriber whose answer rejected the ingest's H.264
-	// profile gets silent black video (audio fine) — make that visible.
-	if sub.VideoSender != nil {
-		params := sub.VideoSender.GetParameters()
-		if len(params.Codecs) == 0 {
-			log.Printf("WARNING: subscriber %s negotiated NO video codec — video will be black", subscriberID)
-		} else {
-			log.Printf("Subscriber %s outbound video codec: %s %s", subscriberID, params.Codecs[0].MimeType, params.Codecs[0].SDPFmtpLine)
-		}
+	// Diagnostic: inspect what the browser actually accepted in its answer.
+	// A rejected video m-line (port 0) or an H.264-free codec list means the
+	// browser cannot decode our stream at all — silent black video with
+	// working audio (seen with Chromium builds lacking proprietary codecs).
+	summary := summarizeVideoAnswer(answer.SDP)
+	if !strings.Contains(summary, "H264") {
+		log.Printf("WARNING: subscriber %s answer accepts no H264 video — stream will be black for this browser (%s)", subscriberID, summary)
+	} else {
+		log.Printf("Subscriber %s answer video: %s", subscriberID, summary)
 	}
 
 	log.Printf("Set answer for subscriber %s (flushed %d buffered candidates)", subscriberID, len(pending))
 	return nil
+}
+
+// summarizeVideoAnswer extracts the video m-line port and rtpmap codec list
+// from an SDP answer for diagnostics.
+func summarizeVideoAnswer(sdp string) string {
+	inVideo := false
+	port := ""
+	var codecs []string
+	for _, ln := range strings.Split(sdp, "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "m=") {
+			if strings.HasPrefix(ln, "m=video") {
+				inVideo = true
+				if fields := strings.Fields(ln); len(fields) > 1 {
+					port = fields[1]
+				}
+			} else {
+				inVideo = false
+			}
+			continue
+		}
+		if inVideo && strings.HasPrefix(ln, "a=rtpmap:") {
+			if idx := strings.Index(ln, " "); idx > 0 && idx < len(ln)-1 {
+				codecs = append(codecs, ln[idx+1:])
+			}
+		}
+	}
+	if port == "" {
+		return "no video m-line"
+	}
+	return fmt.Sprintf("port=%s codecs=%v", port, codecs)
 }
 
 // AddSubscriberICECandidate adds an ICE candidate from a subscriber.

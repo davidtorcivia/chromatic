@@ -81,9 +81,14 @@
     interface Props {
         videoElement: HTMLVideoElement;
         enabled: boolean;
+        /** Which video this overlay annotates: the main stream ("video",
+         *  default) or the screen-share pane ("share"). Outgoing cursor
+         *  messages are tagged with it and incoming ones filtered by it, so
+         *  one overlay instance per surface renders only its own lasers. */
+        surface?: 'video' | 'share';
     }
 
-    let { videoElement, enabled = false }: Props = $props();
+    let { videoElement, enabled = false, surface = 'video' }: Props = $props();
 
     let isPointing = $state(false);
     let videoRect = $state({ x: 0, y: 0, width: 0, height: 0 });
@@ -276,7 +281,10 @@
                 y: number;
                 active: boolean;
                 release?: boolean;
+                surface?: string;
             };
+            // Only render lasers aimed at this overlay's video surface.
+            if ((data.surface ?? 'video') !== surface) return;
             // The local cursor is driven directly by pointer events with
             // zero latency; ignore the server echo of our own messages.
             if (data.participantId === session.state.participantId) return;
@@ -635,7 +643,7 @@
             // high-rate input device cannot inflate message size.
             const points = subsampleBatch(pendingPoints);
             pendingPoints = [];
-            session.send("cursor", { points, active: true });
+            session.send("cursor", { points, active: true, surface });
         }
         sendTimer = setTimeout(() => {
             sendTimer = null;
@@ -659,6 +667,7 @@
             points,
             active: false,
             release: lastQueuedPos !== null,
+            surface,
         });
         lastQueuedPos = null;
     }

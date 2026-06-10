@@ -52,6 +52,9 @@ export interface WebRTCManagerOptions {
     onIceRestartFailed?: () => void;
     onRenegotiation?: () => void;
     onScreenShareEnded?: () => void;
+    /** Local renegotiation failed repeatedly — the page should rebuild the
+     *  subscription (local tracks re-attach on the fresh offer). */
+    onNegotiationWedged?: () => void;
 }
 
 export class WebRTCManager {
@@ -642,13 +645,24 @@ export class WebRTCManager {
         }
     }
 
-    // Renegotiate the connection after adding tracks.
-    // Starts a watchdog timer that retries if the offer goes unanswered.
-    private async renegotiate(): Promise<void> {
+    // Renegotiate the connection after adding tracks. Returns whether the
+    // offer actually went out — errors used to be swallowed here, which let
+    // screen shares die silently (the sharer saw "sharing", the server never
+    // got an offer). Starts a watchdog timer that retries if the offer goes
+    // unanswered.
+    private async renegotiate(): Promise<boolean> {
         return this.enqueueSignaling(async () => {
-            if (!this.pc) return;
+            if (!this.pc) return false;
 
             try {
+                // A leftover unanswered local offer blocks a replacement
+                // offer in Safari — roll it back first. (Never touch an ICE
+                // restart offer; its own machinery handles retries.)
+                if (this.pc.signalingState === 'have-local-offer' && !this.iceRestartPending) {
+                    console.log('Rolling back stale local offer before renegotiating');
+                    await this.pc.setLocalDescription({ type: 'rollback' });
+                }
+
                 const offer = await this.pc.createOffer();
                 await this.pc.setLocalDescription(offer);
 
@@ -661,9 +675,22 @@ export class WebRTCManager {
                 // the timeout, the server never answered — retry.
                 this.startVoiceOfferWatchdog();
 
-                console.log('Sent renegotiation offer for voice');
+                console.log('Sent renegotiation offer');
+                return true;
             } catch (err) {
+                const e = err as Error;
                 console.error('Failed to renegotiate:', err);
+                // Mirror to the server log — these failures only reproduce
+                // on testers' machines.
+                try {
+                    this.options.sendSignal('client:debug', {
+                        event: 'renegotiate-failed',
+                        detail: `${e?.name ?? 'Error'}: ${e?.message ?? String(err)} (state=${this.pc?.signalingState ?? 'gone'})`
+                    });
+                } catch {
+                    // diagnostics must never throw
+                }
+                return false;
             }
         });
     }
@@ -840,8 +867,21 @@ export class WebRTCManager {
             // Add track to peer connection and renegotiate
             this.screenShareSender = this.pc.addTrack(videoTrack, this.screenShareStream);
             this.shareDebug('track-added', `pc=${this.pc.connectionState}/${this.pc.signalingState}`);
-            await this.renegotiate();
-            this.shareDebug('offer-sent', `signaling=${this.pc?.signalingState ?? 'gone'}`);
+            let negotiated = await this.renegotiate();
+            if (!negotiated) {
+                // One retry after a beat — transient signaling races settle.
+                await new Promise((r) => setTimeout(r, 500));
+                negotiated = await this.renegotiate();
+            }
+            if (!negotiated) {
+                // The peer connection is wedged. Ask the page to rebuild the
+                // whole subscription — the capture stays alive and handleOffer
+                // re-attaches it to the fresh connection automatically.
+                this.shareDebug('negotiation-wedged', 'requesting fresh subscription');
+                this.options.onNegotiationWedged?.();
+            } else {
+                this.shareDebug('offer-sent', `signaling=${this.pc?.signalingState ?? 'gone'}`);
+            }
 
             console.log('Screen share started');
             return true;
