@@ -10,6 +10,7 @@
     import { WebRTCManager, getStoredMicDeviceId, storeMicDeviceId } from "$lib/webrtc/manager";
     import { deriveStreamOverlayState } from "$lib/video/stream-overlay";
     import { AudioDuckingManager } from "$lib/audio/ducking";
+    import { playShareRequestChime, playWaitingRoomChime } from "$lib/audio/chimes";
     import LaserPointerOverlay from "$lib/components/LaserPointerOverlay.svelte";
     import ChatPanel from "$lib/components/ChatPanel.svelte";
     import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
@@ -139,7 +140,6 @@
     let shareApprovedPrompt = $state(false);
     // Local self-preview of the sharer's own capture (BUG 4)
     let selfShareStream = $state<MediaStream | null>(null);
-    let selfShareVideoEl = $state<HTMLVideoElement | null>(null);
 
     // Get session data from storage
     let sessionData = $state<{
@@ -362,6 +362,7 @@
         session.onMessage("screenshare:pending", (payload: unknown) => {
             const data = payload as { participantId: string; name: string };
             pendingScreenShareRequest = data;
+            playShareRequestChime();
         });
 
         // Waiting-room popups (admins only — the server only sends these to
@@ -372,6 +373,7 @@
             if (!data?.participantId) return;
             if (waitingRequests.some((r) => r.participantId === data.participantId)) return;
             waitingRequests = [...waitingRequests, data];
+            playWaitingRoomChime();
         });
 
         session.onMessage("waiting:list", (payload: unknown) => {
@@ -1594,30 +1596,17 @@
         }
     });
 
-    // Bind screen share stream to video element when both are available.
-    // Cleanup nulls srcObject so a stale stream doesn't hold decoder resources.
+    // Bind the split-pane share video: a remote participant's relay stream,
+    // or the sharer's own capture (so the sharer gets the same layout as
+    // everyone else). Cleanup nulls srcObject so a stale stream doesn't hold
+    // decoder resources.
     $effect(() => {
         const el = screenShareVideoEl;
-        const stream = screenShareStream;
+        const stream = screenShareStream ?? selfShareStream;
         if (el && stream) {
             el.srcObject = stream;
             el.play().catch(err => {
                 console.warn('Failed to autoplay screen share video:', err);
-            });
-            return () => {
-                el.srcObject = null;
-            };
-        }
-    });
-
-    // Bind the sharer's own capture to the self-preview PiP (BUG 4).
-    $effect(() => {
-        const el = selfShareVideoEl;
-        const stream = selfShareStream;
-        if (el && stream) {
-            el.srcObject = stream;
-            el.play().catch(err => {
-                console.warn('Failed to autoplay self share preview:', err);
             });
             return () => {
                 el.srcObject = null;
@@ -1634,15 +1623,21 @@
 <svelte:document onfullscreenchange={handleFullscreenChange} />
 
 <main class="session-page" onmousemove={handleMouseMove} onpointerdown={handlePagePointerDown}>
-    <div class="video-wrapper" class:split-active={screenShareStream}>
-        {#if screenShareStream}
+    <div class="video-wrapper" class:split-active={screenShareStream || selfShareStream}>
+        {#if screenShareStream || selfShareStream}
+            <!-- The sharer sees their own capture in the same split position
+                 as everyone else, so the room shares one layout. -->
             <div class="split-screenshare">
                 <video bind:this={screenShareVideoEl} autoplay playsinline muted>
                     <track kind="captions" />
                 </video>
                 <div class="split-screenshare-label">
-                    <span>{screenShareParticipantName || "Screen"}'s screen</span>
-                    {#if isAdmin || screenShareParticipantId === sessionData?.participantId}
+                    {#if screenShareStream}
+                        <span>{screenShareParticipantName || "Screen"}'s screen</span>
+                    {:else}
+                        <span><span class="self-share-dot" aria-hidden="true"></span> You're sharing</span>
+                    {/if}
+                    {#if !screenShareStream || isAdmin || screenShareParticipantId === sessionData?.participantId}
                         <button class="split-screenshare-stop" onclick={stopScreenSharePip} title="Stop screen share">
                             <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
                             Stop
@@ -2300,24 +2295,6 @@
             </div>
         {/if}
 
-        <!-- Self-preview of the local screen share (BUG 4) -->
-        {#if selfShareStream}
-            <div class="self-share-pip" transition:fly={{ y: 12, duration: 200 }}>
-                <video bind:this={selfShareVideoEl} autoplay playsinline muted>
-                    <track kind="captions" />
-                </video>
-                <div class="self-share-bar">
-                    <span class="self-share-label">
-                        <span class="self-share-dot" aria-hidden="true"></span>
-                        You're sharing
-                    </span>
-                    <button class="self-share-stop" onclick={toggleScreenShare} title="Stop sharing your screen">
-                        Stop
-                    </button>
-                </div>
-            </div>
-        {/if}
-
         <!-- Full-screen end state (session ended / removed / terminated) -->
         {#if endState}
             <div class="end-state-overlay" transition:fade={{ duration: 150 }}>
@@ -2919,45 +2896,7 @@
         color: var(--color-text-muted);
     }
 
-    /* Sharer's local self-preview (BUG 4): small fixed PiP above the control
-       bar, bottom-right, never captures the picture area. */
-    .self-share-pip {
-        position: absolute;
-        right: var(--space-lg);
-        bottom: 112px;
-        width: 240px;
-        z-index: 24;
-        border-radius: var(--radius-md);
-        overflow: hidden;
-        background: rgba(10, 10, 12, 0.85);
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-    }
-    .self-share-pip video {
-        display: block;
-        width: 100%;
-        aspect-ratio: 16 / 9;
-        object-fit: contain;
-        background: #000;
-    }
-    .self-share-bar {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: var(--space-sm);
-        padding: 6px 8px;
-        background: rgba(255, 255, 255, 0.04);
-        border-top: 1px solid rgba(255, 255, 255, 0.08);
-    }
-    .self-share-label {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 0.6875rem;
-        font-weight: 600;
-        letter-spacing: 0.02em;
-        color: var(--color-text);
-    }
+    /* Live indicator dot in the sharer's split-pane label */
     .self-share-dot {
         width: 7px;
         height: 7px;
@@ -2965,22 +2904,6 @@
         background: var(--color-success);
         animation: pulse-speaking 1.6s infinite;
     }
-    .self-share-stop {
-        border: 1px solid rgba(239, 68, 68, 0.45);
-        background: rgba(239, 68, 68, 0.14);
-        color: var(--color-error);
-        border-radius: var(--radius-sm);
-        font-size: 0.6875rem;
-        font-weight: 600;
-        padding: 3px 10px;
-        cursor: pointer;
-        transition: background 0.15s ease, border-color 0.15s ease;
-    }
-    .self-share-stop:hover {
-        background: rgba(239, 68, 68, 0.28);
-        border-color: rgba(239, 68, 68, 0.7);
-    }
-
     /* 3-column grid keeps the control bar truly centered */
     .bottom-bar {
         display: grid;
@@ -3696,7 +3619,6 @@
         .control-btn svg { width: 20px; height: 20px; }
         .control-label { font-size: 0.5625rem; }
         .active-speaker-indicator { bottom: 80px; }
-        .self-share-pip { width: 180px; bottom: 96px; right: var(--space-sm); }
         .presence-row { display: none; }
         .video-wrapper.split-active { flex-direction: column; }
         .video-wrapper.split-active .video-container { flex: 1; }

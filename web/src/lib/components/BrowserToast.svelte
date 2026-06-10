@@ -115,11 +115,10 @@
         align-items: flex-start;
         gap: 0.75rem;
         padding: 1rem 1.25rem;
-        background: var(--color-surface, #2a2a2a);
-        border: 1px solid var(--color-border, #3a3a3a);
-        border-radius: var(--radius-lg, 0.75rem);
-        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
         max-width: 400px;
+        /* No background/border — floats over the dark UI; a soft text
+           shadow keeps it readable over video. */
+        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
     }
 
     .toast-icon {

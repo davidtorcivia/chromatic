@@ -1026,7 +1026,52 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 		return nil, "", fmt.Errorf("failed to set local description: %w", err)
 	}
 
+	// Diagnostic: read the viewer's RTCP for the video stream. Receiver
+	// reports with an advancing highest-sequence prove packets arrive (a
+	// black screen is then a decode problem); absent/stuck reports mean the
+	// transport never delivers video at all.
+	if sub.VideoSender != nil {
+		go logSubscriberVideoRTCP(sub, subscriberID)
+	}
+
 	return pc, offer.SDP, nil
+}
+
+// logSubscriberVideoRTCP logs a bounded number of RTCP receiver reports and
+// PLI requests from a subscriber's video stream, then exits. Purely
+// diagnostic — used to tell "not receiving video" apart from "receiving but
+// not decoding" (e.g. Chrome-only black screens).
+func logSubscriberVideoRTCP(sub *Subscriber, subscriberID string) {
+	const maxReports = 8
+	logged := 0
+	pliCount := 0
+	start := time.Now()
+	for logged < maxReports && time.Since(start) < 2*time.Minute {
+		select {
+		case <-sub.done:
+			return
+		default:
+		}
+		pkts, _, err := sub.VideoSender.ReadRTCP()
+		if err != nil {
+			return
+		}
+		for _, p := range pkts {
+			switch r := p.(type) {
+			case *rtcp.ReceiverReport:
+				for _, rep := range r.Reports {
+					log.Printf("Subscriber %s video RR: highestSeq=%d totalLost=%d fractionLost=%d jitter=%d (PLIs so far: %d)",
+						subscriberID, rep.LastSequenceNumber, rep.TotalLost, rep.FractionLost, rep.Jitter, pliCount)
+					logged++
+				}
+			case *rtcp.PictureLossIndication:
+				pliCount++
+				if pliCount <= 3 || pliCount%20 == 0 {
+					log.Printf("Subscriber %s sent video PLI #%d (decoder waiting on a usable keyframe)", subscriberID, pliCount)
+				}
+			}
+		}
+	}
 }
 
 // EnableSubscriberTrickleICE sets the ICE candidate callback for a subscriber

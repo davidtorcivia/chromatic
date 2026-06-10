@@ -438,6 +438,27 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 	return true
 }
 
+// handleClientDebug mirrors client-side flow breadcrumbs (e.g. the screen
+// share pipeline) into the server log so failures on remote testers'
+// machines are diagnosable without access to their browser console.
+func (h *WebSocketHandler) handleClientDebug(client *websocket.Client, payload json.RawMessage) {
+	var data struct {
+		Event  string `json:"event"`
+		Detail string `json:"detail"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil || data.Event == "" {
+		return
+	}
+	if len(data.Event) > 64 {
+		data.Event = data.Event[:64]
+	}
+	if len(data.Detail) > 256 {
+		data.Detail = data.Detail[:256]
+	}
+	logger.Info("Client debug", "event", data.Event, "detail", data.Detail,
+		"participant_id", client.ID, "name", client.Name, "room", client.RoomSlug)
+}
+
 // handleResubscribe forces a fresh subscriber for a client whose media path
 // failed beyond ICE-restart repair (e.g. dead TURN allocation). It reruns the
 // full subscription flow; CreateSubscriberConnection displaces the old
@@ -757,6 +778,8 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 		h.handleResync(client)
 	case "signal:resubscribe":
 		h.handleResubscribe(client)
+	case "client:debug":
+		h.handleClientDebug(client, msg.Payload)
 	case "signal:ice-servers-request":
 		h.handleICEServersRequest(client)
 	// Admin commands

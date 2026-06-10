@@ -413,6 +413,11 @@
         const out: BatchPoint[] = [];
         for (const ce of events) {
             const c = clientToVideoCoords(ce.clientX, ce.clientY, videoElement);
+            // Drop samples outside the video content (letterbox bars, the
+            // screen-share pane in split view). clientToVideoCoords clamps
+            // to 0–1, so sending them pins the stroke along the video edge —
+            // remote viewers see it "squeezed" against the border.
+            if (!c.valid) continue;
             out.push({ x: c.x, y: c.y });
         }
         return out;
@@ -618,6 +623,7 @@
 
     function sendCursor(e: PointerEvent) {
         const batch = coalescedCoords(e);
+        if (batch.length === 0) return; // pointer currently outside the video
         pendingPoints.push(...batch);
         lastQueuedPos = batch[batch.length - 1];
         if (!sendTimer) flushSend();

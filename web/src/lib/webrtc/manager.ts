@@ -796,10 +796,26 @@ export class WebRTCManager {
     }
 
     // Start screen sharing — captures display and adds video track to peer connection
+    // Breadcrumb reporting for the share flow: mirrored to the server log so
+    // failures on remote testers' machines are diagnosable without console
+    // access (multiple field reports of shares silently not arriving).
+    private shareDebug(event: string, detail = ''): void {
+        console.log(`[share] ${event}`, detail);
+        try {
+            this.options.sendSignal('client:debug', { event: `share:${event}`, detail });
+        } catch {
+            // never let diagnostics break the share flow
+        }
+    }
+
     async startScreenShare(): Promise<boolean> {
-        if (!this.pc) return false;
+        if (!this.pc) {
+            this.shareDebug('failed', 'no peer connection');
+            return false;
+        }
 
         try {
+            this.shareDebug('capture-requested');
             this.screenShareStream = await navigator.mediaDevices.getDisplayMedia({
                 video: true,
                 audio: false
@@ -807,9 +823,12 @@ export class WebRTCManager {
 
             const videoTrack = this.screenShareStream.getVideoTracks()[0];
             if (!videoTrack) {
+                this.shareDebug('failed', 'capture has no video track');
                 this.screenShareStream = null;
                 return false;
             }
+            const s = videoTrack.getSettings();
+            this.shareDebug('capture-acquired', `${s.width}x${s.height} state=${videoTrack.readyState}`);
 
             // Listen for browser "Stop sharing" button
             videoTrack.onended = () => {
@@ -820,11 +839,15 @@ export class WebRTCManager {
 
             // Add track to peer connection and renegotiate
             this.screenShareSender = this.pc.addTrack(videoTrack, this.screenShareStream);
+            this.shareDebug('track-added', `pc=${this.pc.connectionState}/${this.pc.signalingState}`);
             await this.renegotiate();
+            this.shareDebug('offer-sent', `signaling=${this.pc?.signalingState ?? 'gone'}`);
 
             console.log('Screen share started');
             return true;
         } catch (err) {
+            const e = err as Error;
+            this.shareDebug('failed', `${e?.name ?? 'Error'}: ${e?.message ?? String(err)}`);
             console.error('Failed to start screen share:', err);
             this.screenShareStream = null;
             return false;
