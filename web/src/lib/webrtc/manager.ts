@@ -645,11 +645,60 @@ export class WebRTCManager {
         }
     }
 
-    // NOTE: do NOT call setCodecPreferences on the transceivers before
-    // re-offering. It was tried as a fix for Chrome's "demuxer criteria"
-    // re-offer crash, but rewriting the recvonly video m-line's codec set in
-    // the client re-offer made pion stop sending video to that subscriber
-    // entirely (Firefox host went black after its mic renegotiation).
+    // Pin every transceiver's codecs to the INTERSECTION of the browser's
+    // capabilities and what the server actually offered in the current
+    // remote description. For Firefox/Safari this is a no-op (same codecs,
+    // same payload types). For Chrome it stops the re-offer from expanding
+    // m-lines with AV1/H265/VP9/RTX payload types the server never offered —
+    // which collide across the BUNDLE and crash Chrome's own
+    // setLocalDescription with "Failed to apply demuxer criteria", wrecking
+    // the session seconds after join (mic offer) and leaving video black.
+    //
+    // IMPORTANT: do NOT pin to the raw getCapabilities() list (tried —
+    // extra H264 profiles/packetization modes renumbered the payload types
+    // and pion silently stopped sending video to the subscriber).
+    private pinCodecsToRemoteOffer(): void {
+        const pc = this.pc;
+        const remoteSdp = pc?.remoteDescription?.sdp;
+        if (!pc || !remoteSdp) return;
+
+        // Collect the server-offered codec set as "mimetype|sorted-fmtp".
+        const canonFmtp = (f: string | undefined) =>
+            (f ?? '').split(';').map((s) => s.trim()).filter(Boolean).sort().join(';');
+        const offered = new Set<string>();
+        const rtpmaps = new Map<string, string>(); // pt -> codec name/clock
+        const fmtps = new Map<string, string>(); // pt -> fmtp line
+        for (const line of remoteSdp.split('\n')) {
+            const rtpmap = line.match(/^a=rtpmap:(\d+) ([^\r]+)/);
+            if (rtpmap) rtpmaps.set(rtpmap[1], rtpmap[2].trim());
+            const fmtp = line.match(/^a=fmtp:(\d+) ([^\r]+)/);
+            if (fmtp) fmtps.set(fmtp[1], fmtp[2].trim());
+        }
+        for (const [pt, nameClock] of rtpmaps) {
+            const [name] = nameClock.split('/');
+            offered.add(`${name.toLowerCase()}|${canonFmtp(fmtps.get(pt))}`);
+        }
+        if (offered.size === 0) return;
+
+        for (const t of pc.getTransceivers()) {
+            if (typeof t.setCodecPreferences !== 'function') continue;
+            const kind = t.receiver?.track?.kind;
+            if (kind !== 'video' && kind !== 'audio') continue;
+            try {
+                const caps = RTCRtpReceiver.getCapabilities(kind);
+                if (!caps) continue;
+                const allowed = caps.codecs.filter((c) => {
+                    const name = c.mimeType.toLowerCase().replace(/^(audio|video)\//, '');
+                    return offered.has(`${name}|${canonFmtp(c.sdpFmtpLine)}`);
+                });
+                if (allowed.length > 0) {
+                    t.setCodecPreferences(allowed);
+                }
+            } catch {
+                // Best-effort: an unpinned offer may still succeed.
+            }
+        }
+    }
 
     // Renegotiate the connection after adding tracks. Returns whether the
     // offer actually went out — errors used to be swallowed here, which let
@@ -669,6 +718,7 @@ export class WebRTCManager {
                     await this.pc.setLocalDescription({ type: 'rollback' });
                 }
 
+                this.pinCodecsToRemoteOffer();
                 const offer = await this.pc.createOffer();
                 await this.pc.setLocalDescription(offer);
 

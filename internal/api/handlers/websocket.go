@@ -295,19 +295,11 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 			delete(h.subStates, c)
 			h.subMu.Unlock()
 
-			// Atomically unregister ONLY if this client is still current. If a
-			// new connection (page refresh) already replaced it, skip all
-			// cleanup — the participant is still in the room. The check and the
-			// removal must be one atomic step: a separate check-then-cleanup
-			// races with the replacement registering, and the stale
-			// participant:left broadcast would remove a present participant
-			// from everyone's UI.
-			if !h.hub.UnregisterIfCurrent(c) {
-				logger.Info("Client replaced (page refresh), skipping cleanup", "participant_id", c.ID, "name", c.Name, "room", c.RoomSlug)
-				return
-			}
-
-			// Clean up screen share if this participant was sharing
+			// Clean up screen share if this participant was sharing. This runs
+			// BEFORE the replaced-check on purpose: a page refresh replaces the
+			// Client but the getDisplayMedia capture died with the old page, so
+			// the share must be torn down for everyone either way (they can
+			// re-share after reloading).
 			roomTracks := h.sfu.GetRoomTracksForSlug(c.RoomSlug)
 			if roomTracks != nil {
 				roomTracks.RLockVoiceTracks()
@@ -320,7 +312,20 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 					for _, subID := range affected {
 						go h.renegotiateSubscriber(c.RoomSlug, subID)
 					}
+					logger.Info("Screen share stopped (sharer disconnected)", "sharer", c.ID, "room", c.RoomSlug)
 				}
+			}
+
+			// Atomically unregister ONLY if this client is still current. If a
+			// new connection (page refresh) already replaced it, skip the
+			// remaining cleanup — the participant is still in the room. The
+			// check and the removal must be one atomic step: a separate
+			// check-then-cleanup races with the replacement registering, and
+			// the stale participant:left broadcast would remove a present
+			// participant from everyone's UI.
+			if !h.hub.UnregisterIfCurrent(c) {
+				logger.Info("Client replaced (page refresh), skipping cleanup", "participant_id", c.ID, "name", c.Name, "room", c.RoomSlug)
+				return
 			}
 			// Broadcast participant:left when client disconnects
 			h.hub.BroadcastJSON(c.RoomSlug, "participant:left", map[string]interface{}{

@@ -3386,7 +3386,9 @@
     }
     .split-screenshare-label {
         position: absolute;
-        top: 8px;
+        /* Bottom-left: the top-left corner is occupied by the room-name
+           popup, which was covering the Stop button. */
+        bottom: 8px;
         left: 8px;
         display: flex;
         align-items: center;

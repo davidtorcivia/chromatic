@@ -67,29 +67,21 @@
 
 {#if isVisible && !dismissed}
     <div class="toast" role="alert">
-        <div class="toast-content">
-            <div class="toast-icon">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <circle cx="12" cy="12" r="10" />
-                    <line x1="12" y1="8" x2="12" y2="12" />
-                    <line x1="12" y1="16" x2="12.01" y2="16" />
-                </svg>
-            </div>
-            <div class="toast-text">
-                <strong>Color Accuracy Tip</strong>
-                <p>For best color accuracy in color grading workflows, Safari on macOS provides better display color management.</p>
-            </div>
-            <button class="toast-close" onclick={dismiss} aria-label="Dismiss">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                </svg>
-            </button>
-        </div>
+        <p class="toast-text">
+            <strong>Color tip:</strong> Safari on macOS has more accurate color management than Chrome.
+        </p>
+        <button class="toast-close" onclick={dismiss} aria-label="Dismiss">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+        </button>
     </div>
 {/if}
 
 <style>
+    /* One compact line, shrink-wrapped to its content, floating over the
+       dark UI with a text shadow instead of a background box. */
     .toast {
         position: fixed;
         bottom: 1.5rem;
@@ -97,6 +89,11 @@
         transform: translateX(-50%);
         z-index: 1000;
         animation: slideUp 0.3s ease-out;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        max-width: 92vw;
+        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
     }
 
     @keyframes slideUp {
@@ -110,43 +107,16 @@
         }
     }
 
-    .toast-content {
-        display: flex;
-        align-items: flex-start;
-        gap: 0.75rem;
-        padding: 1rem 1.25rem;
-        /* Hug the content so the close button sits right after the text
-           instead of floating in dead space at a fixed width. */
-        width: fit-content;
-        max-width: min(420px, 92vw);
-        /* No background/border — floats over the dark UI; a soft text
-           shadow keeps it readable over video. */
-        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
-    }
-
-    .toast-icon {
-        flex-shrink: 0;
-        color: var(--color-warning, #f59e0b);
-        margin-top: 0.125rem;
-    }
-
     .toast-text {
-        flex: 1;
+        margin: 0;
+        font-size: 0.8125rem;
+        line-height: 1.4;
+        color: var(--color-text-muted, #a0a0a0);
     }
 
     .toast-text strong {
-        display: block;
-        font-size: 0.875rem;
         font-weight: 600;
         color: var(--color-text, #fff);
-        margin-bottom: 0.25rem;
-    }
-
-    .toast-text p {
-        font-size: 0.8125rem;
-        color: var(--color-text-muted, #a0a0a0);
-        margin: 0;
-        line-height: 1.4;
     }
 
     .toast-close {
