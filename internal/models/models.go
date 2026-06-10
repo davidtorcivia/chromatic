@@ -13,6 +13,12 @@ type Room struct {
 	// Scheduling
 	ScheduledAt     *time.Time `json:"scheduledAt,omitempty"`
 	DurationMinutes *int       `json:"durationMinutes,omitempty"`
+	// EarlyOpenMinutes is how many minutes before ScheduledAt guests may
+	// enter the countdown lobby (0-120, default 10).
+	EarlyOpenMinutes int `json:"earlyOpenMinutes"`
+	// OpenedAt is set when an admin opens the room ahead of schedule or when
+	// the first stream arrives. Nil = the room opens at ScheduledAt.
+	OpenedAt *time.Time `json:"openedAt,omitempty"`
 
 	// Access Control
 	PasswordHash       *string `json:"-"`

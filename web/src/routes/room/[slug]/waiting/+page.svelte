@@ -2,7 +2,8 @@
     import { onMount, onDestroy } from "svelte";
     import { fade, fly } from "svelte/transition";
     import { page } from "$app/stores";
-    import { rooms } from "$lib/api/client";
+    import { rooms, type LobbyInfo } from "$lib/api/client";
+    import { countdownParts, formatScheduleLabel, serverClockOffset } from "$lib/lobby";
     import StateCard from "$lib/components/StateCard.svelte";
 
     const slug = $page.params.slug!;
@@ -12,7 +13,7 @@
     const RECONNECT_BASE_DELAY = 1000; // 1 second
     const RECONNECT_MAX_DELAY = 30000; // 30 seconds
 
-    let status = $state<"waiting" | "admitted" | "ended" | "error" | "connection_failed">("waiting");
+    let status = $state<"lobby" | "waiting" | "admitted" | "ended" | "error" | "connection_failed">("waiting");
     let error = $state("");
     let roomName = $state("");
     let eventSource: EventSource | null = null;
@@ -29,6 +30,13 @@
     let isLeaving = $state(false);
     let exitTimer: ReturnType<typeof setTimeout>;
 
+    // Countdown lobby (scheduled room joined before it opened)
+    let lobby = $state<LobbyInfo | null>(null);
+    let now = $state(Date.now());
+    // Offset to the server clock — countdowns must not trust the local clock.
+    let serverOffset = 0;
+    let countdownTimer: ReturnType<typeof setInterval> | undefined;
+
     const prefersReducedMotion =
         typeof window !== "undefined" &&
         window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -38,6 +46,8 @@
         participantId: string;
         token: string;
         color: string;
+        serverTime?: string;
+        lobby?: LobbyInfo;
     } | null = null;
 
     onMount(async () => {
@@ -50,11 +60,31 @@
 
         sessionData = JSON.parse(stored);
 
+        // Countdown lobby: anchor to the server clock captured at join time,
+        // then refine with the fresher timestamp from /info below.
+        serverOffset = serverClockOffset(sessionData?.serverTime, Date.now());
+        if (sessionData?.lobby) {
+            lobby = sessionData.lobby;
+            if (Date.parse(lobby.scheduledAt) > Date.now() + serverOffset) {
+                status = "lobby";
+            } else if (lobby.waitingRoomEnabled) {
+                status = "waiting";
+            } else {
+                status = "lobby"; // T-0 already passed; shows "starting" state
+            }
+            countdownTimer = setInterval(() => {
+                now = Date.now();
+            }, 250);
+        }
+
         // Fetch the room name so the wait screen says what you're joining
         rooms
             .info(slug)
             .then((info) => {
                 roomName = info.name;
+                if (info.serverTime) {
+                    serverOffset = serverClockOffset(info.serverTime, Date.now());
+                }
             })
             .catch(() => {
                 // Non-fatal: fall back to generic copy
@@ -80,6 +110,29 @@
         }
         if (exitTimer) {
             clearTimeout(exitTimer);
+        }
+        if (countdownTimer) {
+            clearInterval(countdownTimer);
+        }
+    });
+
+    // Server-anchored countdown state
+    let serverNow = $derived(now + serverOffset);
+    let scheduledDate = $derived(lobby ? new Date(lobby.scheduledAt) : null);
+    let countdown = $derived(
+        scheduledDate ? countdownParts(scheduledDate.getTime(), serverNow) : null
+    );
+    let scheduleLabel = $derived(
+        scheduledDate ? formatScheduleLabel(scheduledDate, new Date(serverNow)) : ""
+    );
+    let countdownDone = $derived(countdown !== null && countdown.totalMs <= 0);
+
+    // T-0 transition: waiting-room-enabled lobbies crossfade into the
+    // approval-waiting state; auto-admit lobbies hold a "starting" state
+    // until the server's SSE "admitted" event lands (enterSession).
+    $effect(() => {
+        if (status === "lobby" && countdownDone && lobby?.waitingRoomEnabled) {
+            status = "waiting";
         }
     });
 
@@ -146,6 +199,19 @@
                 } else if (data.event === "ended") {
                     status = "ended";
                     eventSource?.close();
+                } else if (data.event === "denied") {
+                    status = "error";
+                    error = "The host declined your request to join this session.";
+                    eventSource?.close();
+                } else if (data.event === "open") {
+                    // The room opened (waiting-room enabled): countdown
+                    // crossfades into the approval-waiting state. The server
+                    // closes the SSE stream after any event, so reconnect.
+                    if (status === "lobby") {
+                        status = "waiting";
+                    }
+                    eventSource?.close();
+                    connectSSE();
                 }
             } catch (e) {
                 console.error("Failed to parse SSE message", e);
@@ -238,7 +304,52 @@
 
 <main class="waiting-page" class:leaving={isLeaving}>
     <div class="waiting-content" aria-live="polite">
-        {#if status === "waiting"}
+        {#if status === "lobby" && countdown}
+            <div class="lobby-card" in:fade={{ duration: prefersReducedMotion ? 0 : 200 }}>
+                <div class="wordmark">Chromatic</div>
+                <h1 class="lobby-room">{roomName || "Your session"}</h1>
+                <p class="lobby-schedule">{scheduleLabel}</p>
+
+                {#if !countdownDone}
+                    <p class="lobby-lead">You're early — the session begins in</p>
+                    <div class="lobby-countdown" role="timer" aria-label="Time until the session begins">
+                        {#if countdown.days > 0}
+                            <div class="count-unit">
+                                <span class="count-value">{countdown.days}</span>
+                                <span class="count-label">{countdown.days === 1 ? "day" : "days"}</span>
+                            </div>
+                            <span class="count-sep" aria-hidden="true">:</span>
+                        {/if}
+                        <div class="count-unit">
+                            <span class="count-value">{String(countdown.hours).padStart(2, "0")}</span>
+                            <span class="count-label">hours</span>
+                        </div>
+                        <span class="count-sep" aria-hidden="true">:</span>
+                        <div class="count-unit">
+                            <span class="count-value">{String(countdown.minutes).padStart(2, "0")}</span>
+                            <span class="count-label">min</span>
+                        </div>
+                        <span class="count-sep" aria-hidden="true">:</span>
+                        <div class="count-unit">
+                            <span class="count-value">{String(countdown.seconds).padStart(2, "0")}</span>
+                            <span class="count-label">sec</span>
+                        </div>
+                    </div>
+                    <p class="lobby-hint">Keep this page open — you'll be taken in automatically.</p>
+                {:else}
+                    <div class="waiting-pulse lobby-pulse" aria-hidden="true">
+                        <span class="pulse-core"></span>
+                        <span class="pulse-ring"></span>
+                    </div>
+                    <p class="lobby-lead">Starting now — opening the room…</p>
+                    <p class="lobby-hint">You'll be taken in automatically.</p>
+                {/if}
+
+                <button class="btn btn-secondary waiting-leave" onclick={handleLeave}>
+                    Leave
+                </button>
+            </div>
+        {:else if status === "waiting"}
             <div class="waiting-card" in:fly={{ y: 8, duration: prefersReducedMotion ? 0 : 200 }}>
                 <div class="wordmark">Chromatic</div>
                 <div class="waiting-pulse" aria-hidden="true">
@@ -429,6 +540,96 @@
         70%, 100% { opacity: 0; transform: scale(2.6); }
     }
 
+    /* Countdown lobby: centered composition with a large live countdown */
+    .lobby-card {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        background: var(--color-surface);
+        border-radius: var(--radius-lg);
+        padding: var(--space-2xl, 3rem) var(--space-xl);
+        text-align: center;
+        border: 1px solid var(--color-border);
+        box-shadow: var(--shadow-md);
+    }
+
+    .lobby-card .wordmark {
+        margin-bottom: var(--space-xl);
+    }
+
+    .lobby-room {
+        font-family: var(--font-display);
+        font-size: clamp(1.5rem, 6vw, 1.875rem);
+        letter-spacing: -0.015em;
+        text-wrap: balance;
+        margin: 0 0 var(--space-xs);
+        color: var(--color-text);
+    }
+
+    .lobby-schedule {
+        margin: 0 0 var(--space-xl);
+        font-size: var(--text-body);
+        color: var(--color-primary);
+        font-weight: 500;
+    }
+
+    .lobby-lead {
+        margin: 0 0 var(--space-md);
+        font-size: var(--text-body);
+        color: var(--color-text-muted);
+    }
+
+    .lobby-countdown {
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+        gap: var(--space-sm);
+        margin-bottom: var(--space-lg);
+    }
+
+    .count-unit {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        min-width: 3.25rem;
+    }
+
+    .count-value {
+        font-family: var(--font-display);
+        font-size: clamp(2rem, 9vw, 2.75rem);
+        font-weight: 600;
+        line-height: 1.1;
+        letter-spacing: 0.01em;
+        font-variant-numeric: tabular-nums;
+        color: var(--color-text);
+    }
+
+    .count-label {
+        margin-top: 2px;
+        font-size: var(--text-min);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--color-text-subtle);
+    }
+
+    .count-sep {
+        font-family: var(--font-display);
+        font-size: clamp(1.5rem, 7vw, 2rem);
+        line-height: 1.4;
+        color: var(--color-text-subtle);
+        opacity: 0.6;
+    }
+
+    .lobby-hint {
+        margin: 0 0 var(--space-lg);
+        font-size: var(--text-meta);
+        color: var(--color-text-subtle);
+    }
+
+    .lobby-pulse {
+        margin-bottom: var(--space-lg);
+    }
+
     @media (max-width: 480px) {
         .waiting-page {
             padding-left: var(--space-md);
@@ -436,6 +637,10 @@
         }
 
         .waiting-card {
+            padding: var(--space-xl) var(--space-lg);
+        }
+
+        .lobby-card {
             padding: var(--space-xl) var(--space-lg);
         }
     }

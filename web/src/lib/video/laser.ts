@@ -8,6 +8,12 @@ export interface TrailPoint {
     t: number; // timestamp (ms)
 }
 
+/** One position sample inside a batched cursor message (normalized 0-1). */
+export interface BatchPoint {
+    x: number;
+    y: number;
+}
+
 /** How long a trail point remains visible before fully fading out. */
 export const TRAIL_FADE_MS = 2000;
 
@@ -21,6 +27,18 @@ export const RIPPLE_END_RADIUS = 48;
 
 /** Minimum on-screen distance (px) between recorded trail points. */
 export const TRAIL_MIN_DIST_PX = 2;
+
+/**
+ * Maximum points per batched cursor network message. Coalesced pointer
+ * events can produce far more samples per ~33ms send tick than this on
+ * high-rate input devices; denser batches are evenly subsampled because
+ * ~20 points per 33ms window is already well past visual saturation.
+ * Must match the server-side cap in handleCursor.
+ */
+export const MAX_BATCH_POINTS = 20;
+
+/** Interval (ms) between batched cursor sends while pointing (~30Hz). */
+export const CURSOR_SEND_INTERVAL_MS = 33;
 
 /** Trail stroke width at the head (px); tapers to 0 at the tail. */
 export const TRAIL_HEAD_WIDTH = 4;
@@ -96,11 +114,59 @@ export function trailAlpha(ageMs: number, maxAgeMs: number = TRAIL_FADE_MS): num
 /**
  * Frame-rate independent exponential smoothing factor: the fraction of
  * the remaining distance to the target to cover this frame. tauMs is
- * the time constant (smaller = snappier).
+ * the time constant (smaller = snappier). The default is tuned for the
+ * remote cursor dot: batched messages already carry the dense trail
+ * geometry, so the dot only needs enough smoothing to glide between
+ * ~30Hz targets without judder — a short tau keeps it close to live.
  */
-export function smoothingFactor(dtMs: number, tauMs = 55): number {
+export function smoothingFactor(dtMs: number, tauMs = 25): number {
     if (dtMs <= 0 || tauMs <= 0) return dtMs > 0 ? 1 : 0;
     return 1 - Math.exp(-dtMs / tauMs);
+}
+
+/**
+ * Evenly subsample a batch down to at most `max` points, always keeping
+ * the first and last samples (the last is the authoritative cursor
+ * position; the first anchors continuity with the previous batch).
+ * Returns the input array unchanged (same reference) when it already
+ * fits.
+ */
+export function subsampleBatch<T>(points: T[], max: number = MAX_BATCH_POINTS): T[] {
+    if (max <= 0) return [];
+    if (points.length <= max) return points;
+    if (max === 1) return [points[points.length - 1]];
+    const out: T[] = new Array(max);
+    const step = (points.length - 1) / (max - 1);
+    for (let i = 0; i < max; i++) {
+        out[i] = points[Math.round(i * step)];
+    }
+    return out;
+}
+
+/**
+ * Convert a received batch of positions into trail points whose
+ * timestamps are spread linearly across (startT, endT]. The samples in
+ * a batch were captured over the preceding send window but arrive in
+ * one message; interpolating their timestamps keeps the age-based
+ * fade/taper smooth along the batch instead of aging it as one clump.
+ * The last point always gets exactly endT. startT is clamped to endT.
+ */
+export function timestampBatch(
+    points: BatchPoint[],
+    startT: number,
+    endT: number
+): TrailPoint[] {
+    const span = Math.max(0, endT - startT);
+    const n = points.length;
+    const out: TrailPoint[] = new Array(n);
+    for (let i = 0; i < n; i++) {
+        out[i] = {
+            x: points[i].x,
+            y: points[i].y,
+            t: endT - span + (span * (i + 1)) / n
+        };
+    }
+    return out;
 }
 
 /**

@@ -22,6 +22,14 @@ import (
 // SessionValidator validates an admin session ID and returns true if still active.
 type SessionValidator func(sessionID string) bool
 
+// WaitingActions exposes the shared waiting-room admit/deny logic (implemented
+// by RoomHandler) so the admin:waiting-approve/deny WebSocket commands behave
+// identically to the REST endpoints.
+type WaitingActions interface {
+	AdmitWaitingParticipant(roomSlug, participantID string) (bool, error)
+	DenyWaitingParticipant(roomSlug, participantID string) (bool, error)
+}
+
 // WebSocketHandler handles WebSocket connections
 type WebSocketHandler struct {
 	db              *database.DB
@@ -30,7 +38,13 @@ type WebSocketHandler struct {
 	originValidator *middleware.OriginValidator
 	tokenManager    *TokenManager
 	validateSession SessionValidator
+	waitingActions  WaitingActions
 	upgrader        gorillaws.Upgrader
+}
+
+// SetWaitingActions wires the shared waiting-room admit/deny implementation.
+func (h *WebSocketHandler) SetWaitingActions(actions WaitingActions) {
+	h.waitingActions = actions
 }
 
 // NewWebSocketHandler creates a new WebSocketHandler.
@@ -211,6 +225,8 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	// Send initial room state and chat history
 	h.sendRoomState(client, slug)
 	h.sendChatHistory(client, slug)
+	// Admins joining mid-session still see pending waiting-room requests
+	h.sendWaitingState(client, slug)
 
 	// Notify others of new participant
 	h.hub.BroadcastJSON(slug, "participant:joined", map[string]interface{}{
@@ -352,6 +368,9 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 	var watermarkOpacity float64
 	var watermarkPosX, watermarkPosY *float64
 	var watermarkScale float64
+	var scheduledAt, openedAt *time.Time
+	var earlyOpenMinutes int
+	var waitingRoomEnabled bool
 
 	err := h.db.QueryRow(`
 		SELECT name, status,
@@ -362,9 +381,14 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 			COALESCE(watermark_opacity, 0.3),
 			watermark_pos_x,
 			watermark_pos_y,
-			COALESCE(watermark_scale, 1.0)
+			COALESCE(watermark_scale, 1.0),
+			scheduled_at,
+			opened_at,
+			COALESCE(early_open_minutes, 10),
+			waiting_room_enabled
 		FROM rooms WHERE slug = ?
-	`, slug).Scan(&roomName, &roomStatus, &watermarkMode, &watermarkText, &watermarkLogoPath, &watermarkLogoPosition, &watermarkOpacity, &watermarkPosX, &watermarkPosY, &watermarkScale)
+	`, slug).Scan(&roomName, &roomStatus, &watermarkMode, &watermarkText, &watermarkLogoPath, &watermarkLogoPosition, &watermarkOpacity, &watermarkPosX, &watermarkPosY, &watermarkScale,
+		&scheduledAt, &openedAt, &earlyOpenMinutes, &waitingRoomEnabled)
 
 	if err != nil {
 		return
@@ -413,6 +437,15 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 		"watermarkLogoPosition": watermarkLogoPosition,
 		"watermarkOpacity":      watermarkOpacity,
 		"watermarkScale":        watermarkScale,
+		"earlyOpenMinutes":      earlyOpenMinutes,
+		"waitingRoomEnabled":    waitingRoomEnabled,
+	}
+	// Scheduling/open state for the admin "open room now" banner
+	if scheduledAt != nil {
+		roomData["scheduledAt"] = scheduledAt.UTC()
+	}
+	if openedAt != nil {
+		roomData["openedAt"] = openedAt.UTC()
 	}
 
 	// Add optional watermark fields if set
@@ -462,6 +495,58 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 		"iceServers":   h.sfu.GetICEServers(),
 		"screenShare":  screenShareData,
 	})
+}
+
+// sendWaitingState sends the current waiting-room roster (waiting:list) or
+// countdown-lobby headcount (lobby:count) to a newly connected admin so an
+// admin joining mid-session still sees pending requests. No-op for guests.
+func (h *WebSocketHandler) sendWaitingState(client *websocket.Client, slug string) {
+	if !client.IsAdmin {
+		return
+	}
+
+	var roomID string
+	var waitingRoomEnabled bool
+	if err := h.db.QueryRow(`
+		SELECT id, waiting_room_enabled FROM rooms WHERE slug = ?
+	`, slug).Scan(&roomID, &waitingRoomEnabled); err != nil {
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT id, name, joined_at FROM participants
+		WHERE room_id = ? AND is_admitted = FALSE
+		ORDER BY joined_at
+	`, roomID)
+	if err != nil {
+		logger.Warn("Failed to load waiting roster", "room", slug, "error", err)
+		return
+	}
+	defer rows.Close()
+
+	waiting := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		var id, name string
+		var joinedAt time.Time
+		if rows.Scan(&id, &name, &joinedAt) != nil {
+			continue
+		}
+		waiting = append(waiting, map[string]interface{}{
+			"participantId": id,
+			"name":          sanitizeText(name),
+			"joinedAt":      joinedAt.UTC(),
+		})
+	}
+
+	if waitingRoomEnabled {
+		client.SendJSON("waiting:list", map[string]interface{}{
+			"participants": waiting,
+		})
+	} else {
+		client.SendJSON("lobby:count", map[string]interface{}{
+			"count": len(waiting),
+		})
+	}
 }
 
 // sendChatHistory sends the most recent persisted chat messages to a newly
@@ -562,6 +647,11 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 		h.handleAdminKick(client, msg.Payload)
 	case "admin:end-session":
 		h.handleAdminEndSession(client)
+	// Waiting room (in-session approval popups)
+	case "admin:waiting-approve":
+		h.handleWaitingApprove(client, msg.Payload)
+	case "admin:waiting-deny":
+		h.handleWaitingDeny(client, msg.Payload)
 	// Screen sharing
 	case "screenshare:request":
 		h.handleScreenShareRequest(client)
@@ -685,43 +775,72 @@ func (h *WebSocketHandler) handleChatFile(client *websocket.Client, payload json
 	}, "")
 }
 
+// maxCursorBatchPoints caps the number of position samples accepted per
+// cursor message. Clients batch coalesced pointer samples into one message
+// per ~33ms send tick and subsample to this cap themselves; anything beyond
+// it is dropped server-side. Must match MAX_BATCH_POINTS in laser.ts.
+const maxCursorBatchPoints = 20
+
 func (h *WebSocketHandler) handleCursor(client *websocket.Client, payload json.RawMessage) {
 	if !client.AllowCursor() {
 		return
 	}
 
+	type cursorPoint struct {
+		X float64 `json:"x"`
+		Y float64 `json:"y"`
+	}
 	var data struct {
-		X       float64 `json:"x"`
-		Y       float64 `json:"y"`
-		Active  bool    `json:"active"`
-		Release bool    `json:"release"`
+		// Batched format: dense coalesced pointer samples for one send tick.
+		Points []cursorPoint `json:"points"`
+		// Legacy single-point format (used when Points is absent).
+		X       *float64 `json:"x"`
+		Y       *float64 `json:"y"`
+		Active  bool     `json:"active"`
+		Release bool     `json:"release"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return
 	}
 
-	if math.IsNaN(data.X) || math.IsNaN(data.Y) || math.IsInf(data.X, 0) || math.IsInf(data.Y, 0) {
+	raw := data.Points
+	if len(raw) == 0 {
+		// Backward compatibility: single {x,y} becomes a one-point batch.
+		if data.X == nil || data.Y == nil {
+			return
+		}
+		raw = []cursorPoint{{X: *data.X, Y: *data.Y}}
+	}
+	// Cap batch length (drop extras beyond the cap).
+	if len(raw) > maxCursorBatchPoints {
+		raw = raw[:maxCursorBatchPoints]
+	}
+
+	// Validate every point: reject NaN/Inf samples, clamp the rest to [0,1].
+	points := make([]map[string]interface{}, 0, len(raw))
+	var lastX, lastY float64
+	for _, p := range raw {
+		if math.IsNaN(p.X) || math.IsNaN(p.Y) || math.IsInf(p.X, 0) || math.IsInf(p.Y, 0) {
+			continue
+		}
+		x := math.Min(1, math.Max(0, p.X))
+		y := math.Min(1, math.Max(0, p.Y))
+		points = append(points, map[string]interface{}{"x": x, "y": y})
+		lastX, lastY = x, y
+	}
+	if len(points) == 0 {
 		return
 	}
 
-	if data.X < 0 {
-		data.X = 0
-	} else if data.X > 1 {
-		data.X = 1
-	}
-	if data.Y < 0 {
-		data.Y = 0
-	} else if data.Y > 1 {
-		data.Y = 1
-	}
-
-	// Broadcast cursor to all (including sender for latency feedback)
+	// Broadcast the batched shape to all. Top-level x/y mirror the newest
+	// point for backward compatibility with single-point consumers.
 	h.hub.BroadcastJSON(client.RoomSlug, "cursor", map[string]interface{}{
 		"participantId":   client.ID,
 		"participantName": client.Name,
 		"color":           client.Color,
-		"x":               data.X,
-		"y":               data.Y,
+		"points":          points,
+		"x":               lastX,
+		"y":               lastY,
 		"active":          data.Active,
 		"release":         data.Release && !data.Active,
 	}, "")
@@ -1061,6 +1180,65 @@ func (h *WebSocketHandler) handleAdminEndSession(client *websocket.Client) {
 
 	// Broadcast session end to all
 	h.hub.BroadcastJSON(client.RoomSlug, "room:ended", map[string]interface{}{}, "")
+}
+
+// handleWaitingApprove admits a waiting participant from the in-session
+// approval popup. Delegates to the same shared logic as the REST admit
+// endpoint (DB update + SSE notification + waiting:resolved broadcast).
+func (h *WebSocketHandler) handleWaitingApprove(client *websocket.Client, payload json.RawMessage) {
+	if !h.requireAdmin(client, "waiting-approve") {
+		return
+	}
+	if h.waitingActions == nil {
+		return
+	}
+
+	var data struct {
+		ParticipantID string `json:"participantId"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil || data.ParticipantID == "" {
+		return
+	}
+
+	found, err := h.waitingActions.AdmitWaitingParticipant(client.RoomSlug, data.ParticipantID)
+	if err != nil {
+		logger.Error("Failed to admit waiting participant", "participant_id", data.ParticipantID, "admin", client.ID, "room", client.RoomSlug, "error", err)
+		return
+	}
+	if !found {
+		logger.Debug("Waiting participant already resolved", "participant_id", data.ParticipantID, "room", client.RoomSlug)
+		return
+	}
+	logger.Info("Waiting participant approved", "participant_id", data.ParticipantID, "admin", client.ID, "room", client.RoomSlug)
+}
+
+// handleWaitingDeny denies a waiting participant from the in-session approval
+// popup, reusing the shared REST deny logic.
+func (h *WebSocketHandler) handleWaitingDeny(client *websocket.Client, payload json.RawMessage) {
+	if !h.requireAdmin(client, "waiting-deny") {
+		return
+	}
+	if h.waitingActions == nil {
+		return
+	}
+
+	var data struct {
+		ParticipantID string `json:"participantId"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil || data.ParticipantID == "" {
+		return
+	}
+
+	found, err := h.waitingActions.DenyWaitingParticipant(client.RoomSlug, data.ParticipantID)
+	if err != nil {
+		logger.Error("Failed to deny waiting participant", "participant_id", data.ParticipantID, "admin", client.ID, "room", client.RoomSlug, "error", err)
+		return
+	}
+	if !found {
+		logger.Debug("Waiting participant already resolved", "participant_id", data.ParticipantID, "room", client.RoomSlug)
+		return
+	}
+	logger.Info("Waiting participant denied", "participant_id", data.ParticipantID, "admin", client.ID, "room", client.RoomSlug)
 }
 
 // handleScreenShareRequest processes a guest's request to share their screen

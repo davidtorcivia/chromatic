@@ -9,6 +9,9 @@ import {
     splitLongSegments,
     buildSplineSegments,
     trailStyle,
+    subsampleBatch,
+    timestampBatch,
+    MAX_BATCH_POINTS,
     TRAIL_FADE_MS,
     TRAIL_MAX_POINTS,
     TRAIL_MIN_DIST_PX,
@@ -19,7 +22,8 @@ import {
     RIPPLE_DURATION_MS,
     RIPPLE_START_RADIUS,
     RIPPLE_END_RADIUS,
-    type TrailPoint
+    type TrailPoint,
+    type BatchPoint
 } from "./laser";
 
 function pt(t: number): TrailPoint {
@@ -359,6 +363,108 @@ describe("trailStyle", () => {
         // At half strength the width is sqrt(0.5) of head, > linear 0.5
         expect(trailStyle(0.5, 1).width).toBeCloseTo(TRAIL_HEAD_WIDTH * Math.SQRT1_2);
         expect(trailStyle(0.5, 1).width).toBeGreaterThan(TRAIL_HEAD_WIDTH * 0.5);
+    });
+});
+
+describe("subsampleBatch", () => {
+    function batch(n: number): BatchPoint[] {
+        return Array.from({ length: n }, (_, i) => ({ x: i, y: i * 2 }));
+    }
+
+    it("returns the same array reference when within the cap", () => {
+        const pts = batch(5);
+        expect(subsampleBatch(pts, 5)).toBe(pts);
+        expect(subsampleBatch(pts, 20)).toBe(pts);
+        const empty: BatchPoint[] = [];
+        expect(subsampleBatch(empty)).toBe(empty);
+    });
+
+    it("uses MAX_BATCH_POINTS as the default cap", () => {
+        expect(subsampleBatch(batch(MAX_BATCH_POINTS)).length).toBe(MAX_BATCH_POINTS);
+        expect(subsampleBatch(batch(MAX_BATCH_POINTS * 3)).length).toBe(MAX_BATCH_POINTS);
+    });
+
+    it("keeps the first and last points when subsampling", () => {
+        const pts = batch(97);
+        const out = subsampleBatch(pts, 20);
+        expect(out).toHaveLength(20);
+        expect(out[0]).toBe(pts[0]);
+        expect(out[out.length - 1]).toBe(pts[pts.length - 1]);
+    });
+
+    it("samples evenly (monotonic source indices, roughly uniform spacing)", () => {
+        const pts = batch(101);
+        const out = subsampleBatch(pts, 11);
+        const indices = out.map((p) => p.x);
+        for (let i = 1; i < indices.length; i++) {
+            expect(indices[i]).toBeGreaterThan(indices[i - 1]);
+            expect(indices[i] - indices[i - 1]).toBeGreaterThanOrEqual(9);
+            expect(indices[i] - indices[i - 1]).toBeLessThanOrEqual(11);
+        }
+    });
+
+    it("handles degenerate caps", () => {
+        const pts = batch(7);
+        expect(subsampleBatch(pts, 0)).toEqual([]);
+        const one = subsampleBatch(pts, 1);
+        expect(one).toHaveLength(1);
+        expect(one[0]).toBe(pts[6]); // the newest point wins
+    });
+});
+
+describe("timestampBatch", () => {
+    const pts: BatchPoint[] = [
+        { x: 0.1, y: 0.2 },
+        { x: 0.3, y: 0.4 },
+        { x: 0.5, y: 0.6 },
+        { x: 0.7, y: 0.8 }
+    ];
+
+    it("preserves coordinates and assigns the end time to the last point", () => {
+        const out = timestampBatch(pts, 1000, 1033);
+        expect(out).toHaveLength(4);
+        for (let i = 0; i < pts.length; i++) {
+            expect(out[i].x).toBe(pts[i].x);
+            expect(out[i].y).toBe(pts[i].y);
+        }
+        expect(out[out.length - 1].t).toBe(1033);
+    });
+
+    it("spreads timestamps linearly across (startT, endT]", () => {
+        const out = timestampBatch(pts, 1000, 1040);
+        expect(out.map((p) => p.t)).toEqual([1010, 1020, 1030, 1040]);
+    });
+
+    it("is strictly increasing and stays after startT", () => {
+        const out = timestampBatch(pts, 500, 533);
+        expect(out[0].t).toBeGreaterThan(500);
+        for (let i = 1; i < out.length; i++) {
+            expect(out[i].t).toBeGreaterThan(out[i - 1].t);
+        }
+    });
+
+    it("gives a single point exactly the end time", () => {
+        const out = timestampBatch([{ x: 0.5, y: 0.5 }], 100, 133);
+        expect(out).toHaveLength(1);
+        expect(out[0].t).toBe(133);
+    });
+
+    it("clamps an inverted window: never timestamps past endT", () => {
+        const out = timestampBatch(pts, 2000, 1000);
+        for (const p of out) {
+            expect(p.t).toBe(1000);
+        }
+    });
+
+    it("handles an empty batch", () => {
+        expect(timestampBatch([], 0, 100)).toEqual([]);
+    });
+
+    it("produces trail points compatible with pruneTrail ordering", () => {
+        const now = 10_000;
+        const out = timestampBatch(pts, now - 33, now);
+        pruneTrail(out, now);
+        expect(out).toHaveLength(4); // all fresh, nothing pruned
     });
 });
 

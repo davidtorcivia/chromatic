@@ -65,6 +65,15 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	authHandler := handlers.NewAuthHandler(db, cfg.AdminToken, cfg.ProductionMode)
 	wsHandler := handlers.NewWebSocketHandler(db, hub, sfu, cfg.AllowedOrigins, cfg.ProductionMode, tokenSecret, authHandler.ValidateSession)
 
+	// Join requests carrying a valid admin session cookie are granted the
+	// admin role (dashboard "Join as host") — same validator the WebSocket
+	// handler uses.
+	roomHandler.SetSessionValidator(authHandler.ValidateSession)
+
+	// WS admin:waiting-approve/deny reuse the exact admit/deny logic the REST
+	// endpoints run (DB update + SSE notification + admin broadcast).
+	wsHandler.SetWaitingActions(roomHandler)
+
 	// Wire up room live callback to initiate WebRTC subscriptions
 	roomHandler.SetOnRoomLive(wsHandler.InitiateSubscriptionsForRoom)
 
@@ -121,11 +130,14 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	adminMux.HandleFunc("PATCH /api/rooms/{slug}", roomHandler.Update)
 	adminMux.HandleFunc("DELETE /api/rooms/{slug}", roomHandler.Delete)
 	adminMux.HandleFunc("POST /api/rooms/{slug}/end", roomHandler.EndSession)
+	// Open a scheduled room ahead of time (auto-admits the countdown lobby)
+	adminMux.HandleFunc("POST /api/rooms/{slug}/open", roomHandler.OpenRoom)
 
 	// Waiting Room (admin)
 	adminMux.HandleFunc("GET /api/rooms/{slug}/waiting", roomHandler.ListWaiting)
 	adminMux.HandleFunc("POST /api/rooms/{slug}/admit/{id}", roomHandler.AdmitParticipant)
 	adminMux.HandleFunc("POST /api/rooms/{slug}/admit-all", roomHandler.AdmitAll)
+	adminMux.HandleFunc("POST /api/rooms/{slug}/deny/{id}", roomHandler.DenyParticipant)
 
 	// Config (admin)
 	adminMux.HandleFunc("GET /api/config", configHandler.Get)

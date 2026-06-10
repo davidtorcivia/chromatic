@@ -272,6 +272,52 @@ func TestHub_BroadcastJSON(t *testing.T) {
 	}
 }
 
+func TestHub_BroadcastToAdminsJSON(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+	defer stopHub(hub)
+
+	admin := newTestClient("admin-1", "Host", "test-room", hub)
+	admin.IsAdmin = true
+	guest := newTestClient("guest-1", "Guest", "test-room", hub)
+
+	hub.Register(admin)
+	hub.Register(guest)
+
+	if err := hub.BroadcastToAdminsJSON("test-room", "waiting:joined", map[string]interface{}{
+		"participantId": "p1",
+		"name":          "Newcomer",
+	}); err != nil {
+		t.Fatalf("BroadcastToAdminsJSON failed: %v", err)
+	}
+
+	// Admin receives the message
+	select {
+	case raw := <-admin.Send:
+		var msg Message
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			t.Fatalf("failed to parse admin message: %v", err)
+		}
+		if msg.Type != "waiting:joined" {
+			t.Errorf("expected waiting:joined, got %s", msg.Type)
+		}
+		var payload map[string]interface{}
+		json.Unmarshal(msg.Payload, &payload)
+		if payload["participantId"] != "p1" {
+			t.Errorf("unexpected payload: %v", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("admin did not receive the broadcast")
+	}
+
+	// Guest receives nothing
+	select {
+	case raw := <-guest.Send:
+		t.Errorf("guest must not receive admin-only broadcasts, got %s", raw)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestHub_SendTo(t *testing.T) {
 	hub := NewHub()
 	go hub.Run()

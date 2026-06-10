@@ -3,7 +3,13 @@
     import { fade, fly } from "svelte/transition";
     import { goto } from "$app/navigation";
     import { page } from "$app/stores";
-    import { rooms, type RoomInfo } from "$lib/api/client";
+    import { rooms, type RoomInfo, type JoinResult } from "$lib/api/client";
+    import {
+        countdownParts,
+        formatOpensIn,
+        formatScheduleLabel,
+        serverClockOffset,
+    } from "$lib/lobby";
     import StatusBadge from "$lib/components/StatusBadge.svelte";
     import StateCard from "$lib/components/StateCard.svelte";
 
@@ -15,9 +21,13 @@
     let showHostSection = $state(false);
     let isLoading = $state(false);
     let now = $state(Date.now());
-    let timer: ReturnType<typeof setInterval>;
-
-    const EARLY_ACCESS_WINDOW_MS = 10 * 60 * 1000;
+    // Offset to the server clock (computed from /info's serverTime) so the
+    // "opens in" countdown doesn't trust the local clock.
+    let serverOffset = $state(0);
+    let timer: ReturnType<typeof setInterval> | undefined;
+    // ?host=1 auto-join: 'joining' shows the branded hold state instead of
+    // flashing the form; 'failed' falls back to the form with the token field.
+    let hostJoinState = $state<"none" | "joining" | "failed">("none");
 
     const slug = $page.params.slug!;
 
@@ -32,6 +42,13 @@
         delay: prefersReducedMotion ? 0 : step * 80,
     });
 
+    function startTicker(intervalMs: number) {
+        if (timer) clearInterval(timer);
+        timer = setInterval(() => {
+            now = Date.now();
+        }, intervalMs);
+    }
+
     onMount(async () => {
         // Pre-fill the name from a previous session
         const storedName = localStorage.getItem("chromatic_name");
@@ -39,20 +56,28 @@
             name = storedName;
         }
 
-        // Reveal the host token field when arriving via a host link
-        if ($page.url.searchParams.get("host") === "1") {
-            showHostSection = true;
+        const isHostLink = $page.url.searchParams.get("host") === "1";
+        if (isHostLink) {
+            // Hold the form back while the automatic admin join runs.
+            hostJoinState = "joining";
         }
 
         try {
             roomInfo = await rooms.info(slug);
+            serverOffset = serverClockOffset(roomInfo.serverTime, Date.now());
         } catch (e) {
             error = "Room not found";
+            hostJoinState = "none";
         }
 
-        timer = setInterval(() => {
-            now = Date.now();
-        }, 30000);
+        if (isHostLink && roomInfo && roomInfo.status !== "ended") {
+            await attemptHostJoin();
+        } else if (hostJoinState === "joining") {
+            hostJoinState = roomInfo ? "failed" : "none";
+            showHostSection = true;
+        }
+
+        startTicker(1000);
     });
 
     onDestroy(() => {
@@ -61,27 +86,74 @@
         }
     });
 
+    // Automatic admin join for dashboard "Join as host" links: the admin
+    // session cookie travels with the request, so no password or token is
+    // needed. If the server doesn't grant the admin role (no/expired
+    // session), fall back to the normal form with the token field revealed.
+    async function attemptHostJoin() {
+        const hostName = localStorage.getItem("chromatic_name")?.trim() || "Host";
+        try {
+            const result = await rooms.join(slug, hostName);
+            if (result.role === "admin") {
+                finishJoin(result, hostName);
+                return;
+            }
+        } catch {
+            // 401 / network — fall through to the manual form
+        }
+        hostJoinState = "failed";
+        showHostSection = true;
+    }
+
+    function finishJoin(result: JoinResult, joinedName: string) {
+        // Store sanitized participant name for future sessions
+        localStorage.setItem("chromatic_name", result.name || joinedName);
+
+        // Store session info (includes the server-assigned role and any
+        // countdown-lobby payload for the waiting page)
+        sessionStorage.setItem(`chromatic_session_${slug}`, JSON.stringify(result));
+
+        // Navigate based on waiting room / lobby status
+        if (result.waitingRoom) {
+            goto(`/room/${slug}/waiting`);
+        } else {
+            goto(`/room/${slug}/session`);
+        }
+    }
+
     let scheduledAt = $derived(roomInfo?.scheduledAt ? new Date(roomInfo.scheduledAt) : null);
-    let earlyAccessAt = $derived(
-        scheduledAt ? new Date(scheduledAt.getTime() - EARLY_ACCESS_WINDOW_MS) : null
+    let earlyOpenMs = $derived((roomInfo?.earlyOpenMinutes ?? 10) * 60 * 1000);
+    let lobbyOpensAt = $derived(
+        scheduledAt ? new Date(scheduledAt.getTime() - earlyOpenMs) : null
     );
-    let canJoin = $derived(!earlyAccessAt || now >= earlyAccessAt.getTime());
+    let serverNow = $derived(now + serverOffset);
+    // The lobby window opens earlyOpenMinutes before start — or immediately
+    // if the host opened the room early / the stream is already live.
+    let canJoin = $derived(
+        !lobbyOpensAt ||
+            serverNow >= lobbyOpensAt.getTime() ||
+            Boolean(roomInfo?.openedAt) ||
+            roomInfo?.status === "live"
+    );
     let scheduledLabel = $derived(
-        scheduledAt?.toLocaleString(undefined, {
-            month: "short",
-            day: "numeric",
-            hour: "2-digit",
-            minute: "2-digit",
-        }) ?? ""
+        scheduledAt ? formatScheduleLabel(scheduledAt, new Date(serverNow)) : ""
+    );
+    let opensInLabel = $derived(
+        lobbyOpensAt && !canJoin
+            ? formatOpensIn(countdownParts(lobbyOpensAt.getTime(), serverNow))
+            : ""
     );
     let hasSessionDetails = $derived(
         Boolean(roomInfo && (scheduledAt || roomInfo.hasPassword || roomInfo.waitingRoomEnabled))
     );
+    // Hosts bypass scheduling server-side, so a filled-in host token always
+    // unlocks the Join button — even before the lobby window opens.
+    let canSubmit = $derived(canJoin || adminToken.trim().length > 0);
 
     async function handleJoin(e: SubmitEvent) {
         e.preventDefault();
         if (!name.trim()) return;
-        if (!canJoin) {
+        if (!canSubmit) {
             error = "This session is not open yet.";
             return;
         }
@@ -97,22 +169,7 @@
                 adminToken.trim() || undefined,
             );
 
-            // Store sanitized participant name for future sessions
-            localStorage.setItem('chromatic_name', result.name || name.trim());
-
-            // Store session info (includes the server-assigned role, so the
-            // session page knows whether this participant is an admin)
-            sessionStorage.setItem(
-                `chromatic_session_${slug}`,
-                JSON.stringify(result),
-            );
-
-            // Navigate based on waiting room status
-            if (result.waitingRoom) {
-                goto(`/room/${slug}/waiting`);
-            } else {
-                goto(`/room/${slug}/session`);
-            }
+            finishJoin(result, name.trim());
         } catch (e: any) {
             error = e.message || "We couldn't join the session. Please try again.";
         } finally {
@@ -126,7 +183,19 @@
 </svelte:head>
 
 <main class="join-page">
-    {#if error && !roomInfo}
+    {#if hostJoinState === "joining"}
+        <!-- Branded hold state while the automatic admin join runs (no form flash) -->
+        <div class="join-content host-joining" in:fade={{ duration: prefersReducedMotion ? 0 : 150 }}>
+            <div class="invite-header">
+                <div class="wordmark">Chromatic</div>
+            </div>
+            <div class="card host-joining-card">
+                <div class="host-spinner" aria-hidden="true"></div>
+                <h1>Joining as host…</h1>
+                <p>Setting up your session with host controls.</p>
+            </div>
+        </div>
+    {:else if error && !roomInfo}
         <div class="join-content" in:fly={enter(0)}>
             <div class="invite-header">
                 <div class="wordmark">Chromatic</div>
@@ -180,15 +249,16 @@
                         body="The review is over. If you were expecting to join, check with your host for a new link."
                     />
                 </div>
-            {:else if !canJoin}
-                <div in:fly={enter(3)}>
-                    <StateCard
-                        icon="clock"
-                        title="The room opens soon"
-                        body={`This session is scheduled for ${scheduledLabel}. The room opens 10 minutes before — this page will let you in automatically.`}
-                    />
-                </div>
             {:else}
+                {#if !canJoin}
+                    <div class="opens-soon" in:fly={enter(3)} aria-live="polite">
+                        <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16" aria-hidden="true"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg>
+                        <div class="opens-soon-copy">
+                            <span class="opens-soon-title">Scheduled for {scheduledLabel}</span>
+                            <span class="opens-soon-line">The room opens in <strong class="opens-soon-count">{opensInLabel}</strong> — the Join button will unlock automatically.</span>
+                        </div>
+                    </div>
+                {/if}
                 <form class="card join-form" in:fly={enter(3)} onsubmit={handleJoin}>
                     {#if error}
                         <div class="alert alert-error" role="alert" in:fade={{ duration: prefersReducedMotion ? 0 : 150 }}>
@@ -238,11 +308,13 @@
                     <button
                         type="submit"
                         class="btn btn-primary btn-join"
-                        disabled={isLoading}
+                        disabled={isLoading || !canSubmit}
                     >
                         {#if isLoading}
                             <span class="btn-spinner" aria-hidden="true"></span>
                             Joining…
+                        {:else if !canSubmit}
+                            Opens in {opensInLabel}
                         {:else}
                             Join session
                         {/if}
@@ -433,6 +505,91 @@
     .loading-state {
         display: flex;
         justify-content: center;
+    }
+
+    /* Branded hold state while the automatic admin join runs */
+    .host-joining-card {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+        padding: var(--space-xl);
+        box-shadow: var(--shadow-md);
+    }
+
+    .host-joining-card h1 {
+        margin: 0 0 var(--space-xs);
+        font-size: clamp(1.25rem, 5vw, 1.5rem);
+        letter-spacing: -0.015em;
+    }
+
+    .host-joining-card p {
+        margin: 0;
+        font-size: var(--text-body);
+        color: var(--color-text-muted);
+    }
+
+    .host-spinner {
+        width: 22px;
+        height: 22px;
+        margin-bottom: var(--space-lg);
+        border-radius: 50%;
+        border: 2px solid var(--color-border);
+        border-top-color: var(--color-primary);
+        animation: host-spin 0.8s linear infinite;
+    }
+
+    @keyframes host-spin {
+        to { transform: rotate(360deg); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .host-spinner {
+            animation-duration: 1.6s;
+        }
+    }
+
+    /* Pre-window schedule banner with the live "opens in" countdown */
+    .opens-soon {
+        display: flex;
+        align-items: flex-start;
+        gap: var(--space-sm);
+        padding: var(--space-md);
+        margin-bottom: var(--space-md);
+        background: var(--color-surface);
+        border: 1px solid var(--color-border);
+        border-radius: var(--radius-md);
+        color: var(--color-text-muted);
+    }
+
+    .opens-soon svg {
+        flex-shrink: 0;
+        margin-top: 2px;
+        color: var(--color-primary);
+        opacity: 0.9;
+    }
+
+    .opens-soon-copy {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+
+    .opens-soon-title {
+        font-size: var(--text-body);
+        font-weight: 500;
+        color: var(--color-text);
+    }
+
+    .opens-soon-line {
+        font-size: var(--text-meta);
+        color: var(--color-text-subtle);
+    }
+
+    .opens-soon-count {
+        color: var(--color-primary);
+        font-variant-numeric: tabular-nums;
+        font-weight: 600;
     }
 
     @media (max-width: 480px) {

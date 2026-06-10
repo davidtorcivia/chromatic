@@ -4,6 +4,7 @@
     import { goto } from "$app/navigation";
     import { page } from "$app/stores";
     import { session } from "$lib/stores/session.svelte";
+    import { rooms } from "$lib/api/client";
     import { chatStore, type ChatMessage } from "$lib/stores/chat.svelte";
     import { unlockAudio, getAudioContext, closeAudioContext } from "$lib/audio/context";
     import { WebRTCManager, getStoredMicDeviceId, storeMicDeviceId } from "$lib/webrtc/manager";
@@ -105,6 +106,18 @@
     // (can happen when voice relay tracks are in the initial offer and ontrack
     // fires for them before the main video/audio track triggers handleTrack).
     let pendingVoiceTracks = new Map<string, MediaStreamTrack>();
+
+    // Waiting-room approval stack (admins): cards persist until resolved by
+    // ANY admin (waiting:resolved), never auto-dismissed.
+    type WaitingRequest = { participantId: string; name: string; joinedAt: string };
+    let waitingRequests = $state<WaitingRequest[]>([]);
+    // Countdown-lobby headcount for the admin "open room now" banner
+    let lobbyCount = $state(0);
+    let openRoomPending = $state(false);
+    let roomOpenedEarly = $state(false);
+    // 1 Hz tick driving the subtle elapsed-time labels on approval cards;
+    // only runs while cards are visible (see $effect below).
+    let waitingNow = $state(Date.now());
 
     // Screen sharing state
     let screenShareRequested = $state(false);
@@ -337,6 +350,36 @@
         session.onMessage("screenshare:pending", (payload: unknown) => {
             const data = payload as { participantId: string; name: string };
             pendingScreenShareRequest = data;
+        });
+
+        // Waiting-room popups (admins only — the server only sends these to
+        // admin clients). Cards stay until waiting:resolved arrives, so a
+        // request resolved by another admin dismisses everywhere.
+        session.onMessage("waiting:joined", (payload: unknown) => {
+            const data = payload as WaitingRequest;
+            if (!data?.participantId) return;
+            if (waitingRequests.some((r) => r.participantId === data.participantId)) return;
+            waitingRequests = [...waitingRequests, data];
+        });
+
+        session.onMessage("waiting:list", (payload: unknown) => {
+            const data = payload as { participants?: WaitingRequest[] };
+            waitingRequests = data?.participants ?? [];
+        });
+
+        session.onMessage("waiting:resolved", (payload: unknown) => {
+            const data = payload as { participantId: string; action: string };
+            if (!data?.participantId) return;
+            waitingRequests = waitingRequests.filter(
+                (r) => r.participantId !== data.participantId
+            );
+        });
+
+        // Countdown-lobby headcount (waiting-room-disabled scheduled rooms):
+        // drives the admin "open room now" banner.
+        session.onMessage("lobby:count", (payload: unknown) => {
+            const data = payload as { count?: number };
+            lobbyCount = data?.count ?? 0;
         });
 
         // Release per-participant audio graph (VAD + ducking) when someone
@@ -824,6 +867,40 @@
         if (!pendingScreenShareRequest) return;
         session.send("admin:screenshare-deny", { participantId: pendingScreenShareRequest.participantId });
         pendingScreenShareRequest = null;
+    }
+
+    // Waiting-room approval actions: same shared server logic as the REST
+    // admit/deny endpoints. The card is removed by the waiting:resolved
+    // broadcast, not optimistically, so every admin's stack stays in sync.
+    function approveWaiting(participantId: string) {
+        session.send("admin:waiting-approve", { participantId });
+    }
+
+    function denyWaiting(participantId: string) {
+        session.send("admin:waiting-deny", { participantId });
+    }
+
+    // Open a scheduled room ahead of the countdown (admin banner)
+    async function openRoomNow() {
+        if (openRoomPending) return;
+        openRoomPending = true;
+        try {
+            await rooms.open(slug);
+            roomOpenedEarly = true;
+            lobbyCount = 0;
+        } catch (err) {
+            console.error("Failed to open room early:", err);
+        } finally {
+            openRoomPending = false;
+        }
+    }
+
+    function waitingElapsedLabel(joinedAt: string, nowMs: number): string {
+        const seconds = Math.max(0, Math.floor((nowMs - Date.parse(joinedAt)) / 1000));
+        if (seconds < 60) return `${seconds}s`;
+        const minutes = Math.floor(seconds / 60);
+        if (minutes < 60) return `${minutes}m`;
+        return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
     }
 
     function stopScreenSharePip() {
@@ -1344,6 +1421,28 @@
         })
     );
 
+    // Admin "open room now" banner: scheduled room, not opened early yet,
+    // stream not live, and guests waiting on the countdown.
+    let showOpenEarlyBanner = $derived(
+        isAdmin &&
+            !roomOpenedEarly &&
+            lobbyCount > 0 &&
+            Boolean(roomState?.scheduledAt) &&
+            !roomState?.openedAt &&
+            !isLive
+    );
+
+    // Tick the approval-card elapsed labels only while cards are on screen.
+    $effect(() => {
+        if (isAdmin && waitingRequests.length > 0) {
+            waitingNow = Date.now();
+            const tick = setInterval(() => {
+                waitingNow = Date.now();
+            }, 1000);
+            return () => clearInterval(tick);
+        }
+    });
+
     // Controls stay visible while any of these hold (ITEM 3).
     let controlsPinned = $derived(
         isPointerOverControls ||
@@ -1553,6 +1652,17 @@
 
         <!-- Top banners share one stack so they never overlap -->
         <div class="banner-stack">
+            {#if showOpenEarlyBanner}
+                <div class="open-early-banner" transition:fly={{ y: 8, duration: prefersReducedMotion ? 0 : 200 }}>
+                    <span class="open-early-text">
+                        {lobbyCount === 1 ? "1 guest is" : `${lobbyCount} guests are`} waiting on the countdown
+                    </span>
+                    <button class="open-early-btn" onclick={openRoomNow} disabled={openRoomPending}>
+                        {openRoomPending ? "Opening…" : "Open room now"}
+                    </button>
+                </div>
+            {/if}
+
             {#if pendingScreenShareRequest}
                 <div class="screenshare-approval" transition:fly={{ y: 8, duration: 200 }}>
                     <span class="screenshare-approval-text">{pendingScreenShareRequest.name} wants to share their screen</span>
@@ -1588,6 +1698,43 @@
                 </div>
             {/if}
         </div>
+
+        <!-- Waiting-room approval stack (admins): persistent cards, top-right
+             below the top bar. Resolved only via waiting:resolved — no
+             auto-dismiss; scrolls past four pending requests. -->
+        {#if isAdmin && waitingRequests.length > 0}
+            <div class="waiting-stack" role="region" aria-label="Waiting room requests">
+                {#each waitingRequests as request (request.participantId)}
+                    <div
+                        class="waiting-request-card"
+                        class:pulse={!prefersReducedMotion}
+                        in:fly={{ y: 8, duration: prefersReducedMotion ? 0 : 200 }}
+                        out:fade={{ duration: prefersReducedMotion ? 0 : 150 }}
+                    >
+                        <span class="waiting-avatar" aria-hidden="true">
+                            {request.name.charAt(0).toUpperCase()}
+                        </span>
+                        <div class="waiting-request-copy">
+                            <span class="waiting-request-name">{request.name}</span>
+                            <span class="waiting-request-meta">
+                                wants to join
+                                <span class="waiting-request-elapsed">· {waitingElapsedLabel(request.joinedAt, waitingNow)}</span>
+                            </span>
+                        </div>
+                        <div class="waiting-request-actions">
+                            <button
+                                class="waiting-request-btn approve"
+                                onclick={() => approveWaiting(request.participantId)}
+                            >Approve</button>
+                            <button
+                                class="waiting-request-btn deny"
+                                onclick={() => denyWaiting(request.participantId)}
+                            >Deny</button>
+                        </div>
+                    </div>
+                {/each}
+            </div>
+        {/if}
 
         <!-- Controls overlay -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -3239,6 +3386,150 @@
     }
     .screenshare-approval-btn.deny {
         background: rgba(239, 68, 68, 0.8);
+        color: #fff;
+    }
+
+    /* Admin "open room now" banner (guests waiting on the countdown) */
+    .open-early-banner {
+        display: flex;
+        align-items: center;
+        gap: var(--space-sm);
+        padding: var(--space-sm) var(--space-md);
+        border-radius: var(--radius-md);
+        background: rgba(14, 14, 16, 0.92);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        border: 1px solid rgba(72, 182, 166, 0.4);
+        color: #fff;
+        box-shadow: var(--shadow-lg);
+        pointer-events: auto;
+    }
+    .open-early-text {
+        font-size: 0.875rem;
+        font-weight: 500;
+    }
+    .open-early-btn {
+        border: none;
+        border-radius: var(--radius-sm);
+        padding: 6px 12px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        background: var(--color-primary);
+        color: #041014;
+        cursor: pointer;
+        transition: filter 0.15s ease;
+    }
+    .open-early-btn:hover {
+        filter: brightness(1.1);
+    }
+    .open-early-btn:disabled {
+        opacity: 0.6;
+        cursor: wait;
+    }
+
+    /* Waiting-room approval stack: persistent admin cards, top-right below
+       the top bar. Scrolls past ~4 cards; never auto-dismisses. */
+    .waiting-stack {
+        position: absolute;
+        top: calc(64px + env(safe-area-inset-top, 0px));
+        right: var(--space-md);
+        z-index: 26;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        width: min(86vw, 320px);
+        max-height: 312px; /* ~4 cards before scrolling */
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        scrollbar-width: thin;
+        pointer-events: auto;
+    }
+    .waiting-request-card {
+        display: flex;
+        align-items: center;
+        gap: var(--space-sm);
+        padding: var(--space-sm) var(--space-md);
+        border-radius: var(--radius-md);
+        background: rgba(14, 14, 16, 0.92);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        color: #fff;
+        box-shadow: var(--shadow-lg);
+        flex-shrink: 0;
+    }
+    /* Chime-free attention: one brief teal pulse on arrival, then settle. */
+    .waiting-request-card.pulse {
+        animation: waiting-card-pulse 1.2s ease-out 1;
+    }
+    @keyframes waiting-card-pulse {
+        0% { border-color: rgba(72, 182, 166, 0.85); box-shadow: 0 0 0 0 rgba(72, 182, 166, 0.35), var(--shadow-lg); }
+        60% { border-color: rgba(72, 182, 166, 0.45); box-shadow: 0 0 0 8px rgba(72, 182, 166, 0), var(--shadow-lg); }
+        100% { border-color: rgba(255, 255, 255, 0.14); box-shadow: var(--shadow-lg); }
+    }
+    .waiting-avatar {
+        flex-shrink: 0;
+        width: 28px;
+        height: 28px;
+        display: grid;
+        place-items: center;
+        border-radius: 50%;
+        background: rgba(72, 182, 166, 0.18);
+        border: 1px solid rgba(72, 182, 166, 0.5);
+        color: var(--color-primary);
+        font-size: 0.8125rem;
+        font-weight: 600;
+        font-family: var(--font-display);
+    }
+    .waiting-request-copy {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+    }
+    .waiting-request-name {
+        font-size: 0.875rem;
+        font-weight: 600;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .waiting-request-meta {
+        font-size: 0.75rem;
+        color: rgba(255, 255, 255, 0.65);
+    }
+    .waiting-request-elapsed {
+        color: rgba(255, 255, 255, 0.4);
+        font-variant-numeric: tabular-nums;
+    }
+    .waiting-request-actions {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    }
+    .waiting-request-btn {
+        border: none;
+        border-radius: var(--radius-sm);
+        padding: 5px 10px;
+        font-size: 0.6875rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: filter 0.15s ease;
+    }
+    .waiting-request-btn:hover {
+        filter: brightness(1.1);
+    }
+    .waiting-request-btn.approve {
+        background: var(--color-primary);
+        color: #041014;
+    }
+    .waiting-request-btn.deny {
+        background: rgba(255, 255, 255, 0.12);
+        color: rgba(255, 255, 255, 0.85);
+    }
+    .waiting-request-btn.deny:hover {
+        background: rgba(239, 68, 68, 0.75);
         color: #fff;
     }
 

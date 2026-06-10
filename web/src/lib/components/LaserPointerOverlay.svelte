@@ -14,6 +14,8 @@
         splitLongSegments,
         buildSplineSegments,
         trailStyle,
+        subsampleBatch,
+        timestampBatch,
         TRAIL_FADE_MS,
         TRAIL_HEAD_WIDTH,
         TRAIL_GLOW_WIDTH_RATIO,
@@ -21,22 +23,31 @@
         TRAIL_CORE_WIDTH_RATIO,
         TRAIL_CORE_ALPHA,
         TRAIL_CORE_MIN_POS,
+        CURSOR_SEND_INTERVAL_MS,
         type TrailPoint,
+        type BatchPoint,
     } from "$lib/video/laser";
 
     interface Cursor {
         participantId: string;
         participantName: string;
         color: string;
-        // Smoothed (rendered) position, normalized 0-1 video coords
+        // Rendered position, normalized 0-1 video coords. For remote
+        // cursors this is smoothed toward (targetX, targetY); for the
+        // local cursor it snaps to the target (the true pointer position).
         x: number;
         y: number;
-        // Latest network position we interpolate toward
+        // Latest known position: live pointer for local, newest batched
+        // network point for remote.
         targetX: number;
         targetY: number;
         active: boolean;
         lastUpdate: number;
         trail: TrailPoint[];
+        // True for the sender's own cursor: driven directly by local
+        // pointer events with zero network latency; server echoes for
+        // this participantId are ignored.
+        local: boolean;
     }
 
     interface Ripple {
@@ -59,11 +70,11 @@
     let showUsageHint = $state(false);
     let hintTimer: ReturnType<typeof setTimeout> | null = null;
 
-    // ~30Hz send rate while pointing
-    const THROTTLE_MS = 33;
-    let sendThrottle: ReturnType<typeof setTimeout> | null = null;
-    let pendingSend: { x: number; y: number } | null = null;
-    let lastSentPos: { x: number; y: number } | null = null;
+    // Network batching: coalesced pointer samples accumulate here and are
+    // flushed as one {points: [...]} message per ~30Hz send tick.
+    let sendTimer: ReturnType<typeof setTimeout> | null = null;
+    let pendingPoints: BatchPoint[] = [];
+    let lastQueuedPos: BatchPoint | null = null;
 
     // Cursor/effect state intentionally lives outside Svelte reactivity:
     // everything is drawn imperatively on the canvas by a single RAF loop.
@@ -123,6 +134,7 @@
         if (isPointing) {
             activePointerId = null;
             isPointing = false;
+            endLocalStroke();
             sendCursorEnd();
         }
     });
@@ -146,11 +158,13 @@
             showUsageHint = false;
             activePointerId = e.pointerId;
             isPointing = true;
+            beginLocalStroke(e);
             sendCursor(e);
         };
 
         const handleGlobalPointerMove = (e: PointerEvent) => {
             if (!isPointing || activePointerId !== e.pointerId) return;
+            extendLocalStroke(e);
             sendCursor(e);
         };
 
@@ -158,6 +172,7 @@
             if (!isPointing || activePointerId !== e.pointerId) return;
             activePointerId = null;
             isPointing = false;
+            endLocalStroke();
             sendCursorEnd();
         };
 
@@ -165,6 +180,7 @@
             if (!isPointing) return;
             activePointerId = null;
             isPointing = false;
+            endLocalStroke();
             sendCursorEnd();
         };
 
@@ -181,11 +197,31 @@
                 participantId: string;
                 participantName: string;
                 color: string;
+                // Batched format: dense coalesced samples for this send tick.
+                points?: { x: number; y: number }[];
+                // Legacy single-point format (also the last batch point).
                 x: number;
                 y: number;
                 active: boolean;
                 release?: boolean;
             };
+            // The local cursor is driven directly by pointer events with
+            // zero latency; ignore the server echo of our own messages.
+            if (data.participantId === session.state.participantId) return;
+
+            // Normalize to a batch: prefer the dense points array, fall
+            // back to the legacy single {x,y}. Drop non-finite samples.
+            let batch: BatchPoint[] = Array.isArray(data.points)
+                ? data.points.filter(
+                      (p) => Number.isFinite(p?.x) && Number.isFinite(p?.y)
+                  )
+                : [];
+            if (batch.length === 0) {
+                if (!Number.isFinite(data.x) || !Number.isFinite(data.y)) return;
+                batch = [{ x: data.x, y: data.y }];
+            }
+            const head = batch[batch.length - 1];
+
             const now = Date.now();
             // Color is server-authoritative (assigned at join, echoed in every
             // cursor message). Fall back to the room participant list, then a
@@ -201,33 +237,54 @@
                     participantId: data.participantId,
                     participantName: data.participantName,
                     color,
-                    x: data.x,
-                    y: data.y,
-                    targetX: data.x,
-                    targetY: data.y,
+                    x: head.x,
+                    y: head.y,
+                    targetX: head.x,
+                    targetY: head.y,
                     active: data.active,
-                    lastUpdate: now,
+                    lastUpdate: now - CURSOR_SEND_INTERVAL_MS,
                     trail: [],
+                    local: false,
                 };
                 cursorMap.set(data.participantId, cursor);
-            } else {
+            } else if (!cursor.active && data.active) {
                 // Snap when a new stroke starts so the streak doesn't whip
                 // across the frame from the previous stroke's end point.
-                if (!cursor.active && data.active) {
-                    cursor.x = data.x;
-                    cursor.y = data.y;
-                    cursor.trail = [];
-                }
-                cursor.participantName = data.participantName;
-                cursor.color = color;
-                cursor.targetX = data.x;
-                cursor.targetY = data.y;
-                cursor.active = data.active;
-                cursor.lastUpdate = now;
+                cursor.x = batch[0].x;
+                cursor.y = batch[0].y;
+                cursor.trail = [];
+                cursor.lastUpdate = now - CURSOR_SEND_INTERVAL_MS;
             }
 
+            // Append the whole batch to the trail with timestamps spread
+            // across the send window, so fast flicks keep their dense real
+            // geometry and the age fade stays smooth along the batch.
+            if (data.active && !reducedMotion) {
+                const startT = Math.max(
+                    now - 2 * CURSOR_SEND_INTERVAL_MS,
+                    Math.min(cursor.lastUpdate, now)
+                );
+                const w = videoRect.width;
+                const h = videoRect.height;
+                for (const tp of timestampBatch(batch, startT, now)) {
+                    const last = cursor.trail[cursor.trail.length - 1];
+                    if (shouldAppendPoint(last, tp.x, tp.y, w, h)) {
+                        cursor.trail.push(tp);
+                    }
+                }
+            }
+
+            cursor.participantName = data.participantName;
+            cursor.color = color;
+            // The dot smooths toward the newest point; the batch path is
+            // already in the trail behind it.
+            cursor.targetX = head.x;
+            cursor.targetY = head.y;
+            cursor.active = data.active;
+            cursor.lastUpdate = now;
+
             if (data.release && !reducedMotion) {
-                ripples.push({ x: data.x, y: data.y, color: cursor.color, start: now });
+                ripples.push({ x: head.x, y: head.y, color: cursor.color, start: now });
             }
             startRenderLoop();
         });
@@ -237,6 +294,9 @@
         const cleanupInterval = setInterval(() => {
             const now = Date.now();
             for (const [id, cursor] of cursorMap) {
+                // Never expire our own cursor mid-stroke (holding the
+                // pointer still produces no updates).
+                if (cursor.local && isPointing) continue;
                 if (now - cursor.lastUpdate > 3000) {
                     cursorMap.delete(id);
                 }
@@ -254,9 +314,9 @@
             window.removeEventListener("pointercancel", handleGlobalPointerUp);
             window.removeEventListener("blur", handleWindowBlur);
             clearHintTimer();
-            if (sendThrottle) {
-                clearTimeout(sendThrottle);
-                sendThrottle = null;
+            if (sendTimer) {
+                clearTimeout(sendTimer);
+                sendTimer = null;
             }
             if (rafId !== null) {
                 cancelAnimationFrame(rafId);
@@ -267,51 +327,159 @@
         };
     });
 
-    // --- Sending ----------------------------------------------------------
+    // --- Coalesced sampling -------------------------------------------------
 
-    function sendCursor(e: PointerEvent) {
-        const coords = clientToVideoCoords(e.clientX, e.clientY, videoElement);
-        lastSentPos = { x: coords.x, y: coords.y };
-
-        if (sendThrottle) {
-            // Trailing edge: remember the latest position so the throttle
-            // flush sends it instead of dropping it.
-            pendingSend = { x: coords.x, y: coords.y };
-            return;
+    // Browsers coalesce pointer events: one pointermove can carry many true
+    // samples. Capture them all so fast flicks keep their real geometry.
+    function coalescedCoords(e: PointerEvent): BatchPoint[] {
+        const events =
+            typeof e.getCoalescedEvents === "function" && e.getCoalescedEvents().length > 0
+                ? e.getCoalescedEvents()
+                : [e];
+        const out: BatchPoint[] = [];
+        for (const ce of events) {
+            const c = clientToVideoCoords(ce.clientX, ce.clientY, videoElement);
+            out.push({ x: c.x, y: c.y });
         }
-        transmitCursor(coords.x, coords.y);
+        return out;
     }
 
-    function transmitCursor(x: number, y: number) {
-        session.send("cursor", { x, y, active: true });
-        sendThrottle = setTimeout(() => {
-            sendThrottle = null;
-            if (pendingSend && isPointing) {
-                const p = pendingSend;
-                pendingSend = null;
-                transmitCursor(p.x, p.y);
-            } else {
-                pendingSend = null;
+    // --- Local echo ---------------------------------------------------------
+    // The sender's own laser renders with zero network latency: pointer
+    // events drive the local cursor/trail/ripple directly through the same
+    // cursorMap the remote rendering uses, and the server echo for our own
+    // participantId is ignored.
+
+    function localCursor(): Cursor | null {
+        const id = session.state.participantId;
+        if (!id) return null;
+        let cursor = cursorMap.get(id);
+        if (cursor) return cursor;
+        const me = session.state.room?.participants.find((p) => p.id === id);
+        cursor = {
+            participantId: id,
+            participantName: me?.name ?? "",
+            color: me?.color ?? "#e63946",
+            x: 0,
+            y: 0,
+            targetX: 0,
+            targetY: 0,
+            active: false,
+            lastUpdate: Date.now(),
+            trail: [],
+            local: true,
+        };
+        cursorMap.set(id, cursor);
+        return cursor;
+    }
+
+    function appendLocalBatch(cursor: Cursor, batch: BatchPoint[], e: PointerEvent) {
+        const now = Date.now();
+        const w = videoRect.width;
+        const h = videoRect.height;
+        // Anchor batch timestamps to real capture times: coalesced events
+        // share the dispatching event's clock, so map their offsets onto
+        // Date.now() (the trail clock).
+        const firstTs =
+            typeof e.getCoalescedEvents === "function"
+                ? (e.getCoalescedEvents()[0]?.timeStamp ?? e.timeStamp)
+                : e.timeStamp;
+        const span = Math.max(0, e.timeStamp - firstTs);
+        if (!reducedMotion) {
+            for (const tp of timestampBatch(batch, now - span, now)) {
+                const last = cursor.trail[cursor.trail.length - 1];
+                if (shouldAppendPoint(last, tp.x, tp.y, w, h)) {
+                    cursor.trail.push(tp);
+                }
             }
-        }, THROTTLE_MS);
+        }
+        const head = batch[batch.length - 1];
+        // True pointer position every frame: no smoothing for the local
+        // cursor (renderFrame snaps x/y to target for local cursors).
+        cursor.targetX = head.x;
+        cursor.targetY = head.y;
+        cursor.x = head.x;
+        cursor.y = head.y;
+        cursor.lastUpdate = now;
+    }
+
+    function beginLocalStroke(e: PointerEvent) {
+        const cursor = localCursor();
+        if (!cursor) return;
+        cursor.trail = [];
+        cursor.active = true;
+        appendLocalBatch(cursor, coalescedCoords(e), e);
+        startRenderLoop();
+    }
+
+    function extendLocalStroke(e: PointerEvent) {
+        const cursor = localCursor();
+        if (!cursor) return;
+        appendLocalBatch(cursor, coalescedCoords(e), e);
+        startRenderLoop();
+    }
+
+    function endLocalStroke() {
+        const id = session.state.participantId;
+        const cursor = id ? cursorMap.get(id) : undefined;
+        if (!cursor || !cursor.active) return;
+        cursor.active = false;
+        cursor.lastUpdate = Date.now();
+        if (!reducedMotion) {
+            ripples.push({
+                x: cursor.targetX,
+                y: cursor.targetY,
+                color: cursor.color,
+                start: Date.now(),
+            });
+        }
+        startRenderLoop();
+    }
+
+    // --- Sending ------------------------------------------------------------
+    // Coalesced samples accumulate in pendingPoints; one batched message
+    // {points: [...], active} goes out per ~30Hz tick (first sample of a
+    // stroke flushes immediately so remote strokes start without delay).
+
+    function sendCursor(e: PointerEvent) {
+        const batch = coalescedCoords(e);
+        pendingPoints.push(...batch);
+        lastQueuedPos = batch[batch.length - 1];
+        if (!sendTimer) flushSend();
+    }
+
+    function flushSend() {
+        if (pendingPoints.length > 0 && isPointing) {
+            // Cap the batch (evenly subsampled, endpoints kept) so a
+            // high-rate input device cannot inflate message size.
+            const points = subsampleBatch(pendingPoints);
+            pendingPoints = [];
+            session.send("cursor", { points, active: true });
+        }
+        sendTimer = setTimeout(() => {
+            sendTimer = null;
+            if (pendingPoints.length > 0 && isPointing) flushSend();
+        }, CURSOR_SEND_INTERVAL_MS);
     }
 
     function sendCursorEnd() {
-        pendingSend = null;
-        if (sendThrottle) {
-            clearTimeout(sendThrottle);
-            sendThrottle = null;
+        if (sendTimer) {
+            clearTimeout(sendTimer);
+            sendTimer = null;
         }
-        const pos = lastSentPos ?? { x: 0, y: 0 };
-        // `release: true` tells every client to play the expanding ripple
-        // at the final cursor position.
+        // Flush any samples still pending plus the final position, and ask
+        // every client to play the expanding ripple there (`release`).
+        if (pendingPoints.length === 0) {
+            pendingPoints.push(lastQueuedPos ?? { x: 0, y: 0 });
+        }
+        const points = subsampleBatch(pendingPoints);
+        pendingPoints = [];
         session.send("cursor", {
-            x: pos.x,
-            y: pos.y,
+            points,
             active: false,
-            release: lastSentPos !== null,
+            release: lastQueuedPos !== null,
         });
-        lastSentPos = null;
+        lastQueuedPos = null;
     }
 
     // --- Rendering (single RAF loop, idles when there is nothing to draw) --
@@ -362,31 +530,30 @@
                 continue;
             }
 
-            // Interpolate toward the network target so remote cursors glide
-            // at display refresh rate even with ~30Hz input.
-            const dx = cursor.targetX - cursor.x;
-            const dy = cursor.targetY - cursor.y;
-            if (dx * dx + dy * dy > 1e-8) {
-                const f = smoothingFactor(dt);
-                cursor.x += dx * f;
-                cursor.y += dy * f;
-                hasWork = true;
-            } else {
+            // The local cursor tracks the true pointer position with no
+            // smoothing (zero added latency). Remote cursors interpolate
+            // toward the newest batched network point so they glide at
+            // display refresh rate even with ~30Hz input; the dense batch
+            // path is already in the trail behind the dot.
+            if (cursor.local) {
                 cursor.x = cursor.targetX;
                 cursor.y = cursor.targetY;
-            }
-
-            // Record the smoothed position into the streak while pointing.
-            // Points closer than ~2px to the previous one are skipped — the
-            // smoothed curve doesn't need them, and dense sub-pixel points
-            // are what made the additive trail blow out and look jittery.
-            if (cursor.active) {
-                const last = cursor.trail[cursor.trail.length - 1];
-                if (shouldAppendPoint(last, cursor.x, cursor.y, w, h)) {
-                    cursor.trail.push({ x: cursor.x, y: cursor.y, t: now });
+            } else {
+                const dx = cursor.targetX - cursor.x;
+                const dy = cursor.targetY - cursor.y;
+                if (dx * dx + dy * dy > 1e-8) {
+                    const f = smoothingFactor(dt);
+                    cursor.x += dx * f;
+                    cursor.y += dy * f;
+                    hasWork = true;
+                } else {
+                    cursor.x = cursor.targetX;
+                    cursor.y = cursor.targetY;
                 }
             }
 
+            // Trail points are appended at their source (local pointer
+            // events / incoming network batches), already thinned to >=2px.
             pruneTrail(cursor.trail, now);
 
             if (cursor.trail.length > 0) {
@@ -464,11 +631,13 @@
         now: number
     ) {
         // Recorded points are thinned to >=2px spacing, so while pointing we
-        // append a virtual head at the live (smoothed) position. The spline
-        // passes through it with a continuous tangent, so the streak meets
-        // the cursor dot without a kink.
+        // append a virtual head at the live pointer position for the LOCAL
+        // cursor. The spline passes through it with a continuous tangent,
+        // so the streak meets the cursor dot without a kink. Remote trails
+        // already end at the newest real network point (the smoothed dot
+        // glides up to it), so they get no virtual head.
         let points: TrailPoint[] = cursor.trail;
-        if (cursor.active) {
+        if (cursor.active && cursor.local) {
             const last = points[points.length - 1];
             if (!last || last.x !== cursor.x || last.y !== cursor.y) {
                 points = [...points, { x: cursor.x, y: cursor.y, t: now }];

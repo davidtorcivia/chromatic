@@ -83,7 +83,7 @@ type Client struct {
 
 	// Rate limiting for chat messages (30 per minute)
 	chatRateLimiter *RateLimiter
-	// Rate limiting for cursor updates (20 per second)
+	// Rate limiting for cursor updates (40 per second)
 	cursorRateLimiter *RateLimiter
 }
 
@@ -172,8 +172,10 @@ func (c *Client) AllowChatMessage() bool {
 }
 
 // InitCursorRateLimiter initializes the cursor update rate limiter.
-// Clients send at ~30Hz while pointing plus a final release message;
-// 40/sec leaves headroom without letting a client flood the room.
+// Clients send one batched points message per ~33ms tick while pointing
+// (~30 msgs/sec regardless of how many coalesced samples each carries)
+// plus a final release message; 40/sec leaves headroom without letting
+// a client flood the room.
 func (c *Client) InitCursorRateLimiter() {
 	c.cursorRateLimiter = NewRateLimiter(40, time.Second)
 }
@@ -339,6 +341,14 @@ func (h *Hub) UnregisterIfCurrent(client *Client) bool {
 // buffered Send channels decouple slow clients, and there is no shared
 // channel that could block forever after Shutdown.
 func (h *Hub) Broadcast(roomSlug string, message []byte, excludeID string) {
+	h.broadcastFiltered(roomSlug, message, func(c *Client) bool {
+		return c.ID != excludeID
+	})
+}
+
+// broadcastFiltered fans a message out to every client in the room for which
+// the filter returns true. Shared by Broadcast and the admin-only broadcasts.
+func (h *Hub) broadcastFiltered(roomSlug string, message []byte, filter func(*Client) bool) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
@@ -352,8 +362,8 @@ func (h *Hub) Broadcast(roomSlug string, message []byte, excludeID string) {
 		return
 	}
 
-	for id, client := range room.Clients {
-		if id == excludeID {
+	for _, client := range room.Clients {
+		if !filter(client) {
 			continue
 		}
 
@@ -398,6 +408,27 @@ func (h *Hub) BroadcastJSON(roomSlug string, msgType string, payload interface{}
 	}
 
 	h.Broadcast(roomSlug, msgBytes, excludeID)
+	return nil
+}
+
+// BroadcastToAdminsJSON sends a JSON message to the admin clients in a room
+// only. Used for waiting-room notifications that guests must never see.
+func (h *Hub) BroadcastToAdminsJSON(roomSlug, msgType string, payload interface{}) error {
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("BroadcastToAdminsJSON: failed to marshal payload for %q in room %s: %v", msgType, roomSlug, err)
+		return err
+	}
+
+	msgBytes, err := json.Marshal(Message{Type: msgType, Payload: payloadBytes})
+	if err != nil {
+		log.Printf("BroadcastToAdminsJSON: failed to marshal message %q in room %s: %v", msgType, roomSlug, err)
+		return err
+	}
+
+	h.broadcastFiltered(roomSlug, msgBytes, func(c *Client) bool {
+		return c.IsAdmin
+	})
 	return nil
 }
 

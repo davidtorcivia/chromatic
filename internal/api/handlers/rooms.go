@@ -24,7 +24,13 @@ import (
 
 var slugRegex = regexp.MustCompile(`^[a-z0-9-]{3,64}$`)
 
-const earlyAccessWindow = 10 * time.Minute
+// Lobby window defaults/bounds for scheduled rooms: guests may enter the
+// countdown lobby this many minutes before scheduled_at (per-room override
+// via rooms.early_open_minutes).
+const (
+	defaultEarlyOpenMinutes = 10
+	maxEarlyOpenMinutes     = 120
+)
 
 // maxWaitingSubscriptions caps concurrent waiting-room SSE connections to
 // prevent file-descriptor exhaustion from abusive clients.
@@ -87,28 +93,26 @@ func (m *WaitingManager) Unsubscribe(participantID string) {
 
 // NotifyAdmitted sends admission notification to a participant
 func (m *WaitingManager) NotifyAdmitted(participantID string) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	if sub, ok := m.subscriptions[participantID]; ok {
-		select {
-		case sub.Channel <- "admitted":
-		default:
-			// Channel full or closed, skip
-		}
-	}
+	m.NotifyEvent([]string{participantID}, "admitted")
 }
 
 // NotifyAllAdmitted sends admission notification to all waiting participants
 func (m *WaitingManager) NotifyAllAdmitted(participantIDs []string) {
+	m.NotifyEvent(participantIDs, "admitted")
+}
+
+// NotifyEvent pushes an arbitrary SSE event ("admitted", "denied", "open",
+// "ended") to each of the given participants' waiting-room subscriptions.
+func (m *WaitingManager) NotifyEvent(participantIDs []string, event string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	for _, id := range participantIDs {
 		if sub, ok := m.subscriptions[id]; ok {
 			select {
-			case sub.Channel <- "admitted":
+			case sub.Channel <- event:
 			default:
+				// Channel full or closed, skip
 			}
 		}
 	}
@@ -124,15 +128,21 @@ type RoomHandler struct {
 	hub interface {
 		BroadcastJSON(roomSlug string, msgType string, payload interface{}, excludeID string) error
 		SendToJSON(roomSlug, clientID, msgType string, payload interface{}) error
+		BroadcastToAdminsJSON(roomSlug, msgType string, payload interface{}) error
 	}
 	onRoomLive          func(roomSlug string) // Called when room goes live
 	tokenManager        *TokenManager         // For generating signed WebSocket tokens
 	waitingManager      *WaitingManager       // For waiting room SSE notifications
 	adminToken          string                // For validating admin joins (constant-time compared)
+	validateSession     SessionValidator      // Admin session cookie validation (join-as-host)
 	maxParticipants     int                   // Cap on non-ended participants per room
 	obsReconnectTimeout time.Duration
 	timerMu             sync.Mutex
 	streamEndTimers     map[string]*time.Timer
+	// openTimers fire when a scheduled room reaches scheduled_at so lobby
+	// participants are auto-admitted without any polling. One timer per room,
+	// armed lazily when the first lobby participant joins.
+	openTimers map[string]*time.Timer
 }
 
 // NewRoomHandler creates a new RoomHandler
@@ -149,7 +159,25 @@ func NewRoomHandler(db *database.DB, cfg *config.Config, tokenSecret []byte) *Ro
 		maxParticipants:     maxParticipants,
 		obsReconnectTimeout: cfg.OBSReconnectTimeout,
 		streamEndTimers:     make(map[string]*time.Timer),
+		openTimers:          make(map[string]*time.Timer),
 	}
+}
+
+// SetSessionValidator wires the admin session cookie validator so Join can
+// grant the admin role to requests carrying a valid admin session cookie
+// (same validator the WebSocket handler uses).
+func (h *RoomHandler) SetSessionValidator(validator SessionValidator) {
+	h.validateSession = validator
+}
+
+// hasAdminSession reports whether the request carries a valid admin session
+// cookie (set by POST /api/auth/login).
+func (h *RoomHandler) hasAdminSession(r *http.Request) bool {
+	if h.validateSession == nil {
+		return false
+	}
+	c, err := r.Cookie(SessionCookieName)
+	return err == nil && c.Value != "" && h.validateSession(c.Value)
 }
 
 // SetSFU sets the SFU reference (for stream binding)
@@ -164,6 +192,7 @@ func (h *RoomHandler) SetSFU(sfu interface {
 func (h *RoomHandler) SetHub(hub interface {
 	BroadcastJSON(roomSlug string, msgType string, payload interface{}, excludeID string) error
 	SendToJSON(roomSlug, clientID, msgType string, payload interface{}) error
+	BroadcastToAdminsJSON(roomSlug, msgType string, payload interface{}) error
 }) {
 	h.hub = hub
 }
@@ -217,12 +246,170 @@ func (h *RoomHandler) scheduleStreamEnd(roomSlug string) {
 	h.timerMu.Unlock()
 }
 
+// ensureOpenTimer arms (at most one) timer per room that fires at
+// scheduled_at and runs the room-open flow. Armed lazily when a lobby
+// participant joins, so idle scheduled rooms cost nothing.
+func (h *RoomHandler) ensureOpenTimer(slug string, scheduledAt time.Time) {
+	h.timerMu.Lock()
+	defer h.timerMu.Unlock()
+
+	if _, ok := h.openTimers[slug]; ok {
+		return
+	}
+
+	delay := time.Until(scheduledAt)
+	if delay < 0 {
+		delay = 0
+	}
+	h.openTimers[slug] = time.AfterFunc(delay, func() {
+		h.timerMu.Lock()
+		delete(h.openTimers, slug)
+		h.timerMu.Unlock()
+		h.handleRoomOpen(slug)
+	})
+}
+
+func (h *RoomHandler) cancelOpenTimer(slug string) {
+	h.timerMu.Lock()
+	defer h.timerMu.Unlock()
+
+	if timer, ok := h.openTimers[slug]; ok {
+		timer.Stop()
+		delete(h.openTimers, slug)
+	}
+}
+
+// handleRoomOpen runs when a room opens (scheduled_at reached, an admin
+// opened it early, or the first stream arrived):
+//   - waiting_room_enabled=false: every lobby participant is auto-admitted —
+//     the same DB update + SSE "admitted" notification a manual admit sends.
+//   - waiting_room_enabled=true: lobby participants get an "open" SSE event
+//     so their countdown crossfades into the approval-waiting state; admins
+//     already received waiting:joined popups at join time.
+func (h *RoomHandler) handleRoomOpen(slug string) {
+	h.cancelOpenTimer(slug)
+
+	var roomID string
+	var waitingRoom bool
+	var roomStatus string
+	err := h.db.QueryRow(`
+		SELECT id, waiting_room_enabled, status FROM rooms WHERE slug = ?
+	`, slug).Scan(&roomID, &waitingRoom, &roomStatus)
+	if err != nil || roomStatus == "ended" {
+		return
+	}
+
+	rows, err := h.db.Query(`SELECT id FROM participants WHERE room_id = ? AND is_admitted = FALSE`, roomID)
+	if err != nil {
+		logger.Error("Failed to list lobby participants on room open", "room", slug, "error", err)
+		return
+	}
+	var waitingIDs []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			waitingIDs = append(waitingIDs, id)
+		}
+	}
+	rows.Close()
+
+	if len(waitingIDs) == 0 {
+		return
+	}
+
+	if waitingRoom {
+		// Switch lobby viewers to the normal approval flow.
+		h.waitingManager.NotifyEvent(waitingIDs, "open")
+		logger.Info("Room opened; lobby switched to approval flow", "room", slug, "waiting", len(waitingIDs))
+		return
+	}
+
+	// Auto-admit everyone in the lobby.
+	if _, err := h.db.Exec(`
+		UPDATE participants SET is_admitted = TRUE WHERE room_id = ? AND is_admitted = FALSE
+	`, roomID); err != nil {
+		logger.Error("Failed to auto-admit lobby participants", "room", slug, "error", err)
+		return
+	}
+	metrics.Get().WaitingParticipants.Add(-int64(len(waitingIDs)))
+	h.waitingManager.NotifyAllAdmitted(waitingIDs)
+	if h.hub != nil {
+		h.hub.BroadcastToAdminsJSON(slug, "lobby:count", map[string]interface{}{"count": 0})
+	}
+	logger.Info("Room opened; lobby auto-admitted", "room", slug, "admitted", len(waitingIDs))
+}
+
+// maybeRunMissedOpen lazily recovers from a lost open timer (e.g. a server
+// restart): for a scheduled room that should already be open but still has
+// unadmitted lobby participants in a waiting-room-disabled room, run the open
+// flow now; for one that opens in the future, re-arm the timer. Called from
+// the lobby's SSE/status endpoints, so there is no global polling.
+func (h *RoomHandler) maybeRunMissedOpen(slug string) {
+	var roomID string
+	var waitingRoom bool
+	var scheduledAt, openedAt *time.Time
+	var roomStatus string
+	err := h.db.QueryRow(`
+		SELECT id, waiting_room_enabled, scheduled_at, opened_at, status
+		FROM rooms WHERE slug = ?
+	`, slug).Scan(&roomID, &waitingRoom, &scheduledAt, &openedAt, &roomStatus)
+	if err != nil || roomStatus == "ended" || scheduledAt == nil {
+		return
+	}
+	if openedAt == nil && time.Now().Before(*scheduledAt) {
+		// Not open yet — make sure the open timer survives restarts.
+		h.ensureOpenTimer(slug, *scheduledAt)
+		return
+	}
+	// Open already: only the auto-admit case needs recovery (waiting-room
+	// rooms are in the normal approval flow and must not be re-notified).
+	if !waitingRoom && h.countWaiting(roomID) > 0 {
+		h.handleRoomOpen(slug)
+	}
+}
+
+// OpenRoom (POST /api/rooms/{slug}/open, admin auth) opens a scheduled room
+// ahead of time: sets opened_at and runs the auto-admission flow.
+func (h *RoomHandler) OpenRoom(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+
+	var roomStatus string
+	var openedAt *time.Time
+	err := h.db.QueryRow(`SELECT status, opened_at FROM rooms WHERE slug = ?`, slug).Scan(&roomStatus, &openedAt)
+	if err != nil {
+		http.Error(w, "Room not found", http.StatusNotFound)
+		return
+	}
+	if roomStatus == "ended" {
+		http.Error(w, "Room has ended", http.StatusGone)
+		return
+	}
+
+	now := time.Now()
+	if openedAt == nil {
+		if _, err := h.db.Exec(`
+			UPDATE rooms SET opened_at = ? WHERE slug = ? AND opened_at IS NULL
+		`, now, slug); err != nil {
+			http.Error(w, "Database error", http.StatusInternalServerError)
+			return
+		}
+		openedAt = &now
+	}
+
+	h.handleRoomOpen(slug)
+
+	respondJSON(w, map[string]interface{}{
+		"openedAt": openedAt.UTC(),
+	})
+}
+
 // List returns all rooms with optional status filter
 func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
 
 	query := `
 		SELECT id, slug, name, scheduled_at, duration_minutes,
+		       COALESCE(early_open_minutes, 10), opened_at,
 		       password_hash IS NOT NULL as has_password, waiting_room_enabled,
 		       stream_key_id, watermark_mode, watermark_text, watermark_logo_path,
 		       watermark_logo_position, watermark_opacity,
@@ -253,6 +440,7 @@ func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 		var room models.Room
 		err := rows.Scan(
 			&room.ID, &room.Slug, &room.Name, &room.ScheduledAt, &room.DurationMinutes,
+			&room.EarlyOpenMinutes, &room.OpenedAt,
 			&room.HasPassword, &room.WaitingRoomEnabled, &room.StreamKeyID,
 			&room.WatermarkMode, &room.WatermarkText, &room.WatermarkLogoPath,
 			&room.WatermarkLogoPosition, &room.WatermarkOpacity,
@@ -277,6 +465,7 @@ type CreateRoomRequest struct {
 	Name                  string     `json:"name"`
 	ScheduledAt           *time.Time `json:"scheduledAt,omitempty"`
 	DurationMinutes       *int       `json:"durationMinutes,omitempty"`
+	EarlyOpenMinutes      *int       `json:"earlyOpenMinutes,omitempty"`
 	Password              *string    `json:"password,omitempty"`
 	WaitingRoomEnabled    bool       `json:"waitingRoomEnabled"`
 	StreamKeyID           *string    `json:"streamKeyId,omitempty"`
@@ -402,15 +591,27 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Lobby window for scheduled rooms (minutes before start; default 10)
+	earlyOpenMinutes := defaultEarlyOpenMinutes
+	if req.EarlyOpenMinutes != nil {
+		if *req.EarlyOpenMinutes < 0 || *req.EarlyOpenMinutes > maxEarlyOpenMinutes {
+			http.Error(w, "Lobby window must be between 0 and 120 minutes", http.StatusBadRequest)
+			return
+		}
+		earlyOpenMinutes = *req.EarlyOpenMinutes
+	}
+
 	// Insert room
 	_, err := h.db.Exec(`
 		INSERT INTO rooms (
-			id, slug, name, scheduled_at, duration_minutes, password_hash,
+			id, slug, name, scheduled_at, duration_minutes, early_open_minutes,
+			password_hash,
 			waiting_room_enabled, stream_key_id, watermark_mode, watermark_text,
 			watermark_logo_position, watermark_opacity, watermark_pos_x,
 			watermark_pos_y, watermark_scale, max_participants
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, id, req.Slug, req.Name, req.ScheduledAt, req.DurationMinutes, passwordHash,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, id, req.Slug, req.Name, req.ScheduledAt, req.DurationMinutes, earlyOpenMinutes,
+		passwordHash,
 		req.WaitingRoomEnabled, req.StreamKeyID, req.WatermarkMode, req.WatermarkText,
 		req.WatermarkLogoPosition, watermarkOpacity, req.WatermarkPosX,
 		req.WatermarkPosY, watermarkScale, req.MaxParticipants)
@@ -428,6 +629,7 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Name:                  req.Name,
 		ScheduledAt:           req.ScheduledAt,
 		DurationMinutes:       req.DurationMinutes,
+		EarlyOpenMinutes:      earlyOpenMinutes,
 		HasPassword:           passwordHash != nil,
 		WaitingRoomEnabled:    req.WaitingRoomEnabled,
 		StreamKeyID:           req.StreamKeyID,
@@ -517,6 +719,20 @@ func (h *RoomHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 		setClauses = append(setClauses, "duration_minutes = ?")
 		args = append(args, duration)
+	}
+
+	if raw, ok := updates["earlyOpenMinutes"]; ok {
+		var minutes int
+		if err := json.Unmarshal(raw, &minutes); err != nil {
+			http.Error(w, "Invalid earlyOpenMinutes", http.StatusBadRequest)
+			return
+		}
+		if minutes < 0 || minutes > maxEarlyOpenMinutes {
+			http.Error(w, "Lobby window must be between 0 and 120 minutes", http.StatusBadRequest)
+			return
+		}
+		setClauses = append(setClauses, "early_open_minutes = ?")
+		args = append(args, minutes)
 	}
 
 	if raw, ok := updates["password"]; ok {
@@ -719,6 +935,8 @@ func (h *RoomHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.cancelOpenTimer(slug)
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -741,6 +959,8 @@ func (h *RoomHandler) EndSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.cancelOpenTimer(slug)
+
 	if h.hub != nil {
 		h.hub.BroadcastJSON(slug, "room:ended", map[string]interface{}{}, "")
 	}
@@ -748,7 +968,9 @@ func (h *RoomHandler) EndSession(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// PublicInfo returns public information about a room (for join flow)
+// PublicInfo returns public information about a room (for join flow).
+// serverTime lets clients anchor lobby countdowns to the server clock
+// instead of trusting the local one.
 func (h *RoomHandler) PublicInfo(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 
@@ -758,18 +980,24 @@ func (h *RoomHandler) PublicInfo(w http.ResponseWriter, r *http.Request) {
 		WaitingRoomEnabled bool       `json:"waitingRoomEnabled"`
 		Status             string     `json:"status"`
 		ScheduledAt        *time.Time `json:"scheduledAt,omitempty"`
+		EarlyOpenMinutes   int        `json:"earlyOpenMinutes"`
+		OpenedAt           *time.Time `json:"openedAt,omitempty"`
+		ServerTime         time.Time  `json:"serverTime"`
 	}
 
 	err := h.db.QueryRow(`
-		SELECT name, password_hash IS NOT NULL, waiting_room_enabled, status, scheduled_at
+		SELECT name, password_hash IS NOT NULL, waiting_room_enabled, status, scheduled_at,
+		       COALESCE(early_open_minutes, 10), opened_at
 		FROM rooms WHERE slug = ?
-	`, slug).Scan(&info.Name, &info.HasPassword, &info.WaitingRoomEnabled, &info.Status, &info.ScheduledAt)
+	`, slug).Scan(&info.Name, &info.HasPassword, &info.WaitingRoomEnabled, &info.Status, &info.ScheduledAt,
+		&info.EarlyOpenMinutes, &info.OpenedAt)
 
 	if err != nil {
 		http.Error(w, "Room not found", http.StatusNotFound)
 		return
 	}
 
+	info.ServerTime = time.Now().UTC()
 	respondJSON(w, info)
 }
 
@@ -801,13 +1029,16 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 	var roomID, passwordHash string
 	var waitingRoom bool
 	var roomStatus string
-	var scheduledAt *time.Time
+	var scheduledAt, openedAt *time.Time
+	var earlyOpenMinutes int
 	var roomMaxParticipants *int
 
 	err := h.db.QueryRow(`
-		SELECT id, COALESCE(password_hash, ''), waiting_room_enabled, status, scheduled_at, max_participants
+		SELECT id, COALESCE(password_hash, ''), waiting_room_enabled, status, scheduled_at,
+		       COALESCE(early_open_minutes, 10), opened_at, max_participants
 		FROM rooms WHERE slug = ?
-	`, slug).Scan(&roomID, &passwordHash, &waitingRoom, &roomStatus, &scheduledAt, &roomMaxParticipants)
+	`, slug).Scan(&roomID, &passwordHash, &waitingRoom, &roomStatus, &scheduledAt,
+		&earlyOpenMinutes, &openedAt, &roomMaxParticipants)
 
 	if err != nil {
 		http.Error(w, "Room not found", http.StatusNotFound)
@@ -819,21 +1050,37 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if scheduledAt != nil && time.Now().Before(scheduledAt.Add(-earlyAccessWindow)) {
-		http.Error(w, "Session not open yet", http.StatusForbidden)
-		return
-	}
-
-	// Admin join: validate the admin token from the request body (never from
-	// the URL, where it would be logged by proxies). Admins bypass the
-	// waiting room and password check.
-	isAdmin := false
+	// Admin join: a valid admin session cookie (dashboard "Join as host") or
+	// the admin token in the request body (never from the URL, where it would
+	// be logged by proxies). Admins bypass scheduling, the waiting room and
+	// the password check. An explicitly provided token must always be valid,
+	// even when a session cookie is also present.
+	isAdmin := h.hasAdminSession(r)
 	if req.AdminToken != nil {
 		if h.adminToken == "" || subtle.ConstantTimeCompare([]byte(*req.AdminToken), []byte(h.adminToken)) != 1 {
 			http.Error(w, "Invalid admin token", http.StatusUnauthorized)
 			return
 		}
 		isAdmin = true
+	}
+
+	// Scheduled-room gating (admins always bypass). A room counts as open
+	// once scheduled_at has passed, an admin opened it early (opened_at), or
+	// the stream is already live. Between (scheduled_at - early_open_minutes)
+	// and open, guests land in the countdown lobby: a participant row with
+	// is_admitted=false plus a `lobby` payload so the client renders a
+	// countdown instead of an approval queue.
+	now := time.Now()
+	roomOpen := scheduledAt == nil || openedAt != nil || roomStatus == "live" || !now.Before(*scheduledAt)
+	inLobby := false
+	var opensAt time.Time
+	if !isAdmin && !roomOpen {
+		opensAt = scheduledAt.Add(-time.Duration(earlyOpenMinutes) * time.Minute)
+		if now.Before(opensAt) {
+			http.Error(w, "Session not open yet", http.StatusForbidden)
+			return
+		}
+		inLobby = true
 	}
 
 	// Check password (admins bypass)
@@ -864,10 +1111,12 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create participant
+	// Create participant. Admins bypass the waiting room; lobby joiners stay
+	// unadmitted until the room opens (then waiting-room-disabled rooms
+	// auto-admit, waiting-room-enabled rooms fall into the approval flow).
 	participantID := generateID()
 	color := h.assignRoomColor(roomID, participantID)
-	isAdmitted := isAdmin || !waitingRoom // Admins bypass the waiting room
+	isAdmitted := isAdmin || (!waitingRoom && !inLobby)
 	role := "viewer"
 	if isAdmin {
 		role = "admin"
@@ -898,17 +1147,56 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 		metrics.Get().WaitingParticipants.Add(1)
 	}
 
+	// Tell in-session admins about the new arrival: approval popup for
+	// waiting-room participants, lobby headcount for countdown lobbies.
+	if !isAdmitted && h.hub != nil {
+		if waitingRoom {
+			h.hub.BroadcastToAdminsJSON(slug, "waiting:joined", map[string]interface{}{
+				"participantId": participantID,
+				"name":          req.Name,
+				"joinedAt":      now.UTC(),
+			})
+		} else {
+			h.hub.BroadcastToAdminsJSON(slug, "lobby:count", map[string]interface{}{
+				"count": h.countWaiting(roomID),
+			})
+		}
+	}
+
+	// Arm the auto-open timer so lobby participants are admitted the moment
+	// scheduled_at arrives — no polling.
+	if inLobby {
+		h.ensureOpenTimer(slug, *scheduledAt)
+	}
+
 	response := map[string]interface{}{
 		"participantId": participantID,
 		"token":         token,
 		"isAdmitted":    isAdmitted,
-		"waitingRoom":   waitingRoom && !isAdmitted,
+		"waitingRoom":   !isAdmitted,
 		"color":         color,
 		"name":          req.Name,
 		"role":          role,
+		"serverTime":    now.UTC(),
+	}
+	if inLobby {
+		response["lobby"] = map[string]interface{}{
+			"scheduledAt":        scheduledAt.UTC(),
+			"opensAt":            opensAt.UTC(),
+			"waitingRoomEnabled": waitingRoom,
+		}
 	}
 
 	respondJSON(w, response)
+}
+
+// countWaiting returns the number of unadmitted participants in a room.
+func (h *RoomHandler) countWaiting(roomID string) int {
+	var n int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM participants WHERE room_id = ? AND is_admitted = FALSE`, roomID).Scan(&n); err != nil {
+		return 0
+	}
+	return n
 }
 
 // ListWaiting lists participants in the waiting room
@@ -945,25 +1233,24 @@ func (h *RoomHandler) ListWaiting(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, participants)
 }
 
-// AdmitParticipant admits a specific participant from waiting room
-func (h *RoomHandler) AdmitParticipant(w http.ResponseWriter, r *http.Request) {
-	slug := r.PathValue("slug")
-	participantID := r.PathValue("id")
-
+// AdmitWaitingParticipant flips a waiting participant to admitted, notifies
+// them over SSE, and tells the room's admins the request is resolved. This is
+// the single admit implementation shared by the REST endpoint and the
+// admin:waiting-approve WebSocket command. Returns false when no waiting
+// participant matched.
+func (h *RoomHandler) AdmitWaitingParticipant(slug, participantID string) (bool, error) {
 	result, err := h.db.Exec(`
 		UPDATE participants SET is_admitted = TRUE
-		WHERE id = ? AND room_id = (SELECT id FROM rooms WHERE slug = ?)
+		WHERE id = ? AND is_admitted = FALSE
+		  AND room_id = (SELECT id FROM rooms WHERE slug = ?)
 	`, participantID, slug)
-
 	if err != nil {
-		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
+		return false, err
 	}
 
 	affected, _ := result.RowsAffected()
 	if affected == 0 {
-		http.Error(w, "Participant not found", http.StatusNotFound)
-		return
+		return false, nil
 	}
 
 	// Track admitted participant
@@ -971,6 +1258,82 @@ func (h *RoomHandler) AdmitParticipant(w http.ResponseWriter, r *http.Request) {
 
 	// Notify waiting participant via SSE
 	h.waitingManager.NotifyAdmitted(participantID)
+
+	// Dismiss this request on every admin's approval stack
+	if h.hub != nil {
+		h.hub.BroadcastToAdminsJSON(slug, "waiting:resolved", map[string]interface{}{
+			"participantId": participantID,
+			"action":        "approved",
+		})
+	}
+	return true, nil
+}
+
+// DenyWaitingParticipant removes a waiting participant, notifies them over
+// SSE, and tells the room's admins the request is resolved. Shared by the
+// REST endpoint and the admin:waiting-deny WebSocket command.
+func (h *RoomHandler) DenyWaitingParticipant(slug, participantID string) (bool, error) {
+	// Notify before deleting the row so the SSE handler can still validate
+	// the subscription; the connection closes right after the event anyway.
+	result, err := h.db.Exec(`
+		DELETE FROM participants
+		WHERE id = ? AND is_admitted = FALSE
+		  AND room_id = (SELECT id FROM rooms WHERE slug = ?)
+	`, participantID, slug)
+	if err != nil {
+		return false, err
+	}
+
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return false, nil
+	}
+
+	metrics.Get().WaitingParticipants.Add(-1)
+
+	h.waitingManager.NotifyEvent([]string{participantID}, "denied")
+
+	if h.hub != nil {
+		h.hub.BroadcastToAdminsJSON(slug, "waiting:resolved", map[string]interface{}{
+			"participantId": participantID,
+			"action":        "denied",
+		})
+	}
+	return true, nil
+}
+
+// AdmitParticipant admits a specific participant from waiting room
+func (h *RoomHandler) AdmitParticipant(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	participantID := r.PathValue("id")
+
+	found, err := h.AdmitWaitingParticipant(slug, participantID)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	if !found {
+		http.Error(w, "Participant not found", http.StatusNotFound)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// DenyParticipant denies (removes) a specific waiting participant
+func (h *RoomHandler) DenyParticipant(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	participantID := r.PathValue("id")
+
+	found, err := h.DenyWaitingParticipant(slug, participantID)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	if !found {
+		http.Error(w, "Participant not found", http.StatusNotFound)
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1016,6 +1379,17 @@ func (h *RoomHandler) AdmitAll(w http.ResponseWriter, r *http.Request) {
 	// Notify all waiting participants via SSE
 	h.waitingManager.NotifyAllAdmitted(waitingIDs)
 
+	// Dismiss every pending request on the admins' approval stacks
+	if h.hub != nil {
+		for _, id := range waitingIDs {
+			h.hub.BroadcastToAdminsJSON(slug, "waiting:resolved", map[string]interface{}{
+				"participantId": id,
+				"action":        "approved",
+			})
+		}
+		h.hub.BroadcastToAdminsJSON(slug, "lobby:count", map[string]interface{}{"count": 0})
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1040,6 +1414,9 @@ func (h *RoomHandler) CheckParticipantStatus(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Recover from a lost open timer (server restart) before reading state.
+	h.maybeRunMissedOpen(slug)
+
 	var isAdmitted bool
 	var roomStatus string
 
@@ -1058,6 +1435,7 @@ func (h *RoomHandler) CheckParticipantStatus(w http.ResponseWriter, r *http.Requ
 	respondJSON(w, map[string]interface{}{
 		"isAdmitted": isAdmitted,
 		"roomStatus": roomStatus,
+		"serverTime": time.Now().UTC(),
 	})
 }
 
@@ -1129,6 +1507,19 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 
 	// Cancel any pending stream end timer
 	h.cancelStreamEndTimer(roomSlug)
+
+	// Going live opens a scheduled room early: mark opened_at and run the
+	// lobby auto-admission flow. Only relevant while scheduled_at is still in
+	// the future — past that point the open timer / join gating already
+	// treats the room as open.
+	if res, err := h.db.Exec(`
+		UPDATE rooms SET opened_at = ?
+		WHERE slug = ? AND opened_at IS NULL AND scheduled_at IS NOT NULL AND scheduled_at > ?
+	`, now, roomSlug, now); err == nil {
+		if affected, _ := res.RowsAffected(); affected > 0 {
+			h.handleRoomOpen(roomSlug)
+		}
+	}
 
 	// Bind ingest tracks to room for distribution
 	var subsNeedingReneg []string
@@ -1207,6 +1598,7 @@ func (h *RoomHandler) getRoomBySlug(slug string) (*models.Room, error) {
 	var room models.Room
 	err := h.db.QueryRow(`
 		SELECT id, slug, name, scheduled_at, duration_minutes,
+		       COALESCE(early_open_minutes, 10), opened_at,
 		       password_hash IS NOT NULL, waiting_room_enabled, stream_key_id,
 		       watermark_mode, watermark_text, watermark_logo_path,
 		       watermark_logo_position, watermark_opacity,
@@ -1216,6 +1608,7 @@ func (h *RoomHandler) getRoomBySlug(slug string) (*models.Room, error) {
 		FROM rooms WHERE slug = ?
 	`, slug).Scan(
 		&room.ID, &room.Slug, &room.Name, &room.ScheduledAt, &room.DurationMinutes,
+		&room.EarlyOpenMinutes, &room.OpenedAt,
 		&room.HasPassword, &room.WaitingRoomEnabled, &room.StreamKeyID,
 		&room.WatermarkMode, &room.WatermarkText, &room.WatermarkLogoPath,
 		&room.WatermarkLogoPosition, &room.WatermarkOpacity,
@@ -1317,6 +1710,9 @@ func (h *RoomHandler) WaitingEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid token", http.StatusUnauthorized)
 		return
 	}
+
+	// Recover from a lost open timer (server restart) before reading state.
+	h.maybeRunMissedOpen(slug)
 
 	// Verify participant exists and is in waiting state
 	var isAdmitted bool

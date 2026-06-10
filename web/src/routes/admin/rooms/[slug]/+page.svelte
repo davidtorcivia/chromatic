@@ -25,6 +25,10 @@
     let name = $state("");
     let password = $state("");
     let waitingRoomEnabled = $state(false);
+    // Scheduling: local datetime-local string ("" = unscheduled) + lobby window
+    let scheduledAtLocal = $state("");
+    let earlyOpenMinutes = $state(10);
+    let isOpeningRoom = $state(false);
     let streamKeyId = $state<string>("");
     let watermarkMode = $state<"none" | "text" | "logo" | "both">("text");
     let watermarkText = $state("");
@@ -122,6 +126,8 @@
             // Populate form fields
             name = room.name;
             waitingRoomEnabled = room.waitingRoomEnabled;
+            scheduledAtLocal = isoToLocalInput(room.scheduledAt);
+            earlyOpenMinutes = room.earlyOpenMinutes ?? 10;
             streamKeyId = room.streamKeyId || "";
             watermarkMode = (room.watermarkMode as "none" | "text" | "logo" | "both") || "text";
             watermarkText = room.watermarkText || "{{ name }} - {{ date }}";
@@ -159,6 +165,49 @@
         }
     }
 
+    // datetime-local <-> ISO conversion (datetime-local has no timezone; it
+    // represents the admin's local wall-clock time)
+    function isoToLocalInput(iso?: string): string {
+        if (!iso) return "";
+        const d = new Date(iso);
+        if (Number.isNaN(d.getTime())) return "";
+        const pad = (n: number) => String(n).padStart(2, "0");
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+
+    function localInputToIso(local: string): string | null {
+        if (!local) return null;
+        const d = new Date(local);
+        return Number.isNaN(d.getTime()) ? null : d.toISOString();
+    }
+
+    async function handleOpenRoom() {
+        if (isOpeningRoom) return;
+        isOpeningRoom = true;
+        error = "";
+        try {
+            const result = await rooms.open(slug);
+            if (room) {
+                room.openedAt = result.openedAt;
+            }
+            waitingParticipants = [];
+            successMessage = "Room opened — waiting guests have been let in.";
+        } catch (e: any) {
+            error = e.message || "Failed to open the room";
+        } finally {
+            isOpeningRoom = false;
+        }
+    }
+
+    async function handleDeny(participantId: string) {
+        try {
+            await rooms.deny(slug, participantId);
+            waitingParticipants = waitingParticipants.filter(p => p.id !== participantId);
+        } catch (e) {
+            console.error("Failed to deny participant", e);
+        }
+    }
+
     async function handleSave(e: SubmitEvent) {
         e.preventDefault();
         if (!name.trim()) return;
@@ -172,6 +221,11 @@
                 name: name.trim(),
                 waitingRoomEnabled,
                 watermarkMode,
+                scheduledAt: localInputToIso(scheduledAtLocal),
+                earlyOpenMinutes:
+                    typeof earlyOpenMinutes === "number" && !Number.isNaN(earlyOpenMinutes)
+                        ? Math.min(120, Math.max(0, earlyOpenMinutes))
+                        : 10,
             };
 
             if (password) {
@@ -292,6 +346,9 @@
         </div>
         {#if room && room.status !== "ended"}
             <div class="header-actions">
+                <a href="/room/{slug}?host=1" target="_blank" class="btn btn-primary">
+                    Join as host
+                </a>
                 <a href="/room/{slug}" target="_blank" class="btn btn-secondary">
                     View Room
                 </a>
@@ -323,6 +380,23 @@
                 </div>
             {/if}
 
+            <!-- Scheduled session: open ahead of the countdown -->
+            {#if room.scheduledAt && !room.openedAt && room.status === "pending"}
+                <div class="card scheduled-card">
+                    <div class="card-header">
+                        <h3>Scheduled Session</h3>
+                        <button class="btn btn-primary btn-sm" onclick={handleOpenRoom} disabled={isOpeningRoom}>
+                            {isOpeningRoom ? "Opening…" : "Open room now"}
+                        </button>
+                    </div>
+                    <p class="scheduled-info">
+                        Starts {formatDate(room.scheduledAt)}. Guests can enter the lobby
+                        {room.earlyOpenMinutes ?? 10} minutes before — opening the room now lets
+                        them in immediately{room.waitingRoomEnabled ? " (waiting room approval still applies)" : ""}.
+                    </p>
+                </div>
+            {/if}
+
             <!-- Waiting Room -->
             {#if room.waitingRoomEnabled && room.status !== "ended"}
                 <div class="card waiting-card">
@@ -347,12 +421,20 @@
                                             Joined {formatDate(participant.joinedAt)}
                                         </span>
                                     </div>
-                                    <button
-                                        class="btn btn-primary btn-sm"
-                                        onclick={() => handleAdmit(participant.id)}
-                                    >
-                                        Admit
-                                    </button>
+                                    <div class="participant-actions">
+                                        <button
+                                            class="btn btn-primary btn-sm"
+                                            onclick={() => handleAdmit(participant.id)}
+                                        >
+                                            Admit
+                                        </button>
+                                        <button
+                                            class="btn btn-secondary btn-sm"
+                                            onclick={() => handleDeny(participant.id)}
+                                        >
+                                            Deny
+                                        </button>
+                                    </div>
                                 </li>
                             {/each}
                         </ul>
@@ -465,6 +547,33 @@
                         <span>Enable Waiting Room</span>
                     </label>
                 </div>
+
+                <div class="form-group">
+                    <label for="scheduledAt">Scheduled Start (optional)</label>
+                    <input
+                        type="datetime-local"
+                        id="scheduledAt"
+                        class="input"
+                        bind:value={scheduledAtLocal}
+                    />
+                    <p class="form-hint">Guests see a countdown lobby until the session starts. Leave blank for an instant room.</p>
+                </div>
+
+                {#if scheduledAtLocal}
+                    <div class="form-group">
+                        <label for="earlyOpenMinutes">Lobby opens (minutes before start)</label>
+                        <input
+                            type="number"
+                            id="earlyOpenMinutes"
+                            class="input"
+                            bind:value={earlyOpenMinutes}
+                            min="0"
+                            max="120"
+                            placeholder="10"
+                        />
+                        <p class="form-hint">How early guests may enter the countdown lobby (0–120 minutes).</p>
+                    </div>
+                {/if}
 
                 <div class="form-group">
                     <label for="maxParticipants">Participant Limit</label>
@@ -733,8 +842,23 @@
         margin: 0;
     }
 
+    .scheduled-card {
+        border: 1px solid var(--color-primary);
+    }
+
+    .scheduled-info {
+        color: var(--color-text-muted);
+        font-size: var(--text-body);
+        margin: 0;
+    }
+
     .waiting-card .participant-list {
         list-style: none;
+    }
+
+    .participant-actions {
+        display: flex;
+        gap: var(--space-xs);
     }
 
     .participant-item {

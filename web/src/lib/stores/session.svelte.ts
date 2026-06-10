@@ -12,6 +12,11 @@ export interface RoomState {
     name: string;
     isLive: boolean;
     participants: SessionParticipant[];
+    // Scheduling/open state (admin "open room now" banner)
+    scheduledAt?: string | null;
+    openedAt?: string | null;
+    earlyOpenMinutes?: number;
+    waitingRoomEnabled?: boolean;
     // Watermark configuration
     watermarkMode: 'none' | 'text' | 'logo' | 'both';
     watermarkText?: string;
@@ -170,6 +175,10 @@ export function createSessionStore() {
                     room: {
                         slug: string;
                         name: string;
+                        scheduledAt?: string;
+                        openedAt?: string;
+                        earlyOpenMinutes?: number;
+                        waitingRoomEnabled?: boolean;
                         watermarkMode?: 'none' | 'text' | 'logo' | 'both';
                         watermarkText?: string;
                         watermarkLogoUrl?: string;
@@ -189,6 +198,10 @@ export function createSessionStore() {
                     name: roomState.room.name,
                     isLive: roomState.isLive,
                     participants: roomState.participants,
+                    scheduledAt: roomState.room.scheduledAt ?? null,
+                    openedAt: roomState.room.openedAt ?? null,
+                    earlyOpenMinutes: roomState.room.earlyOpenMinutes ?? 10,
+                    waitingRoomEnabled: roomState.room.waitingRoomEnabled ?? false,
                     // Map watermark configuration
                     watermarkMode: roomState.room.watermarkMode || 'none',
                     watermarkText: roomState.room.watermarkText,

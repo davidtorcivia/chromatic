@@ -29,7 +29,10 @@ export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
         throw new Error(await res.text());
     }
 
-    return res.json();
+    // Several endpoints (admit, deny, end) reply 204 No Content; res.json()
+    // would throw on the empty body.
+    const text = await res.text();
+    return (text ? JSON.parse(text) : undefined) as T;
 }
 
 export async function apiPatch<T>(path: string, body: unknown): Promise<T> {
@@ -77,6 +80,10 @@ export interface Room {
     name: string;
     scheduledAt?: string;
     durationMinutes?: number;
+    /** Minutes before scheduledAt that guests may enter the countdown lobby (0-120, default 10) */
+    earlyOpenMinutes?: number;
+    /** Set when an admin opened the room early or the first stream arrived */
+    openedAt?: string;
     hasPassword: boolean;
     waitingRoomEnabled: boolean;
     streamKeyId?: string;
@@ -119,6 +126,29 @@ export interface RoomInfo {
     waitingRoomEnabled: boolean;
     status: string;
     scheduledAt?: string;
+    earlyOpenMinutes?: number;
+    openedAt?: string;
+    /** Server clock at response time — anchor countdowns to this, not the local clock */
+    serverTime?: string;
+}
+
+/** Countdown-lobby info returned by join when a scheduled room hasn't opened yet */
+export interface LobbyInfo {
+    scheduledAt: string;
+    opensAt: string;
+    waitingRoomEnabled: boolean;
+}
+
+export interface JoinResult {
+    participantId: string;
+    token: string;
+    isAdmitted: boolean;
+    waitingRoom: boolean;
+    color: string;
+    name: string;
+    role: 'admin' | 'viewer';
+    serverTime?: string;
+    lobby?: LobbyInfo;
 }
 
 // API functions
@@ -142,6 +172,8 @@ export const rooms = {
         return { failed };
     },
     end: (slug: string) => apiPost(`/api/rooms/${slug}/end`),
+    /** Open a scheduled room ahead of time (admin). Auto-admits the countdown lobby. */
+    open: (slug: string) => apiPost<{ openedAt: string }>(`/api/rooms/${slug}/open`),
     // Bulk end: loops the single-room end endpoint, reporting failures.
     endMany: async (slugs: string[]): Promise<{ failed: string[] }> => {
         const failed: string[] = [];
@@ -156,14 +188,12 @@ export const rooms = {
     },
     info: (slug: string) => apiGet<RoomInfo>(`/api/rooms/${slug}/info`),
     join: (slug: string, name: string, password?: string, adminToken?: string) =>
-        apiPost<{ participantId: string; token: string; isAdmitted: boolean; waitingRoom: boolean; color: string; name: string; role: 'admin' | 'viewer' }>(
-            `/api/rooms/${slug}/join`,
-            { name, password, adminToken }
-        ),
+        apiPost<JoinResult>(`/api/rooms/${slug}/join`, { name, password, adminToken }),
     listWaiting: (slug: string) => apiGet<{ id: string; name: string; joinedAt: string }[]>(`/api/rooms/${slug}/waiting`),
     admit: (slug: string, participantId: string) => apiPost(`/api/rooms/${slug}/admit/${participantId}`),
     admitAll: (slug: string) => apiPost(`/api/rooms/${slug}/admit-all`),
-    checkStatus: async (slug: string, participantId: string, token: string): Promise<{ isAdmitted: boolean; roomStatus: string }> => {
+    deny: (slug: string, participantId: string) => apiPost(`/api/rooms/${slug}/deny/${participantId}`),
+    checkStatus: async (slug: string, participantId: string, token: string): Promise<{ isAdmitted: boolean; roomStatus: string; serverTime?: string }> => {
         // The join token travels in a header rather than a query param so it
         // doesn't leak into server/proxy logs. (The SSE waitingEvents endpoint
         // keeps the query param — EventSource can't set headers.)

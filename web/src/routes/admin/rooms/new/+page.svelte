@@ -14,6 +14,9 @@
     let slug = $state("");
     let password = $state("");
     let waitingRoomEnabled = $state(false);
+    // Scheduling: local datetime-local string ("" = instant room) + lobby window
+    let scheduledAtLocal = $state("");
+    let earlyOpenMinutes = $state(10);
     let streamKeyId = $state<string>("");
     let watermarkMode = $state<"none" | "text" | "logo" | "both">("text");
     let watermarkText = $state("{{ name }} - {{ date }}");
@@ -144,6 +147,17 @@
                 watermarkMode,
             };
 
+            if (scheduledAtLocal) {
+                const scheduled = new Date(scheduledAtLocal);
+                if (!Number.isNaN(scheduled.getTime())) {
+                    roomData.scheduledAt = scheduled.toISOString();
+                    roomData.earlyOpenMinutes =
+                        typeof earlyOpenMinutes === "number" && !Number.isNaN(earlyOpenMinutes)
+                            ? Math.min(120, Math.max(0, earlyOpenMinutes))
+                            : 10;
+                }
+            }
+
             if (password) {
                 roomData.password = password;
             }
@@ -241,6 +255,42 @@
                         >3-64 characters: lowercase letters, numbers, and hyphens only</span
                     >
                 </div>
+            </div>
+
+            <div class="form-section">
+                <h3>Schedule</h3>
+
+                <div class="form-group">
+                    <label for="scheduledAt">Scheduled Start (optional)</label>
+                    <input
+                        type="datetime-local"
+                        id="scheduledAt"
+                        class="input"
+                        bind:value={scheduledAtLocal}
+                    />
+                    <span class="form-hint"
+                        >Guests see a countdown lobby until the session starts.
+                        Leave blank for an instant room.</span
+                    >
+                </div>
+
+                {#if scheduledAtLocal}
+                    <div class="form-group">
+                        <label for="earlyOpenMinutes">Lobby opens (minutes before start)</label>
+                        <input
+                            type="number"
+                            id="earlyOpenMinutes"
+                            class="input"
+                            bind:value={earlyOpenMinutes}
+                            min="0"
+                            max="120"
+                            placeholder="10"
+                        />
+                        <span class="form-hint"
+                            >How early guests may enter the countdown lobby (0&ndash;120 minutes).</span
+                        >
+                    </div>
+                {/if}
             </div>
 
             <div class="form-section">
