@@ -77,11 +77,13 @@ export class WebRTCManager {
     // failure rather than firing onIceRestartFailed prematurely.
     private iceRestartAttempted: boolean = false;
     private connectionLostTimeout: ReturnType<typeof setTimeout> | null = null;
-    // Watchdog: retries voice renegotiation if the offer goes unanswered
+    // Dedicated send-only peer connection (mic + screen share). The client is
+    // always the offerer here; the subscriber PC (this.pc) is receive-only
+    // with the server as sole offerer. See ensurePublisher().
+    private publisherPc: RTCPeerConnection | null = null;
+    // Watchdog: rebuilds the publisher if an offer goes unanswered
     private voiceOfferTimer: ReturnType<typeof setTimeout> | null = null;
-    private voiceOfferRetries: number = 0;
     private static readonly VOICE_OFFER_TIMEOUT_MS = 8000;
-    private static readonly VOICE_OFFER_MAX_RETRIES = 3;
     // Serialize all SDP operations to prevent concurrent modifications
     // to the PeerConnection's signaling state (e.g. handleOffer + handleRenegotiation
     // firing from separate WebSocket messages while awaiting).
@@ -136,16 +138,9 @@ export class WebRTCManager {
 
             const pc = this.pc!;
 
-            // If we have a pending local offer (voice renegotiation, etc.),
-            // rollback to accept the server's offer. Clear watchdog since
-            // the voice offer is being abandoned.
-            if (pc.signalingState === 'have-local-offer') {
-                console.log('Rolling back local offer to accept server offer');
-                this.clearVoiceOfferWatchdog();
-                await pc.setLocalDescription({ type: 'rollback' });
-            }
-
-            // Set remote description (the offer from server)
+            // Set remote description (the offer from server). The subscriber
+            // PC is receive-only and the client never offers on it, so no
+            // pending-local-offer handling is needed here.
             const offer: RTCSessionDescriptionInit = { type: 'offer', sdp };
             await pc.setRemoteDescription(offer);
             console.log('Set remote description');
@@ -156,39 +151,9 @@ export class WebRTCManager {
 
             this.options.sendSignal('signal:answer', { sdp: answer.sdp });
 
-            // Re-attach local senders that died with a replaced peer
-            // connection (fresh offer after reconnect/resubscribe), then
-            // fire-and-forget ONE renegotiation. We must NOT await
-            // renegotiate() here because we're already inside
-            // enqueueSignaling — awaiting a nested enqueue would deadlock
-            // the signaling queue.
-            let needsLocalRenegotiation = false;
-
-            if (this.localStream && !this.audioSender && !this.isMicMuted) {
-                const audioTrack = this.localStream.getAudioTracks()[0];
-                if (audioTrack) {
-                    this.audioSender = pc.addTrack(audioTrack, this.localStream);
-                    console.log('Added pending mic track after offer');
-                    needsLocalRenegotiation = true;
-                }
-            }
-
-            // An active screen capture survives a PC rebuild (the browser
-            // keeps capturing and the UI shows "you're sharing"), but its
-            // sender belonged to the old PC — without re-adding it here the
-            // share silently stops reaching everyone else.
-            if (this.screenShareStream && !this.screenShareSender) {
-                const shareTrack = this.screenShareStream.getVideoTracks()[0];
-                if (shareTrack && shareTrack.readyState === 'live') {
-                    this.screenShareSender = pc.addTrack(shareTrack, this.screenShareStream);
-                    console.log('Re-added screen share track after peer connection rebuild');
-                    needsLocalRenegotiation = true;
-                }
-            }
-
-            if (needsLocalRenegotiation) {
-                this.renegotiate();
-            }
+            // Outgoing media (mic, screen share) lives on the publisher PC,
+            // which is independent of subscriber rebuilds — nothing to
+            // re-attach here.
         });
     }
 
@@ -204,14 +169,10 @@ export class WebRTCManager {
             clearTimeout(this.iceRestartTimeout);
             this.iceRestartTimeout = null;
         }
-        this.clearVoiceOfferWatchdog();
-        this.voiceOfferRetries = 0;
         this.iceRestartPending = false;
         this.iceRestartAttempted = false;
-        this.audioSender = null;
-        // The screen-share sender belonged to the old PC; the capture stream
-        // (if any) is left running so the caller can decide whether to re-share.
-        this.screenShareSender = null;
+        // NOTE: audioSender/screenShareSender belong to the publisher PC,
+        // which is independent of the subscriber PC reset here.
         if (this.pc) {
             try {
                 this.pc.close();
@@ -393,8 +354,6 @@ export class WebRTCManager {
 
         this.iceRestartPending = true;
         this.iceRestartAttempted = false;
-        // Clear voice watchdog — ICE restart takes priority
-        this.clearVoiceOfferWatchdog();
         console.log('Performing ICE restart...');
         this.options.onIceRestart?.();
 
@@ -606,8 +565,8 @@ export class WebRTCManager {
             });
         }
 
-        // If we have a peer connection and local stream, add/update track
-        if (enabled && this.pc && this.localStream) {
+        // Publishing rides its own PC — no subscriber connection needed
+        if (enabled && this.localStream) {
             this.addLocalAudioTrack().catch(err => {
                 console.error('Failed to add local audio track, reverting mic state:', err);
                 this.isMicMuted = true;
@@ -625,9 +584,9 @@ export class WebRTCManager {
         return !this.isMicMuted;
     }
 
-    // Add local audio track to peer connection
+    // Add local audio track to the publisher connection
     private async addLocalAudioTrack(): Promise<void> {
-        if (!this.pc || !this.localStream) return;
+        if (!this.localStream) return;
 
         const audioTrack = this.localStream.getAudioTracks()[0];
         if (!audioTrack) return;
@@ -637,109 +596,69 @@ export class WebRTCManager {
             // Replace track
             await this.audioSender.replaceTrack(audioTrack);
         } else {
-            // Add new track
-            this.audioSender = this.pc.addTrack(audioTrack, this.localStream);
-
-            // Need to renegotiate - create and send offer
-            await this.renegotiate();
+            // Add new track on the publisher PC and negotiate
+            const pub = this.ensurePublisher();
+            this.audioSender = pub.addTrack(audioTrack, this.localStream);
+            await this.negotiatePublisher();
         }
     }
 
-    // Pin every transceiver's codecs to the INTERSECTION of the browser's
-    // capabilities and what the server actually offered in the current
-    // remote description. For Firefox/Safari this is a no-op (same codecs,
-    // same payload types). For Chrome it stops the re-offer from expanding
-    // m-lines with AV1/H265/VP9/RTX payload types the server never offered —
-    // which collide across the BUNDLE and crash Chrome's own
-    // setLocalDescription with "Failed to apply demuxer criteria", wrecking
-    // the session seconds after join (mic offer) and leaving video black.
-    //
-    // IMPORTANT: do NOT pin to the raw getCapabilities() list (tried —
-    // extra H264 profiles/packetization modes renumbered the payload types
-    // and pion silently stopped sending video to the subscriber).
-    private pinCodecsToRemoteOffer(): void {
-        const pc = this.pc;
-        const remoteSdp = pc?.remoteDescription?.sdp;
-        if (!pc || !remoteSdp) return;
+    // ---- Publisher peer connection -----------------------------------------
+    // All outgoing media (mic, screen share) flows over a dedicated PC where
+    // the CLIENT is always the offerer and the server only answers. The
+    // subscriber PC (this.pc) is server-offer-only. Mixing offer directions
+    // on one PC is what caused every signaling wedge in the field: Chrome's
+    // "Failed to apply demuxer criteria" re-offer crashes and Safari's
+    // unrecoverable "Failed to set SSL role" rollback failures. A wedged
+    // publisher carries no inbound state, so the recovery story is trivial:
+    // tear it down and rebuild it with the current local tracks.
 
-        // Collect the server-offered codec set as "mimetype|sorted-fmtp".
-        const canonFmtp = (f: string | undefined) =>
-            (f ?? '').split(';').map((s) => s.trim()).filter(Boolean).sort().join(';');
-        const offered = new Set<string>();
-        const rtpmaps = new Map<string, string>(); // pt -> codec name/clock
-        const fmtps = new Map<string, string>(); // pt -> fmtp line
-        for (const line of remoteSdp.split('\n')) {
-            const rtpmap = line.match(/^a=rtpmap:(\d+) ([^\r]+)/);
-            if (rtpmap) rtpmaps.set(rtpmap[1], rtpmap[2].trim());
-            const fmtp = line.match(/^a=fmtp:(\d+) ([^\r]+)/);
-            if (fmtp) fmtps.set(fmtp[1], fmtp[2].trim());
-        }
-        for (const [pt, nameClock] of rtpmaps) {
-            const [name] = nameClock.split('/');
-            offered.add(`${name.toLowerCase()}|${canonFmtp(fmtps.get(pt))}`);
-        }
-        if (offered.size === 0) return;
+    private ensurePublisher(): RTCPeerConnection {
+        if (this.publisherPc) return this.publisherPc;
 
-        for (const t of pc.getTransceivers()) {
-            if (typeof t.setCodecPreferences !== 'function') continue;
-            const kind = t.receiver?.track?.kind;
-            if (kind !== 'video' && kind !== 'audio') continue;
-            try {
-                const caps = RTCRtpReceiver.getCapabilities(kind);
-                if (!caps) continue;
-                const allowed = caps.codecs.filter((c) => {
-                    const name = c.mimeType.toLowerCase().replace(/^(audio|video)\//, '');
-                    return offered.has(`${name}|${canonFmtp(c.sdpFmtpLine)}`);
+        const pc = new RTCPeerConnection({ iceServers: this.options.iceServers });
+        pc.onicecandidate = (event) => {
+            if (event.candidate) {
+                this.options.sendSignal('publish:candidate', {
+                    candidate: event.candidate.candidate,
+                    sdpMid: event.candidate.sdpMid,
+                    sdpMLineIndex: event.candidate.sdpMLineIndex
                 });
-                if (allowed.length > 0) {
-                    t.setCodecPreferences(allowed);
-                }
-            } catch {
-                // Best-effort: an unpinned offer may still succeed.
             }
-        }
+        };
+        pc.onconnectionstatechange = () => {
+            console.log('Publisher connection state:', pc.connectionState);
+            if (pc.connectionState === 'failed' && this.publisherPc === pc) {
+                this.rebuildPublisher();
+            }
+        };
+        this.publisherPc = pc;
+        return pc;
     }
 
-    // Renegotiate the connection after adding tracks. Returns whether the
-    // offer actually went out — errors used to be swallowed here, which let
-    // screen shares die silently (the sharer saw "sharing", the server never
-    // got an offer). Starts a watchdog timer that retries if the offer goes
-    // unanswered.
-    private async renegotiate(): Promise<boolean> {
+    // Create and send an offer on the publisher PC. The server answers
+    // immediately (no offer can ever be in flight from the server on this
+    // PC), so an unanswered offer means a lost message or wedged PC — the
+    // watchdog rebuilds the publisher from scratch in that case.
+    private async negotiatePublisher(): Promise<boolean> {
         return this.enqueueSignaling(async () => {
-            if (!this.pc) return false;
+            const pc = this.publisherPc;
+            if (!pc) return false;
 
             try {
-                // NO rollback here: explicitly rolling back a pending local
-                // offer triggers "Failed to set SSL role for the transport"
-                // in Chrome AND Safari once DTLS is up, permanently wedging
-                // the connection in have-local-offer. Setting a new local
-                // offer directly REPLACES a pending one (legal in all
-                // browsers), so a stale unanswered offer is superseded.
-                this.pinCodecsToRemoteOffer();
-                const offer = await this.pc.createOffer();
-                await this.pc.setLocalDescription(offer);
-
-                // Send offer to server
-                this.options.sendSignal('signal:offer', {
-                    sdp: offer.sdp
-                });
-
-                // Start watchdog: if we're still in have-local-offer after
-                // the timeout, the server never answered — retry.
-                this.startVoiceOfferWatchdog();
-
-                console.log('Sent renegotiation offer');
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                this.options.sendSignal('publish:offer', { sdp: offer.sdp });
+                this.startPublishAnswerWatchdog();
+                console.log('Sent publisher offer');
                 return true;
             } catch (err) {
                 const e = err as Error;
-                console.error('Failed to renegotiate:', err);
-                // Mirror to the server log — these failures only reproduce
-                // on testers' machines.
+                console.error('Failed to negotiate publisher:', err);
                 try {
                     this.options.sendSignal('client:debug', {
-                        event: 'renegotiate-failed',
-                        detail: `${e?.name ?? 'Error'}: ${e?.message ?? String(err)} (state=${this.pc?.signalingState ?? 'gone'})`
+                        event: 'publish-negotiate-failed',
+                        detail: `${e?.name ?? 'Error'}: ${e?.message ?? String(err)} (state=${pc.signalingState})`
                     });
                 } catch {
                     // diagnostics must never throw
@@ -749,40 +668,60 @@ export class WebRTCManager {
         });
     }
 
-    // Start (or restart) the watchdog timer for unanswered voice offers
-    private startVoiceOfferWatchdog(): void {
-        this.clearVoiceOfferWatchdog();
+    // Apply the server's answer to the publisher offer.
+    async handlePublishAnswer(sdp: string): Promise<void> {
+        return this.enqueueSignaling(async () => {
+            const pc = this.publisherPc;
+            if (!pc) return;
+            await pc.setRemoteDescription({ type: 'answer', sdp });
+            this.clearPublishAnswerWatchdog();
+            console.log('Publisher answer applied');
+        });
+    }
+
+    // Tear down and recreate the publisher with the current local tracks.
+    // Safe at any time: the publisher has no inbound state to lose.
+    private rebuildPublisher(): void {
+        console.warn('Rebuilding publisher peer connection');
+        this.clearPublishAnswerWatchdog();
+        const old = this.publisherPc;
+        this.publisherPc = null;
+        this.audioSender = null;
+        this.screenShareSender = null;
+        try {
+            old?.close();
+        } catch {
+            // already closed
+        }
+
+        const audioTrack = this.localStream?.getAudioTracks()[0];
+        const shareTrack = this.screenShareStream?.getVideoTracks()[0];
+        if (!audioTrack && !(shareTrack && shareTrack.readyState === 'live')) {
+            return; // nothing to publish; next mic/share enable recreates it
+        }
+
+        const pc = this.ensurePublisher();
+        if (audioTrack && this.localStream) {
+            this.audioSender = pc.addTrack(audioTrack, this.localStream);
+        }
+        if (shareTrack && shareTrack.readyState === 'live' && this.screenShareStream) {
+            this.screenShareSender = pc.addTrack(shareTrack, this.screenShareStream);
+        }
+        void this.negotiatePublisher();
+    }
+
+    private startPublishAnswerWatchdog(): void {
+        this.clearPublishAnswerWatchdog();
         this.voiceOfferTimer = setTimeout(() => {
-            if (!this.pc) return;
-            if (this.pc.signalingState !== 'have-local-offer') return;
-            // Don't interfere with ICE restart offers
-            if (this.iceRestartPending) return;
-            if (this.voiceOfferRetries >= WebRTCManager.VOICE_OFFER_MAX_RETRIES) {
-                console.error('Voice offer unanswered after max retries; requesting a fresh subscription');
-                this.voiceOfferRetries = 0;
-                // Don't rollback (browsers fail it with "Failed to set SSL
-                // role" after DTLS is up) — rebuild the subscription instead;
-                // local tracks re-attach on the fresh offer.
-                this.options.onNegotiationWedged?.();
-                return;
+            this.voiceOfferTimer = null;
+            if (this.publisherPc?.signalingState === 'have-local-offer') {
+                console.warn('Publisher offer unanswered; rebuilding publisher');
+                this.rebuildPublisher();
             }
-            this.voiceOfferRetries++;
-            console.warn(`Voice offer unanswered after ${WebRTCManager.VOICE_OFFER_TIMEOUT_MS}ms, retrying (${this.voiceOfferRetries}/${WebRTCManager.VOICE_OFFER_MAX_RETRIES})`);
-            // Re-send: a new local offer directly replaces the stale pending
-            // one (no rollback — see above).
-            this.enqueueSignaling(async () => {
-                if (!this.pc || this.pc.signalingState !== 'have-local-offer') return;
-                if (this.iceRestartPending) return;
-                const offer = await this.pc.createOffer();
-                await this.pc.setLocalDescription(offer);
-                this.options.sendSignal('signal:offer', { sdp: offer.sdp });
-                this.startVoiceOfferWatchdog();
-                console.log('Re-sent voice offer');
-            });
         }, WebRTCManager.VOICE_OFFER_TIMEOUT_MS);
     }
 
-    private clearVoiceOfferWatchdog(): void {
+    private clearPublishAnswerWatchdog(): void {
         if (this.voiceOfferTimer) {
             clearTimeout(this.voiceOfferTimer);
             this.voiceOfferTimer = null;
@@ -800,14 +739,13 @@ export class WebRTCManager {
             };
 
             await this.pc.setRemoteDescription(answer);
-            // Answer received — clear the watchdog and reset retries
-            this.clearVoiceOfferWatchdog();
-            this.voiceOfferRetries = 0;
-            console.log('Set remote description for voice answer');
+            console.log('Set remote description for answer');
         });
     }
 
-    // Handle server-initiated renegotiation (e.g., when voice tracks are added)
+    // Handle server-initiated renegotiation (e.g., when voice tracks are added).
+    // The subscriber PC is receive-only with the server as sole offerer, so
+    // this is a pure offer→answer exchange — no glare, no rollbacks.
     async handleRenegotiation(sdp: string, participantId?: string): Promise<void> {
         return this.enqueueSignaling(async () => {
             if (!this.pc) {
@@ -818,56 +756,16 @@ export class WebRTCManager {
             console.log('Handling server-initiated renegotiation', participantId ? `for voice from ${participantId}` : '');
             this.options.onRenegotiation?.();
 
-            let rolledBack = false;
-
             try {
-                // If we have a pending local offer (client-initiated renegotiation),
-                // rollback to accept the server's offer instead. The server is the
-                // "impolite" peer in our signaling model.
-                if (this.pc.signalingState === 'have-local-offer') {
-                    console.log('Rolling back local offer to accept server renegotiation');
-                    this.clearVoiceOfferWatchdog();
-                    await this.pc.setLocalDescription({ type: 'rollback' });
-                    rolledBack = true;
-                }
-
-                // Set the new offer from server
-                const offer: RTCSessionDescriptionInit = {
-                    type: 'offer',
-                    sdp: sdp
-                };
-                await this.pc.setRemoteDescription(offer);
-
-                // If we have a pending mic stream, add the track before creating
-                // the answer so the answer includes the mic media section.
-                if (this.localStream && !this.audioSender && !this.isMicMuted) {
-                    const audioTrack = this.localStream.getAudioTracks()[0];
-                    if (audioTrack) {
-                        this.audioSender = this.pc.addTrack(audioTrack, this.localStream);
-                        console.log('Added mic track during renegotiation answer');
-                    }
-                }
-
-                // Create answer
+                await this.pc.setRemoteDescription({ type: 'offer', sdp });
                 const answer = await this.pc.createAnswer();
                 await this.pc.setLocalDescription(answer);
 
-                // Send answer back to server
                 this.options.sendSignal('signal:renegotiate-answer', {
                     sdp: answer.sdp
                 });
 
                 console.log('Sent renegotiation answer');
-
-                // If we rolled back a client-initiated offer, any locally-added
-                // tracks (mic, screen share) still exist on the PC but were NOT
-                // included in the answer (createAnswer can only match the server's
-                // offer m-lines). Re-trigger a client offer so those tracks get
-                // properly negotiated.
-                if (rolledBack && (this.audioSender || this.screenShareSender)) {
-                    console.log('Re-offering after rollback to negotiate local tracks');
-                    this.renegotiate();
-                }
             } catch (err) {
                 console.error('Failed to handle renegotiation:', err);
             }
@@ -888,11 +786,6 @@ export class WebRTCManager {
     }
 
     async startScreenShare(): Promise<boolean> {
-        if (!this.pc) {
-            this.shareDebug('failed', 'no peer connection');
-            return false;
-        }
-
         try {
             this.shareDebug('capture-requested');
             this.screenShareStream = await navigator.mediaDevices.getDisplayMedia({
@@ -916,23 +809,19 @@ export class WebRTCManager {
                 this.options.onScreenShareEnded?.();
             };
 
-            // Add track to peer connection and renegotiate
-            this.screenShareSender = this.pc.addTrack(videoTrack, this.screenShareStream);
-            this.shareDebug('track-added', `pc=${this.pc.connectionState}/${this.pc.signalingState}`);
-            let negotiated = await this.renegotiate();
+            // Add track to the publisher PC and negotiate
+            const pub = this.ensurePublisher();
+            this.screenShareSender = pub.addTrack(videoTrack, this.screenShareStream);
+            this.shareDebug('track-added', `publisher=${pub.connectionState}/${pub.signalingState}`);
+            const negotiated = await this.negotiatePublisher();
             if (!negotiated) {
-                // One retry after a beat — transient signaling races settle.
-                await new Promise((r) => setTimeout(r, 500));
-                negotiated = await this.renegotiate();
-            }
-            if (!negotiated) {
-                // The peer connection is wedged. Ask the page to rebuild the
-                // whole subscription — the capture stays alive and handleOffer
-                // re-attaches it to the fresh connection automatically.
-                this.shareDebug('negotiation-wedged', 'requesting fresh subscription');
-                this.options.onNegotiationWedged?.();
+                // Publisher signaling failed — rebuild it from scratch (it
+                // carries no inbound state, so this is always safe). The
+                // rebuild re-adds the live capture and negotiates again.
+                this.shareDebug('negotiation-wedged', 'rebuilding publisher');
+                this.rebuildPublisher();
             } else {
-                this.shareDebug('offer-sent', `signaling=${this.pc?.signalingState ?? 'gone'}`);
+                this.shareDebug('offer-sent', `publisher=${this.publisherPc?.signalingState ?? 'gone'}`);
             }
 
             console.log('Screen share started');
@@ -953,11 +842,11 @@ export class WebRTCManager {
 
     // Stop screen sharing
     stopScreenShare(): void {
-        const needsRenegotiation = this.screenShareSender != null && this.pc != null;
+        const needsRenegotiation = this.screenShareSender != null && this.publisherPc != null;
 
-        if (this.screenShareSender && this.pc) {
+        if (this.screenShareSender && this.publisherPc) {
             try {
-                this.pc.removeTrack(this.screenShareSender);
+                this.publisherPc.removeTrack(this.screenShareSender);
             } catch (err) {
                 console.error('Failed to remove screen share track:', err);
             }
@@ -971,7 +860,7 @@ export class WebRTCManager {
 
         // Renegotiate so the server knows the track was removed
         if (needsRenegotiation) {
-            this.renegotiate();
+            void this.negotiatePublisher();
         }
 
         console.log('Screen share stopped');
@@ -979,7 +868,7 @@ export class WebRTCManager {
 
     // Clean up
     close(): void {
-        this.clearVoiceOfferWatchdog();
+        this.clearPublishAnswerWatchdog();
 
         if (this.connectionLostTimeout) {
             clearTimeout(this.connectionLostTimeout);
@@ -1012,6 +901,15 @@ export class WebRTCManager {
         if (this.pc) {
             this.pc.close();
             this.pc = null;
+        }
+
+        if (this.publisherPc) {
+            try {
+                this.publisherPc.close();
+            } catch {
+                // already closed
+            }
+            this.publisherPc = null;
         }
     }
 }

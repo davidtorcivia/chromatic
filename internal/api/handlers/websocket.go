@@ -443,6 +443,66 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 	return true
 }
 
+// handlePublishOffer negotiates a participant's dedicated publisher peer
+// connection (mic + screen share). The client is always the offerer here and
+// the server only answers, so this path has no glare/rollback failure modes.
+// Published tracks are routed exactly like the legacy subscriber-PC paths:
+// audio → voice relay fan-out, video → screen share relay fan-out.
+func (h *WebSocketHandler) handlePublishOffer(client *websocket.Client, payload json.RawMessage) {
+	var data struct {
+		SDP string `json:"sdp"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil || data.SDP == "" {
+		logger.Warn("Invalid publish offer", "participant_id", client.ID)
+		return
+	}
+
+	roomSlug := client.RoomSlug
+	answer, err := h.sfu.HandlePublisherOffer(roomSlug, client.ID, data.SDP, func(pid string, track *pionwebrtc.TrackRemote) {
+		if track.Kind() == pionwebrtc.RTPCodecTypeVideo {
+			// Screen share — only forward when the participant holds share
+			// permission (admins implicitly do).
+			if !client.IsAdmin && !h.participantCanScreenshare(roomSlug, pid) {
+				logger.Warn("Ignoring unauthorized published video track", "participant_id", pid, "room", roomSlug)
+				return
+			}
+			h.forwardScreenShareTrack(roomSlug, pid, track)
+			return
+		}
+		h.forwardVoiceTrack(roomSlug, pid, track)
+	})
+	if err != nil {
+		logger.Error("Failed to handle publish offer", "participant_id", client.ID, "error", err)
+		client.SendJSON("publish:error", map[string]interface{}{
+			"message": "Failed to negotiate publishing connection",
+		})
+		return
+	}
+
+	client.SendJSON("publish:answer", map[string]interface{}{
+		"sdp": answer,
+	})
+	logger.Debug("Publisher negotiated", "participant_id", client.ID, "room", roomSlug)
+}
+
+func (h *WebSocketHandler) handlePublishCandidate(client *websocket.Client, payload json.RawMessage) {
+	var data struct {
+		Candidate     string  `json:"candidate"`
+		SDPMid        *string `json:"sdpMid"`
+		SDPMLineIndex *uint16 `json:"sdpMLineIndex"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return
+	}
+	if err := h.sfu.AddPublisherCandidate(client.RoomSlug, client.ID, pionwebrtc.ICECandidateInit{
+		Candidate:     data.Candidate,
+		SDPMid:        data.SDPMid,
+		SDPMLineIndex: data.SDPMLineIndex,
+	}); err != nil {
+		logger.Debug("Failed to add publisher ICE candidate", "participant_id", client.ID, "error", err)
+	}
+}
+
 // handleClientDebug mirrors client-side flow breadcrumbs (e.g. the screen
 // share pipeline) into the server log so failures on remote testers'
 // machines are diagnosable without access to their browser console.
@@ -785,6 +845,11 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 		h.handleResubscribe(client)
 	case "client:debug":
 		h.handleClientDebug(client, msg.Payload)
+	// Publisher PC (client-offers-only: mic + screen share)
+	case "publish:offer":
+		h.handlePublishOffer(client, msg.Payload)
+	case "publish:candidate":
+		h.handlePublishCandidate(client, msg.Payload)
 	case "signal:ice-servers-request":
 		h.handleICEServersRequest(client)
 	// Admin commands

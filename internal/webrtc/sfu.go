@@ -1454,10 +1454,67 @@ type VoiceSession struct {
 	Muted atomic.Bool
 }
 
-// HandleVoiceOffer processes an offer from a client wanting to send voice audio
-// over a dedicated peer connection. Returns the SDP answer to send back.
-// (The primary voice path is the subscriber PC; this remains for clients that
-// negotiate a standalone voice PC.)
+// HandlePublisherOffer processes an offer on a participant's dedicated
+// publisher peer connection (microphone + screen share). The client is
+// ALWAYS the offerer on this PC and the server only answers; combined with
+// the server-offer-only subscriber PC this removes signaling glare entirely
+// (Chrome's demuxer-criteria crashes and Safari's unrecoverable "Failed to
+// set SSL role" wedges both stem from mixing offer directions on one PC).
+// An offer arriving for a live publisher renegotiates it in place (e.g.
+// adding a screen-share track to an existing mic session).
+func (s *SFU) HandlePublisherOffer(roomSlug, participantID, offerSDP string, onTrack func(participantID string, track *webrtc.TrackRemote)) (string, error) {
+	room := s.GetRoomTracks(roomSlug)
+
+	room.mu.Lock()
+	if room.VoiceSessions == nil {
+		room.VoiceSessions = make(map[string]*VoiceSession)
+	}
+	existing := room.VoiceSessions[participantID]
+	room.mu.Unlock()
+
+	// Renegotiate a live publisher in place. The ICE/DTLS transport is
+	// already established, so the answer needs no candidate gathering.
+	if existing != nil && existing.PeerConnection != nil {
+		state := existing.PeerConnection.ConnectionState()
+		if state != webrtc.PeerConnectionStateFailed && state != webrtc.PeerConnectionStateClosed {
+			pc := existing.PeerConnection
+			if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offerSDP}); err != nil {
+				return "", fmt.Errorf("failed to set publisher remote description: %w", err)
+			}
+			answer, err := pc.CreateAnswer(nil)
+			if err != nil {
+				return "", fmt.Errorf("failed to create publisher answer: %w", err)
+			}
+			if err := pc.SetLocalDescription(answer); err != nil {
+				return "", fmt.Errorf("failed to set publisher local description: %w", err)
+			}
+			log.Printf("Publisher renegotiated for %s in room %s", participantID, roomSlug)
+			return answer.SDP, nil
+		}
+	}
+
+	return s.HandleVoiceOffer(roomSlug, participantID, offerSDP, onTrack)
+}
+
+// AddPublisherCandidate adds a trickled ICE candidate from the client to its
+// publisher peer connection.
+func (s *SFU) AddPublisherCandidate(roomSlug, participantID string, candidate webrtc.ICECandidateInit) error {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return fmt.Errorf("room not found: %s", roomSlug)
+	}
+	room.mu.RLock()
+	vs := room.VoiceSessions[participantID]
+	room.mu.RUnlock()
+	if vs == nil || vs.PeerConnection == nil {
+		return fmt.Errorf("no publisher session for %s", participantID)
+	}
+	return vs.PeerConnection.AddICECandidate(candidate)
+}
+
+// HandleVoiceOffer processes an offer from a client wanting to send media
+// over a dedicated publisher peer connection. Returns the SDP answer (with
+// candidates pre-gathered) to send back.
 func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP string, onTrack func(participantID string, track *webrtc.TrackRemote)) (string, error) {
 	// Create a peer connection
 	pc, err := s.CreatePeerConnection()
@@ -1465,12 +1522,11 @@ func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP string, onTrack
 		return "", fmt.Errorf("failed to create peer connection: %w", err)
 	}
 
-	// Set the handler for when we receive the audio track
+	// Forward every published track (mic audio AND screen-share video) —
+	// the caller routes by kind.
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		log.Printf("Received voice track from %s: %s", participantID, track.Kind())
-		if track.Kind() == webrtc.RTPCodecTypeAudio {
-			onTrack(participantID, track)
-		}
+		log.Printf("Received published track from %s: %s", participantID, track.Kind())
+		onTrack(participantID, track)
 	})
 
 	// Set the remote description (the offer)

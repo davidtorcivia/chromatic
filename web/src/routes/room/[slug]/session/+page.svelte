@@ -292,6 +292,22 @@
             }
         });
 
+        // Publisher PC answers (mic + screen share ride a dedicated
+        // client-offers-only connection).
+        session.onMessage("publish:answer", async (payload: unknown) => {
+            const data = payload as { sdp: string };
+            try {
+                if (webrtcManager) await webrtcManager.handlePublishAnswer(data.sdp);
+            } catch (err) {
+                console.error('Failed to handle publish answer:', err);
+            }
+        });
+
+        session.onMessage("publish:error", (payload: unknown) => {
+            const data = payload as { message?: string };
+            console.error('Publisher negotiation failed server-side:', data?.message);
+        });
+
         session.onMessage("signal:renegotiate", async (payload: unknown) => {
             const data = payload as { sdp: string; participantId?: string };
             try {
