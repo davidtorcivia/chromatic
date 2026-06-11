@@ -1,6 +1,7 @@
 <script lang="ts">
     import { onMount, onDestroy } from "svelte";
     import { fade, fly } from "svelte/transition";
+    import { quintOut } from "svelte/easing";
     import { page } from "$app/stores";
     import { rooms, type LobbyInfo } from "$lib/api/client";
     import { countdownParts, formatScheduleLabel, serverClockOffset } from "$lib/lobby";
@@ -302,10 +303,10 @@
     <title>Waiting Room | Chromatic</title>
 </svelte:head>
 
-<main class="waiting-page" class:leaving={isLeaving}>
+<main class="waiting-page stage" class:leaving={isLeaving}>
     <div class="waiting-content" aria-live="polite">
         {#if status === "lobby" && countdown}
-            <div class="lobby-card" in:fade={{ duration: prefersReducedMotion ? 0 : 200 }}>
+            <div class="lobby-card glass-card" in:fade={{ duration: prefersReducedMotion ? 0 : 200 }}>
                 <div class="wordmark">Chromatic</div>
                 <h1 class="lobby-room">{roomName || "Your session"}</h1>
                 <p class="lobby-schedule">{scheduleLabel}</p>
@@ -315,23 +316,36 @@
                     <div class="lobby-countdown" role="timer" aria-label="Time until the session begins">
                         {#if countdown.days > 0}
                             <div class="count-unit">
-                                <span class="count-value">{countdown.days}</span>
+                                <span class="count-value-slot">
+                                    {#key countdown.days}
+                                        <span class="count-value" in:fly={{ y: -10, duration: prefersReducedMotion ? 0 : 260, easing: quintOut }}>{countdown.days}</span>
+                                    {/key}
+                                </span>
                                 <span class="count-label">{countdown.days === 1 ? "day" : "days"}</span>
                             </div>
-                            <span class="count-sep" aria-hidden="true">:</span>
                         {/if}
                         <div class="count-unit">
-                            <span class="count-value">{String(countdown.hours).padStart(2, "0")}</span>
+                            <span class="count-value-slot">
+                                {#key countdown.hours}
+                                    <span class="count-value" in:fly={{ y: -10, duration: prefersReducedMotion ? 0 : 260, easing: quintOut }}>{String(countdown.hours).padStart(2, "0")}</span>
+                                {/key}
+                            </span>
                             <span class="count-label">hours</span>
                         </div>
-                        <span class="count-sep" aria-hidden="true">:</span>
                         <div class="count-unit">
-                            <span class="count-value">{String(countdown.minutes).padStart(2, "0")}</span>
+                            <span class="count-value-slot">
+                                {#key countdown.minutes}
+                                    <span class="count-value" in:fly={{ y: -10, duration: prefersReducedMotion ? 0 : 260, easing: quintOut }}>{String(countdown.minutes).padStart(2, "0")}</span>
+                                {/key}
+                            </span>
                             <span class="count-label">min</span>
                         </div>
-                        <span class="count-sep" aria-hidden="true">:</span>
                         <div class="count-unit">
-                            <span class="count-value">{String(countdown.seconds).padStart(2, "0")}</span>
+                            <span class="count-value-slot">
+                                {#key countdown.seconds}
+                                    <span class="count-value" in:fly={{ y: -10, duration: prefersReducedMotion ? 0 : 260, easing: quintOut }}>{String(countdown.seconds).padStart(2, "0")}</span>
+                                {/key}
+                            </span>
                             <span class="count-label">sec</span>
                         </div>
                     </div>
@@ -350,7 +364,7 @@
                 </button>
             </div>
         {:else if status === "waiting"}
-            <div class="waiting-card" in:fly={{ y: 8, duration: prefersReducedMotion ? 0 : 200 }}>
+            <div class="waiting-card glass-card" in:fly={{ y: 8, duration: prefersReducedMotion ? 0 : 200 }}>
                 <div class="wordmark">Chromatic</div>
                 <div class="waiting-pulse" aria-hidden="true">
                     <span class="pulse-core"></span>
@@ -428,13 +442,6 @@
         padding: var(--space-lg);
         padding-top: calc(var(--space-lg) + env(safe-area-inset-top, 0px));
         padding-bottom: calc(var(--space-lg) + env(safe-area-inset-bottom, 0px));
-        background:
-            radial-gradient(
-                ellipse 70% 45% at 50% 0%,
-                rgba(72, 182, 166, 0.05),
-                transparent 70%
-            ),
-            var(--color-bg);
         opacity: 1;
         transition: opacity 400ms ease;
     }
@@ -454,12 +461,8 @@
         display: flex;
         flex-direction: column;
         align-items: center;
-        background: var(--color-surface);
-        border-radius: var(--radius-lg);
         padding: var(--space-xl);
         text-align: center;
-        border: 1px solid var(--color-border);
-        box-shadow: var(--shadow-md);
     }
 
     .waiting-card .wordmark {
@@ -501,8 +504,26 @@
         color: var(--color-text-subtle);
     }
 
+    /* Quiet ghost capsule: leaving should never compete with waiting */
     .waiting-leave {
         min-height: 40px;
+        border-radius: var(--radius-full);
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        color: var(--color-text-muted);
+        transition:
+            background var(--transition-fast),
+            color var(--transition-fast),
+            transform 0.2s var(--ease-spring);
+    }
+
+    .waiting-leave:hover {
+        background: rgba(255, 255, 255, 0.1);
+        color: var(--color-text);
+    }
+
+    .waiting-leave:active {
+        transform: scale(0.97);
     }
 
     /* Soft pulse: a calm core with a slow expanding halo */
@@ -545,12 +566,8 @@
         display: flex;
         flex-direction: column;
         align-items: center;
-        background: var(--color-surface);
-        border-radius: var(--radius-lg);
         padding: var(--space-2xl, 3rem) var(--space-xl);
         text-align: center;
-        border: 1px solid var(--color-border);
-        box-shadow: var(--shadow-md);
     }
 
     .lobby-card .wordmark {
@@ -587,11 +604,28 @@
         margin-bottom: var(--space-lg);
     }
 
+    /* Glass clock tiles; digits tick in from above on change */
     .count-unit {
         display: flex;
         flex-direction: column;
         align-items: center;
-        min-width: 3.25rem;
+        gap: 6px;
+    }
+
+    .count-value-slot {
+        display: grid;
+        place-items: center;
+        overflow: hidden;
+        min-width: 4rem;
+        padding: 10px 8px;
+        background: rgba(255, 255, 255, 0.045);
+        border: 1px solid rgba(255, 255, 255, 0.07);
+        border-radius: 14px;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    }
+
+    .count-value-slot > * {
+        grid-area: 1 / 1;
     }
 
     .count-value {
@@ -605,19 +639,10 @@
     }
 
     .count-label {
-        margin-top: 2px;
         font-size: var(--text-min);
         text-transform: uppercase;
         letter-spacing: 0.08em;
         color: var(--color-text-subtle);
-    }
-
-    .count-sep {
-        font-family: var(--font-display);
-        font-size: clamp(1.5rem, 7vw, 2rem);
-        line-height: 1.4;
-        color: var(--color-text-subtle);
-        opacity: 0.6;
     }
 
     .lobby-hint {

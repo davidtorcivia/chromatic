@@ -182,14 +182,14 @@
     <title>{roomInfo?.name || "Join Room"} | Chromatic</title>
 </svelte:head>
 
-<main class="join-page">
+<main class="join-page stage">
     {#if hostJoinState === "joining"}
         <!-- Branded hold state while the automatic admin join runs (no form flash) -->
         <div class="join-content host-joining" in:fade={{ duration: prefersReducedMotion ? 0 : 150 }}>
             <div class="invite-header">
                 <div class="wordmark">Chromatic</div>
             </div>
-            <div class="card host-joining-card">
+            <div class="glass-card host-joining-card">
                 <div class="host-spinner" aria-hidden="true"></div>
                 <h1>Joining as host…</h1>
                 <p>Setting up your session with host controls.</p>
@@ -222,19 +222,19 @@
                 <div class="session-details" in:fly={enter(2)}>
                     {#if scheduledAt}
                         <span class="session-detail">
-                            <svg viewBox="0 0 24 24" fill="currentColor" width="13" height="13" aria-hidden="true"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
                             {scheduledLabel}
                         </span>
                     {/if}
                     {#if roomInfo.hasPassword}
                         <span class="session-detail">
-                            <svg viewBox="0 0 24 24" fill="currentColor" width="13" height="13" aria-hidden="true"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zM9 8V6c0-1.66 1.34-3 3-3s3 1.34 3 3v2H9z"/></svg>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13" aria-hidden="true"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
                             Private session
                         </span>
                     {/if}
                     {#if roomInfo.waitingRoomEnabled}
                         <span class="session-detail">
-                            <svg viewBox="0 0 24 24" fill="currentColor" width="13" height="13" aria-hidden="true"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z"/></svg>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1 1 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg>
                             Host admits each guest
                         </span>
                     {/if}
@@ -252,14 +252,14 @@
             {:else}
                 {#if !canJoin}
                     <div class="opens-soon" in:fly={enter(3)} aria-live="polite">
-                        <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16" aria-hidden="true"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
                         <div class="opens-soon-copy">
                             <span class="opens-soon-title">Scheduled for {scheduledLabel}</span>
                             <span class="opens-soon-line">The room opens in <strong class="opens-soon-count">{opensInLabel}</strong>. The Join button will unlock automatically.</span>
                         </div>
                     </div>
                 {/if}
-                <form class="card join-form" in:fly={enter(3)} onsubmit={handleJoin}>
+                <form class="glass-card join-form" in:fly={enter(3)} onsubmit={handleJoin}>
                     {#if error}
                         <div class="alert alert-error" role="alert" in:fade={{ duration: prefersReducedMotion ? 0 : 150 }}>
                             {error}
@@ -347,6 +347,7 @@
 </main>
 
 <style>
+    /* Background comes from the shared .stage (aurora + drift + grain) */
     .join-page {
         min-height: 100vh;
         min-height: 100dvh;
@@ -356,13 +357,6 @@
         padding: var(--space-lg);
         padding-top: calc(var(--space-lg) + env(safe-area-inset-top, 0px));
         padding-bottom: calc(var(--space-lg) + env(safe-area-inset-bottom, 0px));
-        background:
-            radial-gradient(
-                ellipse 70% 45% at 50% 0%,
-                rgba(72, 182, 166, 0.05),
-                transparent 70%
-            ),
-            var(--color-bg);
     }
 
     .join-content {
@@ -429,7 +423,6 @@
         display: flex;
         flex-direction: column;
         padding: var(--space-xl);
-        box-shadow: var(--shadow-md);
     }
 
     .form-group {
@@ -446,29 +439,63 @@
         color: var(--color-text-muted);
     }
 
-    /* Comfortable, confident fields */
+    /* Comfortable, confident fields on glass */
     .input.input-lg {
         min-height: 48px;
         padding: 0 var(--space-md);
         font-size: 1rem;
-        background: var(--color-surface-elevated);
+        background: rgba(255, 255, 255, 0.05);
+        border-color: rgba(255, 255, 255, 0.1);
+        border-radius: 12px;
+        transition:
+            border-color var(--transition-fast),
+            background var(--transition-fast);
     }
 
+    .input.input-lg:hover {
+        border-color: rgba(255, 255, 255, 0.18);
+    }
+
+    .input.input-lg:focus,
+    .input.input-lg:focus-visible {
+        background: rgba(255, 255, 255, 0.07);
+        border-color: rgba(72, 182, 166, 0.6);
+        box-shadow: 0 0 0 3px rgba(72, 182, 166, 0.16);
+    }
+
+    /* The one saturated moment on the page: a lit teal capsule */
     .btn-join {
         width: 100%;
         min-height: 48px;
         padding: var(--space-md) var(--space-lg);
         font-size: 1rem;
         font-weight: 600;
+        border-radius: var(--radius-full);
+        background: linear-gradient(to bottom, #54c2b2, #3da394);
+        color: #04201c;
+        box-shadow:
+            inset 0 1px 0 rgba(255, 255, 255, 0.28),
+            0 6px 18px rgba(61, 163, 148, 0.22);
         transition:
-            background var(--transition-fast),
-            transform var(--transition-fast),
+            filter var(--transition-fast),
+            transform 0.2s var(--ease-spring),
             box-shadow var(--transition-fast);
     }
 
+    .btn-join:not(:disabled):hover {
+        background: linear-gradient(to bottom, #54c2b2, #3da394);
+        filter: brightness(1.06);
+    }
+
     .btn-join:not(:disabled):active {
-        transform: translateY(1px) scale(0.99);
-        background: var(--color-primary-hover);
+        transform: scale(0.985);
+    }
+
+    .btn-join:disabled {
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--color-text-subtle);
+        box-shadow: none;
+        opacity: 1;
     }
 
     .mic-hint {
@@ -514,7 +541,6 @@
         align-items: center;
         text-align: center;
         padding: var(--space-xl);
-        box-shadow: var(--shadow-md);
     }
 
     .host-joining-card h1 {
@@ -556,9 +582,14 @@
         gap: var(--space-sm);
         padding: var(--space-md);
         margin-bottom: var(--space-md);
-        background: var(--color-surface);
-        border: 1px solid var(--color-border);
-        border-radius: var(--radius-md);
+        background:
+            linear-gradient(to bottom, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0) 32px),
+            var(--glass-bg-deep);
+        backdrop-filter: var(--glass-backdrop-deep);
+        -webkit-backdrop-filter: var(--glass-backdrop-deep);
+        border: 1px solid var(--glass-edge);
+        border-radius: 14px;
+        box-shadow: var(--glass-specular);
         color: var(--color-text-muted);
     }
 

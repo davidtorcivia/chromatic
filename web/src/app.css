@@ -624,6 +624,63 @@ input[type="range"] {
   }
 }
 
+/* ===== Pre-session stage (join / lobby / waiting screens) =====
+   A quiet aurora with a slow drift and barely-there film grain: gives
+   the glass cards something real to frost, and makes the dark field
+   feel like a graded frame instead of a flat page. */
+.stage {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse 75% 50% at 50% -8%, rgba(72, 182, 166, 0.09), transparent 62%),
+    radial-gradient(ellipse 55% 40% at 88% 108%, rgba(72, 182, 166, 0.045), transparent 65%),
+    var(--color-bg);
+}
+
+.stage::before {
+  content: "";
+  position: absolute;
+  inset: -20%;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(
+    ellipse 40% 30% at 32% 28%,
+    rgba(72, 182, 166, 0.055),
+    transparent 70%
+  );
+  animation: stage-drift 36s ease-in-out infinite alternate;
+}
+
+@keyframes stage-drift {
+  from { transform: translate3d(-3%, -2%, 0); }
+  to { transform: translate3d(3%, 2%, 0); }
+}
+
+.stage::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  opacity: 0.04;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 160px 160px;
+}
+
+/* Deep glass panel for screens without live video behind them; same
+   material family as the room surfaces, frosting the stage glow. */
+.glass-card {
+  background:
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0) 48px),
+    var(--glass-bg-deep);
+  backdrop-filter: var(--glass-backdrop-deep);
+  -webkit-backdrop-filter: var(--glass-backdrop-deep);
+  border: 1px solid var(--glass-edge);
+  border-radius: 20px;
+  box-shadow: var(--glass-specular), var(--glass-shadow);
+}
+
 /* Glass tooltip (lib/ui/tooltip.ts) — appended to body, fixed position */
 .glass-tooltip {
   position: fixed;
