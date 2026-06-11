@@ -57,3 +57,6 @@ debug
 # Air live reload
 .air.toml
 tmp/
+
+# E2E tooling
+/e2e/node_modules/

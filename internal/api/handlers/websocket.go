@@ -823,6 +823,8 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 	case "chat:file":
 		metrics.Get().TotalMessagesChat.Add(1)
 		h.handleChatFile(client, msg.Payload)
+	case "chat:typing":
+		h.handleChatTyping(client)
 	case "cursor":
 		metrics.Get().TotalMessagesCursor.Add(1)
 		h.handleCursor(client, msg.Payload)
@@ -918,6 +920,21 @@ func (h *WebSocketHandler) handleChatSend(client *websocket.Client, payload json
 		"content":         sanitizedContent,
 		"timestamp":       now.UnixMilli(),
 	}, "")
+}
+
+// handleChatTyping relays a transient typing signal to everyone else in
+// the room. Nothing is validated or persisted; senders throttle to one
+// signal per ~1.5s and receivers expire the indicator on their own. Uses
+// the high-frequency cursor limiter, NOT the chat limiter: typing pings
+// must never consume the 30/min message budget.
+func (h *WebSocketHandler) handleChatTyping(client *websocket.Client) {
+	if !client.AllowCursor() {
+		return
+	}
+	h.hub.BroadcastJSON(client.RoomSlug, "chat:typing", map[string]interface{}{
+		"participantId":   client.ID,
+		"participantName": sanitizeText(client.Name),
+	}, client.ID)
 }
 
 func (h *WebSocketHandler) handleChatFile(client *websocket.Client, payload json.RawMessage) {
