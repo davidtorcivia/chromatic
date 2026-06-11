@@ -706,8 +706,28 @@ export class WebRTCManager {
         }
         if (shareTrack && shareTrack.readyState === 'live' && this.screenShareStream) {
             this.screenShareSender = pc.addTrack(shareTrack, this.screenShareStream);
+            void this.tuneShareSender(this.screenShareSender);
         }
         void this.negotiatePublisher();
+    }
+
+    // Raise the share encoder's quality ceiling: more bitrate headroom and
+    // resolution-first degradation. Defaults cap screen shares around
+    // 2.5 Mbps, which reads soft for color-review content.
+    private async tuneShareSender(sender: RTCRtpSender): Promise<void> {
+        try {
+            const params = sender.getParameters();
+            params.degradationPreference = 'maintain-resolution';
+            if (!params.encodings || params.encodings.length === 0) {
+                params.encodings = [{}];
+            }
+            params.encodings[0].maxBitrate = 8_000_000;
+            await sender.setParameters(params);
+        } catch (err) {
+            // Browser-dependent (Safari is picky pre-negotiation) — defaults
+            // still work, just softer.
+            console.warn('Could not tune share sender parameters:', err);
+        }
     }
 
     private startPublishAnswerWatchdog(): void {
@@ -789,7 +809,13 @@ export class WebRTCManager {
         try {
             this.shareDebug('capture-requested');
             this.screenShareStream = await navigator.mediaDevices.getDisplayMedia({
-                video: true,
+                // Capture at native resolution up to 4K; review content is
+                // detail-critical so resolution beats framerate.
+                video: {
+                    width: { ideal: 3840 },
+                    height: { ideal: 2160 },
+                    frameRate: { ideal: 30 }
+                },
                 audio: false
             });
 
@@ -809,9 +835,18 @@ export class WebRTCManager {
                 this.options.onScreenShareEnded?.();
             };
 
+            // Screen content is detail-critical: bias the encoder toward
+            // sharpness (it will drop framerate before resolution).
+            try {
+                videoTrack.contentHint = 'detail';
+            } catch {
+                // older browsers — fine without the hint
+            }
+
             // Add track to the publisher PC and negotiate
             const pub = this.ensurePublisher();
             this.screenShareSender = pub.addTrack(videoTrack, this.screenShareStream);
+            void this.tuneShareSender(this.screenShareSender);
             this.shareDebug('track-added', `publisher=${pub.connectionState}/${pub.signalingState}`);
             const negotiated = await this.negotiatePublisher();
             if (!negotiated) {
