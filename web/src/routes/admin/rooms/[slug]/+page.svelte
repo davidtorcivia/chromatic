@@ -223,7 +223,7 @@
                 room.openedAt = result.openedAt;
             }
             waitingParticipants = [];
-            successMessage = "Room opened — waiting guests have been let in.";
+            successMessage = "Room opened. Waiting guests have been let in.";
         } catch (e: any) {
             error = e.message || "Failed to open the room";
         } finally {
@@ -423,7 +423,7 @@
                     </div>
                     <p class="scheduled-info">
                         Starts {formatDate(room.scheduledAt)}. Guests can enter the lobby
-                        {room.earlyOpenMinutes ?? 10} minutes before — opening the room now lets
+                        {room.earlyOpenMinutes ?? 10} minutes before. Opening the room now lets
                         them in immediately{room.waitingRoomEnabled ? " (waiting room approval still applies)" : ""}.
                     </p>
                 </div>
@@ -639,7 +639,7 @@
                             max="120"
                             placeholder="10"
                         />
-                        <p class="form-hint">How early guests may enter the countdown lobby (0–120 minutes).</p>
+                        <p class="form-hint">How early guests may enter the countdown lobby (0 to 120 minutes).</p>
                     </div>
                 {/if}
 

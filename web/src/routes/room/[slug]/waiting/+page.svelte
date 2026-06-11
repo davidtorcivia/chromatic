@@ -311,7 +311,7 @@
                 <p class="lobby-schedule">{scheduleLabel}</p>
 
                 {#if !countdownDone}
-                    <p class="lobby-lead">You're early — the session begins in</p>
+                    <p class="lobby-lead">You're early. The session begins in</p>
                     <div class="lobby-countdown" role="timer" aria-label="Time until the session begins">
                         {#if countdown.days > 0}
                             <div class="count-unit">
@@ -335,13 +335,13 @@
                             <span class="count-label">sec</span>
                         </div>
                     </div>
-                    <p class="lobby-hint">Keep this page open — you'll be taken in automatically.</p>
+                    <p class="lobby-hint">Keep this page open and you'll be taken in automatically.</p>
                 {:else}
                     <div class="waiting-pulse lobby-pulse" aria-hidden="true">
                         <span class="pulse-core"></span>
                         <span class="pulse-ring"></span>
                     </div>
-                    <p class="lobby-lead">Starting now — opening the room…</p>
+                    <p class="lobby-lead">Starting now, opening the room…</p>
                     <p class="lobby-hint">You'll be taken in automatically.</p>
                 {/if}
 
@@ -365,7 +365,7 @@
                             transition:fade={{ duration: prefersReducedMotion ? 0 : 200 }}
                         >
                             {waitedLong
-                                ? "Still waiting — the host has been notified."
+                                ? "Still waiting. The host has been notified."
                                 : "Keep this page open."}
                         </p>
                     {/key}
