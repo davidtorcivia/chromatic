@@ -146,19 +146,21 @@ func (env *streamStartTestEnv) startIngest() {
 	}
 }
 
-// assertPreStreamSilence verifies that while no ingest exists the server
+// assertPreStreamOffer verifies the immediate pre-stream offer: subscribers
+// are created on connect even before the ingest binds (the offer carries no
+// media yet) so the voice relay has a pipe for lobby conversation. Replaces
 // neither initiates the subscription handshake (signal:offer) nor surfaces a
 // handshake failure (signal:error, routed to sim.errCh) — connecting before
 // the stream starts is a normal pre-stream state, not an error.
-func assertPreStreamSilence(t *testing.T, sim *browserSim, wait time.Duration) {
+func assertPreStreamOffer(t *testing.T, sim *browserSim, wait time.Duration) {
 	t.Helper()
 	select {
 	case <-sim.offerReceived:
-		t.Fatal("received signal:offer before the ingest started")
+		// expected: the empty pre-stream offer arrived promptly
 	case err := <-sim.errCh:
-		t.Fatalf("signaling error before the ingest started: %v", err)
+		t.Fatalf("signaling error before the pre-stream offer: %v", err)
 	case <-time.After(wait):
-		// expected: nothing offer-like arrived
+		t.Fatal("client never received the pre-stream signal:offer")
 	}
 }
 
@@ -167,13 +169,12 @@ func assertPreStreamSilence(t *testing.T, sim *browserSim, wait time.Duration) {
 //
 //  1. The room is marked live in the DB (OBS reconnect window / server
 //     restart) but the SFU has no RoomTracks for the slug.
-//  2. A viewer connects — must receive room:state and NO signal:offer and NO
-//     signal:error (previously: error-level "room not found" + signal:error,
-//     never retried).
+//  2. A viewer connects — must receive room:state and an immediate
+//     pre-stream signal:offer (no media sections yet; the subscriber
+//     exists so lobby voice can flow before the picture).
 //  3. The WHIP ingest starts (BindIngestToRoom + stream-start hook).
-//  4. The already-connected viewer must receive a signal:offer and complete
-//     negotiation to Connected WITHOUT reconnecting (previously: stuck on the
-//     waiting overlay forever until a page refresh).
+//  4. The ingest tracks attach to the existing subscriber and the
+//     renegotiation must reach Connected WITHOUT the client reconnecting.
 func TestPreStreamJoin_GetsOfferOnStreamStart(t *testing.T) {
 	env, cleanup := newStreamStartTestEnv(t, "live")
 	defer cleanup()
@@ -185,22 +186,15 @@ func TestPreStreamJoin_GetsOfferOnStreamStart(t *testing.T) {
 	conn.SetReadDeadline(time.Time{})
 
 	// Hand the connection to the browser sim BEFORE the stream starts so it
-	// services signaling the same way the real client would, then verify the
-	// server stays silent (no offer, no error) while no ingest exists.
+	// services signaling the same way the real client would; the empty
+	// pre-stream offer must arrive promptly.
 	sim := newBrowserSim(t, conn)
 	defer sim.close()
-	assertPreStreamSilence(t, sim, 700*time.Millisecond)
+	assertPreStreamOffer(t, sim, 5*time.Second)
 
-	// OBS connects.
+	// OBS connects: tracks attach to the existing subscriber and arrive as
+	// a renegotiation the sim answers on the same connection.
 	env.startIngest()
-
-	select {
-	case <-sim.offerReceived:
-	case err := <-sim.errCh:
-		t.Fatalf("signaling failed before an offer arrived: %v", err)
-	case <-time.After(10 * time.Second):
-		t.Fatal("client never received signal:offer after the ingest started")
-	}
 
 	if err := sim.pumpUntilConnected(90 * time.Second); err != nil {
 		t.Fatalf("pre-stream joiner never reached Connected after stream start: %v", err)
@@ -234,17 +228,9 @@ func TestPreStreamJoin_PendingRoom_GetsOfferOnStreamStart(t *testing.T) {
 
 	sim := newBrowserSim(t, conn)
 	defer sim.close()
-	assertPreStreamSilence(t, sim, 700*time.Millisecond)
+	assertPreStreamOffer(t, sim, 5*time.Second)
 
 	env.startIngest()
-
-	select {
-	case <-sim.offerReceived:
-	case err := <-sim.errCh:
-		t.Fatalf("signaling failed before an offer arrived: %v", err)
-	case <-time.After(10 * time.Second):
-		t.Fatal("client never received signal:offer after the room went live")
-	}
 
 	if err := sim.pumpUntilConnected(90 * time.Second); err != nil {
 		t.Fatalf("pre-stream joiner never reached Connected after the room went live: %v", err)

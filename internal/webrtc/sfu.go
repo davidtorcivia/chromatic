@@ -937,7 +937,10 @@ func (s *SFU) HasSubscriber(roomSlug, subscriberID string) bool {
 // ICE candidates are NOT included in the offer — they are trickled via
 // EnableSubscriberTrickleICE after the offer has been sent to the client.
 func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc.PeerConnection, string, error) {
-	room := s.GetRoomTracksForSlug(roomSlug)
+	// Materialize the room on demand: subscribers are now created on
+	// connect, before any ingest (or voice path) has built the RoomTracks
+	// entry — the caller has already validated the join.
+	room := s.GetRoomTracks(roomSlug)
 	if room == nil {
 		return nil, "", fmt.Errorf("room not found: %s", roomSlug)
 	}
@@ -1030,6 +1033,20 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 			log.Printf("Failed to add voice relay track for %s to subscriber %s: %v", pid, subscriberID, addErr)
 		} else {
 			log.Printf("Added existing voice relay track to subscriber %s", subscriberID)
+		}
+	}
+
+	// Pre-stream there may be no tracks at all, and an SDP without a
+	// single m-line carries no ICE credentials (clients reject it with
+	// "no ice-ufrag"). A recvonly audio transceiver guarantees a valid
+	// offer and matches this PC's design — it already receives the
+	// client's voice (see OnTrack in the ws handler); later relay
+	// AddTrack calls upgrade it to sendrecv.
+	if room.VideoTrack == nil && room.AudioTrack == nil && len(room.VoiceLocalTracks) == 0 {
+		if _, trErr := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+			Direction: webrtc.RTPTransceiverDirectionRecvonly,
+		}); trErr != nil {
+			log.Printf("Failed to add placeholder audio transceiver for subscriber %s: %v", subscriberID, trErr)
 		}
 	}
 

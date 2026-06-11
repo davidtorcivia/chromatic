@@ -267,17 +267,13 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 		},
 	}, client.ID)
 
-	// If the stream is already up, initiate the WebRTC subscription. The room
-	// can be marked live in the DB while the SFU has no bound ingest yet (OBS
-	// reconnecting, or a server restart) — that is a normal pre-stream state:
-	// ensureSubscription defers, and the stream-start path creates the
-	// subscriber the moment the ingest binds. The SFU-side check additionally
-	// covers the race where the DB status was read as "pending" just before
-	// OnStreamStart committed: it runs after hub registration, so a client
-	// that misses the stream-start client snapshot sees the SFU live here.
-	if roomStatus == "live" || h.sfu.IsRoomLive(slug) {
-		go h.ensureSubscription(client, slug)
-	}
+	// Initiate the WebRTC subscription unconditionally: pre-stream the
+	// offer carries no program media yet, but the subscriber PC is the
+	// pipe the voice relay rides, so participants can talk in the lobby
+	// before the host starts streaming. When the ingest later binds,
+	// BindIngestToRoom attaches the tracks to this same subscriber via
+	// renegotiation (no reconnect, no second offer race).
+	go h.ensureSubscription(client, slug)
 
 	// Start write pump
 	go client.WritePump()
@@ -370,15 +366,12 @@ func (h *WebSocketHandler) ensureSubscription(client *websocket.Client, roomSlug
 // attempt should be retried later (the stream isn't up yet, or subscriber
 // creation failed and the next stream-start may succeed).
 func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSlug string) bool {
-	// Pre-stream state: the SFU has no ingest tracks bound for this room yet
-	// (viewer connected before OBS started, OBS reconnecting, or a server
-	// restart). This is normal, not an error — the stream-start path runs this
-	// flow again for clients without a subscriber once the ingest binds.
-	if !h.sfu.IsRoomLive(roomSlug) {
-		logger.Debug("Stream not started yet; deferring subscriber creation until ingest binds",
-			"participant_id", client.ID, "room", roomSlug)
-		return false
-	}
+	// Subscribers are created even before the ingest binds (pre-stream the
+	// offer simply has no media sections): voice relay rides the subscriber
+	// PC, so participants must be able to hear each other in the lobby
+	// before the host starts streaming. When the ingest later binds,
+	// BindIngestToRoom attaches the tracks to these existing subscribers
+	// via AddTrack + renegotiation (covered by TestSFU_PreStreamSubscriber).
 
 	// Create subscriber connection and get offer (no ICE candidates yet — trickle ICE)
 	pc, offerSDP, err := h.sfu.CreateSubscriberConnection(roomSlug, client.ID)
@@ -1397,21 +1390,25 @@ func (h *WebSocketHandler) handleAdminMute(client *websocket.Client, payload jso
 
 	var data struct {
 		ParticipantID string `json:"participantId"`
+		// Omitted means true, so older clients' plain "mute" keeps working.
+		Muted *bool `json:"muted,omitempty"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return
 	}
+	muted := data.Muted == nil || *data.Muted
 
 	// Gate voice RTP at the server — admin:muted as a broadcast-only hint is
 	// advisory, and a malicious client could simply ignore it and keep
 	// sending. Flipping the relay's mute flag drops the packets regardless
 	// of what the client chooses to do.
-	h.sfu.SetVoiceMuted(client.RoomSlug, data.ParticipantID, true)
+	h.sfu.SetVoiceMuted(client.RoomSlug, data.ParticipantID, muted)
 
 	h.hub.BroadcastJSON(client.RoomSlug, "admin:muted", map[string]interface{}{
 		"participantId": data.ParticipantID,
+		"muted":         muted,
 	}, "")
-	logger.Info("Admin mute", "by", client.ID, "target", data.ParticipantID, "room", client.RoomSlug)
+	logger.Info("Admin mute toggle", "by", client.ID, "target", data.ParticipantID, "muted", muted, "room", client.RoomSlug)
 }
 
 func (h *WebSocketHandler) handleAdminKick(client *websocket.Client, payload json.RawMessage) {
@@ -1433,10 +1430,18 @@ func (h *WebSocketHandler) handleAdminKick(client *websocket.Client, payload jso
 	})
 
 	// Force disconnect — closing the connection triggers ReadPump exit,
-	// which fires onDisconnect and broadcasts participant:left.
-	if target := h.hub.GetClient(client.RoomSlug, data.ParticipantID); target != nil {
-		target.Conn.Close()
-	}
+	// which fires onDisconnect and broadcasts participant:left. Deferred
+	// briefly so the write pump flushes the "kicked" message first: an
+	// immediate Close raced the queued send, and a target that never saw
+	// "kicked" treated it as a network blip and silently reconnected.
+	roomSlug := client.RoomSlug
+	targetID := data.ParticipantID
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		if target := h.hub.GetClient(roomSlug, targetID); target != nil {
+			target.Conn.Close()
+		}
+	}()
 
 	logger.Info("Admin kick", "by", client.ID, "target", data.ParticipantID, "room", client.RoomSlug)
 }

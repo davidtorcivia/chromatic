@@ -153,6 +153,10 @@
     let isLaserEnabled = $state(false);
     let showParticipantList = $state(false);
     let speakingParticipants = $state<Set<string>>(new Set());
+    // Participants currently muted BY AN ADMIN (distinct from self-muted:
+    // the admin toggle must only offer Unmute where it was the admin who
+    // muted — force-enabling a self-muted mic would be a hot-mic surprise).
+    let adminMutedIds = $state<Set<string>>(new Set());
     // VAD analysers share the page's AudioContext; only the analyser/source
     // nodes are per-track. The context is torn down on page destroy.
     let voiceAnalysers = new Map<string, { analyser: AnalyserNode; source: MediaStreamAudioSourceNode }>();
@@ -343,12 +347,25 @@
         });
 
         session.onMessage("admin:muted", (payload: unknown) => {
-            const data = payload as { participantId: string };
+            const data = payload as { participantId: string; muted?: boolean };
+            const muted = data.muted !== false;
+            const next = new Set(adminMutedIds);
+            if (muted) next.add(data.participantId);
+            else next.delete(data.participantId);
+            adminMutedIds = next;
+
             if (data.participantId === sessionData?.participantId) {
-                isMicEnabled = false;
-                micAutoEnablePending = false;
-                webrtcManager?.setMicEnabled(false);
-                setSelfAudio(false);
+                if (muted) {
+                    isMicEnabled = false;
+                    micAutoEnablePending = false;
+                    webrtcManager?.setMicEnabled(false);
+                    setSelfAudio(false);
+                } else if (hasMicPermission && webrtcManager) {
+                    // Admin restored the mic they muted: resume it
+                    isMicEnabled = true;
+                    webrtcManager.setMicEnabled(true);
+                    setSelfAudio(true);
+                }
             }
         });
 
@@ -1545,7 +1562,7 @@
     function muteAllParticipants() {
         for (const p of participants) {
             if (p.id !== sessionData?.participantId && p.audioEnabled) {
-                muteParticipant(p.id);
+                session.send("admin:mute", { participantId: p.id, muted: true });
             }
         }
     }
@@ -1642,8 +1659,9 @@
         };
     });
 
-    function muteParticipant(participantId: string) {
-        session.send("admin:mute", { participantId });
+    function toggleParticipantMute(participantId: string) {
+        const muted = !adminMutedIds.has(participantId);
+        session.send("admin:mute", { participantId, muted });
     }
 
     function confirmKickParticipant() {
@@ -2767,9 +2785,9 @@
                                 {/if}
                                 <button
                                     class="participant-action"
-                                    onclick={() => muteParticipant(p.id)}
-                                    title="Mute {p.name}"
-                                >Mute</button>
+                                    onclick={() => toggleParticipantMute(p.id)}
+                                    title={adminMutedIds.has(p.id) ? `Unmute ${p.name}` : `Mute ${p.name}`}
+                                >{adminMutedIds.has(p.id) ? "Unmute" : "Mute"}</button>
                                 <button
                                     class="participant-action danger"
                                     onclick={() => (kickTarget = { id: p.id, name: p.name })}
