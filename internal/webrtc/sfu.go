@@ -1157,6 +1157,23 @@ func (s *SFU) SetSubscriberAnswer(roomSlug, subscriberID string, answer webrtc.S
 	}
 
 	log.Printf("Set answer for subscriber %s (flushed %d buffered candidates)", subscriberID, len(pending))
+
+	// One-shot probe: 10s in, log what pion actually SENT to this
+	// subscriber. Distinguishes "server never sends video to this browser"
+	// (binding bug here) from "sent but lost/dropped client-side".
+	go func(pc *webrtc.PeerConnection, id string, done <-chan struct{}) {
+		select {
+		case <-done:
+			return
+		case <-time.After(10 * time.Second):
+		}
+		for _, s := range pc.GetStats() {
+			if v, ok := s.(webrtc.OutboundRTPStreamStats); ok {
+				log.Printf("Subscriber %s outbound %s stats after 10s: packetsSent=%d bytesSent=%d", id, v.Kind, v.PacketsSent, v.BytesSent)
+			}
+		}
+	}(sub.PeerConnection, subscriberID, sub.done)
+
 	return nil
 }
 

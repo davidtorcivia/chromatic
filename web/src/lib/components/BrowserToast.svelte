@@ -84,7 +84,8 @@
        dark UI with a text shadow instead of a background box. */
     .toast {
         position: fixed;
-        bottom: 1.5rem;
+        /* Above the session control bar, not on top of it */
+        bottom: 7rem;
         left: 50%;
         transform: translateX(-50%);
         z-index: 1000;
