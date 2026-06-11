@@ -306,7 +306,7 @@
 <main class="waiting-page stage" class:leaving={isLeaving}>
     <div class="waiting-content" aria-live="polite">
         {#if status === "lobby" && countdown}
-            <div class="lobby-card glass-card" in:fade={{ duration: prefersReducedMotion ? 0 : 200 }}>
+            <div class="lobby-card stage-panel" in:fade={{ duration: prefersReducedMotion ? 0 : 200 }}>
                 <div class="wordmark">Chromatic</div>
                 <h1 class="lobby-room">{roomName || "Your session"}</h1>
                 <p class="lobby-schedule">{scheduleLabel}</p>
@@ -364,7 +364,7 @@
                 </button>
             </div>
         {:else if status === "waiting"}
-            <div class="waiting-card glass-card" in:fly={{ y: 8, duration: prefersReducedMotion ? 0 : 200 }}>
+            <div class="waiting-card stage-panel" in:fly={{ y: 8, duration: prefersReducedMotion ? 0 : 200 }}>
                 <div class="wordmark">Chromatic</div>
                 <div class="waiting-pulse" aria-hidden="true">
                     <span class="pulse-core"></span>
@@ -618,8 +618,8 @@
         overflow: hidden;
         min-width: 4rem;
         padding: 10px 8px;
-        background: rgba(255, 255, 255, 0.045);
-        border: 1px solid rgba(255, 255, 255, 0.07);
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.06);
         border-radius: 14px;
         box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
     }

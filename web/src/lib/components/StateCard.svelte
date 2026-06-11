@@ -17,7 +17,7 @@
     let { icon, tone = "neutral", title, body, children }: Props = $props();
 </script>
 
-<div class="state-card glass-card {tone}">
+<div class="state-card stage-panel {tone}">
     {#if icon}
         <div class="state-card-icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
@@ -55,7 +55,7 @@
 </div>
 
 <style>
-    /* Material comes from the global .glass-card */
+    /* Material comes from the global .stage-panel */
     .state-card {
         display: flex;
         flex-direction: column;

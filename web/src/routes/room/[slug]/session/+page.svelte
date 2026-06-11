@@ -42,7 +42,6 @@
     let micPromptState = $state<MicPromptState>("hidden");
     let micAutoRequestStarted = false;
     let micAutoEnablePending = false;
-    let initialOfferHandled = false;
     let micPromptTimer: ReturnType<typeof setTimeout> | null = null;
     let kickTarget = $state<{ id: string; name: string } | null>(null);
     let endState = $state<{ title: string; body: string } | null>(null);
@@ -285,7 +284,6 @@
             if (webrtcManager) {
                 try {
                     await webrtcManager.handleOffer(data.sdp);
-                    initialOfferHandled = true;
                     tryEnablePendingAutoMic();
                 } catch (err) {
                     console.error('Failed to handle offer:', err);
@@ -718,7 +716,12 @@
     }
 
     function tryEnablePendingAutoMic() {
-        if (!webrtcManager || !hasMicPermission || !micAutoEnablePending || !initialOfferHandled) return;
+        // Deliberately NOT gated on the subscriber offer: mic publishing
+        // rides its own publisher PC (see manager.setMicEnabled), so the
+        // mic connects immediately on join even when no stream is live
+        // yet. The old offer gate left "Connecting your microphone"
+        // spinning until the host started streaming.
+        if (!webrtcManager || !hasMicPermission || !micAutoEnablePending) return;
 
         micAutoEnablePending = false;
         isMicEnabled = true;
@@ -1232,7 +1235,6 @@
         needsPlayClick = false;
         clearKeyframeNudge();
         currentRtt = null;
-        initialOfferHandled = false;
         micAutoEnablePending = false;
         clearMicPromptTimer();
         micPromptState = "hidden";

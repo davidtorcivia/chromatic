@@ -633,7 +633,7 @@ input[type="range"] {
   isolation: isolate;
   overflow: hidden;
   background:
-    radial-gradient(ellipse 75% 50% at 50% -8%, rgba(72, 182, 166, 0.09), transparent 62%),
+    radial-gradient(ellipse 75% 50% at 50% -8%, rgba(72, 182, 166, 0.12), transparent 62%),
     radial-gradient(ellipse 55% 40% at 88% 108%, rgba(72, 182, 166, 0.045), transparent 65%),
     var(--color-bg);
 }
@@ -668,17 +668,19 @@ input[type="range"] {
   background-size: 160px 160px;
 }
 
-/* Deep glass panel for screens without live video behind them; same
-   material family as the room surfaces, frosting the stage glow. */
-.glass-card {
-  background:
-    linear-gradient(to bottom, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0) 48px),
-    var(--glass-bg-deep);
-  backdrop-filter: var(--glass-backdrop-deep);
-  -webkit-backdrop-filter: var(--glass-backdrop-deep);
-  border: 1px solid var(--glass-edge);
-  border-radius: 20px;
-  box-shadow: var(--glass-specular), var(--glass-shadow);
+/* Solid premium panel for the pre-session screens. Glass needs live
+   content behind it to mean anything; over a static field it reads as
+   dated translucency. These panels are rich and precise instead:
+   a barely-there vertical gradient, hairline edge, lit top, deep soft
+   shadow that seats them on the stage. */
+.stage-panel {
+  background: linear-gradient(180deg, #1b1b1f 0%, #161619 100%);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 24px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 4px 16px rgba(0, 0, 0, 0.35),
+    0 32px 80px -16px rgba(0, 0, 0, 0.6);
 }
 
 /* Glass tooltip (lib/ui/tooltip.ts) — appended to body, fixed position */

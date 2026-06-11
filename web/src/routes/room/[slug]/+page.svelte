@@ -10,7 +10,6 @@
         formatScheduleLabel,
         serverClockOffset,
     } from "$lib/lobby";
-    import StatusBadge from "$lib/components/StatusBadge.svelte";
     import StateCard from "$lib/components/StateCard.svelte";
 
     let roomInfo = $state<RoomInfo | null>(null);
@@ -189,7 +188,7 @@
             <div class="invite-header">
                 <div class="wordmark">Chromatic</div>
             </div>
-            <div class="glass-card host-joining-card">
+            <div class="stage-panel host-joining-card">
                 <div class="host-spinner" aria-hidden="true"></div>
                 <h1>Joining as host…</h1>
                 <p>Setting up your session with host controls.</p>
@@ -208,18 +207,30 @@
         </div>
     {:else if roomInfo}
         <div class="join-content">
-            <div class="invite-header" in:fly={enter(0)}>
+            {#if roomInfo.status === "ended"}
+                <div class="invite-header" in:fly={enter(0)}>
+                    <div class="wordmark">Chromatic</div>
+                </div>
+                <div in:fly={enter(1)}>
+                    <StateCard
+                        icon="ended"
+                        title="This session has ended"
+                        body="The review is over. If you were expecting to join, check with your host for a new link."
+                    />
+                </div>
+            {:else}
+            <div class="stage-panel join-panel" in:fly={enter(0)}>
                 <div class="wordmark">Chromatic</div>
-                <p class="invite-line">You've been invited to a live color review.</p>
-            </div>
+                <p class="invite-line" in:fly={enter(1)}>You've been invited to a live color review.</p>
+                <h1 class="join-room-name" in:fly={enter(1)}>{roomInfo.name}</h1>
 
-            <div class="room-hero" in:fly={enter(1)}>
-                <h1>{roomInfo.name}</h1>
-                <StatusBadge status={roomInfo.status} />
-            </div>
-
-            {#if hasSessionDetails}
                 <div class="session-details" in:fly={enter(2)}>
+                    {#if roomInfo.status === "live"}
+                        <span class="session-detail live-detail">
+                            <span class="live-dot-mini" aria-hidden="true"></span>
+                            Live now
+                        </span>
+                    {/if}
                     {#if scheduledAt}
                         <span class="session-detail">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
@@ -239,17 +250,9 @@
                         </span>
                     {/if}
                 </div>
-            {/if}
 
-            {#if roomInfo.status === "ended"}
-                <div in:fly={enter(2)}>
-                    <StateCard
-                        icon="ended"
-                        title="This session has ended"
-                        body="The review is over. If you were expecting to join, check with your host for a new link."
-                    />
-                </div>
-            {:else}
+                <div class="join-divider" aria-hidden="true"></div>
+
                 {#if !canJoin}
                     <div class="opens-soon" in:fly={enter(3)} aria-live="polite">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
@@ -259,7 +262,7 @@
                         </div>
                     </div>
                 {/if}
-                <form class="glass-card join-form" in:fly={enter(3)} onsubmit={handleJoin}>
+                <form class="join-form" onsubmit={handleJoin}>
                     {#if error}
                         <div class="alert alert-error" role="alert" in:fade={{ duration: prefersReducedMotion ? 0 : 150 }}>
                             {error}
@@ -325,6 +328,7 @@
                         for permission once you're in.
                     </p>
                 </form>
+            </div>
 
                 {#if !showHostSection}
                     <p class="host-link-row" in:fade={{ duration: prefersReducedMotion ? 0 : 200, delay: prefersReducedMotion ? 0 : 320 }}>
@@ -360,8 +364,56 @@
     }
 
     .join-content {
-        max-width: 400px;
+        max-width: 420px;
         width: 100%;
+    }
+
+    /* One centered panel carries the whole invitation, like the lobby */
+    .join-panel {
+        display: flex;
+        flex-direction: column;
+        padding: var(--space-xl);
+        text-align: center;
+    }
+
+    .join-panel .wordmark {
+        margin-bottom: var(--space-md);
+    }
+
+    .join-room-name {
+        margin: var(--space-xs) 0 var(--space-md);
+        font-size: clamp(1.5rem, 6vw, 1.875rem);
+        letter-spacing: -0.015em;
+        text-wrap: balance;
+    }
+
+    .join-divider {
+        height: 1px;
+        margin: var(--space-lg) calc(-1 * var(--space-xl)) var(--space-lg);
+        background: linear-gradient(
+            to right,
+            transparent,
+            rgba(255, 255, 255, 0.07) 20%,
+            rgba(255, 255, 255, 0.07) 80%,
+            transparent
+        );
+    }
+
+    .live-detail {
+        color: var(--color-success);
+    }
+
+    .live-dot-mini {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--color-success);
+        animation: live-mini-pulse 1.6s ease-in-out infinite;
+    }
+
+    @keyframes live-mini-pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.45; }
     }
 
     .invite-header {
@@ -369,30 +421,10 @@
         margin-bottom: var(--space-xl);
     }
 
-    .invite-header .wordmark {
-        margin-bottom: var(--space-sm);
-    }
-
     .invite-line {
         font-size: var(--text-body);
         color: var(--color-text-muted);
         margin: 0;
-    }
-
-    .room-hero {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: var(--space-sm);
-        text-align: center;
-        margin-bottom: var(--space-lg);
-    }
-
-    .room-hero h1 {
-        margin: 0;
-        font-size: clamp(1.625rem, 6vw, 2rem);
-        letter-spacing: -0.015em;
-        text-wrap: balance;
     }
 
     /* Quiet icon+text rows for session particulars */
@@ -402,7 +434,6 @@
         justify-content: center;
         column-gap: var(--space-lg);
         row-gap: var(--space-xs);
-        margin-bottom: var(--space-lg);
     }
 
     .session-detail {
@@ -422,7 +453,7 @@
     .join-form {
         display: flex;
         flex-direction: column;
-        padding: var(--space-xl);
+        text-align: left;
     }
 
     .form-group {
@@ -439,28 +470,29 @@
         color: var(--color-text-muted);
     }
 
-    /* Comfortable, confident fields on glass */
+    /* Filled, borderless fields: the border exists only to show focus */
     .input.input-lg {
         min-height: 48px;
         padding: 0 var(--space-md);
         font-size: 1rem;
-        background: rgba(255, 255, 255, 0.05);
-        border-color: rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.06);
+        border-color: transparent;
         border-radius: 12px;
         transition:
             border-color var(--transition-fast),
-            background var(--transition-fast);
+            background var(--transition-fast),
+            box-shadow var(--transition-fast);
     }
 
     .input.input-lg:hover {
-        border-color: rgba(255, 255, 255, 0.18);
+        background: rgba(255, 255, 255, 0.08);
     }
 
     .input.input-lg:focus,
     .input.input-lg:focus-visible {
         background: rgba(255, 255, 255, 0.07);
-        border-color: rgba(72, 182, 166, 0.6);
-        box-shadow: 0 0 0 3px rgba(72, 182, 166, 0.16);
+        border-color: rgba(72, 182, 166, 0.55);
+        box-shadow: 0 0 0 3px rgba(72, 182, 166, 0.14);
     }
 
     /* The one saturated moment on the page: a lit teal capsule */
@@ -483,12 +515,18 @@
     }
 
     .btn-join:not(:disabled):hover {
-        background: linear-gradient(to bottom, #54c2b2, #3da394);
-        filter: brightness(1.06);
+        background: linear-gradient(to bottom, #5ccaba, #45ab9c);
+        transform: translateY(-1px);
+        box-shadow:
+            inset 0 1px 0 rgba(255, 255, 255, 0.32),
+            0 10px 28px rgba(72, 182, 166, 0.32);
     }
 
     .btn-join:not(:disabled):active {
-        transform: scale(0.985);
+        transform: translateY(0) scale(0.985);
+        box-shadow:
+            inset 0 1px 0 rgba(255, 255, 255, 0.22),
+            0 4px 12px rgba(61, 163, 148, 0.2);
     }
 
     .btn-join:disabled {
@@ -575,21 +613,16 @@
         }
     }
 
-    /* Pre-window schedule banner with the live "opens in" countdown */
+    /* Pre-window schedule note: a quiet inset row inside the panel */
     .opens-soon {
         display: flex;
         align-items: flex-start;
         gap: var(--space-sm);
         padding: var(--space-md);
-        margin-bottom: var(--space-md);
-        background:
-            linear-gradient(to bottom, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0) 32px),
-            var(--glass-bg-deep);
-        backdrop-filter: var(--glass-backdrop-deep);
-        -webkit-backdrop-filter: var(--glass-backdrop-deep);
-        border: 1px solid var(--glass-edge);
-        border-radius: 14px;
-        box-shadow: var(--glass-specular);
+        margin-bottom: var(--space-lg);
+        text-align: left;
+        background: rgba(255, 255, 255, 0.035);
+        border-radius: 12px;
         color: var(--color-text-muted);
     }
 
@@ -631,8 +664,13 @@
             padding-top: calc(var(--space-2xl) + env(safe-area-inset-top, 0px));
         }
 
-        .join-form {
+        .join-panel {
             padding: var(--space-lg);
+        }
+
+        .join-divider {
+            margin-left: calc(-1 * var(--space-lg));
+            margin-right: calc(-1 * var(--space-lg));
         }
 
         .session-details {
