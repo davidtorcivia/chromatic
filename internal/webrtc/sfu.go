@@ -1067,6 +1067,8 @@ func logSubscriberVideoRTCP(sub *Subscriber, subscriberID string) {
 	const maxReports = 8
 	logged := 0
 	pliCount := 0
+	nackCount := 0
+	nackPackets := 0
 	start := time.Now()
 	for logged < maxReports && time.Since(start) < 2*time.Minute {
 		select {
@@ -1082,8 +1084,8 @@ func logSubscriberVideoRTCP(sub *Subscriber, subscriberID string) {
 			switch r := p.(type) {
 			case *rtcp.ReceiverReport:
 				for _, rep := range r.Reports {
-					log.Printf("Subscriber %s video RR: highestSeq=%d totalLost=%d fractionLost=%d jitter=%d (PLIs so far: %d)",
-						subscriberID, rep.LastSequenceNumber, rep.TotalLost, rep.FractionLost, rep.Jitter, pliCount)
+					log.Printf("Subscriber %s video RR: highestSeq=%d totalLost=%d fractionLost=%d jitter=%d (PLIs: %d, NACKs: %d for %d pkts)",
+						subscriberID, rep.LastSequenceNumber, rep.TotalLost, rep.FractionLost, rep.Jitter, pliCount, nackCount, nackPackets)
 					logged++
 				}
 			case *rtcp.PictureLossIndication:
@@ -1091,9 +1093,26 @@ func logSubscriberVideoRTCP(sub *Subscriber, subscriberID string) {
 				if pliCount <= 3 || pliCount%20 == 0 {
 					log.Printf("Subscriber %s sent video PLI #%d (decoder waiting on a usable keyframe)", subscriberID, pliCount)
 				}
+			case *rtcp.TransportLayerNack:
+				// Counts whether viewers ASK for retransmissions — if these
+				// stay zero while totalLost climbs, loss recovery is dead and
+				// every oversized keyframe arrives corrupted.
+				nackCount++
+				for _, pair := range r.Nacks {
+					nackPackets += 1 + popCount16(uint16(pair.LostPackets))
+				}
 			}
 		}
 	}
+}
+
+func popCount16(v uint16) int {
+	n := 0
+	for v != 0 {
+		n += int(v & 1)
+		v >>= 1
+	}
+	return n
 }
 
 // EnableSubscriberTrickleICE sets the ICE candidate callback for a subscriber
