@@ -810,14 +810,7 @@
             hasStream = true;
             attemptAutoplay();
 
-            if (!audioDuckingManager) {
-                audioDuckingManager = new AudioDuckingManager(videoElement, isAdmin);
-                // Flush any voice tracks that arrived before we were created
-                for (const [pid, vTrack] of pendingVoiceTracks) {
-                    audioDuckingManager.addVoiceTrack(pid, vTrack);
-                }
-                pendingVoiceTracks.clear();
-            }
+            ensureAudioDuckingManager();
             startStatsPolling();
         } catch (err) {
             console.error('Failed to attach stream:', err);
@@ -998,15 +991,30 @@
         }
     }
 
+    // The audio graph that PLAYS voice must not wait for the program
+    // stream: pre-stream lobby voice arrives long before handleTrack ever
+    // fires, and buffering it until stream start meant participants could
+    // not hear each other while waiting for the host (voice tracks flowed,
+    // playback never started).
+    function ensureAudioDuckingManager() {
+        if (audioDuckingManager || !videoElement) return;
+        audioDuckingManager = new AudioDuckingManager(videoElement, isAdmin);
+        audioDuckingManager.setStreamVolume(streamVolume);
+        audioDuckingManager.setVoiceVolume(voiceVolume);
+        // Flush any voice tracks that arrived before we were created
+        for (const [pid, vTrack] of pendingVoiceTracks) {
+            audioDuckingManager.addVoiceTrack(pid, vTrack);
+        }
+        pendingVoiceTracks.clear();
+    }
+
     function handleVoiceTrack(participantId: string, track: MediaStreamTrack) {
+        ensureAudioDuckingManager();
         if (audioDuckingManager) {
             audioDuckingManager.addVoiceTrack(participantId, track);
         } else {
-            // Buffer track for when audioDuckingManager is created — voice
-            // relay tracks can arrive in the initial offer before the main
-            // video/audio track has triggered handleTrack (which creates
-            // audioDuckingManager). Without this buffer, early joiners miss
-            // voice until the next renegotiation.
+            // videoElement not bound yet (very early in mount): buffer for
+            // the ensure call that runs on the next voice/main track.
             pendingVoiceTracks.set(participantId, track);
         }
 

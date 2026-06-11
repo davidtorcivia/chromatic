@@ -25,6 +25,9 @@ export class AudioDuckingManager {
     private voiceAnalysers: Map<string, AnalyserNode> = new Map();
     private voiceGainNodes: Map<string, GainNode> = new Map();
     private voiceSources: Map<string, MediaStreamAudioSourceNode> = new Map();
+    // Muted media-element sinks that force Chromium to decode each remote
+    // voice track (see the comment in addVoiceTrack).
+    private voiceSinks: Map<string, HTMLAudioElement> = new Map();
     private isDucked: boolean = false;
     private releaseTimer: ReturnType<typeof setTimeout> | null = null;
     private monitorFrame: number | null = null;
@@ -84,6 +87,22 @@ export class AudioDuckingManager {
         const ctx = await getAudioContext();
 
         const stream = new MediaStreamCtor([track]);
+
+        // Chromium quirk (crbug.com/121673 lineage, still live in 2026,
+        // confirmed empirically: analyser energy is ZERO without this): a
+        // remote WebRTC audio track consumed only through WebAudio decodes
+        // to silence — the track must also have a media-element sink. The
+        // element stays muted; the WebAudio graph below (with ducking and
+        // volume control) is the audible path.
+        const sink = new Audio();
+        sink.srcObject = stream;
+        sink.muted = true;
+        void sink.play().catch(() => {
+            // Playback of a muted element may still be policy-blocked in
+            // odd states; attaching srcObject alone starts the decoder.
+        });
+        this.voiceSinks.set(participantId, sink);
+
         const source = ctx.createMediaStreamSource(stream);
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 256;
@@ -108,6 +127,12 @@ export class AudioDuckingManager {
     }
 
     removeVoiceTrack(participantId: string): void {
+        const sink = this.voiceSinks.get(participantId);
+        if (sink) {
+            sink.srcObject = null;
+            this.voiceSinks.delete(participantId);
+        }
+
         // Disconnect the full chain (source -> analyser -> gain) so the
         // nodes and the underlying MediaStreamTrack can be released.
         const source = this.voiceSources.get(participantId);
@@ -230,6 +255,10 @@ export class AudioDuckingManager {
     }
 
     destroy(): void {
+        for (const sink of this.voiceSinks.values()) {
+            sink.srcObject = null;
+        }
+        this.voiceSinks.clear();
         if (this.monitorFrame) {
             cancelAnimationFrame(this.monitorFrame);
             this.monitorFrame = null;
