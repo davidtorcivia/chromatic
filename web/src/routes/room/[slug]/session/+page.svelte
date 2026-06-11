@@ -1351,6 +1351,13 @@
         isLaserEnabled = !isLaserEnabled;
     }
 
+    // Safari shows native hover media controls over the share video and a
+    // click (e.g. using the laser) pauses it — a paused live stream is never
+    // meaningful, so resume immediately.
+    function handleSharePause() {
+        screenShareVideoEl?.play().catch(() => {});
+    }
+
     function toggleFullscreen() {
         if (document.fullscreenElement) {
             document.exitFullscreen();
@@ -1647,9 +1654,16 @@
             <!-- The sharer sees their own capture in the same split position
                  as everyone else, so the room shares one layout. -->
             <div class="split-screenshare">
-                <video bind:this={screenShareVideoEl} autoplay playsinline muted>
-                    <track kind="captions" />
-                </video>
+                <!-- svelte-ignore a11y_media_has_caption -->
+                <video
+                    bind:this={screenShareVideoEl}
+                    autoplay
+                    playsinline
+                    muted
+                    disablepictureinpicture
+                    controlslist="nodownload nofullscreen noremoteplayback"
+                    onpause={handleSharePause}
+                ></video>
 
                 {#if screenShareVideoEl}
                     <LaserPointerOverlay videoElement={screenShareVideoEl} enabled={isLaserEnabled} surface="share" />
@@ -3399,6 +3413,14 @@
         height: 100%;
         object-fit: contain;
         background: #000;
+    }
+    /* Suppress WebKit's native hover/overlay media controls on the live
+       share — clicking them pauses a livestream (and fights the laser). */
+    .split-screenshare video::-webkit-media-controls,
+    .split-screenshare video::-webkit-media-controls-enclosure,
+    .split-screenshare video::-webkit-media-controls-overlay-play-button {
+        display: none !important;
+        -webkit-appearance: none;
     }
     .split-screenshare-label {
         position: absolute;
