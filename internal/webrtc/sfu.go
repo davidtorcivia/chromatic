@@ -272,9 +272,25 @@ func NewSFU(cfg *config.Config) (*SFU, error) {
 	}
 
 	// Create API with our MediaEngine and Interceptors
+	// Restrict ICE gathering to real network interfaces. With host
+	// networking this box otherwise advertises ~50 candidates (every docker
+	// bridge, veth, libvirt and tailscale interface), which slows ICE and
+	// lets clients nominate pairs through interfaces that silently drop
+	// large packets — audio (small) flows while video (full-size) vanishes.
+	se := webrtc.SettingEngine{}
+	se.SetInterfaceFilter(func(name string) bool {
+		for _, prefix := range []string{"veth", "br-", "docker", "vnet", "virbr", "tailscale", "wg", "lxc", "cni"} {
+			if strings.HasPrefix(name, prefix) {
+				return false
+			}
+		}
+		return true
+	})
+
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(m),
 		webrtc.WithInterceptorRegistry(i),
+		webrtc.WithSettingEngine(se),
 	)
 
 	sfu := &SFU{
