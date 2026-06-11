@@ -18,6 +18,7 @@ import (
 	"github.com/pion/interceptor/pkg/intervalpli"
 	"github.com/pion/interceptor/pkg/stats"
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -1935,6 +1936,7 @@ func (s *SFU) CreateVoiceRelayTrack(roomSlug, participantID string, remoteTrack 
 // ignores the client-side mute request.
 func relayTrackLoop(remoteTrack *webrtc.TrackRemote, localTrack *webrtc.TrackLocalStaticRTP, done <-chan struct{}, muted *atomic.Bool, label, participantID string) {
 	buf := make([]byte, 1500)
+	var pkt rtp.Packet
 	for {
 		select {
 		case <-done:
@@ -1958,11 +1960,26 @@ func relayTrackLoop(remoteTrack *webrtc.TrackRemote, localTrack *webrtc.TrackLoc
 		if muted != nil && muted.Load() {
 			continue
 		}
-		if _, err := localTrack.Write(buf[:n]); err != nil {
+		if err := pkt.Unmarshal(buf[:n]); err != nil {
+			continue
+		}
+		// Strip the publisher's RTP header extensions — their IDs/values are
+		// scoped to the publisher's negotiation and misroute streams in
+		// subscribers' BUNDLE demux (see the WHIP forward loop for details).
+		stripHeaderExtensions(&pkt.Header)
+		if err := localTrack.WriteRTP(&pkt); err != nil {
 			log.Printf("%s relay write error for %s: %v", label, participantID, err)
 			return
 		}
 	}
+}
+
+// stripHeaderExtensions removes all RTP header extensions from a packet so
+// relayed media carries none of the source negotiation's extension IDs.
+func stripHeaderExtensions(h *rtp.Header) {
+	h.Extension = false
+	h.ExtensionProfile = 0
+	h.Extensions = nil
 }
 
 // GetVoiceRelayTrack returns the relay local track for a voice source (if one exists)

@@ -12,6 +12,7 @@ import (
 
 	"chromatic/internal/metrics"
 
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -165,6 +166,7 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 		// PC.Close() cascades to ErrClosedPipe on the next Write.
 		go func() {
 			buf := make([]byte, 1500)
+			var pkt rtp.Packet
 			for {
 				n, _, err := remoteTrack.Read(buf)
 				if err != nil {
@@ -180,7 +182,19 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 					return
 				default:
 				}
-				if _, err := localTrack.Write(buf[:n]); err != nil {
+				if err := pkt.Unmarshal(buf[:n]); err != nil {
+					continue
+				}
+				// Strip the SOURCE's RTP header extensions before fan-out.
+				// Their IDs/values (MID, TWCC, ...) are scoped to the OBS↔SFU
+				// negotiation and mean something else — or something wrong —
+				// in each subscriber's own negotiation. Chrome's BUNDLE demux
+				// trusts an in-packet MID over the signaled SSRC, so a stale
+				// MID can silently misroute the whole stream (black video).
+				// pion re-stamps each subscriber's negotiated extensions on
+				// the way out.
+				stripHeaderExtensions(&pkt.Header)
+				if err := localTrack.WriteRTP(&pkt); err != nil {
 					if err != io.ErrClosedPipe {
 						log.Printf("Error writing to local track: %v", err)
 					}
