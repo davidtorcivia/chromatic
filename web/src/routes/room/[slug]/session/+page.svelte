@@ -157,6 +157,11 @@
     // the admin toggle must only offer Unmute where it was the admin who
     // muted — force-enabling a self-muted mic would be a hot-mic surprise).
     let adminMutedIds = $state<Set<string>>(new Set());
+    // Hot-mic guard: an admin unmute may only RESUME a mic that was live
+    // when the admin muted it. Anything else (we were self-muted, or a
+    // stray/forged unmute for someone never admin-muted) must not touch
+    // the microphone.
+    let resumeMicOnAdminUnmute = false;
     // VAD analysers share the page's AudioContext; only the analyser/source
     // nodes are per-track. The context is torn down on page destroy.
     let voiceAnalysers = new Map<string, { analyser: AnalyserNode; source: MediaStreamAudioSourceNode }>();
@@ -349,6 +354,9 @@
         session.onMessage("admin:muted", (payload: unknown) => {
             const data = payload as { participantId: string; muted?: boolean };
             const muted = data.muted !== false;
+            // Read the prior state BEFORE updating the set: resume is only
+            // legitimate when this unmute reverses an admin mute we saw.
+            const selfWasAdminMuted = adminMutedIds.has(data.participantId);
             const next = new Set(adminMutedIds);
             if (muted) next.add(data.participantId);
             else next.delete(data.participantId);
@@ -356,15 +364,24 @@
 
             if (data.participantId === sessionData?.participantId) {
                 if (muted) {
+                    resumeMicOnAdminUnmute = isMicEnabled;
                     isMicEnabled = false;
                     micAutoEnablePending = false;
                     webrtcManager?.setMicEnabled(false);
                     setSelfAudio(false);
-                } else if (hasMicPermission && webrtcManager) {
-                    // Admin restored the mic they muted: resume it
+                } else if (
+                    selfWasAdminMuted &&
+                    resumeMicOnAdminUnmute &&
+                    hasMicPermission &&
+                    webrtcManager
+                ) {
+                    // Admin restored a mic that was live when they muted it
+                    resumeMicOnAdminUnmute = false;
                     isMicEnabled = true;
                     webrtcManager.setMicEnabled(true);
                     setSelfAudio(true);
+                } else {
+                    resumeMicOnAdminUnmute = false;
                 }
             }
         });
