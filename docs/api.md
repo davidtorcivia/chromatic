@@ -148,8 +148,12 @@ PATCH /api/rooms/{slug}
 ### Delete Room
 
 ```
-DELETE /api/rooms/{slug}
+DELETE /api/rooms/{slug}?deleteFiles=true
 ```
+
+**Query parameters:**
+- `deleteFiles` (optional) — when `true`, also removes the room's uploaded
+  files and thumbnails from disk. Database rows cascade either way.
 
 **Response:** `204 No Content`
 
@@ -425,6 +429,44 @@ GET /api/files/{id}/thumbnail
 
 **Response:** JPEG thumbnail (images only)
 
+### List Room Files (Admin)
+
+```
+GET /api/rooms/{slug}/files
+```
+
+Requires an admin session. Returns every file uploaded to the room, newest
+first — used by the room-settings Files review section.
+
+**Response:**
+```json
+{
+  "files": [
+    {
+      "id": "uuid",
+      "originalName": "still.png",
+      "mimeType": "image/png",
+      "sizeBytes": 123456,
+      "uploaderName": "Jane",
+      "createdAt": 1765400000000,
+      "url": "/api/files/uuid",
+      "thumbnailUrl": "/api/files/uuid/thumbnail"
+    }
+  ]
+}
+```
+
+### Delete File (Admin)
+
+```
+DELETE /api/files/{id}
+```
+
+Requires an admin session. Removes the file and its thumbnail from disk,
+deletes the database row, and removes chat messages that referenced it.
+
+**Response:** `204 No Content`
+
 ---
 
 ## WHIP (WebRTC-HTTP Ingestion Protocol)
@@ -455,181 +497,84 @@ ws://host/ws/room/{slug}?token={jwt}&name={viewerName}
 
 ### Client → Server Messages
 
-#### Cursor Update (Laser Pointer)
-```json
-{
-  "type": "cursor:update",
-  "payload": {
-    "x": 0.5,
-    "y": 0.3,
-    "active": true
-  }
-}
-```
+All messages are JSON: `{"type": "...", "payload": {...}}`.
 
-#### Chat Message
-```json
-{
-  "type": "chat:message",
-  "payload": {
-    "content": "Hello everyone!"
-  }
-}
-```
+#### Media signaling (subscriber connection — server is the only offerer)
 
-#### Chat File
-```json
-{
-  "type": "chat:file",
-  "payload": {
-    "fileId": "uuid",
-    "fileName": "screenshot.png",
-    "mimeType": "image/png",
-    "url": "/api/files/uuid",
-    "thumbnailUrl": "/api/files/uuid/thumbnail"
-  }
-}
-```
+| Type | Payload | Purpose |
+|------|---------|---------|
+| `signal:answer` | `{sdp}` | Answer to the server's subscription offer |
+| `signal:candidate` | `{candidate, sdpMid, sdpMLineIndex}` | Trickled ICE candidate |
+| `signal:renegotiate-answer` | `{sdp}` | Answer to a server renegotiation offer (`signal:renegotiate`) |
+| `signal:ice-restart` | `{sdp}` | Client-initiated ICE restart offer (connection recovery) |
+| `signal:resync` | `{}` | Request a keyframe from the publisher (video not rendering) |
+| `signal:resubscribe` | `{}` | Tear down and rebuild the server-side subscriber (unrecoverable media path) |
+| `signal:ice-servers-request` | `{}` | Request fresh ICE servers/TURN credentials (long sessions) |
+| `signal:offer` | `{sdp}` | Legacy: client offer on the subscriber PC (superseded by `publish:offer`) |
 
-#### Request WebRTC Subscription
-```json
-{
-  "type": "webrtc:subscribe",
-  "payload": {}
-}
-```
+#### Publishing (dedicated publisher connection — client is the only offerer)
 
-#### WebRTC Answer
-```json
-{
-  "type": "webrtc:answer",
-  "payload": {
-    "sdp": "v=0..."
-  }
-}
-```
+Microphone audio and screen-share video are sent over a separate peer
+connection negotiated with these messages. The server only answers, so the
+publisher path has no signaling glare.
 
-#### ICE Candidate
-```json
-{
-  "type": "webrtc:ice",
-  "payload": {
-    "candidate": "candidate:...",
-    "sdpMid": "0",
-    "sdpMLineIndex": 0
-  }
-}
-```
+| Type | Payload | Purpose |
+|------|---------|---------|
+| `publish:offer` | `{sdp}` | Offer for the publisher PC (initial or renegotiation, e.g. adding a share track) |
+| `publish:candidate` | `{candidate, sdpMid, sdpMLineIndex}` | Trickled ICE candidate for the publisher PC |
+
+#### Collaboration
+
+| Type | Payload | Purpose |
+|------|---------|---------|
+| `cursor` | `{points: [{x, y}...], active, release?, surface?}` | Laser pointer batch; coordinates normalized 0–1 to the video content. `surface` is `"video"` (default) or `"share"` |
+| `chat:send` | `{content}` | Text chat message (max 2000 chars) |
+| `chat:file` | `{fileId}` | Share a previously uploaded file in chat |
+| `media:toggle` | `{audio}` | Broadcast local mic on/off state |
+| `screenshare:request` | `{}` | Ask to share the screen (admins auto-approved) |
+| `screenshare:stop` | `{}` | Stop the active screen share (sharer or admin) |
+| `client:debug` | `{event, detail}` | Client-side diagnostic breadcrumb, mirrored to the server log |
+
+#### Admin commands
+
+| Type | Payload | Purpose |
+|------|---------|---------|
+| `admin:mute` | `{participantId}` | Server-enforced mute of a participant's voice |
+| `admin:kick` | `{participantId}` | Remove a participant from the session |
+| `admin:end-session` | `{}` | End the session for everyone |
+| `admin:delete-message` | `{messageId}` | Delete a chat message for everyone (moderation) |
+| `admin:waiting-approve` / `admin:waiting-deny` | `{participantId}` | Resolve a waiting-room request |
+| `admin:screenshare-approve` / `admin:screenshare-deny` / `admin:screenshare-revoke` | `{participantId}` | Manage screen-share permission |
 
 ### Server → Client Messages
 
-#### Room State (on connect)
-```json
-{
-  "type": "room:state",
-  "payload": {
-    "room": {
-      "slug": "my-session",
-      "name": "Color Review Session"
-    },
-    "participants": [...],
-    "isLive": true,
-    "iceServers": [
-      {"urls": ["stun:stun.l.google.com:19302"]},
-      {"urls": ["turn:server:3478"], "username": "u", "credential": "p"}
-    ]
-  }
-}
-```
-
-#### Room Live
-```json
-{
-  "type": "room:live",
-  "payload": {}
-}
-```
-
-#### Room Ended
-```json
-{
-  "type": "room:ended",
-  "payload": {}
-}
-```
-
-#### Participant Joined
-```json
-{
-  "type": "participant:joined",
-  "payload": {
-    "participant": {
-      "id": "uuid",
-      "name": "John",
-      "color": "#4F46E5"
-    }
-  }
-}
-```
-
-#### Participant Left
-```json
-{
-  "type": "participant:left",
-  "payload": {
-    "participantId": "uuid"
-  }
-}
-```
-
-#### Cursor Update (from others)
-```json
-{
-  "type": "cursor:update",
-  "payload": {
-    "participantId": "uuid",
-    "participantName": "John",
-    "color": "#4F46E5",
-    "x": 0.5,
-    "y": 0.3,
-    "active": true
-  }
-}
-```
-
-#### Chat Message (from others)
-```json
-{
-  "type": "chat:message",
-  "payload": {
-    "participantId": "uuid",
-    "participantName": "John",
-    "content": "Hello everyone!"
-  }
-}
-```
-
-#### WebRTC Offer
-```json
-{
-  "type": "webrtc:offer",
-  "payload": {
-    "sdp": "v=0..."
-  }
-}
-```
-
-#### ICE Candidate
-```json
-{
-  "type": "webrtc:ice",
-  "payload": {
-    "candidate": "candidate:...",
-    "sdpMid": "0",
-    "sdpMLineIndex": 0
-  }
-}
-```
+| Type | Payload | Purpose |
+|------|---------|---------|
+| `room:state` | `{room, participants, isLive, iceServers, ...}` | Full state on connect/reconnect |
+| `iceServers` | `[{urls, username?, credential?}...]` | ICE servers for the WebRTC connections |
+| `signal:ice-servers` | `{iceServers}` | Refreshed TURN credentials (periodic) |
+| `signal:offer` | `{sdp}` | Fresh subscription offer (new server-side subscriber) |
+| `signal:renegotiate` | `{sdp, participantId?}` | Renegotiation offer (voice/share track added or removed) |
+| `signal:answer` | `{sdp}` | Answer to a client ICE-restart offer |
+| `signal:candidate` | `{candidate, sdpMid, sdpMLineIndex}` | Trickled server ICE candidate |
+| `signal:error` | `{code, message}` | Subscription setup failed (client retries/resubscribes) |
+| `signal:voice-answer` | `{sdp}` | Legacy answer to a client `signal:offer` |
+| `publish:answer` | `{sdp}` | Answer to a `publish:offer` |
+| `publish:error` | `{message}` | Publisher negotiation failed |
+| `cursor` | `{participantId, participantName, color, points, x, y, active, release, surface}` | Laser pointer update from another participant |
+| `chat:history` | `{messages: [...]}` | Last 50 messages on join/reconnect |
+| `chat:message` | `{id, participantId, participantName, type, content, file?, timestamp}` | New chat message |
+| `chat:message-deleted` | `{id}` | A message was removed by an admin |
+| `participant:joined` / `participant:left` / `participant:updated` | `{participant}` / `{participantId}` / `{participant}` | Presence updates |
+| `room:live` / `room:ended` | `{}` | Stream lifecycle |
+| `stream:paused` / `stream:resumed` | `{message?}` | OBS disconnected / reconnected |
+| `admin:muted` | `{participantId}` | A participant was muted by an admin |
+| `kicked` | `{reason?}` | You were removed from the session |
+| `screenshare:pending` | `{participantId, name}` | (Admins) someone requests to share |
+| `screenshare:approved` / `screenshare:denied` | `{}` / `{reason?}` | Your share request was resolved |
+| `screenshare:started` / `screenshare:stopped` | `{participantId, name}` / `{}` | Share lifecycle |
+| `waiting:joined` / `waiting:list` / `waiting:resolved` | `{participantId, name}` / `{participants}` / `{participantId, action}` | (Admins) waiting-room queue |
+| `lobby:count` | `{count}` | (Admins) countdown-lobby headcount for scheduled rooms |
 
 ---
 

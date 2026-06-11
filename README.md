@@ -264,10 +264,11 @@ The dashboard shows:
 |---------|--------|-------|
 | Safari 15+ (macOS) | Reference | Best color management |
 | Chrome 90+ (macOS) | Primary | Most users |
-| Chrome 90+ (Windows) | Supported | Gamma shifts possible |
+| Chrome 90+ (Windows) | Supported | |
 | Edge 90+ | Supported | Chromium-based |
 | Firefox 90+ | Supported | |
-| Mobile Safari/Chrome | Supported | Voice only |
+| Mobile Safari (iOS) | Supported | Field-tested: full stream viewing works |
+| Mobile Chrome | Supported | |
 
 ## Development
 

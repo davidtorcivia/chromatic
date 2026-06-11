@@ -26,46 +26,62 @@ The voice chat system uses WebRTC for peer-to-peer audio communication. When a v
 
 ## Message Flow
 
+Outgoing media (microphone, screen share) rides a dedicated **publisher peer
+connection** where the client is the only offerer and the server only
+answers. The subscriber connection (stream + received voice) is the mirror
+image: the server is the only offerer. Keeping each connection's offer
+direction fixed eliminates signaling glare entirely (mixed-direction offers
+caused unrecoverable wedges in both Chrome and Safari).
+
 ### 1. Viewer Enables Microphone
 
-When a viewer clicks the microphone button:
+When a viewer's microphone is enabled:
 
-1. Browser requests microphone permission
-2. Client creates a new RTCPeerConnection for voice
-3. Client creates an SDP offer with the audio track
-4. Client sends `signal:offer` to server
+1. Browser requests microphone permission (audio is routed through a light
+   cleanup chain: high-pass filter + soft noise gate, on top of the
+   browser's `noiseSuppression`/`echoCancellation` constraints)
+2. Client lazily creates the publisher RTCPeerConnection
+3. Client adds the audio track and sends `publish:offer`
 
 ```json
 {
-  "type": "signal:offer",
+  "type": "publish:offer",
   "payload": {
     "sdp": "v=0\r\no=- ..."
   }
 }
 ```
 
-### 2. Server Processes Voice Offer
+ICE candidates for the publisher trickle via `publish:candidate`.
 
-1. SFU creates a peer connection to receive the voice audio
-2. SFU sends back `signal:voice-answer` to the client
+### 2. Server Answers
+
+The SFU creates (or renegotiates, if one already exists) the participant's
+publisher peer connection and answers immediately:
 
 ```json
 {
-  "type": "signal:voice-answer",
+  "type": "publish:answer",
   "payload": {
     "sdp": "v=0\r\no=- ..."
   }
 }
 ```
+
+If the answer never arrives (lost message, wedged connection), the client
+rebuilds the publisher from scratch with its current tracks — the publisher
+carries no inbound state, so this is always safe.
 
 ### 3. Voice Track Forwarding
 
 When the SFU receives the voice audio track:
 
-1. For each other participant in the room:
-   - SFU adds the voice track to their subscriber connection
-   - SFU generates a renegotiation offer
-   - SFU sends `signal:renegotiate` to the participant
+1. It creates one shared relay track per speaker and fans it out
+2. For each other participant, the track is added to their subscriber
+   connection and a renegotiation offer is sent (`signal:renegotiate`)
+3. If a subscriber's signaling is busy, the track is attached anyway and the
+   offer is deferred until the in-flight exchange settles — voice tracks are
+   never dropped
 
 ```json
 {
@@ -79,10 +95,9 @@ When the SFU receives the voice audio track:
 
 ### 4. Client Receives Voice Track
 
-1. Client receives renegotiation offer
-2. Client sets remote description
-3. Client creates answer
-4. Client sends `signal:renegotiate-answer`
+1. Client receives the renegotiation offer on the subscriber connection
+2. Client sets remote description, creates an answer
+3. Client sends `signal:renegotiate-answer`
 
 The voice track is received in the `ontrack` handler with an ID prefixed with `voice-`:
 
@@ -95,6 +110,11 @@ pc.ontrack = (event) => {
   }
 };
 ```
+
+### Server-Enforced Mute
+
+`admin:mute` flips a server-side gate on the speaker's relay: incoming RTP
+is dropped at the SFU, so muting works even if the muted client ignores it.
 
 ## Audio Ducking
 
@@ -137,7 +157,7 @@ function handleVoiceTrack(participantId: string, track: MediaStreamTrack) {
 
 1. **Check microphone permissions**: Browser must have microphone access
 2. **Check peer connection state**: Ensure WebRTC connection is established
-3. **Check console for errors**: Look for `Failed to handle voice offer` messages
+3. **Check console for errors**: Look for `Failed to negotiate publisher` messages (client) or `Failed to handle publish offer` (server logs)
 
 ### Audio Ducking Not Working
 
@@ -163,15 +183,19 @@ function handleVoiceTrack(participantId: string, track: MediaStreamTrack) {
 
 | Type | Description |
 |------|-------------|
-| `signal:offer` | Voice SDP offer (client mic enabled) |
-| `signal:renegotiate-answer` | Answer to renegotiation offer |
+| `publish:offer` | Publisher SDP offer (mic enabled / share added) |
+| `publish:candidate` | Trickled ICE candidate for the publisher |
+| `signal:renegotiate-answer` | Answer to a subscriber renegotiation offer |
+| `media:toggle` | Broadcast local mic on/off state |
 
 ### Server to Client
 
 | Type | Description |
 |------|-------------|
-| `signal:voice-answer` | Answer to client's voice offer |
-| `signal:renegotiate` | Offer with new voice track added |
+| `publish:answer` | Answer to the client's publisher offer |
+| `publish:error` | Publisher negotiation failed |
+| `signal:renegotiate` | Subscriber offer with a new voice track added |
+| `admin:muted` | A participant was muted by an admin |
 
 ## Performance Considerations
 

@@ -1,8 +1,16 @@
 # Chromatic — Self-Hosted Client Streaming Platform
 ## Design Document v2.3
 
-> **Implementation Status:** Planning Complete — Ready for Phase 1  
-> **Last Updated:** 2024-12-27
+> **Implementation Status:** Shipped and field-tested. This document is the
+> original design and is kept for historical context — where it disagrees
+> with the implementation, the implementation wins. The accurate protocol
+> reference (REST + WebSocket message types) is [docs/api.md](docs/api.md);
+> notable post-design changes: outgoing media (mic/screen share) rides a
+> dedicated client-offers-only publisher peer connection
+> (`publish:offer/answer/candidate`), relayed RTP is stripped of source
+> header extensions, OBS color space guidance is sRGB, and keyframe
+> interval is 1s.
+> **Last Updated:** 2024-12-27 (status note 2026-06-11)
 
 ---
 

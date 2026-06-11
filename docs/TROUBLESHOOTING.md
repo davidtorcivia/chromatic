@@ -221,6 +221,29 @@ This guide covers common issues and their solutions when running Chromatic.
 
 ## Audio/Video Quality
 
+### Stream looks washed out (lifted blacks, low contrast)
+
+Most common on macOS viewers, in every browser.
+
+**Solution**: set OBS **Color Space to sRGB** (Settings > Advanced > Video),
+Color Range **Limited**. macOS displays Rec. 709-tagged video with a 1.96
+gamma, which lifts the shadows; sRGB-tagged video renders consistently on
+every platform. Field-verified fix.
+
+### Video is black but audio and lasers work
+
+1. **Check the server logs** — `docker logs chromatic` includes per-viewer
+   diagnostics: the codecs each browser accepted (`answer video: ...`),
+   whether the SFU is transmitting (`outbound video ... packetsSent=`), and
+   the viewer's receiver reports (`video RR: ...`).
+   - `packetsSent=0` or `NO STATS` → server-side binding problem
+   - packets sent but no `video RR` lines → the browser is discarding the
+     stream (historically: stale relay header extensions; fixed)
+   - RRs plus climbing `PLIs` → decoder waiting on a keyframe (check OBS
+     keyframe interval = 1s)
+2. **Reload the stream** from the viewer's error card — this rebuilds the
+   whole subscription with fresh TURN credentials.
+
 ### Video is pixelated/blocky
 
 **Solutions**:
@@ -257,7 +280,7 @@ This guide covers common issues and their solutions when running Chromatic.
 1. **Check if using TURN relay**: Relay adds latency (~100-200ms)
 
 2. **OBS settings**:
-   - Keyframe interval: 2 seconds
+   - Keyframe interval: 1 second
    - Tune: zerolatency
 
 3. **Server resource check**:
