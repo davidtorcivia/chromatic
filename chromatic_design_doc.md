@@ -150,7 +150,9 @@ The colorist (admin) is exempt from audio ducking. Assumption: colorist monitors
 3. No forced calibration patterns. Trust Apple XDR display ecosystem baseline.
 
 **Color Pipeline (OBS → Browser):**
-- OBS Color Space: Rec. 709
+- OBS Color Space: sRGB (field-tested 2026-06: Rec. 709 renders washed out on
+  macOS, where ColorSync displays 709-tagged video with a 1.96 gamma; sRGB
+  tagging is interpreted consistently across platforms)
 - OBS Color Range: Limited/Partial (prevents crushed blacks)
 - Browser: Standard video element rendering
 
@@ -801,11 +803,11 @@ export function clientToVideoCoords(
 | Encoder | x264 / NVENC / QSV | Hardware preferred if available |
 | Rate Control | CBR | Consistent bandwidth, predictable quality |
 | Bitrate | 6000–10000 Kbps | Balance fidelity vs. bandwidth |
-| Keyframe Interval | 2 seconds | Fast recovery from packet loss |
-| Profile | High | Maximum compression efficiency |
+| Keyframe Interval | 1 second | Fast join and recovery from packet loss |
+| Profile | baseline | Required — the SFU rejects Main/High |
 | Tune | zerolatency | Minimize encoder buffering |
 | **B-Frames** | **0** | **CRITICAL: Browsers cannot reorder B-frames in live WebRTC. Non-zero causes 2+ second latency.** |
-| Color Space | Rec. 709 | Web delivery standard |
+| Color Space | sRGB | Consistent rendering on all platforms (macOS shows Rec. 709 washed out via 1.96 gamma) |
 | Color Range | Limited/Partial | Prevents crushed blacks in browser |
 
 ### 10.2 WHIP Configuration

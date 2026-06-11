@@ -13,10 +13,11 @@ Chromatic enables real-time color-critical streaming from DaVinci Resolve via OB
 - **SFU architecture**: Efficient one-to-many broadcasting via Pion WebRTC
 
 ### Collaboration
-- **Laser pointer**: Interactive pointing visible to all participants
-- **Voice chat**: Built-in audio with intelligent ducking when speaking
-- **Chat messaging**: Text communication during sessions
-- **File sharing**: Share images, audio references, and PDFs
+- **Laser pointer**: Interactive pointing visible to all participants — works on the stream and on screen shares
+- **Screen sharing**: Any participant can share their screen (admin-approved), shown split-screen beside the stream
+- **Voice chat**: Built-in audio with light noise reduction and intelligent ducking when speaking
+- **Chat messaging**: Text communication during sessions, with admin moderation
+- **File sharing**: Share images, audio references, and PDFs; admins can review and remove room files
 
 ### Security & Access Control
 - **Waiting room**: Approve participants before they join
@@ -118,11 +119,22 @@ If anonymous pulls fail, set the GHCR package visibility to public.
 |---------|-------|-----|
 | Profile | **Baseline** | Main/High can use B-frames |
 | B-Frames | **0** | Non-zero causes 2+ second latency |
-| Keyframe Interval | 2 seconds | Balance latency vs recovery |
+| Keyframe Interval | 1 second | Fast join and recovery from packet loss |
 | Tune | zerolatency | Optimizes for real-time |
 | Bitrate | 6000-10000 Kbps | Adjust for your bandwidth |
 
 > **Warning**: B-frames MUST be disabled. This is the #1 cause of high latency issues.
+
+### Color Settings (Settings > Advanced > Video)
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| Color Format | NV12 | Standard 4:2:0 for H.264 delivery |
+| Color Space | **sRGB** | Consistent rendering on all platforms — macOS displays Rec. 709-tagged video with a 1.96 gamma, which looks washed out |
+| Color Range | Limited | Prevents crushed blacks in browsers |
+
+> **Tip**: If Mac viewers report a washed-out image, the stream is almost
+> certainly tagged Rec. 709 — switch OBS Color Space to sRGB.
 
 ## Architecture
 
@@ -254,7 +266,7 @@ The dashboard shows:
 | Chrome 90+ (macOS) | Primary | Most users |
 | Chrome 90+ (Windows) | Supported | Gamma shifts possible |
 | Edge 90+ | Supported | Chromium-based |
-| Firefox 90+ | Degraded | WebRTC quirks |
+| Firefox 90+ | Supported | |
 | Mobile Safari/Chrome | Supported | Voice only |
 
 ## Development
@@ -326,6 +338,11 @@ Please ensure:
 - Set B-frames to **0** in OBS
 - Use **Baseline** profile (not Main or High)
 - Set tune to **zerolatency**
+
+### Stream looks washed out (especially on Mac)
+- Set OBS **Color Space to sRGB** (Settings > Advanced > Video)
+- macOS displays Rec. 709-tagged video with a 1.96 gamma, lifting the
+  shadows; sRGB-tagged video renders consistently on every platform
 
 ### Viewers stuck on "Connecting..."
 - Check TURN provider configuration (`TURN_MODE`, Cloudflare creds, or Coturn if self-hosted)

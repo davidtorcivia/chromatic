@@ -1325,7 +1325,7 @@
                                             </li>
                                             <li>
                                                 <span>Color Space</span>
-                                                <strong>Rec. 709</strong>
+                                                <strong>sRGB</strong>
                                             </li>
                                             <li>
                                                 <span>Color Range</span>
@@ -1333,9 +1333,11 @@
                                             </li>
                                         </ul>
                                         <p class="hint">
-                                            SDR Rec.709 limited matches how
-                                            browsers render video, keeping
-                                            review color accurate.
+                                            sRGB matches how browsers render
+                                            video on every platform. Rec. 709
+                                            looks washed out on macOS, which
+                                            displays 709-tagged video with a
+                                            1.96 gamma.
                                         </p>
                                     </li>
                                 </ol>

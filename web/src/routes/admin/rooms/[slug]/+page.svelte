@@ -538,9 +538,11 @@
                                 <li>
                                     <strong>Settings &rarr; Advanced &rarr; Video:</strong>
                                     Color Format <strong>NV12</strong>,
-                                    Color Space <strong>Rec. 709</strong>,
+                                    Color Space <strong>sRGB</strong>,
                                     Color Range <strong>Limited</strong>
-                                    &mdash; matches browser rendering for accurate review color.
+                                    &mdash; sRGB matches browser rendering on every platform
+                                    (Rec. 709 looks washed out on macOS, which applies a
+                                    1.96 gamma to 709-tagged video).
                                 </li>
                             </ol>
                         </div>
