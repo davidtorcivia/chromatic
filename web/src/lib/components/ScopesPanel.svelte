@@ -12,7 +12,7 @@
     import { scale } from "svelte/transition";
     import { quintOut } from "svelte/easing";
     import { getFrameBitmap } from "$lib/glass/frameSource";
-    import { underPressure } from "$lib/perf/loadMonitor";
+    import { degradedInterval } from "$lib/perf/loadMonitor";
 
     interface Props {
         videoElement: HTMLVideoElement | null;
@@ -47,6 +47,10 @@
     let lastDrawAt = 0;
     let lastAnalyzed: ImageBitmap | null = null;
     let lastAnalyzedMode: Mode | null = null;
+    // Reused across ticks: a fresh 131KB buffer per analysis was ~6MB/s
+    // of garbage for the lifetime of an open scopes panel.
+    const outBuf = new Uint8ClampedArray(OUT_W * OUT_H * 4);
+    const outImage = new ImageData(outBuf, OUT_W, OUT_H);
 
     try {
         const saved = JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? "null");
@@ -128,7 +132,7 @@
         const now = performance.now();
         // Lowest rung on the priority ladder: under load the scopes drop
         // to ~10fps before anything else is touched.
-        if (now - lastDrawAt < (underPressure() ? 100 : FRAME_MS)) return;
+        if (now - lastDrawAt < degradedInterval("scopes", FRAME_MS)) return;
         lastDrawAt = now;
 
         // Identical frame, same mode: the trace would be identical too.
@@ -149,7 +153,8 @@
         sctx.drawImage(bmp ?? video, 0, 0, SRC_W, SRC_H);
         const src = sctx.getImageData(0, 0, SRC_W, SRC_H).data;
 
-        const out = new Uint8ClampedArray(OUT_W * OUT_H * 4);
+        const out = outBuf;
+        out.fill(0);
 
         if (mode === "vector") {
             // Graticule: center cross + 75% circle
@@ -248,7 +253,7 @@
         }
 
         const dctx = displayCanvas.getContext("2d")!;
-        dctx.putImageData(new ImageData(out, OUT_W, OUT_H), 0, 0);
+        dctx.putImageData(outImage, 0, 0);
     }
 
     $effect(() => {
@@ -259,6 +264,19 @@
             if (raf) cancelAnimationFrame(raf);
             raf = 0;
         };
+    });
+
+    // A position persisted on a wide window can land entirely outside a
+    // smaller one — with the drag handle unreachable. Clamp on open and
+    // again whenever the window resizes.
+    $effect(() => {
+        if (!open || !panelEl) return;
+        if (pos) pos = clampPos(pos.x, pos.y);
+        const onResize = () => {
+            if (pos) pos = clampPos(pos.x, pos.y);
+        };
+        window.addEventListener("resize", onResize);
+        return () => window.removeEventListener("resize", onResize);
     });
 </script>
 

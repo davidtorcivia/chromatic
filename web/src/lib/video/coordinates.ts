@@ -47,6 +47,19 @@ export function getVideoContentRect(video: HTMLVideoElement): VideoRect {
 }
 
 /**
+ * Page-coordinate variant for overlays positioned in viewport space (glass
+ * renderers, loupe). Returns null until the video has dimensions — those
+ * overlays must skip drawing rather than assume the element box.
+ */
+export function getVideoContentPageRect(video: HTMLVideoElement): DOMRect | null {
+    if (!video.videoWidth || !video.videoHeight) return null;
+    const box = video.getBoundingClientRect();
+    if (!box.width || !box.height) return null;
+    const r = getVideoContentRect(video);
+    return new DOMRect(box.left + r.x, box.top + r.y, r.width, r.height);
+}
+
+/**
  * Convert client (mouse/touch) coordinates to normalized video coordinates (0-1)
  */
 export function clientToVideoCoords(

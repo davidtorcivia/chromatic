@@ -48,3 +48,16 @@ export function stopLoadMonitor(): void {
 export function underPressure(): boolean {
 	return performance.now() < busyUntil;
 }
+
+/* The executable ladder: per-tier backoff multipliers applied to a
+ * consumer's base interval while under pressure. Defining them here keeps
+ * the documented ordering and the shipped behavior the same artifact. */
+const TIER_BACKOFF: Record<"loupe" | "scopes", number> = {
+	loupe: 2,
+	scopes: 2.4,
+};
+
+/** A consumer's effective frame interval given the current load. */
+export function degradedInterval(tier: keyof typeof TIER_BACKOFF, baseMs: number): number {
+	return underPressure() ? baseMs * TIER_BACKOFF[tier] : baseMs;
+}

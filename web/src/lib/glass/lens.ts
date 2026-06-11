@@ -14,6 +14,9 @@
  * function appended after url() (mixed lists verified working).
  */
 
+import { IS_CHROMIUM } from "$lib/platform";
+import { glassDisabled } from "./prefs";
+
 interface LensOptions {
 	/** Gaussian blur stdDeviation (≈ CSS blur px), applied after displacement. */
 	blur?: number;
@@ -57,10 +60,8 @@ let defsRoot: SVGDefsElement | null = null;
  */
 export function supportsBackdropLens(): boolean {
 	if (typeof window === "undefined") return false;
-	if (!("userAgentData" in navigator)) return false;
-	if (window.matchMedia("(prefers-reduced-transparency: reduce)").matches) return false;
-	if (window.matchMedia("(prefers-contrast: more)").matches) return false;
-	return true;
+	if (!IS_CHROMIUM) return false;
+	return !glassDisabled();
 }
 
 function ensureDefs(): SVGDefsElement {
@@ -201,15 +202,37 @@ export function liquidLens(node: HTMLElement, options: LensOptions = {}) {
 		node.style.backdropFilter = `url(#${id}) brightness(${opts.brightness})`;
 	}
 
+	// Map regeneration is an O(w*h) pixel loop plus a synchronous PNG
+	// encode — debounce resize storms instead of regenerating per frame
+	// (the stale map stretches via preserveAspectRatio in the interim).
+	let regenTimer: ReturnType<typeof setTimeout> | null = null;
 	const ro = new ResizeObserver(() => {
-		if (!raf) raf = requestAnimationFrame(update);
+		if (regenTimer) clearTimeout(regenTimer);
+		regenTimer = setTimeout(update, 120);
 	});
 	ro.observe(node);
 	update();
 
+	// The in-app reduce-transparency toggle must strip the lens from
+	// surfaces that are ALREADY mounted (the settings popover itself is
+	// open while the user flips the switch).
+	const prefsObserver = new MutationObserver(() => {
+		if (glassDisabled()) {
+			node.style.backdropFilter = "";
+		} else if (lastW && lastH) {
+			node.style.backdropFilter = `url(#${id}) brightness(${opts.brightness})`;
+		}
+	});
+	prefsObserver.observe(document.documentElement, {
+		attributes: true,
+		attributeFilter: ["class"],
+	});
+
 	return {
 		destroy() {
 			ro.disconnect();
+			prefsObserver.disconnect();
+			if (regenTimer) clearTimeout(regenTimer);
 			if (raf) cancelAnimationFrame(raf);
 			filter.remove();
 			node.style.backdropFilter = "";

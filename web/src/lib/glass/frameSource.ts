@@ -14,11 +14,12 @@
  * video element directly.
  */
 
+import { IS_GECKO } from "$lib/platform";
+
 const TARGET_WIDTH = 1024;
 // ~30fps; frost and scopes don't need 60. Gecko pays more per handoff
 // (bitmap creation + texture upload), so it gets 20fps — invisible
 // through frost, meaningful on its main thread.
-const IS_GECKO = typeof navigator !== "undefined" && /Gecko\/\d/.test(navigator.userAgent);
 const MIN_INTERVAL_MS = IS_GECKO ? 50 : 33;
 
 type Mode = "direct" | "canvas" | "unsupported";
@@ -27,8 +28,18 @@ let mode: Mode | null = null;
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
 let latest: ImageBitmap | null = null;
+let lastVideo: HTMLVideoElement | null = null;
 let pending = false;
 let lastDrawAt = 0;
+
+/** Drop the cached frame (leaving a room / stream teardown): without
+ *  this the last frame of the previous source could briefly drive the
+ *  glass and scopes of the next one, and the bitmap leaks tab-wide. */
+export function releaseFrames(): void {
+	latest?.close();
+	latest = null;
+	lastVideo = null;
+}
 
 function targetHeight(video: HTMLVideoElement): number {
 	return Math.max(1, Math.round((TARGET_WIDTH * video.videoHeight) / video.videoWidth));
@@ -70,6 +81,10 @@ function captureViaCanvas(video: HTMLVideoElement, h: number): void {
  */
 export function getFrameBitmap(video: HTMLVideoElement): ImageBitmap | null {
 	if (mode === "unsupported" || typeof createImageBitmap === "undefined") return null;
+	if (video !== lastVideo) {
+		releaseFrames();
+		lastVideo = video;
+	}
 	const vw = video.videoWidth;
 	if (!vw || !video.videoHeight) return latest;
 

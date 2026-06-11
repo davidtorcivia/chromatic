@@ -35,11 +35,16 @@ export function tooltip(node: HTMLElement, text: string) {
 		}
 		tip?.remove();
 		tip = null;
+		window.removeEventListener("scroll", hide, true);
 	}
 
 	function schedule() {
 		if (timer || tip) return;
 		timer = setTimeout(show, SHOW_DELAY_MS);
+		// Registered only while a tip/timer is live: with ~20 tooltipped
+		// controls, permanent capture-phase scroll listeners fan every
+		// scroll event out to that many no-op handlers.
+		window.addEventListener("scroll", hide, true);
 	}
 
 	node.addEventListener("pointerenter", schedule);
@@ -47,7 +52,6 @@ export function tooltip(node: HTMLElement, text: string) {
 	node.addEventListener("pointerdown", hide);
 	node.addEventListener("focus", schedule);
 	node.addEventListener("blur", hide);
-	window.addEventListener("scroll", hide, true);
 
 	return {
 		update(newText: string) {
@@ -61,7 +65,6 @@ export function tooltip(node: HTMLElement, text: string) {
 			node.removeEventListener("pointerdown", hide);
 			node.removeEventListener("focus", schedule);
 			node.removeEventListener("blur", hide);
-			window.removeEventListener("scroll", hide, true);
 		},
 	};
 }

@@ -98,7 +98,9 @@
         url: string;
         name: string;
         kind: "image" | "pdf";
-        index?: number;
+        /** Message id for images: the index into imageMessages is derived
+         *  live, so deletions while the lightbox is open stay in sync. */
+        id?: string;
     } | null>(null);
 
     // Lightbox owns Escape while open (capture phase beats the session
@@ -132,17 +134,29 @@
     // scrollHeight before the check and silently breaks follow mode).
     let pinnedToBottom = true;
     let autoScrolling = false;
+    let autoScrollTimer: ReturnType<typeof setTimeout> | null = null;
 
     function scrollToBottom(smooth = false) {
         if (!messagesContainer) return;
         const container = messagesContainer;
         autoScrolling = true;
+        // Safety: an interrupted smooth scroll never reaches the bottom,
+        // which would leave the latch (and the pin) stuck true forever.
+        if (autoScrollTimer) clearTimeout(autoScrollTimer);
+        autoScrollTimer = setTimeout(() => {
+            autoScrolling = false;
+        }, 800);
         requestAnimationFrame(() => {
             container.scrollTo({
                 top: container.scrollHeight,
                 behavior: smooth ? "smooth" : "auto",
             });
         });
+    }
+
+    // Explicit user scroll intent always overrides an in-flight auto-scroll
+    function handleUserScrollIntent() {
+        autoScrolling = false;
     }
 
     function handleMessagesScroll() {
@@ -304,16 +318,27 @@
         ),
     );
 
+    let lightboxIndex = $derived(
+        lightbox?.kind === "image" && lightbox.id
+            ? imageMessages.findIndex((m) => m.id === lightbox!.id)
+            : -1,
+    );
+    // The viewed image was deleted out from under the lightbox: close it.
+    $effect(() => {
+        if (lightbox?.kind === "image" && lightbox.id && lightboxIndex === -1) {
+            lightbox = null;
+        }
+    });
+
     function navLightbox(delta: number) {
-        if (!lightbox || lightbox.kind !== "image" || lightbox.index == null) return;
-        const next = lightbox.index + delta;
-        const target = imageMessages[next];
+        if (!lightbox || lightbox.kind !== "image" || lightboxIndex < 0) return;
+        const target = imageMessages[lightboxIndex + delta];
         if (!target?.file) return;
         lightbox = {
             url: withJoinToken(target.file.url) ?? "",
             name: target.file.name,
             kind: "image",
-            index: next,
+            id: target.id,
         };
     }
 
@@ -361,7 +386,13 @@
             </button>
         </div>
 
-        <div class="chat-messages" bind:this={messagesContainer} onscroll={handleMessagesScroll}>
+        <div
+            class="chat-messages"
+            bind:this={messagesContainer}
+            onscroll={handleMessagesScroll}
+            onwheel={handleUserScrollIntent}
+            ontouchmove={handleUserScrollIntent}
+        >
             {#each messages as msg, i (msg.id)}
                 {@const grouped = isGrouped(i)}
                 {@const own = msg.participantId === selfId}
@@ -382,7 +413,7 @@
                             <span class="chat-message-time">{formatTime(msg.timestamp)}</span>
                         </div>
                     {/if}
-                    {#if grouped}
+                    {#if grouped || own}
                         <span class="chat-hover-time" aria-hidden="true">{formatTime(msg.timestamp)}</span>
                     {/if}
                     {#if canModerate}
@@ -411,9 +442,7 @@
                                                 url: withJoinToken(msg.file!.url) ?? "",
                                                 name: msg.file!.name,
                                                 kind: "image",
-                                                index: imageMessages.findIndex(
-                                                    (im) => im.id === msg.id,
-                                                ),
+                                                id: msg.id,
                                             };
                                         }}
                                     >
@@ -582,11 +611,11 @@
                 transition:scale={{ start: 0.94, duration: 260, easing: quintOut }}
             />
         {/if}
-        {#if lightbox.kind === "image" && lightbox.index != null && imageMessages.length > 1}
+        {#if lightbox.kind === "image" && lightboxIndex >= 0 && imageMessages.length > 1}
             <button
                 class="chat-lightbox-nav prev"
                 onclick={() => navLightbox(-1)}
-                disabled={lightbox.index <= 0}
+                disabled={lightboxIndex <= 0}
                 aria-label="Previous image"
             >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="20" height="20" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
@@ -594,15 +623,15 @@
             <button
                 class="chat-lightbox-nav next"
                 onclick={() => navLightbox(1)}
-                disabled={lightbox.index >= imageMessages.length - 1}
+                disabled={lightboxIndex >= imageMessages.length - 1}
                 aria-label="Next image"
             >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="20" height="20" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
             </button>
         {/if}
         <div class="chat-lightbox-bar">
-            {#if lightbox.kind === "image" && lightbox.index != null && imageMessages.length > 1}
-                <span class="chat-lightbox-count">{lightbox.index + 1} of {imageMessages.length}</span>
+            {#if lightbox.kind === "image" && lightboxIndex >= 0 && imageMessages.length > 1}
+                <span class="chat-lightbox-count">{lightboxIndex + 1} of {imageMessages.length}</span>
             {/if}
             <span class="chat-lightbox-name">{lightbox.name}</span>
             <a

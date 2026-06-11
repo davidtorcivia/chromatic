@@ -12,7 +12,10 @@
      * the input handler — never waits for a frame.
      */
     import { fade } from "svelte/transition";
-    import { underPressure } from "$lib/perf/loadMonitor";
+    import { degradedInterval } from "$lib/perf/loadMonitor";
+    import { IS_GECKO } from "$lib/platform";
+    import { linkProgram, bindFullscreenTriangle } from "$lib/glass/gl";
+    import { getVideoContentPageRect } from "$lib/video/coordinates";
 
     interface Props {
         videoElement: HTMLVideoElement;
@@ -29,7 +32,7 @@
     const MIN_ZOOM = 2;
     const MAX_ZOOM = 8;
     const HINT_KEY = "chromatic_loupe_hint_v2";
-    const CONTENT_MS = /Gecko\/\d/.test(navigator.userAgent) ? 48 : 32;
+    const CONTENT_MS = IS_GECKO ? 48 : 32;
 
     const VERT = `#version 300 es
 in vec2 a_pos;
@@ -101,29 +104,9 @@ void main() {
                 stencil: false,
             });
             if (!ctx) return;
-            const compile = (type: number, src: string) => {
-                const sh = ctx.createShader(type)!;
-                ctx.shaderSource(sh, src);
-                ctx.compileShader(sh);
-                if (!ctx.getShaderParameter(sh, ctx.COMPILE_STATUS)) {
-                    throw new Error(ctx.getShaderInfoLog(sh) ?? "compile failed");
-                }
-                return sh;
-            };
-            const prog = ctx.createProgram()!;
-            ctx.attachShader(prog, compile(ctx.VERTEX_SHADER, VERT));
-            ctx.attachShader(prog, compile(ctx.FRAGMENT_SHADER, FRAG));
-            ctx.linkProgram(prog);
-            if (!ctx.getProgramParameter(prog, ctx.LINK_STATUS)) {
-                throw new Error(ctx.getProgramInfoLog(prog) ?? "link failed");
-            }
-            const quad = ctx.createBuffer()!;
-            ctx.bindBuffer(ctx.ARRAY_BUFFER, quad);
-            ctx.bufferData(ctx.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), ctx.STATIC_DRAW);
+            const prog = linkProgram(ctx, VERT, FRAG);
+            bindFullscreenTriangle(ctx, [prog]);
             ctx.useProgram(prog);
-            const loc = ctx.getAttribLocation(prog, "a_pos");
-            ctx.enableVertexAttribArray(loc);
-            ctx.vertexAttribPointer(loc, 2, ctx.FLOAT, false, 0, 0);
             uTex = ctx.createTexture()!;
             ctx.bindTexture(ctx.TEXTURE_2D, uTex);
             ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_MIN_FILTER, ctx.LINEAR);
@@ -140,19 +123,6 @@ void main() {
         }
     }
 
-    /** Displayed content rect of an object-fit: contain video, page coords. */
-    function contentRect(video: HTMLVideoElement): DOMRect | null {
-        const vw = video.videoWidth;
-        const vh = video.videoHeight;
-        if (!vw || !vh) return null;
-        const box = video.getBoundingClientRect();
-        if (!box.width || !box.height) return null;
-        const scale = Math.min(box.width / vw, box.height / vh);
-        const w = vw * scale;
-        const h = vh * scale;
-        return new DOMRect(box.left + (box.width - w) / 2, box.top + (box.height - h) / 2, w, h);
-    }
-
     let lastSource: HTMLVideoElement | null = null;
 
     /** Whichever playing video sits under the cursor (share pane wins ties
@@ -160,7 +130,7 @@ void main() {
     function sourceUnderPointer(): { video: HTMLVideoElement; rect: DOMRect } | null {
         for (const v of [shareElement, videoElement]) {
             if (!v || v.readyState < 2) continue;
-            const r = contentRect(v);
+            const r = getVideoContentPageRect(v);
             if (r && px >= r.left && px <= r.right && py >= r.top && py <= r.bottom) {
                 return { video: v, rect: r };
             }
@@ -183,6 +153,12 @@ void main() {
 
     function handleWheel(e: WheelEvent) {
         if (!enabled) return;
+        // Only own the wheel while the lens is over a video surface —
+        // a page-wide preventDefault would make chat, popovers and the
+        // participant list unscrollable for the whole tool session.
+        px = e.clientX;
+        py = e.clientY;
+        if (!sourceUnderPointer()) return;
         e.preventDefault();
         zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom - Math.sign(e.deltaY) * 0.5));
     }
@@ -236,7 +212,7 @@ void main() {
             const now = performance.now();
             gl.bindTexture(gl.TEXTURE_2D, uTex);
             // Yield under load: content freshness halves, tracking doesn't
-            if (now - lastUploadAt >= (underPressure() ? CONTENT_MS * 2 : CONTENT_MS)) {
+            if (now - lastUploadAt >= degradedInterval("loupe", CONTENT_MS)) {
                 lastUploadAt = now;
                 gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
             }
@@ -259,12 +235,20 @@ void main() {
             return;
         }
 
-        // Canvas2D fallback: throttled content copies
+        // Canvas2D fallback: throttled content copies. If WebGL2 context
+        // creation SUCCEEDED but shader setup failed, the canvas is
+        // permanently bound to that context and 2D is unavailable — hide
+        // the lens instead of throwing on null every tick.
         const now = performance.now();
-        if (now - lastUploadAt < CONTENT_MS) return;
+        if (now - lastUploadAt < degradedInterval("loupe", CONTENT_MS)) return;
         lastUploadAt = now;
         const srcSize = srcHalf * 2;
-        const ctx = canvasEl.getContext("2d")!;
+        const ctx = canvasEl.getContext("2d");
+        if (!ctx) {
+            canvasEl.style.opacity = "0";
+            if (chipEl) chipEl.style.opacity = "0";
+            return;
+        }
         ctx.imageSmoothingEnabled = size / srcSize < 1;
         ctx.clearRect(0, 0, size, size);
         ctx.drawImage(video, cx - srcHalf, cy - srcHalf, srcSize, srcSize, 0, 0, size, size);

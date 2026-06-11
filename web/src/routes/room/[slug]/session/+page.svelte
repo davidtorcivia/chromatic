@@ -21,6 +21,7 @@
     import { liquidLens } from "$lib/glass/lens";
     import { videoGlassGroup } from "$lib/glass/videoGlass";
     import { startLoadMonitor, stopLoadMonitor } from "$lib/perf/loadMonitor";
+    import { releaseFrames } from "$lib/glass/frameSource";
     import { tooltip } from "$lib/ui/tooltip";
 
     const slug = $page.params.slug!;
@@ -52,8 +53,12 @@
     let presenceRowEl = $state<HTMLDivElement | null>(null);
     let participantCountEl = $state<HTMLButtonElement | null>(null);
     let livePillEl = $state<HTMLElement | null>(null);
+    let topBarEl = $state<HTMLDivElement | null>(null);
+    let bottomBarEl = $state<HTMLDivElement | null>(null);
     let signalEl = $state<HTMLElement | null>(null);
     let latencyEl = $state<HTMLElement | null>(null);
+    // Popover optics, owned in one place (three surfaces share it)
+    const POPOVER_LENS = { blur: 12, radius: 20, scale: 36, zoom: 0.04, rim: 18 };
     const glassItems = (els: (HTMLElement | null)[]) =>
         els.filter((el): el is HTMLElement => el !== null);
     const topGlassItems = () =>
@@ -183,6 +188,14 @@
     let screenShareVideoEl = $state<HTMLVideoElement | null>(null);
     // False from "someone is starting a share" until their frames render
     let shareVideoReady = $state(false);
+    // Any change of the displayed share stream restarts the loading state;
+    // the video's onplaying flips it back. Structural, so paths that swap
+    // the stream without the start/stop handlers can't leave it stale.
+    $effect(() => {
+        void screenShareStream;
+        void selfShareStream;
+        shareVideoReady = false;
+    });
     let pendingScreenShareRequest = $state<{participantId: string, name: string} | null>(null);
     // Share was approved; waiting for the user's click to open the OS picker
     // (getDisplayMedia must be called from a user gesture).
@@ -412,7 +425,6 @@
             const data = payload as { participantId: string; name: string };
             screenShareParticipantId = data.participantId;
             screenShareParticipantName = data.name;
-            shareVideoReady = false;
             pendingScreenShareRequest = null;
             // Someone else grabbed the share slot while our prompt was up.
             if (data.participantId !== sessionData?.participantId) {
@@ -432,7 +444,6 @@
             screenShareParticipantName = null;
             screenShareStream = null;
             selfShareStream = null;
-            shareVideoReady = false;
         });
 
         session.onMessage("screenshare:pending", (payload: unknown) => {
@@ -598,6 +609,7 @@
 
     onDestroy(() => {
         stopLoadMonitor();
+        releaseFrames();
         cleanupWebRTC();
         if (audioDuckingManager) {
             audioDuckingManager.destroy();
@@ -1270,8 +1282,11 @@
         // only wake near the top/bottom edges (and the glass renderers
         // sleep with them, which keeps strokes fluid on slower engines).
         if (isLaserEnabled || isLoupeEnabled) {
-            const h = window.innerHeight;
-            if (e.clientY > 110 && e.clientY < h - 130) return;
+            // Wake zones track the real bar geometry (the bars stay laid
+            // out while hidden, so their rects are valid).
+            const topEdge = (topBarEl?.getBoundingClientRect().bottom ?? 110) + 24;
+            const bottomEdge = (bottomBarEl?.getBoundingClientRect().top ?? window.innerHeight - 130) - 24;
+            if (e.clientY > topEdge && e.clientY < bottomEdge) return;
         }
         startControlsTimer();
     }
@@ -1286,18 +1301,13 @@
 
     // Keyboard focus on any control reveals (and pins) the bars — tab users
     // must never have the control they're on fade away under them.
-    function handleControlsFocusIn() {
-        controlsHaveFocus = true;
-    }
-
-    // Pointer clicks leave focus sitting on the clicked button, which
-    // pins the controls open through controlsHaveFocus (noticed with the
-    // scopes toggle: the UI never retreated). Blur pointer-initiated
-    // clicks; keyboard activation (detail === 0) keeps focus for a11y.
-    function handleControlsClick(e: MouseEvent) {
-        if (e.detail > 0) {
-            (e.target as HTMLElement | null)?.closest("button")?.blur();
-        }
+    // Pin the controls open only for KEYBOARD focus: pointer clicks also
+    // focus buttons, and treating that as "user is navigating the bar"
+    // pinned the UI open after every click. :focus-visible is the
+    // platform's own keyboard-vs-pointer distinction.
+    function handleControlsFocusIn(e: FocusEvent) {
+        const target = e.target as HTMLElement | null;
+        controlsHaveFocus = !!target?.matches(":focus-visible");
     }
 
     function handleControlsFocusOut(e: FocusEvent) {
@@ -2181,17 +2191,17 @@
         {/if}
 
         <!-- Controls overlay -->
-        <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
             class="controls-overlay"
             class:visible={isControlsVisible}
             onfocusin={handleControlsFocusIn}
             onfocusout={handleControlsFocusOut}
-            onclick={handleControlsClick}
         >
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
                 class="top-bar"
+                bind:this={topBarEl}
                 use:videoGlassGroup={{
                     getVideo: () => videoElement,
                     isEnabled: glassEnabled,
@@ -2239,6 +2249,7 @@
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
                 class="bottom-bar"
+                bind:this={bottomBarEl}
                 use:videoGlassGroup={{
                     getVideo: () => videoElement,
                     isEnabled: glassEnabled,
@@ -2255,7 +2266,7 @@
                 {#if showAudioSettings}
                     <div
                         class="audio-settings-popover"
-                        use:liquidLens={{ blur: 12, radius: 20, scale: 36, zoom: 0.04, rim: 18 }}
+                        use:liquidLens={POPOVER_LENS}
                         bind:this={audioSettingsPopoverEl}
                         transition:scale={{ start: 0.95, duration: 260, easing: quintOut }}
                         role="dialog"
@@ -2541,7 +2552,7 @@
                     {#if showStats}
                         <div
                             class="stats-popover"
-                            use:liquidLens={{ blur: 12, radius: 20, scale: 36, zoom: 0.04, rim: 18 }}
+                            use:liquidLens={POPOVER_LENS}
                             bind:this={statsPopoverEl}
                             transition:scale={{ start: 0.95, duration: 260, easing: quintOut }}
                             role="dialog"
@@ -2578,13 +2589,15 @@
                     {#if isLive}
                         <span class="live-pill" bind:this={livePillEl}><span class="live-dot" aria-hidden="true"></span>Live</span>
                     {/if}
-                    {#if connectionQuality && currentRtt !== null}
+                    {#if hasStream}
                         <button
                             bind:this={signalEl}
-                            class="signal-indicator {connectionQuality}"
+                            class="signal-indicator {connectionQuality ?? ''}"
                             onclick={() => (showStats = !showStats)}
                             use:tooltip={"Stream statistics"}
-                            aria-label="Connection: {connectionQuality} ({Math.round(currentRtt)}ms). Stream statistics"
+                            aria-label={connectionQuality && currentRtt !== null
+                                ? `Connection: ${connectionQuality} (${Math.round(currentRtt)}ms). Stream statistics`
+                                : "Stream statistics"}
                             aria-expanded={showStats}
                             aria-haspopup="dialog"
                         >
@@ -2685,7 +2698,7 @@
         {#if showParticipantList}
             <div
                 class="participant-list"
-                use:liquidLens={{ blur: 12, radius: 20, scale: 36, zoom: 0.04, rim: 18 }}
+                use:liquidLens={POPOVER_LENS}
                 role="dialog"
                 aria-label="Participants"
                 tabindex="-1"

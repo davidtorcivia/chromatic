@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { IS_GECKO } from "$lib/platform";
     import { onMount } from "svelte";
     import { session } from "$lib/stores/session.svelte";
     import {
@@ -170,9 +171,7 @@
         // Gecko rasterizes two full-viewport canvases noticeably slower
         // than Chromium; 1x there keeps strokes fluid (trails stay smooth,
         // they're vector-stroked each frame anyway).
-        const dpr = /Gecko\/\d/.test(navigator.userAgent)
-            ? 1
-            : Math.min(window.devicePixelRatio || 1, 2);
+        const dpr = IS_GECKO ? 1 : Math.min(window.devicePixelRatio || 1, 2);
         const bw = Math.max(1, Math.round(rect.width * dpr));
         const bh = Math.max(1, Math.round(rect.height * dpr));
         trailCanvas.width = bw;

@@ -19,12 +19,35 @@
         else void audioEl.play().catch(() => {});
     }
 
+    // duration can be Infinity (MediaRecorder ogg/webm clips in Chrome
+    // report Infinity at loadedmetadata) — only finite durations are
+    // seekable, and Infinity must never reach the currentTime setter.
+    let seekable = $derived(isFinite(duration) && duration > 0);
+
     function seek(e: MouseEvent) {
-        if (!audioEl || !duration) return;
+        if (!audioEl || !seekable) return;
         const track = e.currentTarget as HTMLElement;
         const rect = track.getBoundingClientRect();
         const f = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
         audioEl.currentTime = f * duration;
+    }
+
+    function seekKeydown(e: KeyboardEvent) {
+        if (!audioEl || !seekable) return;
+        const step = duration / 20;
+        if (e.key === "ArrowRight" || e.key === "ArrowUp") {
+            e.preventDefault();
+            audioEl.currentTime = Math.min(duration, audioEl.currentTime + step);
+        } else if (e.key === "ArrowLeft" || e.key === "ArrowDown") {
+            e.preventDefault();
+            audioEl.currentTime = Math.max(0, audioEl.currentTime - step);
+        } else if (e.key === "Home") {
+            e.preventDefault();
+            audioEl.currentTime = 0;
+        } else if (e.key === "End") {
+            e.preventDefault();
+            audioEl.currentTime = duration;
+        }
     }
 
     function fmt(s: number): string {
@@ -47,6 +70,7 @@
             current = 0;
         }}
         onloadedmetadata={() => (duration = audioEl?.duration ?? 0)}
+        ondurationchange={() => (duration = audioEl?.duration ?? 0)}
         ontimeupdate={() => (current = audioEl?.currentTime ?? 0)}
     ></audio>
     <button class="audio-play" onclick={toggle} aria-label={playing ? "Pause" : "Play"} title={name}>
@@ -58,12 +82,32 @@
     </button>
     <div class="audio-body">
         <span class="audio-name">{name}</span>
-        <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-        <div class="audio-track" onclick={seek}>
-            <div class="audio-fill" style="width: {duration ? (current / duration) * 100 : 0}%"></div>
+        <div
+            class="audio-track"
+            role="slider"
+            tabindex="0"
+            aria-label="Seek"
+            aria-valuemin="0"
+            aria-valuemax={seekable ? Math.round(duration) : 0}
+            aria-valuenow={Math.round(current)}
+            aria-valuetext={fmt(current)}
+            onclick={seek}
+            onkeydown={seekKeydown}
+        >
+            <div class="audio-fill" style="width: {seekable ? (current / duration) * 100 : 0}%"></div>
         </div>
     </div>
-    <span class="audio-time">{fmt(playing || current > 0 ? current : duration)}</span>
+    <span class="audio-time">{fmt(playing || current > 0 ? current : seekable ? duration : 0)}</span>
+    <a
+        class="audio-open"
+        href={src}
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-label="Open audio file"
+        title="Open original file"
+    >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>
+    </a>
 </div>
 
 <style>
@@ -134,5 +178,26 @@
         font-variant-numeric: tabular-nums;
         color: var(--color-text-subtle);
         flex-shrink: 0;
+    }
+
+    .audio-track:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.4);
+    }
+
+    .audio-open {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 22px;
+        height: 22px;
+        flex-shrink: 0;
+        border-radius: var(--radius-full);
+        color: var(--color-text-subtle);
+        transition: background 0.12s ease, color 0.12s ease;
+    }
+    .audio-open:hover {
+        background: rgba(255, 255, 255, 0.08);
+        color: var(--color-text);
     }
 </style>

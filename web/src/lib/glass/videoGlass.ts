@@ -24,6 +24,11 @@
  */
 
 import { getFrameBitmap } from "./frameSource";
+import { glassDisabled } from "./prefs";
+import { compileShader, linkProgram, bindFullscreenTriangle } from "./gl";
+import { IS_GECKO } from "$lib/platform";
+import { easeOutCubic } from "$lib/video/laser";
+import { getVideoContentPageRect } from "$lib/video/coordinates";
 
 interface GroupOptions {
 	/** Returns the <video> element to refract (bound lazily). */
@@ -49,10 +54,10 @@ interface GroupOptions {
 const MAX_RECTS = 10;
 const FBO_WIDTH = 1024;
 const RAMP_MS = 300;
-// Gecko's texture-upload and canvas-compositing overhead is the highest
-// of the engines (though still cheaper than its CSS backdrop-filter over
-// video, which was field-tested as WORSE). Render the glass at 1x there.
-const IS_GECKO = typeof navigator !== "undefined" && /Gecko\/\d/.test(navigator.userAgent);
+// A few consecutive failures (driver quirks, bad video states) and the
+// renderer retires permanently, restoring the CSS material — flapping
+// styles every frame on a deterministic error would be worse than either.
+const MAX_CONSECUTIVE_ERRORS = 3;
 /* Grounding shadow while the shader owns the surface (the CSS inset
    speculars are suppressed; an outer contact shadow is still wanted). */
 const CONTACT_SHADOW = "0 6px 16px rgba(0, 0, 0, 0.28), 0 1px 4px rgba(0, 0, 0, 0.22)";
@@ -174,53 +179,14 @@ void main() {
   frag = vec4(c * alpha, alpha);
 }`;
 
-function compile(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
-	const sh = gl.createShader(type)!;
-	gl.shaderSource(sh, src);
-	gl.compileShader(sh);
-	if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-		throw new Error(gl.getShaderInfoLog(sh) ?? "shader compile failed");
-	}
-	return sh;
-}
-
-function link(gl: WebGL2RenderingContext, frag: string): WebGLProgram {
-	const prog = gl.createProgram()!;
-	gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, VERT));
-	gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, frag));
-	gl.linkProgram(prog);
-	if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-		throw new Error(gl.getProgramInfoLog(prog) ?? "program link failed");
-	}
-	return prog;
-}
-
-/** Displayed content rect of an object-fit: contain video, in page coords. */
-function videoContentRect(video: HTMLVideoElement): DOMRect | null {
-	const vw = video.videoWidth;
-	const vh = video.videoHeight;
-	if (!vw || !vh) return null;
-	const box = video.getBoundingClientRect();
-	if (!box.width || !box.height) return null;
-	const scale = Math.min(box.width / vw, box.height / vh);
-	const w = vw * scale;
-	const h = vh * scale;
-	return new DOMRect(box.left + (box.width - w) / 2, box.top + (box.height - h) / 2, w, h);
-}
-
 const radiusCache = new WeakMap<HTMLElement, number>();
-function cornerRadius(el: HTMLElement): number {
+function cornerRadius(el: HTMLElement, w: number, h: number): number {
 	let r = radiusCache.get(el);
 	if (r === undefined) {
 		r = parseFloat(getComputedStyle(el).borderTopLeftRadius) || 8;
 		radiusCache.set(el, r);
 	}
-	const rect = el.getBoundingClientRect();
-	return Math.min(r, rect.width / 2, rect.height / 2);
-}
-
-function easeOutCubic(x: number): number {
-	return 1 - Math.pow(1 - x, 3);
+	return Math.min(r, w / 2, h / 2);
 }
 
 /**
@@ -228,9 +194,7 @@ function easeOutCubic(x: number): number {
  * one canvas spanning the bar and renders all `items()` surfaces on it.
  */
 export function videoGlassGroup(node: HTMLElement, options: GroupOptions) {
-	if (typeof window === "undefined") return {};
-	if (window.matchMedia("(prefers-reduced-transparency: reduce)").matches) return {};
-	if (window.matchMedia("(prefers-contrast: more)").matches) return {};
+	if (typeof window === "undefined" || glassDisabled()) return {};
 
 	const opts = { zoom: 0.08, rim: 18, bezel: 26, ...options };
 
@@ -255,17 +219,9 @@ export function videoGlassGroup(node: HTMLElement, options: GroupOptions) {
 			stencil: false,
 		});
 		if (!gl) return {};
-		glassProg = link(gl, GLASS_FRAG);
-		downProg = link(gl, DOWNSAMPLE_FRAG);
-
-		const quad = gl.createBuffer()!;
-		gl.bindBuffer(gl.ARRAY_BUFFER, quad);
-		gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
-		for (const prog of [glassProg, downProg]) {
-			const loc = gl.getAttribLocation(prog, "a_pos");
-			gl.enableVertexAttribArray(loc);
-			gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-		}
+		glassProg = linkProgram(gl, VERT, GLASS_FRAG);
+		downProg = linkProgram(gl, VERT, DOWNSAMPLE_FRAG);
+		bindFullscreenTriangle(gl, [glassProg, downProg]);
 
 		videoTex = gl.createTexture()!;
 		gl.bindTexture(gl.TEXTURE_2D, videoTex);
@@ -288,6 +244,9 @@ export function videoGlassGroup(node: HTMLElement, options: GroupOptions) {
 	}
 
 	node.insertBefore(canvas, node.firstChild);
+	// A lost GPU context blanks the canvas while inline transparent styles
+	// would persist on the surfaces — retire to the CSS material instead.
+	canvas.addEventListener("webglcontextlost", () => retire());
 
 	let fboW = 0;
 	let fboH = 0;
@@ -314,20 +273,45 @@ export function videoGlassGroup(node: HTMLElement, options: GroupOptions) {
 		styled.clear();
 	}
 
+	const overlay = node.closest(".controls-overlay");
 	function overlayVisible(): boolean {
-		const overlay = node.closest(".controls-overlay");
 		return !overlay || overlay.classList.contains("visible");
+	}
+
+	/** Permanent retirement: restore the CSS material and stop forever. */
+	function retire() {
+		dead = true;
+		if (raf) cancelAnimationFrame(raf);
+		raf = 0;
+		releaseAll();
 	}
 
 	let rampStart = 0;
 	let wasRendering = false;
 	let lastGeckoTick = 0;
+	let consecutiveErrors = 0;
+	let dead = false;
 	let shimmerStart = -1;
 	let prevShimmerAt = 0;
 	const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 	function frame() {
 		raf = 0;
+		if (dead) return;
+		try {
+			frameBody();
+			consecutiveErrors = 0;
+		} catch {
+			if (++consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+				retire();
+			} else {
+				releaseAll();
+				if (overlayVisible()) schedule();
+			}
+		}
+	}
+
+	function frameBody() {
 		// Gecko: even the cheap skip-path bookkeeping (rect reads, item
 		// diffing) is worth halving on the slowest compositor.
 		if (IS_GECKO) {
@@ -351,7 +335,7 @@ export function videoGlassGroup(node: HTMLElement, options: GroupOptions) {
 		const items = usable ? opts.items().slice(0, MAX_RECTS) : [];
 		const w = node.clientWidth;
 		const h = node.clientHeight;
-		const content = usable ? videoContentRect(video!) : null;
+		const content = usable ? getVideoContentPageRect(video!) : null;
 
 		if (!usable || !items.length || !w || !h || !content) {
 			wasRendering = false;
@@ -394,7 +378,7 @@ export function videoGlassGroup(node: HTMLElement, options: GroupOptions) {
 			rectsArr[count * 4 + 1] = r.top - nodeRect.top;
 			rectsArr[count * 4 + 2] = r.width;
 			rectsArr[count * 4 + 3] = r.height;
-			radiiArr[count] = cornerRadius(el);
+			radiiArr[count] = cornerRadius(el, r.width, r.height);
 			count++;
 		}
 
@@ -525,7 +509,6 @@ export function videoGlassGroup(node: HTMLElement, options: GroupOptions) {
 	}
 
 	// Wake the loop whenever the overlay becomes visible again.
-	const overlay = node.closest(".controls-overlay");
 	const mo = new MutationObserver(() => {
 		if (overlayVisible()) schedule();
 	});

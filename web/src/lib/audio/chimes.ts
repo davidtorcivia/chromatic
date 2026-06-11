@@ -32,8 +32,12 @@ export function setUiSoundsEnabled(on: boolean): void {
 function playNotes(
     notes: { freq: number; at: number; dur: number }[],
     gain: number = CHIME_GAIN,
+    alwaysPlay = false,
 ): void {
-    if (!uiSoundsEnabled) return;
+    // Admin action prompts (waiting-room doorbell, share requests) bypass
+    // the mute: a host who silences ambience must still hear someone
+    // waiting at the door.
+    if (!uiSoundsEnabled && !alwaysPlay) return;
     void (async () => {
         try {
             const ctx = await getAudioContext();
@@ -66,18 +70,26 @@ function playNotes(
 
 /** Two quick ascending notes: someone is asking to share their screen. */
 export function playShareRequestChime(): void {
-    playNotes([
-        { freq: 660, at: 0, dur: 0.18 },
-        { freq: 880, at: 0.14, dur: 0.26 },
-    ]);
+    playNotes(
+        [
+            { freq: 660, at: 0, dur: 0.18 },
+            { freq: 880, at: 0.14, dur: 0.26 },
+        ],
+        CHIME_GAIN,
+        true,
+    );
 }
 
 /** Soft descending doorbell: someone joined the waiting room. */
 export function playWaitingRoomChime(): void {
-    playNotes([
-        { freq: 784, at: 0, dur: 0.22 },
-        { freq: 523, at: 0.18, dur: 0.34 },
-    ]);
+    playNotes(
+        [
+            { freq: 784, at: 0, dur: 0.22 },
+            { freq: 523, at: 0.18, dur: 0.34 },
+        ],
+        CHIME_GAIN,
+        true,
+    );
 }
 
 /** Soft rising fifth (C5 → G5): someone entered the room. Quieter than
