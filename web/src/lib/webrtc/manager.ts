@@ -710,14 +710,12 @@ export class WebRTCManager {
             if (!this.pc) return false;
 
             try {
-                // A leftover unanswered local offer blocks a replacement
-                // offer in Safari — roll it back first. (Never touch an ICE
-                // restart offer; its own machinery handles retries.)
-                if (this.pc.signalingState === 'have-local-offer' && !this.iceRestartPending) {
-                    console.log('Rolling back stale local offer before renegotiating');
-                    await this.pc.setLocalDescription({ type: 'rollback' });
-                }
-
+                // NO rollback here: explicitly rolling back a pending local
+                // offer triggers "Failed to set SSL role for the transport"
+                // in Chrome AND Safari once DTLS is up, permanently wedging
+                // the connection in have-local-offer. Setting a new local
+                // offer directly REPLACES a pending one (legal in all
+                // browsers), so a stale unanswered offer is superseded.
                 this.pinCodecsToRemoteOffer();
                 const offer = await this.pc.createOffer();
                 await this.pc.setLocalDescription(offer);
@@ -760,23 +758,21 @@ export class WebRTCManager {
             // Don't interfere with ICE restart offers
             if (this.iceRestartPending) return;
             if (this.voiceOfferRetries >= WebRTCManager.VOICE_OFFER_MAX_RETRIES) {
-                console.error('Voice offer unanswered after max retries, rolling back stale offer');
+                console.error('Voice offer unanswered after max retries; requesting a fresh subscription');
                 this.voiceOfferRetries = 0;
-                // Rollback so PC isn't stuck in have-local-offer
-                this.enqueueSignaling(async () => {
-                    if (this.pc?.signalingState === 'have-local-offer' && !this.iceRestartPending) {
-                        await this.pc.setLocalDescription({ type: 'rollback' });
-                    }
-                });
+                // Don't rollback (browsers fail it with "Failed to set SSL
+                // role" after DTLS is up) — rebuild the subscription instead;
+                // local tracks re-attach on the fresh offer.
+                this.options.onNegotiationWedged?.();
                 return;
             }
             this.voiceOfferRetries++;
             console.warn(`Voice offer unanswered after ${WebRTCManager.VOICE_OFFER_TIMEOUT_MS}ms, retrying (${this.voiceOfferRetries}/${WebRTCManager.VOICE_OFFER_MAX_RETRIES})`);
-            // Rollback the stale offer and re-send
+            // Re-send: a new local offer directly replaces the stale pending
+            // one (no rollback — see above).
             this.enqueueSignaling(async () => {
                 if (!this.pc || this.pc.signalingState !== 'have-local-offer') return;
                 if (this.iceRestartPending) return;
-                await this.pc.setLocalDescription({ type: 'rollback' });
                 const offer = await this.pc.createOffer();
                 await this.pc.setLocalDescription(offer);
                 this.options.sendSignal('signal:offer', { sdp: offer.sdp });
