@@ -1,21 +1,27 @@
 <script lang="ts">
     import { onMount, onDestroy } from "svelte";
-    import { fade, fly } from "svelte/transition";
+    import { fade, fly, scale } from "svelte/transition";
+    import { quintOut } from "svelte/easing";
     import { goto } from "$app/navigation";
     import { page } from "$app/stores";
     import { session } from "$lib/stores/session.svelte";
-    import { rooms } from "$lib/api/client";
+    import { rooms, uploadFile } from "$lib/api/client";
     import { chatStore, type ChatMessage } from "$lib/stores/chat.svelte";
     import { unlockAudio, getAudioContext, closeAudioContext } from "$lib/audio/context";
     import { WebRTCManager, getStoredMicDeviceId, storeMicDeviceId } from "$lib/webrtc/manager";
     import { deriveStreamOverlayState } from "$lib/video/stream-overlay";
     import { AudioDuckingManager } from "$lib/audio/ducking";
-    import { playShareRequestChime, playWaitingRoomChime } from "$lib/audio/chimes";
+    import { playShareRequestChime, playWaitingRoomChime, playJoinChime, playLeaveChime, playChatReceiveChime, getUiSoundsEnabled, setUiSoundsEnabled } from "$lib/audio/chimes";
     import LaserPointerOverlay from "$lib/components/LaserPointerOverlay.svelte";
+    import LoupeOverlay from "$lib/components/LoupeOverlay.svelte";
+    import ScopesPanel from "$lib/components/ScopesPanel.svelte";
     import ChatPanel from "$lib/components/ChatPanel.svelte";
     import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
     import WatermarkOverlay from "$lib/components/WatermarkOverlay.svelte";
-    import BrowserToast from "$lib/components/BrowserToast.svelte";
+    import { liquidLens } from "$lib/glass/lens";
+    import { videoGlassGroup } from "$lib/glass/videoGlass";
+    import { startLoadMonitor, stopLoadMonitor } from "$lib/perf/loadMonitor";
+    import { tooltip } from "$lib/ui/tooltip";
 
     const slug = $page.params.slug!;
 
@@ -40,8 +46,30 @@
     let kickTarget = $state<{ id: string; name: string } | null>(null);
     let endState = $state<{ title: string; body: string } | null>(null);
     let isFullscreen = $state(false);
-    let soundBtnEl = $state<HTMLButtonElement | null>(null);
-    let volumePopoverEl = $state<HTMLDivElement | null>(null);
+    // Glass surfaces rendered by the shared WebGL bar renderers
+    let controlBarEl = $state<HTMLDivElement | null>(null);
+    let roomNameEl = $state<HTMLDivElement | null>(null);
+    let presenceRowEl = $state<HTMLDivElement | null>(null);
+    let participantCountEl = $state<HTMLButtonElement | null>(null);
+    let livePillEl = $state<HTMLElement | null>(null);
+    let signalEl = $state<HTMLElement | null>(null);
+    let latencyEl = $state<HTMLElement | null>(null);
+    const glassItems = (els: (HTMLElement | null)[]) =>
+        els.filter((el): el is HTMLElement => el !== null);
+    const topGlassItems = () =>
+        glassItems([roomNameEl, presenceRowEl, participantCountEl]);
+    const bottomGlassItems = () =>
+        glassItems([controlBarEl, livePillEl, signalEl, latencyEl]);
+    const glassEnabled = () =>
+        hasStream && isVideoPlaying && !screenShareStream && !selfShareStream;
+    // Specular sweep requests: stream connect and new arrivals. The glass
+    // renderer only honors fresh requests, so a join while the controls
+    // are hidden passes without a stale sweep on the next reveal.
+    let shimmerRequestedAt = $state(0);
+    $effect(() => {
+        if (isVideoPlaying) shimmerRequestedAt = Date.now();
+    });
+    let statsPopoverEl = $state<HTMLDivElement | null>(null);
     let participantListEl = $state<HTMLDivElement | null>(null);
     let currentRtt = $state<number | null>(null);
     let statsInterval: ReturnType<typeof setInterval> | null = null;
@@ -52,7 +80,19 @@
     let iceServerRefreshInterval: ReturnType<typeof setInterval> | null = null;
     let streamVolume = $state(1.0);
     let voiceVolume = $state(1.0);
-    let showVolumeControls = $state(false);
+    // Review tools + new overlays
+    let isLoupeEnabled = $state(false);
+    let showScopes = $state(false);
+    let showShortcuts = $state(false);
+    let showStats = $state(false);
+    let displayFps = $state<number | null>(null);
+    let grabBusy = $state(false);
+    let grabFlash = $state(false);
+    let grabToast = $state<string | null>(null);
+    let grabToastTimer: ReturnType<typeof setTimeout> | null = null;
+    // Preferences (persisted)
+    let uiSounds = $state(getUiSoundsEnabled());
+    let reduceTransparency = $state(false);
     let streamError = $state<string | null>(null);
     let needsPlayClick = $state(false); // Autoplay fallback
     let streamPaused = $state(false); // Stream temporarily disconnected
@@ -96,6 +136,13 @@
     let chatPulseTimer: ReturnType<typeof setTimeout> | null = null;
     let chatToast = $state<{ id: string; name: string; text: string } | null>(null);
     let chatToastTimer: ReturnType<typeof setTimeout> | null = null;
+    // Who's typing in chat (id -> name + expiry); pruned by a 1s sweep so
+    // the indicator dies on its own when signals stop arriving.
+    let typingUsers = $state<Record<string, { name: string; until: number }>>({});
+    let typingPruneInterval: ReturnType<typeof setInterval> | null = null;
+    let typingList = $derived(
+        Object.entries(typingUsers).map(([id, v]) => ({ id, name: v.name })),
+    );
     const prefersReducedMotion =
         typeof window !== "undefined" &&
         window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -134,6 +181,8 @@
     let screenShareParticipantName = $state<string | null>(null);
     let screenShareStream = $state<MediaStream | null>(null);
     let screenShareVideoEl = $state<HTMLVideoElement | null>(null);
+    // False from "someone is starting a share" until their frames render
+    let shareVideoReady = $state(false);
     let pendingScreenShareRequest = $state<{participantId: string, name: string} | null>(null);
     // Share was approved; waiting for the user's click to open the OS picker
     // (getDisplayMedia must be called from a user gesture).
@@ -151,6 +200,15 @@
     } | null>(null);
 
     onMount(async () => {
+        startLoadMonitor();
+        try {
+            if (localStorage.getItem("chromatic_reduce_transparency") === "on") {
+                reduceTransparency = true;
+                document.documentElement.classList.add("reduce-transparency");
+            }
+        } catch {
+            // Storage unavailable; default applies.
+        }
         // Get session data
         const stored = sessionStorage.getItem(`chromatic_session_${slug}`);
         if (!stored) {
@@ -354,6 +412,7 @@
             const data = payload as { participantId: string; name: string };
             screenShareParticipantId = data.participantId;
             screenShareParticipantName = data.name;
+            shareVideoReady = false;
             pendingScreenShareRequest = null;
             // Someone else grabbed the share slot while our prompt was up.
             if (data.participantId !== sessionData?.participantId) {
@@ -373,6 +432,7 @@
             screenShareParticipantName = null;
             screenShareStream = null;
             selfShareStream = null;
+            shareVideoReady = false;
         });
 
         session.onMessage("screenshare:pending", (payload: unknown) => {
@@ -431,8 +491,35 @@
         session.onMessage("chat:message", (payload: unknown) => {
             const msg = payload as ChatMessage;
             chatStore.addMessage(msg);
+            if (msg.participantId !== sessionData?.participantId) {
+                playChatReceiveChime();
+            }
+            // Their message arrived; stop showing them as typing.
+            if (msg.participantId && typingUsers[msg.participantId]) {
+                const { [msg.participantId]: _, ...rest } = typingUsers;
+                typingUsers = rest;
+            }
             notifyChatMessage(msg);
         });
+
+        session.onMessage("chat:typing", (payload: unknown) => {
+            const data = payload as { participantId?: string; participantName?: string };
+            if (!data?.participantId || data.participantId === sessionData?.participantId) return;
+            typingUsers = {
+                ...typingUsers,
+                [data.participantId]: {
+                    name: data.participantName || "Someone",
+                    until: Date.now() + 3500,
+                },
+            };
+        });
+        typingPruneInterval = setInterval(() => {
+            const now = Date.now();
+            const live = Object.entries(typingUsers).filter(([, v]) => v.until > now);
+            if (live.length !== Object.keys(typingUsers).length) {
+                typingUsers = Object.fromEntries(live);
+            }
+        }, 1000);
 
         // Admin moderation: a message was removed from history server-side.
         session.onMessage("chat:message-deleted", (payload: unknown) => {
@@ -510,6 +597,7 @@
     });
 
     onDestroy(() => {
+        stopLoadMonitor();
         cleanupWebRTC();
         if (audioDuckingManager) {
             audioDuckingManager.destroy();
@@ -535,6 +623,10 @@
         if (chatToastTimer) {
             clearTimeout(chatToastTimer);
             chatToastTimer = null;
+        }
+        if (typingPruneInterval) {
+            clearInterval(typingPruneInterval);
+            typingPruneInterval = null;
         }
     });
 
@@ -644,7 +736,7 @@
         }
 
         if (!event.streams || event.streams.length === 0 || !event.streams[0]) {
-            streamError = "The stream isn't available right now — the host may need to restart it.";
+            streamError = "The stream isn't available right now. The host may need to restart it.";
             return;
         }
 
@@ -1172,7 +1264,15 @@
         }, CONTROLS_HIDE_DELAY_MS);
     }
 
-    function handleMouseMove() {
+    function handleMouseMove(e: MouseEvent) {
+        // Tool mode: while the laser or loupe is in hand, moving over the
+        // picture is USING the tool, not asking for chrome. The controls
+        // only wake near the top/bottom edges (and the glass renderers
+        // sleep with them, which keeps strokes fluid on slower engines).
+        if (isLaserEnabled || isLoupeEnabled) {
+            const h = window.innerHeight;
+            if (e.clientY > 110 && e.clientY < h - 130) return;
+        }
         startControlsTimer();
     }
 
@@ -1188,6 +1288,16 @@
     // must never have the control they're on fade away under them.
     function handleControlsFocusIn() {
         controlsHaveFocus = true;
+    }
+
+    // Pointer clicks leave focus sitting on the clicked button, which
+    // pins the controls open through controlsHaveFocus (noticed with the
+    // scopes toggle: the UI never retreated). Blur pointer-initiated
+    // clicks; keyboard activation (detail === 0) keeps focus for a11y.
+    function handleControlsClick(e: MouseEvent) {
+        if (e.detail > 0) {
+            (e.target as HTMLElement | null)?.closest("button")?.blur();
+        }
     }
 
     function handleControlsFocusOut(e: FocusEvent) {
@@ -1349,6 +1459,7 @@
 
     function toggleLaser() {
         isLaserEnabled = !isLaserEnabled;
+        if (isLaserEnabled) isLoupeEnabled = false;
     }
 
     // Safari shows native hover media controls over the share video and a
@@ -1373,8 +1484,9 @@
         }
     }
 
-    function toggleVolumeControls() {
-        showVolumeControls = !showVolumeControls;
+    function toggleLoupe() {
+        isLoupeEnabled = !isLoupeEnabled;
+        if (isLoupeEnabled) isLaserEnabled = false;
     }
 
     function handleStreamVolumeChange(event: Event) {
@@ -1417,6 +1529,106 @@
             hideMicPromptLater();
         }
     }
+
+    function muteAllParticipants() {
+        for (const p of participants) {
+            if (p.id !== sessionData?.participantId && p.audioEnabled) {
+                muteParticipant(p.id);
+            }
+        }
+    }
+
+    function approveAllWaiting() {
+        for (const request of waitingRequests) {
+            approveWaiting(request.participantId);
+        }
+    }
+
+    // Frame grab: capture the current program frame, push it through the
+    // normal chat file pipeline so it lands in history for everyone.
+    async function grabFrame() {
+        if (grabBusy || !videoElement || videoElement.readyState < 2 || !videoElement.videoWidth) {
+            return;
+        }
+        grabBusy = true;
+        grabFlash = true;
+        setTimeout(() => (grabFlash = false), 60);
+        try {
+            const canvas = document.createElement("canvas");
+            canvas.width = videoElement.videoWidth;
+            canvas.height = videoElement.videoHeight;
+            canvas.getContext("2d")!.drawImage(videoElement, 0, 0);
+            const blob = await new Promise<Blob | null>((resolve) =>
+                canvas.toBlob(resolve, "image/jpeg", 0.92),
+            );
+            if (!blob) throw new Error("capture failed");
+            const t = new Date();
+            const stamp = [t.getHours(), t.getMinutes(), t.getSeconds()]
+                .map((n) => n.toString().padStart(2, "0"))
+                .join("");
+            const file = new File([blob], `frame-${slug}-${stamp}.jpg`, { type: "image/jpeg" });
+            const uploaded = await uploadFile(slug, file, sessionData?.token || "");
+            session.send("chat:file", {
+                fileId: uploaded.id,
+                name: uploaded.originalName,
+                mimeType: uploaded.mimeType,
+                url: uploaded.url,
+                thumbnailUrl: uploaded.thumbnailUrl,
+            });
+            showGrabToast("Frame shared to chat");
+        } catch {
+            showGrabToast("Could not capture the frame");
+        } finally {
+            grabBusy = false;
+        }
+    }
+
+    function showGrabToast(text: string) {
+        grabToast = text;
+        if (grabToastTimer) clearTimeout(grabToastTimer);
+        grabToastTimer = setTimeout(() => {
+            grabToast = null;
+            grabToastTimer = null;
+        }, 2200);
+    }
+
+    function toggleUiSounds() {
+        uiSounds = !uiSounds;
+        setUiSoundsEnabled(uiSounds);
+    }
+
+    function toggleReduceTransparency() {
+        reduceTransparency = !reduceTransparency;
+        document.documentElement.classList.toggle("reduce-transparency", reduceTransparency);
+        try {
+            localStorage.setItem("chromatic_reduce_transparency", reduceTransparency ? "on" : "off");
+        } catch {
+            // In-session preference still applies.
+        }
+    }
+
+    // Display fps for the stats card, measured only while it's open.
+    $effect(() => {
+        const video = videoElement;
+        if (!showStats || !video || !("requestVideoFrameCallback" in video)) return;
+        let frames = 0;
+        let windowStart = performance.now();
+        let handle = 0;
+        const tick = (now: number) => {
+            frames++;
+            if (now - windowStart >= 1000) {
+                displayFps = Math.round((frames * 1000) / (now - windowStart));
+                frames = 0;
+                windowStart = now;
+            }
+            handle = (video as any).requestVideoFrameCallback(tick);
+        };
+        handle = (video as any).requestVideoFrameCallback(tick);
+        return () => {
+            (video as any).cancelVideoFrameCallback?.(handle);
+            displayFps = null;
+        };
+    });
 
     function muteParticipant(participantId: string) {
         session.send("admin:mute", { participantId });
@@ -1461,11 +1673,25 @@
             case "l":
                 toggleLaser();
                 break;
+            case "g":
+                void grabFrame();
+                break;
+            case "z":
+                toggleLoupe();
+                break;
+            case "s":
+                showScopes = !showScopes;
+                break;
+            case "?":
+                showShortcuts = !showShortcuts;
+                break;
             case "escape":
-                if (showAudioSettings) {
+                if (showShortcuts) {
+                    showShortcuts = false;
+                } else if (showStats) {
+                    showStats = false;
+                } else if (showAudioSettings) {
                     showAudioSettings = false;
-                } else if (showVolumeControls) {
-                    showVolumeControls = false;
                 } else if (showParticipantList) {
                     showParticipantList = false;
                 } else if (isChatOpen) {
@@ -1478,9 +1704,13 @@
     // Close the volume / audio-settings popovers on click/tap outside them.
     function handleWindowPointerDown(e: PointerEvent) {
         const target = e.target as Node;
-        if (showVolumeControls) {
-            if (!volumePopoverEl?.contains(target) && !soundBtnEl?.contains(target)) {
-                showVolumeControls = false;
+        if (showStats) {
+            if (
+                !statsPopoverEl?.contains(target) &&
+                !signalEl?.contains(target) &&
+                !latencyEl?.contains(target)
+            ) {
+                showStats = false;
             }
         }
         if (showAudioSettings) {
@@ -1518,6 +1748,37 @@
     let unreadCount = $derived(chatStore.unreadCount);
     let roomState = $derived(session.state.room);
     let participants = $derived(roomState?.participants || []);
+
+    // Join/leave chimes for everyone: watch the roster for deltas rather
+    // than a specific message type (joins arrive via roster broadcasts).
+    // The first non-empty roster is the initial sync, not arrivals; own
+    // join/leave never chimes; bursts collapse into one chime.
+    let knownParticipantIds: Set<string> | null = null;
+    let lastRosterChimeAt = 0;
+    $effect(() => {
+        const ids = new Set(participants.map((p: { id: string }) => p.id));
+        if (knownParticipantIds === null) {
+            if (ids.size > 0) knownParticipantIds = ids;
+            return;
+        }
+        const prev = knownParticipantIds;
+        knownParticipantIds = ids;
+        const self = sessionData?.participantId;
+        let joined = false;
+        let left = false;
+        for (const id of ids) if (!prev.has(id) && id !== self) joined = true;
+        for (const id of prev) if (!ids.has(id) && id !== self) left = true;
+        const now = Date.now();
+        if (now - lastRosterChimeAt < 800) return;
+        if (joined) {
+            playJoinChime();
+            shimmerRequestedAt = Date.now();
+            lastRosterChimeAt = now;
+        } else if (left) {
+            playLeaveChime();
+            lastRosterChimeAt = now;
+        }
+    });
     let isLive = $derived(roomState?.isLive || false);
     // Prefer the live role from the server-pushed room state; fall back to the
     // role returned by the join API (persisted in sessionStorage).
@@ -1591,7 +1852,7 @@
     let controlsPinned = $derived(
         isPointerOverControls ||
             controlsHaveFocus ||
-            showVolumeControls ||
+            showStats ||
             showParticipantList ||
             showAudioSettings ||
             isChatOpen
@@ -1648,7 +1909,13 @@
 <svelte:window onkeydown={handleKeydown} onpointerdown={handleWindowPointerDown} />
 <svelte:document onfullscreenchange={handleFullscreenChange} />
 
-<main class="session-page" onmousemove={handleMouseMove} onpointerdown={handlePagePointerDown}>
+<main
+    class="session-page"
+    class:controls-hidden={!isControlsVisible}
+    class:loupe-on={isLoupeEnabled}
+    onmousemove={handleMouseMove}
+    onpointerdown={handlePagePointerDown}
+>
     <div class="video-wrapper" class:split-active={screenShareStream || selfShareStream}>
         {#if screenShareStream || selfShareStream}
             <!-- The sharer sees their own capture in the same split position
@@ -1663,7 +1930,15 @@
                     disablepictureinpicture
                     controlslist="nodownload nofullscreen noremoteplayback"
                     onpause={handleSharePause}
+                    onplaying={() => (shareVideoReady = true)}
                 ></video>
+
+                {#if !shareVideoReady}
+                    <div class="share-loading-pane" transition:fade={{ duration: 150 }}>
+                        <span class="connect-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+                        Loading screen share
+                    </div>
+                {/if}
 
                 {#if screenShareVideoEl}
                     <LaserPointerOverlay videoElement={screenShareVideoEl} enabled={isLaserEnabled} surface="share" />
@@ -1677,7 +1952,7 @@
                     {/if}
                     {#if !screenShareStream || isAdmin || screenShareParticipantId === sessionData?.participantId}
                         <button class="split-screenshare-stop" onclick={stopScreenSharePip} title="Stop screen share">
-                            <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
                             Stop
                         </button>
                     {/if}
@@ -1698,6 +1973,11 @@
 
             {#if videoElement && hasStream && !needsPlayClick}
                 <LaserPointerOverlay {videoElement} enabled={isLaserEnabled} />
+                <LoupeOverlay {videoElement} shareElement={screenShareVideoEl} enabled={isLoupeEnabled} onExit={() => (isLoupeEnabled = false)} />
+            {/if}
+
+            {#if grabFlash}
+                <div class="grab-flash" out:fade={{ duration: 220 }}></div>
             {/if}
 
             {#if roomState?.watermarkMode && roomState.watermarkMode !== 'none'}
@@ -1725,7 +2005,7 @@
                         <svg viewBox="0 0 24 24" fill="currentColor" width="44" height="44"><path d="M8 5v14l11-7z"/></svg>
                     </button>
                     <h2 class="stream-card-title">Tap to start watching</h2>
-                    <p class="stream-card-body">The stream is ready — your browser just needs one tap to begin playback.</p>
+                    <p class="stream-card-body">The stream is ready. Your browser just needs one tap to begin playback.</p>
                 </div>
             </div>
         {:else if overlayState === 'error'}
@@ -1770,7 +2050,7 @@
                         <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
                     </div>
                     <h2 class="stream-card-title">Stream paused</h2>
-                    <p class="stream-card-body">The host's connection was interrupted — the stream will resume automatically.</p>
+                    <p class="stream-card-body">The host's connection was interrupted. The stream will resume automatically.</p>
                 </div>
             </div>
         {:else if overlayState === 'waiting' || overlayState === 'connecting'}
@@ -1824,7 +2104,7 @@
 
             {#if shareApprovedPrompt}
                 <div class="screenshare-approval" transition:fly={{ y: 8, duration: 200 }}>
-                    <span class="screenshare-approval-text">Share approved — choose what to share</span>
+                    <span class="screenshare-approval-text">Share approved. Choose what to share</span>
                     <div class="screenshare-approval-actions">
                         <button class="screenshare-approval-btn approve" onclick={startApprovedShare}>Start sharing</button>
                         <button class="screenshare-approval-btn deny" onclick={dismissApprovedShare}>Cancel</button>
@@ -1847,7 +2127,7 @@
                     {:else}
                         <div class="mic-prompt-copy">
                             <p class="mic-prompt-title">Microphone is blocked</p>
-                            <p class="mic-prompt-text">You can watch and listen — enable your mic anytime to speak.</p>
+                            <p class="mic-prompt-text">You can watch and listen. Enable your mic anytime to speak.</p>
                         </div>
                         <div class="mic-prompt-actions">
                             <button class="mic-prompt-btn primary" onclick={retryMicConnection}>Enable microphone</button>
@@ -1863,6 +2143,11 @@
              auto-dismiss; scrolls past four pending requests. -->
         {#if isAdmin && waitingRequests.length > 0}
             <div class="waiting-stack" role="region" aria-label="Waiting room requests">
+                {#if waitingRequests.length > 1}
+                    <button class="waiting-approve-all" onclick={approveAllWaiting}>
+                        Approve all ({waitingRequests.length})
+                    </button>
+                {/if}
                 {#each waitingRequests as request (request.participantId)}
                     <div
                         class="waiting-request-card"
@@ -1896,25 +2181,32 @@
         {/if}
 
         <!-- Controls overlay -->
-        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
         <div
             class="controls-overlay"
             class:visible={isControlsVisible}
             onfocusin={handleControlsFocusIn}
             onfocusout={handleControlsFocusOut}
+            onclick={handleControlsClick}
         >
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
                 class="top-bar"
+                use:videoGlassGroup={{
+                    getVideo: () => videoElement,
+                    isEnabled: glassEnabled,
+                    items: topGlassItems,
+                    shimmerAt: () => shimmerRequestedAt,
+                }}
                 onpointerenter={handleBarsPointerEnter}
                 onpointerleave={handleBarsPointerLeave}
             >
-                <div class="room-name">{roomState?.name || "Session"}</div>
+                <div class="room-name" bind:this={roomNameEl}>{roomState?.name || "Session"}</div>
                 <div class="top-bar-right">
                     <!-- Compact presence row: one dot per participant, ring
                          glows in their color while speaking, slash = muted -->
                     {#if participants.length > 1}
-                        <div class="presence-row" aria-hidden="true">
+                        <div class="presence-row" aria-hidden="true" bind:this={presenceRowEl}>
                             {#each participants.slice(0, 8) as p (p.id)}
                                 <span
                                     class="presence-dot"
@@ -1931,13 +2223,14 @@
                     {/if}
                     <button
                         class="participant-count"
+                        bind:this={participantCountEl}
                         onclick={toggleParticipantList}
                         class:active={showParticipantList}
                         aria-label="Participants ({participants.length})"
                         aria-expanded={showParticipantList}
                         aria-haspopup="dialog"
                     >
-                        <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
                         {participants.length}
                     </button>
                 </div>
@@ -1946,6 +2239,12 @@
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
                 class="bottom-bar"
+                use:videoGlassGroup={{
+                    getVideo: () => videoElement,
+                    isEnabled: glassEnabled,
+                    items: bottomGlassItems,
+                    shimmerAt: () => shimmerRequestedAt,
+                }}
                 onpointerenter={handleBarsPointerEnter}
                 onpointerleave={handleBarsPointerLeave}
             >
@@ -1953,53 +2252,47 @@
 
                 <!-- Main control bar - large, obvious buttons with labels -->
                 <div class="control-bar-anchor">
-                {#if showVolumeControls}
-                    <div
-                        class="volume-popover"
-                        bind:this={volumePopoverEl}
-                        transition:fly={{ y: 8, duration: 200 }}
-                        role="dialog"
-                        aria-label="Volume controls"
-                    >
-                        <div class="volume-row">
-                            <label for="program-volume">Program</label>
-                            <input
-                                id="program-volume"
-                                class="range-input"
-                                type="range"
-                                min="0"
-                                max="1"
-                                step="0.05"
-                                value={streamVolume}
-                                oninput={handleStreamVolumeChange}
-                            />
-                        </div>
-                        <div class="volume-row">
-                            <label for="voice-volume">Voice chat</label>
-                            <input
-                                id="voice-volume"
-                                class="range-input"
-                                type="range"
-                                min="0"
-                                max="1"
-                                step="0.05"
-                                value={voiceVolume}
-                                oninput={handleVoiceVolumeChange}
-                            />
-                        </div>
-                        <button class="volume-mute-btn" onclick={toggleMute} aria-pressed={isMuted}>
-                            {isMuted ? "Unmute program audio" : "Mute program audio"}
-                        </button>
-                    </div>
-                {/if}
                 {#if showAudioSettings}
                     <div
                         class="audio-settings-popover"
+                        use:liquidLens={{ blur: 12, radius: 20, scale: 36, zoom: 0.04, rim: 18 }}
                         bind:this={audioSettingsPopoverEl}
-                        transition:fly={{ y: 8, duration: 200 }}
+                        transition:scale={{ start: 0.95, duration: 260, easing: quintOut }}
                         role="dialog"
-                        aria-label="Audio settings"
+                        aria-label="Settings"
                     >
+                        <div class="audio-settings-section">
+                            <span class="audio-settings-title">Volume</span>
+                            <div class="volume-row">
+                                <label for="program-volume">Program</label>
+                                <input
+                                    id="program-volume"
+                                    class="range-input"
+                                    type="range"
+                                    min="0"
+                                    max="1"
+                                    step="0.05"
+                                    value={streamVolume}
+                                    oninput={handleStreamVolumeChange}
+                                />
+                            </div>
+                            <div class="volume-row">
+                                <label for="voice-volume">Voice chat</label>
+                                <input
+                                    id="voice-volume"
+                                    class="range-input"
+                                    type="range"
+                                    min="0"
+                                    max="1"
+                                    step="0.05"
+                                    value={voiceVolume}
+                                    oninput={handleVoiceVolumeChange}
+                                />
+                            </div>
+                            <button class="volume-mute-btn" onclick={toggleMute} aria-pressed={isMuted}>
+                                {isMuted ? "Unmute program audio" : "Mute program audio"}
+                            </button>
+                        </div>
                         <div class="audio-settings-section">
                             <span class="audio-settings-title">Microphone</span>
                             {#if !micLabelsAvailable}
@@ -2023,7 +2316,7 @@
                                 >
                                     <span class="audio-device-check" aria-hidden="true">
                                         {#if device.deviceId === activeMicId}
-                                            <svg viewBox="0 0 24 24" fill="currentColor" width="12" height="12"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12"><path d="M20 6 9 17l-5-5"/></svg>
                                         {/if}
                                     </span>
                                     <span class="audio-device-label">{device.label || "Microphone"}</span>
@@ -2042,7 +2335,7 @@
                                     >
                                         <span class="audio-device-check" aria-hidden="true">
                                             {#if device.deviceId === (selectedSpeakerId ?? "default")}
-                                                <svg viewBox="0 0 24 24" fill="currentColor" width="12" height="12"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12"><path d="M20 6 9 17l-5-5"/></svg>
                                             {/if}
                                         </span>
                                         <span class="audio-device-label">{device.label || "Speaker"}</span>
@@ -2050,23 +2343,45 @@
                                 {/each}
                             </div>
                         {/if}
+                        <div class="audio-settings-section">
+                            <span class="audio-settings-title">Preferences</span>
+                            <label class="pref-row">
+                                <span>UI sounds</span>
+                                <input
+                                    type="checkbox"
+                                    class="switch"
+                                    checked={uiSounds}
+                                    onchange={toggleUiSounds}
+                                />
+                            </label>
+                            <label class="pref-row">
+                                <span>Reduce transparency</span>
+                                <input
+                                    type="checkbox"
+                                    class="switch"
+                                    checked={reduceTransparency}
+                                    onchange={toggleReduceTransparency}
+                                />
+                            </label>
+                        </div>
                     </div>
                 {/if}
-                <div class="control-bar">
+                <div class="control-bar" bind:this={controlBarEl}>
                     <button
                         class="control-btn"
+                        style="--stagger: 0ms"
                         class:active={isMicEnabled}
                         class:off={!isMicEnabled}
                         onclick={toggleMic}
                         aria-pressed={isMicEnabled}
                         aria-label="Microphone (M)"
-                        title="Toggle microphone (M)"
+                        use:tooltip={"Microphone (M)"}
                     >
-                        <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
                             {#if isMicEnabled}
-                                <path d="M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/>
+                                <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/>
                             {:else}
-                                <path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"/>
+                                <line x1="2" x2="22" y1="2" y2="22"/><path d="M18.89 13.23A7.12 7.12 0 0 0 19 12v-2"/><path d="M5 10v2a7 7 0 0 0 12 5"/><path d="M15 9.34V5a3 3 0 0 0-5.68-1.33"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12"/><line x1="12" x2="12" y1="19" y2="22"/>
                             {/if}
                         </svg>
                         <span class="control-label">{isMicEnabled ? "Mic On" : "Mic Off"}</span>
@@ -2074,111 +2389,134 @@
 
                     <button
                         class="control-btn"
+                        style="--stagger: 18ms"
                         class:active={showAudioSettings}
+                        class:off={isMuted}
                         onclick={toggleAudioSettings}
                         bind:this={audioSettingsBtnEl}
-                        aria-label="Audio settings"
+                        aria-label="Settings"
                         aria-expanded={showAudioSettings}
                         aria-haspopup="dialog"
-                        title="Audio settings (input device)"
+                        use:tooltip={"Volume, devices and preferences"}
                     >
-                        <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
-                            <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
+                            <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>
                         </svg>
-                        <span class="control-label">Audio</span>
-                    </button>
-
-                    <button
-                        class="control-btn"
-                        class:off={isMuted}
-                        class:active={showVolumeControls}
-                        onclick={toggleVolumeControls}
-                        bind:this={soundBtnEl}
-                        aria-label="Sound and volume"
-                        aria-expanded={showVolumeControls}
-                        aria-haspopup="dialog"
-                        title="Sound and volume"
-                    >
-                        <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
-                            {#if isMuted}
-                                <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>
-                            {:else}
-                                <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
-                            {/if}
-                        </svg>
-                        <span class="control-label">{isMuted ? "Sound Off" : "Sound On"}</span>
+                        <span class="control-label">{isMuted ? "Muted" : "Settings"}</span>
                     </button>
 
                     <button
                         class="control-btn chat-btn"
+                        style="--stagger: 36ms"
                         class:active={isChatOpen}
                         class:pulse={chatPulseActive}
                         onclick={toggleChat}
                         aria-pressed={isChatOpen}
                         aria-label="Chat (C)"
-                        title="Toggle chat (C)"
+                        use:tooltip={"Chat (C)"}
                     >
-                        <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
-                            <path d="M20 2H4c-1.1 0-1.99.9-1.99 2L2 22l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM6 9h12v2H6V9zm8 5H6v-2h8v2zm4-6H6V6h12v2z"/>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
+                            <path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>
                         </svg>
                         <span class="control-label">Chat</span>
                         {#if unreadCount > 0}
-                            <span class="chat-badge">{unreadCount > 9 ? '9+' : unreadCount}</span>
+                            {#key unreadCount}
+                                <span class="chat-badge">{unreadCount > 9 ? '9+' : unreadCount}</span>
+                            {/key}
                         {/if}
                     </button>
 
-                    <button
-                        class="control-btn"
-                        onclick={handleResync}
-                        title="Fixes a frozen or stuck picture"
-                        aria-label="Reload stream"
-                    >
-                        <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
-                            <path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>
-                        </svg>
-                        <span class="control-label">Reload stream</span>
-                    </button>
+                    <span class="bar-divider" aria-hidden="true"></span>
 
                     <button
                         class="control-btn"
+                        style="--stagger: 54ms"
+                        disabled={grabBusy || !hasStream}
+                        onclick={() => void grabFrame()}
+                        use:tooltip={"Grab the current frame to chat (G)"}
+                        aria-label="Grab frame (G)"
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
+                            <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/>
+                        </svg>
+                        <span class="control-label">Grab</span>
+                    </button>
+
+                    <button
+                        class="control-btn laser-btn"
+                        style="--stagger: 72ms"
                         class:active={isLaserEnabled}
                         onclick={toggleLaser}
-                        title="Toggle laser pointer mode (L)"
+                        use:tooltip={"Laser pointer (L)"}
                         aria-pressed={isLaserEnabled}
                         aria-label="Laser pointer (L)"
                     >
-                        <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
-                            <path d="M4 20h2l6-6-2-2-6 6v2zm7.4-7.4 2 2L18 10.01a1.41 1.41 0 0 0 0-2l-2.01-2.01a1.41 1.41 0 0 0-2 0L11.4 8.6zM19 14l-4 4 1 1a2.83 2.83 0 0 0 4 0 2.83 2.83 0 0 0 0-4l-1-1z"/>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
+                            <circle cx="12" cy="12" r="10"/><line x1="22" x2="18" y1="12" y2="12"/><line x1="6" x2="2" y1="12" y2="12"/><line x1="12" x2="12" y1="6" y2="2"/><line x1="12" x2="12" y1="22" y2="18"/>
                         </svg>
-                        <span class="control-label">{isLaserEnabled ? "Laser On" : "Laser Off"}</span>
+                        <span class="control-label">Laser</span>
                     </button>
 
                     <button
                         class="control-btn"
+                        style="--stagger: 90ms"
+                        class:active={isLoupeEnabled}
+                        onclick={toggleLoupe}
+                        use:tooltip={"Pixel loupe, scroll to zoom (Z)"}
+                        aria-pressed={isLoupeEnabled}
+                        aria-label="Loupe (Z)"
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
+                            <circle cx="11" cy="11" r="8"/><line x1="21" x2="16.65" y1="21" y2="16.65"/><line x1="11" x2="11" y1="8" y2="14"/><line x1="8" x2="14" y1="11" y2="11"/>
+                        </svg>
+                        <span class="control-label">Loupe</span>
+                    </button>
+
+                    <button
+                        class="control-btn"
+                        style="--stagger: 108ms"
+                        class:active={showScopes}
+                        onclick={() => (showScopes = !showScopes)}
+                        use:tooltip={"Waveform and RGB parade (S)"}
+                        aria-pressed={showScopes}
+                        aria-label="Scopes (S)"
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
+                            <path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>
+                        </svg>
+                        <span class="control-label">Scopes</span>
+                    </button>
+
+                    <span class="bar-divider" aria-hidden="true"></span>
+
+                    <button
+                        class="control-btn"
+                        style="--stagger: 126ms"
                         class:active={screenShareActive}
                         class:requesting={screenShareRequested}
                         disabled={isScreenShareDisabled}
                         onclick={toggleScreenShare}
-                        title={isScreenShareDisabled ? "Screen share in progress" : screenShareActive ? "Stop sharing" : "Share screen"}
+                        use:tooltip={isScreenShareDisabled ? "Screen share in progress" : screenShareActive ? "Stop sharing" : "Share screen"}
                     >
-                        <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
-                            <path d="M20 18c1.1 0 1.99-.9 1.99-2L22 6c0-1.11-.9-2-2-2H4c-1.11 0-2 .89-2 2v10c0 1.1.89 2 2 2H0v2h24v-2h-4zM4 6h16v10H4V6z"/>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
+                            <path d="m9 10 3-3 3 3"/><path d="M12 13V7"/><rect width="20" height="14" x="2" y="3" rx="2"/><path d="M12 17v4"/><path d="M8 21h8"/>
                         </svg>
                         <span class="control-label">{screenShareActive ? "Stop Share" : screenShareRequested ? "Pending..." : "Share"}</span>
                     </button>
 
                     <button
                         class="control-btn"
+                        style="--stagger: 144ms"
                         onclick={toggleFullscreen}
                         aria-pressed={isFullscreen}
                         aria-label={isFullscreen ? "Exit fullscreen (F)" : "Fullscreen (F)"}
-                        title="Toggle fullscreen (F)"
+                        use:tooltip={"Fullscreen (F)"}
                     >
-                        <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
                             {#if isFullscreen}
-                                <path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/>
+                                <path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/>
                             {:else}
-                                <path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/>
+                                <path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>
                             {/if}
                         </svg>
                         <span class="control-label">{isFullscreen ? "Exit Full" : "Fullscreen"}</span>
@@ -2186,12 +2524,13 @@
 
                     <button
                         class="control-btn leave-btn"
+                        style="--stagger: 162ms"
                         onclick={leaveToRoomPage}
                         aria-label="Leave session"
-                        title="Leave the session"
+                        use:tooltip={"Leave the session"}
                     >
-                        <svg viewBox="0 0 24 24" fill="currentColor" width="24" height="24">
-                            <path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
+                            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/>
                         </svg>
                         <span class="control-label">Leave</span>
                     </button>
@@ -2199,25 +2538,75 @@
                 </div>
 
                 <div class="bottom-right">
+                    {#if showStats}
+                        <div
+                            class="stats-popover"
+                            use:liquidLens={{ blur: 12, radius: 20, scale: 36, zoom: 0.04, rim: 18 }}
+                            bind:this={statsPopoverEl}
+                            transition:scale={{ start: 0.95, duration: 260, easing: quintOut }}
+                            role="dialog"
+                            aria-label="Stream statistics"
+                        >
+                            <div class="stats-row">
+                                <span>Resolution</span>
+                                <span>{videoElement?.videoWidth || 0}×{videoElement?.videoHeight || 0}</span>
+                            </div>
+                            <div class="stats-row">
+                                <span>Frame rate</span>
+                                <span>{displayFps !== null ? `${displayFps} fps` : "measuring"}</span>
+                            </div>
+                            <div class="stats-row">
+                                <span>Latency</span>
+                                <span>{currentRtt !== null ? `~${Math.round(currentRtt)} ms` : "n/a"}</span>
+                            </div>
+                            <div class="stats-row">
+                                <span>Connection</span>
+                                <span class="stats-quality {connectionQuality ?? ''}">{connectionQuality ?? "n/a"}</span>
+                            </div>
+                            <button
+                                class="stats-reload"
+                                onclick={() => {
+                                    handleResync();
+                                    showStats = false;
+                                }}
+                            >
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13" aria-hidden="true"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+                                Reload stream
+                            </button>
+                        </div>
+                    {/if}
                     {#if isLive}
-                        <span class="live-pill"><span class="live-dot" aria-hidden="true"></span>Live</span>
+                        <span class="live-pill" bind:this={livePillEl}><span class="live-dot" aria-hidden="true"></span>Live</span>
                     {/if}
                     {#if connectionQuality && currentRtt !== null}
-                        <div
+                        <button
+                            bind:this={signalEl}
                             class="signal-indicator {connectionQuality}"
-                            role="img"
-                            title="Connection: {connectionQuality} ({Math.round(currentRtt)}ms)"
-                            aria-label="Connection: {connectionQuality} ({Math.round(currentRtt)}ms)"
+                            onclick={() => (showStats = !showStats)}
+                            use:tooltip={"Stream statistics"}
+                            aria-label="Connection: {connectionQuality} ({Math.round(currentRtt)}ms). Stream statistics"
+                            aria-expanded={showStats}
+                            aria-haspopup="dialog"
                         >
                             <span class="signal-bar"></span>
                             <span class="signal-bar"></span>
                             <span class="signal-bar"></span>
-                        </div>
+                        </button>
                     {/if}
                     {#if isAdmin && currentRtt !== null}
-                        <div class="latency-display" class:good={currentRtt < 100} class:warning={currentRtt >= 100 && currentRtt < 300} class:bad={currentRtt >= 300}>
+                        <button
+                            bind:this={latencyEl}
+                            class="latency-display"
+                            class:good={currentRtt < 100}
+                            class:warning={currentRtt >= 100 && currentRtt < 300}
+                            class:bad={currentRtt >= 300}
+                            onclick={() => (showStats = !showStats)}
+                            use:tooltip={"Stream statistics"}
+                            aria-expanded={showStats}
+                            aria-haspopup="dialog"
+                        >
                             ~{Math.round(currentRtt)}ms
-                        </div>
+                        </button>
                     {/if}
                 </div>
             </div>
@@ -2240,7 +2629,7 @@
         {/if}
 
         <!-- Active speaker indicator (always visible when someone is speaking) -->
-        {#if activeSpeakers.length > 0}
+        {#if activeSpeakers.length > 0 && !showParticipantList}
             <div class="active-speaker-indicator">
                 {#each activeSpeakers as speaker (speaker.id)}
                     <div class="active-speaker-chip">
@@ -2254,16 +2643,61 @@
             </div>
         {/if}
 
+        <ScopesPanel {videoElement} open={showScopes} onClose={() => (showScopes = false)} />
+
+        {#if grabToast}
+            <div class="mini-toast" transition:fade={{ duration: 150 }}>{grabToast}</div>
+        {/if}
+
+        {#if screenShareParticipantId && screenShareParticipantId !== sessionData?.participantId && !screenShareStream}
+            <div class="mini-toast share-loading" transition:fade={{ duration: 150 }}>
+                <span class="connect-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+                {screenShareParticipantName || "Someone"} is starting a screen share
+            </div>
+        {/if}
+
+        {#if showShortcuts}
+            <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+            <div
+                class="shortcuts-overlay"
+                role="dialog"
+                aria-modal="true"
+                aria-label="Keyboard shortcuts"
+                tabindex="-1"
+                transition:fade={{ duration: 150 }}
+                onclick={(e) => {
+                    if (e.target === e.currentTarget) showShortcuts = false;
+                }}
+            >
+                <div class="shortcuts-card" transition:scale={{ start: 0.95, duration: 240, easing: quintOut }}>
+                    <h3>Keyboard shortcuts</h3>
+                    {#each [["M", "Toggle microphone"], ["C", "Toggle chat"], ["G", "Grab frame to chat"], ["L", "Laser pointer"], ["Z", "Pixel loupe"], ["S", "Scopes"], ["F", "Fullscreen"], ["Esc", "Close panels"], ["?", "These shortcuts"]] as [key, label] (key)}
+                        <div class="shortcut-row">
+                            <span>{label}</span>
+                            <kbd>{key}</kbd>
+                        </div>
+                    {/each}
+                </div>
+            </div>
+        {/if}
+
         <!-- Participant list (outside controls overlay so it doesn't auto-hide) -->
         {#if showParticipantList}
             <div
                 class="participant-list"
+                use:liquidLens={{ blur: 12, radius: 20, scale: 36, zoom: 0.04, rim: 18 }}
                 role="dialog"
                 aria-label="Participants"
                 tabindex="-1"
                 bind:this={participantListEl}
-                transition:fly={{ y: 8, duration: 200 }}
+                transition:scale={{ start: 0.95, duration: 260, easing: quintOut }}
             >
+                <div class="participant-list-header">
+                    <span>Participants</span>
+                    {#if isAdmin && participants.length > 1}
+                        <button class="participant-action" onclick={muteAllParticipants}>Mute all</button>
+                    {/if}
+                </div>
                 {#each participants as p (p.id)}
                     <div
                         class="participant-list-item"
@@ -2288,15 +2722,15 @@
                         {/if}
                         {#if speakingParticipants.has(p.id)}
                             <span class="speaking-indicator" title="Speaking">
-                                <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/></svg>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
                             </span>
                         {:else if p.audioEnabled}
                             <span class="mic-on-indicator" title="Mic on">
-                                <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.48 6-3.3 6-6.72h-1.7z"/></svg>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
                             </span>
                         {:else}
                             <span class="mic-muted-indicator" title="Mic muted">
-                                <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"/></svg>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><line x1="2" x2="22" y1="2" y2="22"/><path d="M18.89 13.23A7.12 7.12 0 0 0 19 12v-2"/><path d="M5 10v2a7 7 0 0 0 12 5"/><path d="M15 9.34V5a3 3 0 0 0-5.68-1.33"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
                             </span>
                         {/if}
                         {#if isAdmin && p.id !== sessionData?.participantId}
@@ -2338,8 +2772,8 @@
             <div class="end-state-overlay" transition:fade={{ duration: 150 }}>
                 <div class="end-state-card" role="alertdialog" aria-labelledby="end-state-title">
                     <div class="end-state-icon" aria-hidden="true">
-                        <svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28">
-                            <path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="26" height="26">
+                            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/>
                         </svg>
                     </div>
                     <h2 id="end-state-title">{endState.title}</h2>
@@ -2355,13 +2789,13 @@
     <ChatPanel
         isOpen={isChatOpen}
         onClose={() => (isChatOpen = false)}
+        typing={typingList}
         roomSlug={slug}
         joinToken={sessionData?.token || ""}
         {participantColors}
         selfId={sessionData?.participantId || ""}
         canModerate={isAdmin}
     />
-    <BrowserToast />
 
     <ConfirmDialog
         open={kickTarget !== null}
@@ -2439,12 +2873,8 @@
         width: min(92vw, 380px);
         padding: var(--space-xl);
         text-align: center;
-        background: rgba(14, 14, 16, 0.78);
-        backdrop-filter: blur(16px);
-        -webkit-backdrop-filter: blur(16px);
-        border: 1px solid rgba(255, 255, 255, 0.08);
+        border: 1px solid var(--glass-edge);
         border-radius: var(--radius-lg);
-        box-shadow: var(--shadow-lg);
     }
     .stream-card p { margin: 0; }
     .stream-card-title {
@@ -2587,12 +3017,8 @@
         gap: var(--space-sm);
         padding: var(--space-sm) var(--space-md);
         border-radius: var(--radius-md);
-        background: rgba(14, 14, 16, 0.92);
-        backdrop-filter: blur(14px);
-        -webkit-backdrop-filter: blur(14px);
-        border: 1px solid rgba(255, 255, 255, 0.12);
+        border: 1px solid var(--glass-edge);
         color: var(--color-text);
-        box-shadow: var(--shadow-lg);
         pointer-events: auto;
     }
     .mic-prompt.success {
@@ -2665,14 +3091,14 @@
         pointer-events: none;
         opacity: 0;
         visibility: hidden;
-        /* Idle fade-out is gentle (~300ms)… */
-        transition: opacity 300ms ease, visibility 300ms ease;
+        /* Idle fade-out is gentle (~350ms)… */
+        transition: opacity 350ms ease, visibility 350ms ease;
     }
     .controls-overlay.visible {
         opacity: 1;
         visibility: visible;
-        /* …but reappearing on movement is near-instant (~150ms). */
-        transition: opacity 150ms ease, visibility 150ms ease;
+        /* …but reappearing on movement is quick (~200ms, eased). */
+        transition: opacity 200ms var(--ease-glide), visibility 200ms var(--ease-glide);
     }
     @media (prefers-reduced-motion: reduce) {
         .controls-overlay,
@@ -2683,10 +3109,10 @@
     .controls-overlay.visible > * { pointer-events: auto; }
     .controls-overlay .top-bar,
     .controls-overlay .bottom-bar {
-        transition: transform var(--transition-normal);
+        transition: transform 420ms var(--ease-spring);
     }
-    .controls-overlay:not(.visible) .top-bar { transform: translateY(-6px); }
-    .controls-overlay:not(.visible) .bottom-bar { transform: translateY(6px); }
+    .controls-overlay:not(.visible) .top-bar { transform: translateY(-8px) scale(0.99); }
+    .controls-overlay:not(.visible) .bottom-bar { transform: translateY(12px) scale(0.98); }
 
     .top-bar {
         display: flex;
@@ -2704,19 +3130,13 @@
         font-weight: 600;
         font-size: 0.875rem;
         letter-spacing: 0.01em;
-        background: rgba(10, 10, 12, 0.55);
-        backdrop-filter: blur(14px);
-        -webkit-backdrop-filter: blur(14px);
-        border: 1px solid rgba(255, 255, 255, 0.08);
+        border: 1px solid var(--glass-edge);
         padding: 8px 16px;
         border-radius: var(--radius-md);
     }
 
     .latency-display {
         font-size: 0.75rem; font-family: monospace;
-        background: rgba(10, 10, 12, 0.55);
-        backdrop-filter: blur(14px);
-        -webkit-backdrop-filter: blur(14px);
         padding: var(--space-xs) var(--space-sm);
         border-radius: var(--radius-sm);
         border: 1px solid transparent;
@@ -2729,12 +3149,9 @@
         display: flex; align-items: center; gap: 6px;
         font-size: 0.875rem;
         color: var(--color-text-muted);
-        background: rgba(10, 10, 12, 0.55);
-        backdrop-filter: blur(14px);
-        -webkit-backdrop-filter: blur(14px);
         padding: 8px 16px;
         border-radius: var(--radius-md);
-        border: 1px solid rgba(255, 255, 255, 0.08);
+        border: 1px solid var(--glass-edge);
         cursor: pointer;
         transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
     }
@@ -2744,13 +3161,11 @@
     /* Participant list dropdown */
     .participant-list {
         position: absolute;
-        top: 52px;
-        right: var(--space-lg);
-        background: rgba(0, 0, 0, 0.85);
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
-        border: 1px solid rgba(255,255,255,0.1);
-        border-radius: var(--radius-md);
+        top: calc(58px + env(safe-area-inset-top, 0px));
+        right: var(--space-sm);
+        border: 1px solid var(--glass-edge);
+        border-radius: var(--radius-lg);
+        transform-origin: top right;
         /* Fixed compact width: admin row actions are overlaid on hover, so
            they must not stretch the box; long names ellipsize instead. */
         width: min(300px, calc(100vw - 2 * var(--space-lg)));
@@ -2783,16 +3198,21 @@
 
     /* Admin per-row actions: overlaid on the right edge on hover/focus so
        they don't reserve row width and balloon the list. */
+    /* Segmented capsule, macOS-menu style: quiet text buttons inside one
+       pill that floats over the row's right edge on hover/focus. */
     .participant-actions {
         position: absolute;
-        right: var(--space-sm);
+        right: var(--space-xs);
         top: 50%;
         transform: translateY(-50%);
         display: flex;
-        gap: var(--space-xs);
-        padding: 2px 4px;
-        background: rgba(10, 10, 10, 0.92);
-        border-radius: var(--radius-sm);
+        align-items: center;
+        gap: 2px;
+        padding: 3px;
+        background: rgba(28, 28, 33, 0.97);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: var(--radius-full);
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
         opacity: 0;
         pointer-events: none;
         transition: opacity 0.12s ease;
@@ -2803,27 +3223,27 @@
         pointer-events: auto;
     }
     .participant-action {
-        background: rgba(255, 255, 255, 0.08);
-        border: 1px solid rgba(255, 255, 255, 0.15);
-        border-radius: var(--radius-sm);
-        color: var(--color-text);
+        background: transparent;
+        border: none;
+        border-radius: var(--radius-full);
+        color: var(--color-text-muted);
         font-size: var(--text-min);
         font-weight: 500;
-        padding: 2px 8px;
+        padding: 4px 10px;
+        white-space: nowrap;
         cursor: pointer;
-        transition: background 0.12s ease, border-color 0.12s ease;
+        transition: background 0.12s ease, color 0.12s ease;
     }
     .participant-action:hover {
-        background: rgba(255, 255, 255, 0.16);
-        border-color: rgba(255, 255, 255, 0.3);
+        background: rgba(255, 255, 255, 0.14);
+        color: #fff;
     }
     .participant-action.danger {
         color: var(--color-error);
-        border-color: rgba(239, 68, 68, 0.4);
     }
     .participant-action.danger:hover {
-        background: rgba(239, 68, 68, 0.15);
-        border-color: rgba(239, 68, 68, 0.6);
+        background: rgba(239, 68, 68, 0.18);
+        color: #ff8a8a;
     }
 
     .participant-list-avatar {
@@ -2886,10 +3306,7 @@
         align-items: center;
         padding: 6px 8px;
         gap: 0;
-        background: rgba(10, 10, 12, 0.55);
-        backdrop-filter: blur(14px);
-        -webkit-backdrop-filter: blur(14px);
-        border: 1px solid rgba(255, 255, 255, 0.08);
+        border: 1px solid var(--glass-edge);
         border-radius: var(--radius-full);
     }
     .presence-dot {
@@ -2966,12 +3383,9 @@
         text-transform: uppercase;
         letter-spacing: 0.06em;
         color: rgba(255, 255, 255, 0.85);
-        background: rgba(10, 10, 12, 0.55);
-        backdrop-filter: blur(14px);
-        -webkit-backdrop-filter: blur(14px);
         padding: 4px 10px;
         border-radius: var(--radius-full);
-        border: 1px solid rgba(255, 255, 255, 0.1);
+        border: 1px solid var(--glass-edge);
     }
     .live-dot {
         width: 8px;
@@ -2989,10 +3403,7 @@
         height: 14px;
         padding: var(--space-xs) var(--space-sm);
         box-sizing: content-box;
-        background: rgba(10, 10, 12, 0.55);
-        backdrop-filter: blur(14px);
-        -webkit-backdrop-filter: blur(14px);
-        border: 1px solid rgba(255, 255, 255, 0.08);
+        border: 1px solid var(--glass-edge);
         border-radius: var(--radius-sm);
     }
     .signal-bar {
@@ -3012,24 +3423,6 @@
         position: relative;
     }
 
-    .volume-popover {
-        position: absolute;
-        bottom: calc(100% + 8px);
-        left: 50%;
-        width: 240px;
-        margin-left: -120px;
-        display: flex;
-        flex-direction: column;
-        gap: var(--space-md);
-        padding: var(--space-md);
-        background: rgba(0, 0, 0, 0.85);
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: var(--radius-md);
-        box-shadow: var(--shadow-lg);
-        z-index: 30;
-    }
     .volume-row {
         display: flex;
         flex-direction: column;
@@ -3067,12 +3460,9 @@
         padding: var(--space-md);
         max-height: 320px;
         overflow-y: auto;
-        background: rgba(0, 0, 0, 0.85);
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: var(--radius-md);
-        box-shadow: var(--shadow-lg);
+        border: 1px solid var(--glass-edge);
+        border-radius: var(--radius-lg);
+        transform-origin: 50% 100%;
         z-index: 30;
     }
     .audio-settings-section {
@@ -3194,17 +3584,11 @@
     .control-bar {
         display: flex;
         gap: 8px;
-        background: linear-gradient(
-            to bottom,
-            rgba(16, 16, 18, 0.55),
-            rgba(8, 8, 10, 0.7)
-        );
-        backdrop-filter: blur(18px);
-        -webkit-backdrop-filter: blur(18px);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+        border: 1px solid var(--glass-edge);
         padding: 8px;
-        border-radius: 16px;
+        border-radius: 20px;
+        /* WebKit can jank the first blur paint without a promoted layer */
+        transform: translateZ(0);
     }
 
     .control-btn {
@@ -3215,17 +3599,31 @@
         padding: 10px 16px;
         background: rgba(255, 255, 255, 0.06);
         border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 10px;
+        border-radius: 12px;
         color: rgba(255, 255, 255, 0.92);
         cursor: pointer;
-        transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+        transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease,
+            transform 0.2s var(--ease-spring),
+            opacity 280ms var(--ease-glide) var(--stagger, 0ms);
         position: relative;
         min-width: 64px;
     }
 
+    /* Top-lit sheen on hover; press squishes. Plain rgba fills only in
+       here — a backdrop-filter on buttons inside the glass bar would
+       nest backdrop roots and double the per-frame filter cost. */
     .control-btn:hover {
-        background: rgba(255, 255, 255, 0.15);
-        border-color: rgba(255, 255, 255, 0.2);
+        background: radial-gradient(
+            120% 100% at 50% 0%,
+            rgba(255, 255, 255, 0.16),
+            rgba(255, 255, 255, 0.06) 70%
+        );
+        border-color: rgba(255, 255, 255, 0.16);
+    }
+
+    .control-btn:active {
+        transform: scale(0.95);
+        transition-duration: 60ms;
     }
 
     /* Neutral active state: saturated UI next to the picture contaminates
@@ -3240,6 +3638,14 @@
         background: rgba(239, 68, 68, 0.15);
         border-color: rgba(239, 68, 68, 0.4);
         color: var(--color-error);
+    }
+
+    /* Laser is the one deliberate exception to the neutral active state:
+       it matches the green "live/speaking" semantic already on screen. */
+    .control-btn.laser-btn.active {
+        background: rgba(47, 191, 113, 0.16);
+        border-color: rgba(47, 191, 113, 0.5);
+        color: var(--color-success);
     }
 
     .control-btn.leave-btn:hover {
@@ -3260,23 +3666,32 @@
         white-space: nowrap;
     }
 
+    /* Gel pill: inset top light + soft drop, pops on every new message */
     .chat-badge {
         position: absolute;
         top: -4px;
         right: -4px;
-        background: var(--color-primary);
-        color: white;
-        font-size: 0.6rem;
+        background: linear-gradient(to bottom, #58c6b6, #3b9c8d);
+        color: #04201c;
+        font-size: 0.5625rem;
         font-weight: 700;
-        min-width: 1.1rem;
-        height: 1.1rem;
+        font-variant-numeric: tabular-nums;
+        min-width: 15px;
+        height: 15px;
         border-radius: var(--radius-full);
         display: flex;
         align-items: center;
         justify-content: center;
-        padding: 0 3px;
+        padding: 0 4px;
         line-height: 1;
-        border: 2px solid #000;
+        box-shadow:
+            inset 0 1px 0 rgba(255, 255, 255, 0.32),
+            0 1px 4px rgba(0, 0, 0, 0.45);
+        animation: badge-pop 360ms var(--ease-spring);
+    }
+    @keyframes badge-pop {
+        from { transform: scale(0.4); }
+        to { transform: scale(1); }
     }
 
     /* Per-message pulse on the chat button (ITEM 5) */
@@ -3301,9 +3716,6 @@
         gap: var(--space-xs);
         max-width: min(80vw, 420px);
         padding: 8px 14px;
-        background: rgba(0, 0, 0, 0.8);
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
         border: 1px solid rgba(72, 182, 166, 0.35);
         border-radius: var(--radius-full);
         color: var(--color-text);
@@ -3312,7 +3724,6 @@
     }
     .chat-toast:hover {
         border-color: rgba(72, 182, 166, 0.7);
-        background: rgba(0, 0, 0, 0.9);
     }
     .chat-toast-name {
         font-size: 0.75rem;
@@ -3334,13 +3745,15 @@
     }
 
     /* Active speaker indicator */
+    /* Stacked top-right, directly beneath the participant badge */
     .active-speaker-indicator {
         position: absolute;
-        bottom: 100px;
-        left: 50%;
-        transform: translateX(-50%);
+        top: calc(60px + env(safe-area-inset-top, 0px));
+        right: var(--space-lg);
         z-index: 12;
         display: flex;
+        flex-direction: column;
+        align-items: flex-end;
         gap: var(--space-xs);
         pointer-events: none;
     }
@@ -3348,9 +3761,6 @@
         display: flex;
         align-items: center;
         gap: var(--space-xs);
-        background: rgba(0, 0, 0, 0.75);
-        backdrop-filter: blur(12px);
-        -webkit-backdrop-filter: blur(12px);
         padding: 6px 12px 6px 6px;
         border-radius: 999px;
         border: 1px solid rgba(72, 182, 166, 0.4);
@@ -3383,7 +3793,7 @@
         flex-shrink: 0;
     }
     @keyframes speaker-fade-in {
-        from { opacity: 0; transform: translateY(6px); }
+        from { opacity: 0; transform: translateY(-6px); }
         to { opacity: 1; transform: translateY(0); }
     }
 
@@ -3463,12 +3873,8 @@
         gap: var(--space-sm);
         padding: var(--space-sm) var(--space-md);
         border-radius: var(--radius-md);
-        background: rgba(14, 14, 16, 0.92);
-        backdrop-filter: blur(14px);
-        -webkit-backdrop-filter: blur(14px);
-        border: 1px solid rgba(255, 255, 255, 0.14);
+        border: 1px solid var(--glass-edge);
         color: #fff;
-        box-shadow: var(--shadow-lg);
         pointer-events: auto;
     }
     .screenshare-approval-text {
@@ -3507,12 +3913,8 @@
         gap: var(--space-sm);
         padding: var(--space-sm) var(--space-md);
         border-radius: var(--radius-md);
-        background: rgba(14, 14, 16, 0.92);
-        backdrop-filter: blur(14px);
-        -webkit-backdrop-filter: blur(14px);
         border: 1px solid rgba(72, 182, 166, 0.4);
         color: #fff;
-        box-shadow: var(--shadow-lg);
         pointer-events: auto;
     }
     .open-early-text {
@@ -3561,12 +3963,8 @@
         gap: var(--space-sm);
         padding: var(--space-sm) var(--space-md);
         border-radius: var(--radius-md);
-        background: rgba(14, 14, 16, 0.92);
-        backdrop-filter: blur(14px);
-        -webkit-backdrop-filter: blur(14px);
-        border: 1px solid rgba(255, 255, 255, 0.14);
+        border: 1px solid var(--glass-edge);
         color: #fff;
-        box-shadow: var(--shadow-lg);
         flex-shrink: 0;
     }
     /* Chime-free attention: one brief teal pulse on arrival, then settle. */
@@ -3574,9 +3972,9 @@
         animation: waiting-card-pulse 1.2s ease-out 1;
     }
     @keyframes waiting-card-pulse {
-        0% { border-color: rgba(72, 182, 166, 0.85); box-shadow: 0 0 0 0 rgba(72, 182, 166, 0.35), var(--shadow-lg); }
-        60% { border-color: rgba(72, 182, 166, 0.45); box-shadow: 0 0 0 8px rgba(72, 182, 166, 0), var(--shadow-lg); }
-        100% { border-color: rgba(255, 255, 255, 0.14); box-shadow: var(--shadow-lg); }
+        0% { border-color: rgba(72, 182, 166, 0.85); box-shadow: 0 0 0 0 rgba(72, 182, 166, 0.35), var(--glass-specular), var(--glass-shadow); }
+        60% { border-color: rgba(72, 182, 166, 0.45); box-shadow: 0 0 0 8px rgba(72, 182, 166, 0), var(--glass-specular), var(--glass-shadow); }
+        100% { border-color: var(--glass-edge); box-shadow: var(--glass-specular), var(--glass-shadow); }
     }
     .waiting-avatar {
         flex-shrink: 0;
@@ -3659,6 +4057,418 @@
         cursor: not-allowed;
     }
 
+    /* ==================== LIQUID GLASS MATERIAL ====================
+       One shared material for every floating surface (tokens live in
+       app.css). Ambient: pills and bars sitting over the picture.
+       Deep: panels that need text legibility (menus, banners, cards).
+       On Chromium the liquidLens action upgrades key surfaces to true
+       edge refraction; WebKit/Gecko keep this stylesheet material. */
+    .control-bar,
+    .room-name,
+    .participant-count,
+    .presence-row,
+    .live-pill,
+    .signal-indicator,
+    .latency-display,
+    .chat-toast,
+    .active-speaker-chip {
+        background:
+            linear-gradient(to bottom, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0) 55%),
+            var(--glass-bg);
+        backdrop-filter: var(--glass-backdrop);
+        -webkit-backdrop-filter: var(--glass-backdrop);
+        /* Specular only — no drop shadows on ambient pills: a row of soft
+           shadows over the picture blends into a faint dark veil. */
+        box-shadow: var(--glass-specular);
+    }
+
+    .stream-card,
+    .mic-prompt,
+    .screenshare-approval,
+    .open-early-banner,
+    .waiting-request-card,
+    .stats-popover,
+    .shortcuts-card,
+    .audio-settings-popover,
+    .participant-list {
+        background:
+            linear-gradient(to bottom, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0) 48px),
+            var(--glass-bg-deep);
+        backdrop-filter: var(--glass-backdrop-deep);
+        -webkit-backdrop-filter: var(--glass-backdrop-deep);
+        box-shadow: var(--glass-specular), var(--glass-shadow);
+    }
+
+    /* Apple-like geometry: capsules for bars, pills and small action
+       buttons; large continuous radii for panels and banners. */
+    .control-btn,
+    .participant-count,
+    .latency-display,
+    .signal-indicator {
+        border-radius: var(--radius-full);
+    }
+    .stats-popover,
+    .shortcuts-card,
+    .audio-settings-popover,
+    .participant-list,
+    .stream-card {
+        border-radius: 20px;
+    }
+    .mic-prompt,
+    .screenshare-approval,
+    .open-early-banner,
+    .waiting-request-card {
+        border-radius: 16px;
+    }
+    .mic-prompt-btn,
+    .screenshare-approval-btn,
+    .open-early-btn,
+    .waiting-request-btn,
+    .volume-mute-btn,
+    .participant-action,
+    .audio-settings-grant,
+    .split-screenshare-label,
+    .split-screenshare-stop {
+        border-radius: var(--radius-full);
+    }
+    .audio-device-option {
+        border-radius: 10px;
+    }
+
+    /* Continuous (superellipse) corners where the engine has them.
+       NOT the control bar: its WebGL glass draws circular corners, and a
+       squircle CSS border over a circular shader edge doubles the corner. */
+    @supports (corner-shape: squircle) {
+        .control-btn,
+        .stream-card,
+        .mic-prompt,
+        .screenshare-approval,
+        .open-early-banner,
+        .waiting-request-card,
+        .stats-popover,
+        .audio-settings-popover,
+        .participant-list,
+        .room-name,
+        .participant-count {
+            corner-shape: squircle;
+        }
+    }
+
+    /* Bars host a shared glass canvas as their first child; real content
+       must be positioned so it paints above the canvas. */
+    .top-bar,
+    .bottom-bar {
+        position: relative;
+    }
+    .room-name,
+    .top-bar-right,
+    .bottom-left,
+    .bottom-right {
+        position: relative;
+    }
+
+    /* Entrance choreography: bar buttons cascade in left to right */
+    .controls-overlay:not(.visible) .control-btn {
+        opacity: 0;
+    }
+
+    /* Cinema mode: hide the cursor with the controls. The :global(*)
+       leg covers children (video, canvases, overlays) that resolve their
+       own cursor instead of inheriting the wrapper's. */
+    .session-page.controls-hidden .video-wrapper,
+    .session-page.controls-hidden .video-wrapper :global(*) {
+        cursor: none;
+    }
+
+    /* Neutral glass focus ring instead of the default teal outline */
+    .control-btn:focus-visible,
+    .participant-count:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.45);
+    }
+
+    /* Volume sliders: quiet glass track, white thumb */
+    .audio-settings-popover .range-input {
+        height: 4px;
+        background: rgba(255, 255, 255, 0.16);
+    }
+    .audio-settings-popover .range-input::-webkit-slider-thumb {
+        width: 14px;
+        height: 14px;
+        background: #fff;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+    }
+    .audio-settings-popover .range-input::-moz-range-thumb {
+        width: 14px;
+        height: 14px;
+        background: #fff;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+    }
+
+    /* Bar grouping: comms | review tools | session */
+    .bar-divider {
+        width: 1px;
+        align-self: stretch;
+        margin: 8px 3px;
+        background: rgba(255, 255, 255, 0.09);
+        flex-shrink: 0;
+    }
+
+    /* Preference switches in the settings popover */
+    .pref-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-sm);
+        font-size: 0.8125rem;
+        color: var(--color-text);
+        padding: 2px 0;
+        cursor: pointer;
+    }
+    .switch {
+        appearance: none;
+        width: 34px;
+        height: 20px;
+        border-radius: var(--radius-full);
+        background: rgba(255, 255, 255, 0.14);
+        position: relative;
+        cursor: pointer;
+        transition: background 0.18s ease;
+        flex-shrink: 0;
+        margin: 0;
+    }
+    .switch::after {
+        content: "";
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+        transition: transform 0.18s var(--ease-spring);
+    }
+    .switch:checked {
+        background: var(--color-primary);
+    }
+    .switch:checked::after {
+        transform: translateX(14px);
+    }
+
+    /* Stream statistics popover (anchored above the status pills) */
+    .stats-popover {
+        position: absolute;
+        bottom: calc(100% + 8px);
+        right: 0;
+        width: 230px;
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+        padding: var(--space-md);
+        border: 1px solid var(--glass-edge);
+        transform-origin: 100% 100%;
+        z-index: 30;
+    }
+    .stats-row {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        font-size: 0.75rem;
+        color: var(--color-text-muted);
+    }
+    .stats-row span:last-child {
+        color: var(--color-text);
+        font-variant-numeric: tabular-nums;
+    }
+    .stats-quality { text-transform: capitalize; }
+    .stats-quality.good { color: var(--color-success) !important; }
+    .stats-quality.fair { color: var(--color-warning) !important; }
+    .stats-quality.poor { color: var(--color-error) !important; }
+    .stats-reload {
+        margin-top: 4px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        padding: 6px 10px;
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: var(--radius-full);
+        color: var(--color-text);
+        font-size: 0.75rem;
+        font-weight: 500;
+        cursor: pointer;
+        transition: background 0.12s ease;
+    }
+    .stats-reload:hover {
+        background: rgba(255, 255, 255, 0.15);
+    }
+    .signal-indicator,
+    .latency-display {
+        cursor: pointer;
+        font-family: inherit;
+    }
+
+    /* Shutter flash on frame grab */
+    .grab-flash {
+        position: absolute;
+        inset: 0;
+        z-index: 14;
+        background: rgba(255, 255, 255, 0.45);
+        pointer-events: none;
+    }
+
+    .mini-toast.share-loading {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+    .share-loading-pane {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        z-index: 4;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 18px;
+        font-size: 0.8125rem;
+        color: var(--color-text);
+        background: var(--glass-bg-deep);
+        backdrop-filter: var(--glass-backdrop-deep);
+        -webkit-backdrop-filter: var(--glass-backdrop-deep);
+        border: 1px solid var(--glass-edge);
+        border-radius: var(--radius-full);
+        box-shadow: var(--glass-specular);
+        pointer-events: none;
+        white-space: nowrap;
+    }
+
+    /* Neutral confirmation toast (frame grabs etc.) */
+    .mini-toast {
+        position: absolute;
+        bottom: 150px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 22;
+        padding: 7px 16px;
+        font-size: 0.8125rem;
+        color: var(--color-text);
+        background: var(--glass-bg-deep);
+        backdrop-filter: var(--glass-backdrop-deep);
+        -webkit-backdrop-filter: var(--glass-backdrop-deep);
+        border: 1px solid var(--glass-edge);
+        border-radius: var(--radius-full);
+        box-shadow: var(--glass-specular);
+        pointer-events: none;
+        white-space: nowrap;
+    }
+
+    /* Keyboard shortcuts overlay */
+    .shortcuts-overlay {
+        position: absolute;
+        inset: 0;
+        z-index: 55;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.45);
+        padding: var(--space-lg);
+    }
+    .shortcuts-card {
+        width: min(92vw, 340px);
+        display: flex;
+        flex-direction: column;
+        gap: 9px;
+        padding: var(--space-lg);
+        border: 1px solid var(--glass-edge);
+    }
+    .shortcuts-card h3 {
+        margin: 0 0 4px;
+        font-size: 0.8125rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--color-text-muted);
+    }
+    .shortcut-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 0.8125rem;
+        color: var(--color-text-muted);
+    }
+    .shortcut-row kbd {
+        font-family: var(--font-mono);
+        font-size: var(--text-min);
+        color: var(--color-text);
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 6px;
+        padding: 2px 8px;
+        min-width: 30px;
+        text-align: center;
+    }
+
+    /* Participant list header (label + admin batch action) */
+    .participant-list-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: var(--space-xs) var(--space-md) var(--space-sm);
+        font-size: var(--text-min);
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--color-text-muted);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        margin-bottom: var(--space-xs);
+    }
+
+    /* Approve-all shortcut atop the waiting stack */
+    .waiting-approve-all {
+        align-self: flex-end;
+        padding: 5px 12px;
+        background: var(--color-primary);
+        border: none;
+        border-radius: var(--radius-full);
+        color: #041014;
+        font-size: var(--text-min);
+        font-weight: 600;
+        cursor: pointer;
+        transition: filter 0.15s ease;
+        flex-shrink: 0;
+    }
+    .waiting-approve-all:hover {
+        filter: brightness(1.1);
+    }
+
+    /* Loupe: hide the system cursor over the video, lens replaces it */
+    .session-page.loupe-on .video-wrapper,
+    .session-page.loupe-on .video-wrapper :global(*) {
+        cursor: none;
+    }
+
+    /* The scopes panel is interactive chrome inside the video wrapper:
+       it must keep a visible cursor through cinema mode and tool modes
+       (same specificity as the cursor-none rules; later in the file wins,
+       and explicit values beat the inherited none). */
+    .session-page .video-wrapper :global(.scopes-panel),
+    .session-page .video-wrapper :global(.scopes-panel *) {
+        cursor: default;
+    }
+    .session-page .video-wrapper :global(.scopes-panel .scopes-header) {
+        cursor: grab;
+    }
+    .session-page .video-wrapper :global(.scopes-panel button) {
+        cursor: pointer;
+    }
+    .session-page .video-wrapper :global(.scopes-panel .scopes-resize) {
+        cursor: nwse-resize;
+    }
+
     @media (max-width: 768px) {
         .session-page { flex-direction: column; }
         .video-wrapper { flex: 1; min-height: 0; }
@@ -3666,7 +4476,10 @@
         .control-btn { padding: 8px 10px; min-width: 52px; }
         .control-btn svg { width: 20px; height: 20px; }
         .control-label { font-size: 0.5625rem; }
-        .active-speaker-indicator { bottom: 80px; }
+        .active-speaker-indicator {
+            top: calc(52px + env(safe-area-inset-top, 0px));
+            right: var(--space-sm);
+        }
         .presence-row { display: none; }
         .video-wrapper.split-active { flex-direction: column; }
         .video-wrapper.split-active .video-container { flex: 1; }

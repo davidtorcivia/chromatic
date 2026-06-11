@@ -1,5 +1,5 @@
-// Short notification chimes for admin action prompts. Pure WebAudio (no
-// asset files): each chime is a couple of sine notes with a soft envelope on
+// Short notification chimes for room events. Pure WebAudio (no asset
+// files): each chime is a couple of sine notes with a soft envelope on
 // the shared AudioContext. Failures are swallowed — a missed chime must
 // never break the session (e.g. context still suspended before any gesture).
 
@@ -7,7 +7,33 @@ import { getAudioContext } from './context';
 
 const CHIME_GAIN = 0.12; // gentle — admins may be mid-conversation
 
-function playNotes(notes: { freq: number; at: number; dur: number }[]): void {
+// Single mute point for every UI sound, persisted across sessions.
+const SOUNDS_KEY = "chromatic_ui_sounds";
+let uiSoundsEnabled = true;
+try {
+    uiSoundsEnabled = localStorage.getItem(SOUNDS_KEY) !== "off";
+} catch {
+    // Storage unavailable (private mode) — default on.
+}
+
+export function getUiSoundsEnabled(): boolean {
+    return uiSoundsEnabled;
+}
+
+export function setUiSoundsEnabled(on: boolean): void {
+    uiSoundsEnabled = on;
+    try {
+        localStorage.setItem(SOUNDS_KEY, on ? "on" : "off");
+    } catch {
+        // In-session preference still applies.
+    }
+}
+
+function playNotes(
+    notes: { freq: number; at: number; dur: number }[],
+    gain: number = CHIME_GAIN,
+): void {
+    if (!uiSoundsEnabled) return;
     void (async () => {
         try {
             const ctx = await getAudioContext();
@@ -15,21 +41,21 @@ function playNotes(notes: { freq: number; at: number; dur: number }[]): void {
             const now = ctx.currentTime;
             for (const n of notes) {
                 const osc = ctx.createOscillator();
-                const gain = ctx.createGain();
+                const g = ctx.createGain();
                 osc.type = 'sine';
                 osc.frequency.value = n.freq;
                 const start = now + n.at;
                 const end = start + n.dur;
-                gain.gain.setValueAtTime(0, start);
-                gain.gain.linearRampToValueAtTime(CHIME_GAIN, start + 0.015);
-                gain.gain.exponentialRampToValueAtTime(0.0001, end);
-                osc.connect(gain);
-                gain.connect(ctx.destination);
+                g.gain.setValueAtTime(0, start);
+                g.gain.linearRampToValueAtTime(gain, start + 0.015);
+                g.gain.exponentialRampToValueAtTime(0.0001, end);
+                osc.connect(g);
+                g.connect(ctx.destination);
                 osc.start(start);
                 osc.stop(end + 0.05);
                 osc.onended = () => {
                     osc.disconnect();
-                    gain.disconnect();
+                    g.disconnect();
                 };
             }
         } catch {
@@ -52,4 +78,46 @@ export function playWaitingRoomChime(): void {
         { freq: 784, at: 0, dur: 0.22 },
         { freq: 523, at: 0.18, dur: 0.34 },
     ]);
+}
+
+/** Soft rising fifth (C5 → G5): someone entered the room. Quieter than
+ *  the admin prompts — ambient awareness, not a call to action. */
+export function playJoinChime(): void {
+    playNotes(
+        [
+            { freq: 523.25, at: 0, dur: 0.16 },
+            { freq: 783.99, at: 0.12, dur: 0.3 },
+        ],
+        0.08,
+    );
+}
+
+/** Mirrored falling fifth (E5 → A4), pitched apart from the waiting-room
+ *  doorbell: someone left the room. */
+export function playLeaveChime(): void {
+    playNotes(
+        [
+            { freq: 659.25, at: 0, dur: 0.16 },
+            { freq: 440, at: 0.12, dur: 0.3 },
+        ],
+        0.08,
+    );
+}
+
+// Chat sounds are an octave pair (D6 in / D5 out) at whisper level —
+// feedback you feel more than hear. Incoming is rate-limited so a burst
+// of messages reads as one.
+let lastReceiveChimeAt = 0;
+
+/** Barely-there high tick: a chat message arrived. */
+export function playChatReceiveChime(): void {
+    const now = Date.now();
+    if (now - lastReceiveChimeAt < 400) return;
+    lastReceiveChimeAt = now;
+    playNotes([{ freq: 1174.66, at: 0, dur: 0.16 }], 0.07);
+}
+
+/** Softer low tap: your message left. */
+export function playChatSentChime(): void {
+    playNotes([{ freq: 587.33, at: 0, dur: 0.12 }], 0.05);
 }

@@ -59,6 +59,54 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);
   --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.5);
   --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.5);
+
+  /* Liquid glass material (session room overlays).
+     Two depths: "ambient" pills/bars sitting over the picture, and "deep"
+     panels (menus, banners) that need text legibility. Speculars are
+     neutral white only — tinted edges next to the picture would
+     contaminate color judgment. Blur stays ≤16px: backdrop-filter over a
+     playing <video> re-filters every frame and cost scales with radius. */
+  --glass-bg: rgba(22, 22, 26, 0.4);
+  --glass-bg-deep: rgba(15, 15, 18, 0.62);
+  --glass-edge: rgba(255, 255, 255, 0.08);
+  --glass-backdrop: blur(12px) saturate(160%) brightness(1.06);
+  --glass-backdrop-deep: blur(16px) saturate(160%) brightness(1.06);
+  /* Specular: a whisper of top light, nothing more. Bright edges read as
+     cheap strokes, not depth, when there's no refraction behind them. */
+  --glass-specular:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    inset 0 0 20px rgba(255, 255, 255, 0.02);
+  --glass-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  /* Motion language: one soft spring (small, deliberate overshoot) and
+     one glide (fast start, long settle). Every room animation uses one
+     of these two so the whole UI moves with a single voice. */
+  --ease-spring: cubic-bezier(0.3, 1.22, 0.42, 1);
+  --ease-glide: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Transparency/contrast fallback: Safari never shipped
+   prefers-reduced-transparency, so this catches Chromium + users with
+   increased-contrast; it also serves as the perf escape hatch. */
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  :root {
+    --glass-bg: rgba(20, 20, 23, 0.96);
+    --glass-bg-deep: rgba(15, 15, 18, 0.97);
+    --glass-edge: rgba(255, 255, 255, 0.2);
+    --glass-backdrop: none;
+    --glass-backdrop-deep: none;
+    --glass-specular: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  }
+}
+
+/* In-app fallback for the same: Safari never shipped the media query,
+   so the room offers a toggle that sets this class (persisted). */
+:root.reduce-transparency {
+  --glass-bg: rgba(20, 20, 23, 0.96);
+  --glass-bg-deep: rgba(15, 15, 18, 0.97);
+  --glass-edge: rgba(255, 255, 255, 0.2);
+  --glass-backdrop: none;
+  --glass-backdrop-deep: none;
+  --glass-specular: inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
 
 /* Reset & Base */
@@ -571,8 +619,35 @@ input[type="range"] {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* Glass tooltip (lib/ui/tooltip.ts) — appended to body, fixed position */
+.glass-tooltip {
+  position: fixed;
+  z-index: 200;
+  transform: translate(-50%, -100%) scale(0.96);
+  background: rgba(20, 20, 24, 0.92);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-md);
+  padding: 4px 10px;
+  font-size: var(--text-min);
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.92);
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 120ms ease, transform 140ms var(--ease-spring);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+
+.glass-tooltip.visible {
+  opacity: 1;
+  transform: translate(-50%, -100%) scale(1);
 }
 
 /* Mobile */
