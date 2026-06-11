@@ -16,6 +16,7 @@ import (
 
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/intervalpli"
+	"github.com/pion/interceptor/pkg/stats"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 )
@@ -25,6 +26,13 @@ type SFU struct {
 	mu     sync.RWMutex
 	config *config.Config
 	api    *webrtc.API
+
+	// Per-PC stats getters (outbound packet counters for diagnostics).
+	// Guarded by statsMu, which also serializes PC creation so the
+	// interceptor-factory callback maps to the right PC.
+	statsMu                sync.Mutex
+	statsGetters           map[*webrtc.PeerConnection]stats.Getter
+	takePendingStatsGetter func() stats.Getter
 
 	turnMode         string
 	externalTurnURLs []string
@@ -271,6 +279,31 @@ func NewSFU(cfg *config.Config) (*SFU, error) {
 		return nil, fmt.Errorf("failed to register default interceptors: %w", err)
 	}
 
+	// Per-SSRC send/receive counters (pion's native GetStats does not expose
+	// outbound RTP stats). The factory hands each new PC's stats getter to a
+	// slot; CreatePeerConnection (serialized) claims it for the PC it just
+	// built. Used to answer definitively whether the SFU is actually sending
+	// video to a given subscriber.
+	statsFactory, err := stats.NewInterceptor()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stats interceptor: %w", err)
+	}
+	var pendingStatsMu sync.Mutex
+	var pendingStatsGetter stats.Getter
+	statsFactory.OnNewPeerConnection(func(_ string, g stats.Getter) {
+		pendingStatsMu.Lock()
+		pendingStatsGetter = g
+		pendingStatsMu.Unlock()
+	})
+	i.Add(statsFactory)
+	takePendingStatsGetter := func() stats.Getter {
+		pendingStatsMu.Lock()
+		defer pendingStatsMu.Unlock()
+		g := pendingStatsGetter
+		pendingStatsGetter = nil
+		return g
+	}
+
 	// Create API with our MediaEngine and Interceptors
 	// Restrict ICE gathering to real network interfaces. With host
 	// networking this box otherwise advertises ~50 candidates (every docker
@@ -294,14 +327,16 @@ func NewSFU(cfg *config.Config) (*SFU, error) {
 	)
 
 	sfu := &SFU{
-		config:           cfg,
-		api:              api,
-		turnMode:         cfg.TurnMode,
-		externalTurnURLs: append([]string(nil), cfg.TurnExternalURLs...),
-		externalTurnUser: cfg.TurnExternalUser,
-		externalTurnPass: cfg.TurnExternalPass,
-		ingests:          make(map[string]*IngestSession),
-		rooms:            make(map[string]*RoomTracks),
+		config:                 cfg,
+		api:                    api,
+		turnMode:               cfg.TurnMode,
+		externalTurnURLs:       append([]string(nil), cfg.TurnExternalURLs...),
+		externalTurnUser:       cfg.TurnExternalUser,
+		externalTurnPass:       cfg.TurnExternalPass,
+		ingests:                make(map[string]*IngestSession),
+		rooms:                  make(map[string]*RoomTracks),
+		statsGetters:           make(map[*webrtc.PeerConnection]stats.Getter),
+		takePendingStatsGetter: takePendingStatsGetter,
 	}
 
 	// Backward compatibility for callers that set the legacy single URL field.
@@ -414,7 +449,33 @@ func (s *SFU) CreatePeerConnection() (*webrtc.PeerConnection, error) {
 		ICEServers: s.GetICEServers(),
 	}
 
-	return s.api.NewPeerConnection(config)
+	// Serialize creation so the stats-interceptor factory callback (which
+	// fires inside NewPeerConnection) is claimed for THIS PC. Also sweep
+	// entries for closed PCs so the map stays bounded.
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	for old := range s.statsGetters {
+		if old.ConnectionState() == webrtc.PeerConnectionStateClosed {
+			delete(s.statsGetters, old)
+		}
+	}
+	pc, err := s.api.NewPeerConnection(config)
+	if err != nil {
+		return nil, err
+	}
+	if s.takePendingStatsGetter != nil {
+		if g := s.takePendingStatsGetter(); g != nil {
+			s.statsGetters[pc] = g
+		}
+	}
+	return pc, nil
+}
+
+// statsGetterFor returns the per-SSRC stats getter for a PC, if known.
+func (s *SFU) statsGetterFor(pc *webrtc.PeerConnection) stats.Getter {
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	return s.statsGetters[pc]
 }
 
 // GetIngest returns an active ingest session by stream key token
@@ -1196,33 +1257,65 @@ func (s *SFU) SetSubscriberAnswer(roomSlug, subscriberID string, answer webrtc.S
 	// One-shot probe: 10s in, log what pion actually SENT to this
 	// subscriber. Distinguishes "server never sends video to this browser"
 	// (binding bug here) from "sent but lost/dropped client-side".
-	go func(pc *webrtc.PeerConnection, id string, done <-chan struct{}) {
-		select {
-		case <-done:
-			return
-		case <-time.After(10 * time.Second):
-		}
-		for _, s := range pc.GetStats() {
-			if v, ok := s.(webrtc.OutboundRTPStreamStats); ok {
-				log.Printf("Subscriber %s outbound %s stats after 10s: packetsSent=%d bytesSent=%d", id, v.Kind, v.PacketsSent, v.BytesSent)
-			}
-		}
-	}(sub.PeerConnection, subscriberID, sub.done)
+	go s.probeOutboundVideo(sub, subscriberID)
 
 	return nil
 }
 
-// summarizeVideoAnswer extracts the video m-line port and rtpmap codec list
-// from an SDP answer for diagnostics.
+// probeOutboundVideo logs per-SSRC outbound packet counts for every video
+// sender on a subscriber, 10s after a negotiation completes.
+func (s *SFU) probeOutboundVideo(sub *Subscriber, subscriberID string) {
+	select {
+	case <-sub.done:
+		return
+	case <-time.After(10 * time.Second):
+	}
+
+	getter := s.statsGetterFor(sub.PeerConnection)
+	if getter == nil {
+		log.Printf("Subscriber %s: no stats getter for outbound probe", subscriberID)
+		return
+	}
+	for _, sender := range sub.PeerConnection.GetSenders() {
+		track := sender.Track()
+		if track == nil || track.Kind() != webrtc.RTPCodecTypeVideo {
+			continue
+		}
+		params := sender.GetParameters()
+		if len(params.Encodings) == 0 {
+			log.Printf("Subscriber %s outbound video %q: NO ENCODINGS (track unbound — browser cannot receive it)", subscriberID, track.ID())
+			continue
+		}
+		ssrc := uint32(params.Encodings[0].SSRC)
+		st := getter.Get(ssrc)
+		if st == nil {
+			log.Printf("Subscriber %s outbound video %q ssrc=%d: NO STATS — zero packets ever sent on this track", subscriberID, track.ID(), ssrc)
+			continue
+		}
+		log.Printf("Subscriber %s outbound video %q ssrc=%d: packetsSent=%d bytesSent=%d nackRecv=%d pliRecv=%d",
+			subscriberID, track.ID(), ssrc,
+			st.OutboundRTPStreamStats.PacketsSent, st.OutboundRTPStreamStats.BytesSent,
+			st.OutboundRTPStreamStats.NACKCount, st.OutboundRTPStreamStats.PLICount)
+	}
+}
+
+// summarizeVideoAnswer extracts the first video m-line's port, direction,
+// and payload-type→codec/profile mapping from an SDP answer for diagnostics.
 func summarizeVideoAnswer(sdp string) string {
 	inVideo := false
+	seenVideo := false
 	port := ""
+	direction := "?"
 	var codecs []string
+	fmtps := map[string]string{}
+	var order []string
+	rtpmaps := map[string]string{}
 	for _, ln := range strings.Split(sdp, "\n") {
 		ln = strings.TrimSpace(ln)
 		if strings.HasPrefix(ln, "m=") {
-			if strings.HasPrefix(ln, "m=video") {
+			if strings.HasPrefix(ln, "m=video") && !seenVideo {
 				inVideo = true
+				seenVideo = true
 				if fields := strings.Fields(ln); len(fields) > 1 {
 					port = fields[1]
 				}
@@ -1231,16 +1324,39 @@ func summarizeVideoAnswer(sdp string) string {
 			}
 			continue
 		}
-		if inVideo && strings.HasPrefix(ln, "a=rtpmap:") {
-			if idx := strings.Index(ln, " "); idx > 0 && idx < len(ln)-1 {
-				codecs = append(codecs, ln[idx+1:])
+		if !inVideo {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(ln, "a=rtpmap:"):
+			rest := ln[len("a=rtpmap:"):]
+			if idx := strings.Index(rest, " "); idx > 0 {
+				pt := rest[:idx]
+				rtpmaps[pt] = strings.SplitN(rest[idx+1:], "/", 2)[0]
+				order = append(order, pt)
 			}
+		case strings.HasPrefix(ln, "a=fmtp:"):
+			rest := ln[len("a=fmtp:"):]
+			if idx := strings.Index(rest, " "); idx > 0 {
+				fmtps[rest[:idx]] = rest[idx+1:]
+			}
+		case ln == "a=recvonly" || ln == "a=sendrecv" || ln == "a=sendonly" || ln == "a=inactive":
+			direction = ln[2:]
 		}
 	}
-	if port == "" {
+	if !seenVideo {
 		return "no video m-line"
 	}
-	return fmt.Sprintf("port=%s codecs=%v", port, codecs)
+	for _, pt := range order {
+		entry := pt + ":" + rtpmaps[pt]
+		if f := fmtps[pt]; f != "" {
+			if m := strings.Index(f, "profile-level-id="); m >= 0 && m+17+6 <= len(f) {
+				entry += "/" + f[m+17:m+17+6]
+			}
+		}
+		codecs = append(codecs, entry)
+	}
+	return fmt.Sprintf("port=%s dir=%s codecs=%v", port, direction, codecs)
 }
 
 // AddSubscriberICECandidate adds an ICE candidate from a subscriber.
@@ -2199,6 +2315,11 @@ func (s *SFU) HandleRenegotiationAnswer(roomSlug, subscriberID, sdpAnswer string
 	// The answer completes a server-initiated renegotiation; any candidates
 	// the client trickles for it count against a fresh budget.
 	sub.resetICECandidateBudget()
+
+	// Diagnostics: what did this browser accept for video, and does the SFU
+	// actually transmit on every video sender (incl. screen-share relays)?
+	log.Printf("Subscriber %s renegotiation answer video: %s", subscriberID, summarizeVideoAnswer(sdpAnswer))
+	go s.probeOutboundVideo(sub, subscriberID)
 
 	log.Printf("Renegotiation answer processed for subscriber %s", subscriberID)
 	return nil
