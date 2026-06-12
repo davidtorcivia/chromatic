@@ -9,6 +9,7 @@
      * the controls auto-hide — a colorist keeps scopes up while the rest
      * of the UI sleeps.
      */
+    import { untrack } from "svelte";
     import { scale } from "svelte/transition";
     import { quintOut } from "svelte/easing";
     import { getFrameBitmap } from "$lib/glass/frameSource";
@@ -268,15 +269,21 @@
 
     // A position persisted on a wide window can land entirely outside a
     // smaller one — with the drag handle unreachable. Clamp on open and
-    // again whenever the window resizes.
+    // again whenever the window resizes. The clamp must be untracked AND
+    // change-guarded: clampPos returns a fresh object, so an effect that
+    // reads pos and unconditionally reassigns it retriggers itself forever
+    // (this froze the tab the moment scopes opened with a saved layout).
+    function clampPosInPlace() {
+        if (!pos) return;
+        const c = clampPos(pos.x, pos.y);
+        if (c.x !== pos.x || c.y !== pos.y) pos = c;
+    }
+
     $effect(() => {
         if (!open || !panelEl) return;
-        if (pos) pos = clampPos(pos.x, pos.y);
-        const onResize = () => {
-            if (pos) pos = clampPos(pos.x, pos.y);
-        };
-        window.addEventListener("resize", onResize);
-        return () => window.removeEventListener("resize", onResize);
+        untrack(clampPosInPlace);
+        window.addEventListener("resize", clampPosInPlace);
+        return () => window.removeEventListener("resize", clampPosInPlace);
     });
 </script>
 
