@@ -888,18 +888,18 @@ func (s *SFU) RequestScreenShareKeyframe(roomSlug string) {
 
 	room.mu.RLock()
 	sharerID := room.ScreenShareParticipantID
-	sub, ok := room.Subscribers[sharerID]
+	pc := room.screenShareKeyframePeerConnectionLocked(sharerID)
 	room.mu.RUnlock()
 
-	if sharerID == "" || !ok || sub.PeerConnection == nil {
+	if sharerID == "" || pc == nil {
 		return
 	}
 
 	// Find the video receiver on the sharer's PC (the screen share track)
-	for _, receiver := range sub.PeerConnection.GetReceivers() {
+	for _, receiver := range pc.GetReceivers() {
 		track := receiver.Track()
 		if track != nil && track.Kind() == webrtc.RTPCodecTypeVideo {
-			if err := sub.PeerConnection.WriteRTCP([]rtcp.Packet{
+			if err := pc.WriteRTCP([]rtcp.Packet{
 				&rtcp.PictureLossIndication{
 					MediaSSRC: uint32(track.SSRC()),
 				},
@@ -911,6 +911,24 @@ func (s *SFU) RequestScreenShareKeyframe(roomSlug string) {
 			break
 		}
 	}
+}
+
+// screenShareKeyframePeerConnectionLocked returns the PeerConnection that
+// receives the sharer's screen-share RTP. New clients publish screen share on
+// the dedicated publisher PC stored in VoiceSessions; the subscriber fallback
+// supports older in-place publishing paths.
+// Caller must hold room.mu for reading or writing.
+func (room *RoomTracks) screenShareKeyframePeerConnectionLocked(sharerID string) *webrtc.PeerConnection {
+	if sharerID == "" {
+		return nil
+	}
+	if vs := room.VoiceSessions[sharerID]; vs != nil && vs.PeerConnection != nil {
+		return vs.PeerConnection
+	}
+	if sub := room.Subscribers[sharerID]; sub != nil {
+		return sub.PeerConnection
+	}
+	return nil
 }
 
 // GetRoomTracksForSlug returns the room tracks if they exist

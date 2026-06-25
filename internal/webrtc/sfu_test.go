@@ -345,6 +345,69 @@ func TestRoomTracks_AddSubscriber_ReplacesOldOnRejoin(t *testing.T) {
 	}
 }
 
+func TestRoomTracks_ScreenShareKeyframeTargetPrefersPublisherPC(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	publisherPC, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create publisher PC: %v", err)
+	}
+	defer publisherPC.Close()
+
+	subscriberPC, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create subscriber PC: %v", err)
+	}
+	defer subscriberPC.Close()
+
+	room := &RoomTracks{
+		RoomSlug:                 "test-room",
+		ScreenShareParticipantID: "p1",
+		Subscribers: map[string]*Subscriber{
+			"p1": {ID: "p1", PeerConnection: subscriberPC},
+		},
+		VoiceSessions: map[string]*VoiceSession{
+			"p1": {ParticipantID: "p1", PeerConnection: publisherPC},
+		},
+	}
+
+	if got := room.screenShareKeyframePeerConnectionLocked("p1"); got != publisherPC {
+		t.Fatal("screen-share keyframe target should prefer the dedicated publisher PC")
+	}
+}
+
+func TestRoomTracks_ScreenShareKeyframeTargetFallsBackToSubscriberPC(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	subscriberPC, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create subscriber PC: %v", err)
+	}
+	defer subscriberPC.Close()
+
+	room := &RoomTracks{
+		RoomSlug:                 "test-room",
+		ScreenShareParticipantID: "p1",
+		Subscribers: map[string]*Subscriber{
+			"p1": {ID: "p1", PeerConnection: subscriberPC},
+		},
+	}
+
+	if got := room.screenShareKeyframePeerConnectionLocked("p1"); got != subscriberPC {
+		t.Fatal("screen-share keyframe target should fall back to the subscriber PC")
+	}
+}
+
 func TestSFU_SetIngest_ReplacesOldOnReconnect(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)
