@@ -70,6 +70,7 @@
     const PLAY_NUDGE_MAX_ATTEMPTS = 3;
     const PLAY_NUDGE_INTERVAL_MS = 350;
     const MEDIA_STALL_GRACE_MS = 750;
+    const STATS_POLL_INTERVAL_MS = 1000;
     let mediaStallTimer: ReturnType<typeof setTimeout> | null = null;
     // Full re-subscription fallback: when ICE restart can't repair the media
     // path (dead TURN allocation, server-side subscriber gone), ask the server
@@ -879,7 +880,7 @@
     function startStatsPolling() {
         if (statsInterval) return;
         let inFlight = false;
-        statsInterval = setInterval(async () => {
+        const poll = async () => {
             if (!webrtcManager || inFlight) return;
             inFlight = true;
             try {
@@ -889,7 +890,11 @@
             } finally {
                 inFlight = false;
             }
-        }, 2000);
+        };
+        void poll();
+        statsInterval = setInterval(() => {
+            void poll();
+        }, STATS_POLL_INTERVAL_MS);
     }
 
     function stopStatsPolling() {
@@ -1606,7 +1611,7 @@
             : `Video buffer: ${Math.round(currentVideoBufferDelay)}ms${currentRtt === null ? "" : `; network RTT: ${Math.round(currentRtt)}ms`}`
     );
     let displayedLatencyQuality = $derived(
-        displayedLatency === null ? null : displayedLatency < 100 ? "good" : displayedLatency < 300 ? "fair" : "poor"
+        displayedLatency === null ? null : displayedLatency < 100 ? "good" : displayedLatency <= 200 ? "fair" : "poor"
     );
     // Surface WS connection trouble instead of leaving the misleading
     // "host hasn't started streaming" copy up forever (BUG 1 UX).
