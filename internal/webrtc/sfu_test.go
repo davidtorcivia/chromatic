@@ -409,6 +409,21 @@ func TestRoomTracks_ScreenShareKeyframeTargetFallsBackToSubscriberPC(t *testing.
 	}
 }
 
+func TestRoomTracks_KeyframeRequestsAreCoalesced(t *testing.T) {
+	room := &RoomTracks{RoomSlug: "test-room"}
+	now := time.Unix(1_700_000_000, 0)
+
+	if !room.markKeyframeRequestLocked(now) {
+		t.Fatal("first keyframe request should pass")
+	}
+	if room.markKeyframeRequestLocked(now.Add(keyframeRequestMinInterval - time.Millisecond)) {
+		t.Fatal("duplicate keyframe request inside coalescing window should be skipped")
+	}
+	if !room.markKeyframeRequestLocked(now.Add(keyframeRequestMinInterval)) {
+		t.Fatal("keyframe request at coalescing boundary should pass")
+	}
+}
+
 func TestSFU_SetIngest_ReplacesOldOnReconnect(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)

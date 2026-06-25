@@ -62,6 +62,8 @@ type SFU struct {
 // reject all candidates and make ICE restarts fail permanently.
 const MaxICECandidates = 50
 
+const keyframeRequestMinInterval = 250 * time.Millisecond
+
 var ErrStaleSubscriberAnswer = errors.New("stale subscriber answer")
 
 var ErrStaleRenegotiationAnswer = errors.New("stale renegotiation answer")
@@ -139,6 +141,7 @@ type RoomTracks struct {
 	ScreenShareLocalTrack    *webrtc.TrackLocalStaticRTP            // Relay track for fan-out
 	voiceRelayDone           map[string]chan struct{}               // Per-participant cancellation for voice relay goroutines
 	screenShareDone          chan struct{}                          // Cancellation for the screen share relay goroutine
+	lastKeyframeRequest      time.Time                              // Coalesces room-level PLI bursts.
 }
 
 // Subscriber represents a client receiving the stream
@@ -861,13 +864,17 @@ func (s *SFU) RequestKeyframe(roomSlug string) {
 		return
 	}
 
-	room.mu.RLock()
+	room.mu.Lock()
 	ingestPC := room.IngestPC
-	room.mu.RUnlock()
-
 	if ingestPC == nil {
+		room.mu.Unlock()
 		return
 	}
+	if !room.markKeyframeRequestLocked(time.Now()) {
+		room.mu.Unlock()
+		return
+	}
+	room.mu.Unlock()
 
 	// Find video receivers and send PLI for each
 	for _, receiver := range ingestPC.GetReceivers() {
@@ -885,6 +892,14 @@ func (s *SFU) RequestKeyframe(roomSlug string) {
 			break
 		}
 	}
+}
+
+func (room *RoomTracks) markKeyframeRequestLocked(now time.Time) bool {
+	if !room.lastKeyframeRequest.IsZero() && now.Sub(room.lastKeyframeRequest) < keyframeRequestMinInterval {
+		return false
+	}
+	room.lastKeyframeRequest = now
+	return true
 }
 
 // RequestScreenShareKeyframe sends a PLI to the screen-sharing participant's
