@@ -70,6 +70,8 @@ var ErrStaleRenegotiationAnswer = errors.New("stale renegotiation answer")
 
 var ErrStaleSubscriberCandidate = errors.New("stale subscriber candidate")
 
+var ErrStalePublisherCandidate = errors.New("stale publisher candidate")
+
 // iceGatherTimeout bounds how long we wait for ICE gathering to complete before
 // returning the SDP with whatever candidates we already have. Host/srflx
 // candidates gather quickly and are usually sufficient; relay candidates can
@@ -132,7 +134,7 @@ type RoomTracks struct {
 	AudioTrack               *webrtc.TrackLocalStaticRTP
 	Subscribers              map[string]*Subscriber
 	VoiceSessions            map[string]*VoiceSession               // Participant voice connections (also hosts the server-side mute gate)
-	PendingPublisherICE      map[string][]webrtc.ICECandidateInit   // Publisher ICE that arrived before publish:offer.
+	PendingPublisherICE      map[string][]PublisherICECandidate     // Publisher ICE that arrived before publish:offer.
 	VoiceRemoteTracks        map[string]*webrtc.TrackRemote         // Active voice remote tracks keyed by participant ID
 	VoiceLocalTracks         map[string]*webrtc.TrackLocalStaticRTP // Relay local tracks for voice fan-out
 	IngestPC                 *webrtc.PeerConnection                 // Reference to ingest PC for PLI requests
@@ -142,6 +144,11 @@ type RoomTracks struct {
 	voiceRelayDone           map[string]chan struct{}               // Per-participant cancellation for voice relay goroutines
 	screenShareDone          chan struct{}                          // Cancellation for the screen share relay goroutine
 	lastKeyframeRequest      time.Time                              // Coalesces room-level PLI bursts.
+}
+
+type PublisherICECandidate struct {
+	Candidate webrtc.ICECandidateInit
+	OfferID   string
 }
 
 // Subscriber represents a client receiving the stream
@@ -569,7 +576,7 @@ func (s *SFU) GetRoomTracks(roomSlug string) *RoomTracks {
 	room := &RoomTracks{
 		RoomSlug:            roomSlug,
 		Subscribers:         make(map[string]*Subscriber),
-		PendingPublisherICE: make(map[string][]webrtc.ICECandidateInit),
+		PendingPublisherICE: make(map[string][]PublisherICECandidate),
 	}
 	s.rooms[roomSlug] = room
 	return room
@@ -1633,12 +1640,13 @@ func (s *SFU) IsRoomLive(roomSlug string) bool {
 
 // VoiceSession represents a participant's voice connection
 type VoiceSession struct {
-	ParticipantID  string
-	PeerConnection *webrtc.PeerConnection
-	AudioTrack     *webrtc.TrackLocalStaticRTP
-	done           chan struct{}
-	closeOnce      sync.Once
-	SignalingMu    sync.Mutex
+	ParticipantID    string
+	PeerConnection   *webrtc.PeerConnection
+	AudioTrack       *webrtc.TrackLocalStaticRTP
+	PublisherOfferID string
+	done             chan struct{}
+	closeOnce        sync.Once
+	SignalingMu      sync.Mutex
 	// Muted is the server-enforced gate for this participant's voice RTP.
 	// When true, the voice relay forwarder drops incoming packets instead of
 	// writing them to the local track — so admin:mute is effective even if a
@@ -1654,7 +1662,7 @@ type VoiceSession struct {
 // set SSL role" wedges both stem from mixing offer directions on one PC).
 // An offer arriving for a live publisher renegotiates it in place (e.g.
 // adding a screen-share track to an existing mic session).
-func (s *SFU) HandlePublisherOffer(roomSlug, participantID, offerSDP string, onTrack func(participantID string, track *webrtc.TrackRemote)) (string, error) {
+func (s *SFU) HandlePublisherOffer(roomSlug, participantID, offerSDP, offerID string, onTrack func(participantID string, track *webrtc.TrackRemote)) (string, error) {
 	room := s.GetRoomTracks(roomSlug)
 
 	room.mu.Lock()
@@ -1683,33 +1691,38 @@ func (s *SFU) HandlePublisherOffer(roomSlug, participantID, offerSDP string, onT
 			if err := pc.SetLocalDescription(answer); err != nil {
 				return "", fmt.Errorf("failed to set publisher local description: %w", err)
 			}
+			existing.PublisherOfferID = offerID
 			log.Printf("Publisher renegotiated for %s in room %s", participantID, roomSlug)
 			return answer.SDP, nil
 		}
 	}
 
-	return s.HandleVoiceOffer(roomSlug, participantID, offerSDP, onTrack)
+	return s.HandleVoiceOffer(roomSlug, participantID, offerSDP, offerID, onTrack)
 }
 
 // AddPublisherCandidate adds a trickled ICE candidate from the client to its
 // publisher peer connection.
-func (s *SFU) AddPublisherCandidate(roomSlug, participantID string, candidate webrtc.ICECandidateInit) error {
+func (s *SFU) AddPublisherCandidate(roomSlug, participantID string, candidate webrtc.ICECandidateInit, offerID string) error {
 	room := s.GetRoomTracks(roomSlug)
 
 	room.mu.Lock()
 	vs := room.VoiceSessions[participantID]
 	if vs == nil || vs.PeerConnection == nil {
 		if room.PendingPublisherICE == nil {
-			room.PendingPublisherICE = make(map[string][]webrtc.ICECandidateInit)
+			room.PendingPublisherICE = make(map[string][]PublisherICECandidate)
 		}
 		pending := room.PendingPublisherICE[participantID]
 		if len(pending) >= MaxICECandidates {
 			room.mu.Unlock()
 			return fmt.Errorf("too many early publisher ICE candidates from %s", participantID)
 		}
-		room.PendingPublisherICE[participantID] = append(pending, candidate)
+		room.PendingPublisherICE[participantID] = append(pending, PublisherICECandidate{Candidate: candidate, OfferID: offerID})
 		room.mu.Unlock()
 		return nil
+	}
+	if offerID != "" && vs.PublisherOfferID != "" && offerID != vs.PublisherOfferID {
+		room.mu.Unlock()
+		return ErrStalePublisherCandidate
 	}
 	pc := vs.PeerConnection
 	room.mu.Unlock()
@@ -1721,10 +1734,18 @@ func (s *SFU) flushPendingPublisherCandidates(room *RoomTracks, participantID st
 	room.mu.Lock()
 	pending := room.PendingPublisherICE[participantID]
 	delete(room.PendingPublisherICE, participantID)
+	var offerID string
+	if vs := room.VoiceSessions[participantID]; vs != nil {
+		offerID = vs.PublisherOfferID
+	}
 	room.mu.Unlock()
 
-	for _, candidate := range pending {
-		if err := pc.AddICECandidate(candidate); err != nil {
+	for _, pendingCandidate := range pending {
+		if pendingCandidate.OfferID != "" && offerID != "" && pendingCandidate.OfferID != offerID {
+			log.Printf("Ignoring stale buffered publisher ICE candidate for %s", participantID)
+			continue
+		}
+		if err := pc.AddICECandidate(pendingCandidate.Candidate); err != nil {
 			log.Printf("Failed to add buffered publisher ICE candidate for %s: %v", participantID, err)
 		}
 	}
@@ -1733,7 +1754,7 @@ func (s *SFU) flushPendingPublisherCandidates(room *RoomTracks, participantID st
 // HandleVoiceOffer processes an offer from a client wanting to send media
 // over a dedicated publisher peer connection. Returns the SDP answer (with
 // candidates pre-gathered) to send back.
-func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP string, onTrack func(participantID string, track *webrtc.TrackRemote)) (string, error) {
+func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP, offerID string, onTrack func(participantID string, track *webrtc.TrackRemote)) (string, error) {
 	// Create a peer connection
 	pc, err := s.CreatePeerConnection()
 	if err != nil {
@@ -1777,9 +1798,10 @@ func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP string, onTrack
 	// close the old PC first so its terminal-state callback can't later tear
 	// down the replacement.
 	newSession := &VoiceSession{
-		ParticipantID:  participantID,
-		PeerConnection: pc,
-		done:           make(chan struct{}),
+		ParticipantID:    participantID,
+		PeerConnection:   pc,
+		PublisherOfferID: offerID,
+		done:             make(chan struct{}),
 	}
 	room := s.GetRoomTracks(roomSlug)
 	room.mu.Lock()

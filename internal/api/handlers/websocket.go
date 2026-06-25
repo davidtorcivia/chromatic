@@ -475,7 +475,7 @@ func (h *WebSocketHandler) handlePublishOffer(client *websocket.Client, payload 
 	}
 
 	roomSlug := client.RoomSlug
-	answer, err := h.sfu.HandlePublisherOffer(roomSlug, client.ID, data.SDP, func(pid string, track *pionwebrtc.TrackRemote) {
+	answer, err := h.sfu.HandlePublisherOffer(roomSlug, client.ID, data.SDP, data.OfferID, func(pid string, track *pionwebrtc.TrackRemote) {
 		if track.Kind() == pionwebrtc.RTPCodecTypeVideo {
 			// Screen share — only forward when the participant holds share
 			// permission (admins implicitly do).
@@ -511,6 +511,7 @@ func (h *WebSocketHandler) handlePublishCandidate(client *websocket.Client, payl
 		Candidate     string  `json:"candidate"`
 		SDPMid        *string `json:"sdpMid"`
 		SDPMLineIndex *uint16 `json:"sdpMLineIndex"`
+		OfferID       string  `json:"offerId"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return
@@ -519,7 +520,11 @@ func (h *WebSocketHandler) handlePublishCandidate(client *websocket.Client, payl
 		Candidate:     data.Candidate,
 		SDPMid:        data.SDPMid,
 		SDPMLineIndex: data.SDPMLineIndex,
-	}); err != nil {
+	}, data.OfferID); err != nil {
+		if errors.Is(err, webrtc.ErrStalePublisherCandidate) {
+			logger.Debug("Ignored stale publisher ICE candidate", "participant_id", client.ID, "offer_id", data.OfferID)
+			return
+		}
 		logger.Debug("Failed to add publisher ICE candidate", "participant_id", client.ID, "error", err)
 	}
 }

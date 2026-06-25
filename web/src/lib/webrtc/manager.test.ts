@@ -147,6 +147,12 @@ describe('WebRTCManager publisher signaling', () => {
         expect(negotiated).toBe(true);
         expect(sent.map((msg) => msg.type)).toEqual(['publish:offer', 'publish:candidate']);
         expect(sent[0].payload).toEqual({ sdp: 'publisher-offer', offerId: 'publish-1' });
+        expect(sent[1].payload).toEqual({
+            candidate: 'candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host',
+            sdpMid: '0',
+            sdpMLineIndex: 0,
+            offerId: 'publish-1'
+        });
     });
 
     it('does not flush publisher ICE candidates when the offer send fails', async () => {
@@ -217,6 +223,21 @@ describe('WebRTCManager publisher signaling', () => {
         expect(managerInternals.publisherPc?.addedTracks).toEqual([audioTrack]);
         expect(sent.map((msg) => msg.type)).toEqual(['publish:offer', 'publish:candidate']);
         expect(sent[0].payload).toEqual({ sdp: 'publisher-offer', offerId: 'publish-2' });
+        expect(sent[1].payload).toEqual({
+            candidate: 'candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host',
+            sdpMid: '0',
+            sdpMLineIndex: 0,
+            offerId: 'publish-2'
+        });
+
+        oldPc.onicecandidate?.({
+            candidate: {
+                candidate: 'candidate:old 1 udp 2122260223 192.0.2.99 54321 typ host',
+                sdpMid: '0',
+                sdpMLineIndex: 0
+            }
+        });
+        expect(sent).toHaveLength(2);
     });
 
     it('ignores stale publisher answers from a replaced offer', async () => {

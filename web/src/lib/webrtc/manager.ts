@@ -731,7 +731,7 @@ export class WebRTCManager {
                     candidate: event.candidate.candidate,
                     sdpMid: event.candidate.sdpMid,
                     sdpMLineIndex: event.candidate.sdpMLineIndex
-                });
+                }, pc);
             }
         };
         pc.onconnectionstatechange = () => {
@@ -760,20 +760,31 @@ export class WebRTCManager {
         return pc;
     }
 
-    private sendPublisherCandidate(candidate: RTCIceCandidateInit): void {
+    private sendPublisherCandidate(candidate: RTCIceCandidateInit, pc: RTCPeerConnection): void {
+        if (this.publisherPc !== pc) {
+            console.warn('Ignoring ICE candidate from replaced publisher connection');
+            return;
+        }
         if (!this.publisherOfferSent) {
             this.pendingPublisherCandidates.push(candidate);
             return;
         }
-        this.sendSignal('publish:candidate', candidate);
+        this.sendPublisherCandidateForCurrentOffer(candidate);
     }
 
     private flushPendingPublisherCandidates(): void {
         const pending = this.pendingPublisherCandidates;
         this.pendingPublisherCandidates = [];
         for (const candidate of pending) {
-            this.sendSignal('publish:candidate', candidate);
+            this.sendPublisherCandidateForCurrentOffer(candidate);
         }
+    }
+
+    private sendPublisherCandidateForCurrentOffer(candidate: RTCIceCandidateInit): void {
+        this.sendSignal('publish:candidate', {
+            ...candidate,
+            offerId: this.publisherOfferId ?? undefined
+        });
     }
 
     // Create and send an offer on the publisher PC. The server answers
