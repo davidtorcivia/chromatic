@@ -219,6 +219,7 @@
                 try {
                     await webrtcManager.handleOffer(data.sdp, data.offerId);
                     initialOfferHandled = true;
+                    clearSubscriptionRetryTimer();
                     tryEnablePendingAutoMic();
                 } catch (err) {
                     console.error('Failed to handle offer:', err);
@@ -745,6 +746,7 @@
         needsPlayClick = false;
         clearMediaStallTimer();
         clearKeyframeNudge();
+        clearSubscriptionRetryTimer();
         // Media is flowing again — future failures get a fresh retry budget.
         resubscribeAttempts = 0;
     }
