@@ -226,14 +226,14 @@
 
         // Handle ICE candidates from server
         session.onMessage("signal:candidate", async (payload: unknown) => {
-            const data = payload as { candidate: string; sdpMid?: string; sdpMLineIndex?: number };
+            const data = payload as { candidate: string; sdpMid?: string; sdpMLineIndex?: number; offerId?: string };
             if (webrtcManager) {
                 try {
                     await webrtcManager.handleCandidate({
                         candidate: data.candidate,
                         sdpMid: data.sdpMid ?? null,
                         sdpMLineIndex: data.sdpMLineIndex ?? null
-                    });
+                    }, data.offerId);
                 } catch (err) {
                     console.error('Failed to add ICE candidate:', err);
                 }

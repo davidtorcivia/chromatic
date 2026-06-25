@@ -440,6 +440,7 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 			"candidate":     init.Candidate,
 			"sdpMid":        init.SDPMid,
 			"sdpMLineIndex": init.SDPMLineIndex,
+			"offerId":       offerID,
 		})
 	})
 
@@ -1260,6 +1261,7 @@ func (h *WebSocketHandler) handleSignalCandidate(client *websocket.Client, paylo
 		SDPMid           *string `json:"sdpMid"`
 		SDPMLineIndex    *uint16 `json:"sdpMLineIndex"`
 		UsernameFragment *string `json:"usernameFragment,omitempty"`
+		OfferID          string  `json:"offerId"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		logger.Warn("Invalid ICE candidate", "participant_id", client.ID, "error", err)
@@ -1273,7 +1275,11 @@ func (h *WebSocketHandler) handleSignalCandidate(client *websocket.Client, paylo
 		UsernameFragment: data.UsernameFragment,
 	}
 
-	if err := h.sfu.AddSubscriberICECandidate(client.RoomSlug, client.ID, candidate); err != nil {
+	if err := h.sfu.AddSubscriberICECandidate(client.RoomSlug, client.ID, candidate, data.OfferID); err != nil {
+		if errors.Is(err, webrtc.ErrStaleSubscriberCandidate) {
+			logger.Debug("Ignored stale subscriber ICE candidate", "participant_id", client.ID, "offer_id", data.OfferID)
+			return
+		}
 		logger.Warn("Failed to add ICE candidate", "participant_id", client.ID, "error", err)
 		return
 	}

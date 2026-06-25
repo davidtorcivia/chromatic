@@ -66,6 +66,8 @@ var ErrStaleSubscriberAnswer = errors.New("stale subscriber answer")
 
 var ErrStaleRenegotiationAnswer = errors.New("stale renegotiation answer")
 
+var ErrStaleSubscriberCandidate = errors.New("stale subscriber candidate")
+
 // iceGatherTimeout bounds how long we wait for ICE gathering to complete before
 // returning the SDP with whatever candidates we already have. Host/srflx
 // candidates gather quickly and are usually sufficient; relay candidates can
@@ -175,6 +177,7 @@ type Subscriber struct {
 	pendingTracks         []*webrtc.TrackLocalStaticRTP
 	OnRenegotiationNeeded func(offerSDP, offerID string)
 	OfferID               string
+	CandidateID           string
 	RenegotiationOfferID  string
 }
 
@@ -979,11 +982,13 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 	}
 
 	// Create subscriber record
+	offerID := s.nextSignalingOfferID()
 	sub := &Subscriber{
 		ID:             subscriberID,
 		PeerConnection: pc,
 		done:           make(chan struct{}),
-		OfferID:        s.nextSignalingOfferID(),
+		OfferID:        offerID,
+		CandidateID:    offerID,
 	}
 
 	// Set up trickle ICE: buffer candidates until EnableSubscriberTrickleICE is called.
@@ -1411,7 +1416,7 @@ func summarizeVideoAnswer(sdp string) string {
 // AddSubscriberICECandidate adds an ICE candidate from a subscriber.
 // If the remote description hasn't been set yet, the candidate is buffered
 // and will be applied when SetSubscriberAnswer is called.
-func (s *SFU) AddSubscriberICECandidate(roomSlug, subscriberID string, candidate webrtc.ICECandidateInit) error {
+func (s *SFU) AddSubscriberICECandidate(roomSlug, subscriberID string, candidate webrtc.ICECandidateInit, candidateID string) error {
 	room := s.GetRoomTracksForSlug(roomSlug)
 	if room == nil {
 		return fmt.Errorf("room not found: %s", roomSlug)
@@ -1423,6 +1428,10 @@ func (s *SFU) AddSubscriberICECandidate(roomSlug, subscriberID string, candidate
 
 	if !ok {
 		return fmt.Errorf("subscriber not found: %s", subscriberID)
+	}
+
+	if candidateID != "" && sub.CandidateID != "" && candidateID != sub.CandidateID {
+		return fmt.Errorf("%w: got %s, want %s", ErrStaleSubscriberCandidate, candidateID, sub.CandidateID)
 	}
 
 	// Enforce ICE candidate limit to prevent flooding attacks

@@ -59,6 +59,7 @@ export interface WebRTCManagerOptions {
 
 export class WebRTCManager {
     private pc: RTCPeerConnection | null = null;
+    private subscriberOfferId: string | null = null;
     private options: WebRTCManagerOptions;
     // localStream holds the stream whose audio track is SENT — the processed
     // output of the mic cleanup chain when available, the raw capture
@@ -142,6 +143,7 @@ export class WebRTCManager {
                 this.createPeerConnection();
             }
 
+            this.subscriberOfferId = offerId ?? null;
             const pc = this.pc!;
 
             // Set remote description (the offer from server). The subscriber
@@ -195,11 +197,16 @@ export class WebRTCManager {
             }
             this.pc = null;
         }
+        this.subscriberOfferId = null;
     }
 
     // Handle ICE candidate from server (if server sends any)
-    async handleCandidate(candidate: RTCIceCandidateInit): Promise<void> {
+    async handleCandidate(candidate: RTCIceCandidateInit, offerId?: string): Promise<void> {
         return this.enqueueSignaling(async () => {
+            if (offerId && this.subscriberOfferId && offerId !== this.subscriberOfferId) {
+                console.warn('Ignoring stale ICE candidate for replaced subscriber connection', { offerId });
+                return;
+            }
             if (!this.pc) {
                 console.warn('Received ICE candidate but no peer connection');
                 return;
@@ -274,7 +281,8 @@ export class WebRTCManager {
                 this.sendSignal('signal:candidate', {
                     candidate: event.candidate.candidate,
                     sdpMid: event.candidate.sdpMid,
-                    sdpMLineIndex: event.candidate.sdpMLineIndex
+                    sdpMLineIndex: event.candidate.sdpMLineIndex,
+                    offerId: this.subscriberOfferId ?? undefined
                 });
             }
         };

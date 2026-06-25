@@ -34,6 +34,7 @@ class FakeSubscriberPeerConnection {
     connectionState: RTCPeerConnectionState = 'disconnected';
     signalingState: RTCSignalingState = 'stable';
     closed = false;
+    addedCandidates: RTCIceCandidateInit[] = [];
 
     async createOffer(options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
         return { type: 'offer', sdp: options?.iceRestart ? 'ice-restart-offer' : 'offer' };
@@ -69,6 +70,10 @@ class FakeSubscriberPeerConnection {
         if (description.type === 'rollback') {
             this.signalingState = 'stable';
         }
+    }
+
+    async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
+        this.addedCandidates.push(candidate);
     }
 
     close() {
@@ -229,6 +234,64 @@ describe('WebRTCManager subscriber signaling', () => {
         await manager.handleOffer('subscriber-offer', 'offer-123');
 
         expect(sent).toEqual([{ type: 'signal:answer', payload: { sdp: 'subscriber-answer', offerId: 'offer-123' } }]);
+    });
+
+    it('tags subscriber ICE candidates with the current server offer ID', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: (type, payload) => {
+                sent.push({ type, payload });
+            }
+        });
+
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+        sent.length = 0;
+
+        const pc = (manager as unknown as { pc: FakeSubscriberPeerConnection | null }).pc;
+        pc?.onicecandidate?.({
+            candidate: {
+                candidate: 'candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host',
+                sdpMid: '0',
+                sdpMLineIndex: 0
+            }
+        });
+
+        expect(sent).toEqual([
+            {
+                type: 'signal:candidate',
+                payload: {
+                    candidate: 'candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host',
+                    sdpMid: '0',
+                    sdpMLineIndex: 0,
+                    offerId: 'offer-123'
+                }
+            }
+        ]);
+    });
+
+    it('ignores server ICE candidates from a replaced subscriber offer', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: () => {}
+        });
+
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+        const pc = (manager as unknown as { pc: FakeSubscriberPeerConnection | null }).pc;
+
+        await manager.handleCandidate({
+            candidate: 'candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host',
+            sdpMid: '0',
+            sdpMLineIndex: 0
+        }, 'old-offer');
+
+        expect(pc?.addedCandidates).toEqual([]);
     });
 
     it('echoes the server offer ID with the renegotiation answer', async () => {
