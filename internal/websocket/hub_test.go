@@ -243,6 +243,34 @@ func TestHub_BroadcastWithExclude(t *testing.T) {
 	}
 }
 
+func TestHub_BroadcastDropIfFullDoesNotEvict(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+	defer stopHub(hub)
+
+	client := newTestClient("client-1", "Alice", "test-room", hub)
+	client.Send = make(chan []byte, 1)
+	hub.Register(client)
+	time.Sleep(10 * time.Millisecond)
+
+	client.Send <- []byte(`{"type":"queued"}`)
+	hub.BroadcastDropIfFull("test-room", []byte(`{"type":"cursor"}`), "")
+	time.Sleep(10 * time.Millisecond)
+
+	if hub.GetClient("test-room", "client-1") != client {
+		t.Fatal("drop-if-full broadcast evicted a client")
+	}
+
+	select {
+	case msg := <-client.Send:
+		if string(msg) != `{"type":"queued"}` {
+			t.Fatalf("expected original queued message, got %s", msg)
+		}
+	default:
+		t.Fatal("expected original queued message to remain")
+	}
+}
+
 func TestHub_BroadcastJSON(t *testing.T) {
 	hub := NewHub()
 	go hub.Run()

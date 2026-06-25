@@ -1052,9 +1052,12 @@ func (h *WebSocketHandler) handleCursor(client *websocket.Client, payload json.R
 		return
 	}
 
-	// Broadcast the batched shape to all. Top-level x/y mirror the newest
-	// point for backward compatibility with single-point consumers.
-	h.hub.BroadcastJSON(client.RoomSlug, "cursor", map[string]interface{}{
+	// Cursor updates are high-rate disposable state. Drop them for clients
+	// whose WebSocket send buffers are full instead of evicting viewers or
+	// letting stale cursor positions add backpressure to critical signaling.
+	// The batched payload keeps top-level x/y mirroring the newest point for
+	// backward compatibility with single-point consumers.
+	h.hub.BroadcastJSONDropIfFull(client.RoomSlug, "cursor", map[string]interface{}{
 		"participantId":   client.ID,
 		"participantName": client.Name,
 		"color":           client.Color,
