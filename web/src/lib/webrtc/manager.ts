@@ -912,6 +912,9 @@ export class WebRTCManager {
             await pc.setRemoteDescription({ type: 'answer', sdp });
             this.clearPublishAnswerWatchdog();
             this.publisherOfferId = null;
+            if (this.screenShareSender) {
+                await this.tuneShareSender(this.screenShareSender);
+            }
             console.log('Publisher answer applied');
         });
     }

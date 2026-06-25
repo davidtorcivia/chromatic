@@ -50,6 +50,26 @@ class FakePublisherPeerConnection {
     }
 }
 
+class FakeShareSender {
+    parameters: RTCRtpSendParameters = {
+        transactionId: 'fake',
+        codecs: [],
+        headerExtensions: [],
+        rtcp: {},
+        encodings: [{}]
+    };
+    setParametersCalls: RTCRtpSendParameters[] = [];
+
+    getParameters(): RTCRtpSendParameters {
+        return this.parameters;
+    }
+
+    async setParameters(parameters: RTCRtpSendParameters): Promise<void> {
+        this.parameters = parameters;
+        this.setParametersCalls.push(structuredClone(parameters));
+    }
+}
+
 class FakeSubscriberPeerConnection {
     ontrack: ((event: RTCTrackEvent) => void) | null = null;
     onicecandidate: ((event: { candidate: RTCIceCandidateInit | null }) => void) | null = null;
@@ -322,6 +342,28 @@ describe('WebRTCManager publisher signaling', () => {
         await manager.handlePublishAnswer('fresh-answer', 'publish-2');
 
         expect(replacementPc?.signalingState).toBe('stable');
+    });
+
+    it('retries screen share sender tuning after the publisher answer is applied', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakePublisherPeerConnection);
+
+        const manager = newManager(() => {});
+        const shareSender = new FakeShareSender();
+        const managerInternals = manager as unknown as {
+            ensurePublisher(): FakePublisherPeerConnection;
+            negotiatePublisher(): Promise<boolean>;
+            screenShareSender: RTCRtpSender | null;
+        };
+
+        managerInternals.ensurePublisher();
+        managerInternals.screenShareSender = shareSender as unknown as RTCRtpSender;
+        await managerInternals.negotiatePublisher();
+
+        await manager.handlePublishAnswer('publisher-answer', 'publish-1');
+
+        expect(shareSender.setParametersCalls).toHaveLength(1);
+        expect(shareSender.parameters.degradationPreference).toBe('maintain-resolution');
+        expect(shareSender.parameters.encodings[0]?.maxBitrate).toBe(8_000_000);
     });
 });
 
