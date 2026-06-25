@@ -835,6 +835,19 @@ describe('WebRTCManager subscriber signaling', () => {
             videoJitterBufferDelay: 30,
             videoFramesDropped: 2
         });
+
+        pc?.statsReport.set('inbound-video-1', {
+            type: 'inbound-rtp',
+            kind: 'video',
+            jitterBufferDelay: 0.56,
+            jitterBufferEmittedCount: 22,
+            framesDropped: 3
+        });
+
+        const refreshedStats = await manager.getStats();
+        expect(refreshedStats.rtt).toBe(32);
+        expect(refreshedStats.videoJitterBufferDelay).toBeCloseTo(20);
+        expect(refreshedStats.videoFramesDropped).toBe(3);
     });
 });
 

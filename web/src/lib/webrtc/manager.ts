@@ -63,6 +63,11 @@ export interface WebRTCStats {
     videoFramesDropped?: number;
 }
 
+interface JitterBufferSample {
+    delay: number;
+    emittedCount: number;
+}
+
 export class WebRTCManager {
     private pc: RTCPeerConnection | null = null;
     private subscriberOfferId: string | null = null;
@@ -114,6 +119,7 @@ export class WebRTCManager {
     // to the PeerConnection's signaling state (e.g. handleOffer + handleRenegotiation
     // firing from separate WebSocket messages while awaiting).
     private signalingQueue: Promise<void> = Promise.resolve();
+    private videoJitterBufferSamples = new Map<string, JitterBufferSample>();
 
     constructor(options: WebRTCManagerOptions) {
         this.options = options;
@@ -230,6 +236,7 @@ export class WebRTCManager {
         }
         this.subscriberOfferId = null;
         this.subscriberCandidateOfferId = null;
+        this.videoJitterBufferSamples.clear();
     }
 
     // Handle ICE candidate from server (if server sends any)
@@ -588,6 +595,7 @@ export class WebRTCManager {
         let fallbackRtt: number | undefined;
         let videoJitterBufferDelay: number | undefined;
         let videoFramesDropped: number | undefined;
+        const seenVideoReports = new Set<string>();
 
         stats.forEach(report => {
             if (
@@ -607,24 +615,52 @@ export class WebRTCManager {
                 report.type === 'inbound-rtp' &&
                 (report.kind === 'video' || report.mediaType === 'video')
             ) {
+                seenVideoReports.add(report.id);
                 if (
                     typeof report.jitterBufferDelay === 'number' &&
                     typeof report.jitterBufferEmittedCount === 'number' &&
                     report.jitterBufferEmittedCount > 0
                 ) {
-                    videoJitterBufferDelay = (report.jitterBufferDelay / report.jitterBufferEmittedCount) * 1000;
+                    const sample = this.videoJitterBufferDelayForReport(
+                        report.id,
+                        report.jitterBufferDelay,
+                        report.jitterBufferEmittedCount
+                    );
+                    videoJitterBufferDelay = videoJitterBufferDelay === undefined
+                        ? sample
+                        : Math.max(videoJitterBufferDelay, sample);
                 }
                 if (typeof report.framesDropped === 'number') {
                     videoFramesDropped = report.framesDropped;
                 }
             }
         });
+        for (const id of this.videoJitterBufferSamples.keys()) {
+            if (!seenVideoReports.has(id)) {
+                this.videoJitterBufferSamples.delete(id);
+            }
+        }
 
         return {
             rtt: nominatedRtt ?? fallbackRtt,
             videoJitterBufferDelay,
             videoFramesDropped
         };
+    }
+
+    private videoJitterBufferDelayForReport(id: string, delay: number, emittedCount: number): number {
+        const previous = this.videoJitterBufferSamples.get(id);
+        this.videoJitterBufferSamples.set(id, { delay, emittedCount });
+
+        if (
+            previous &&
+            emittedCount > previous.emittedCount &&
+            delay >= previous.delay
+        ) {
+            return ((delay - previous.delay) / (emittedCount - previous.emittedCount)) * 1000;
+        }
+
+        return (delay / emittedCount) * 1000;
     }
 
     // Request microphone access and prepare for sending. Honors the persisted
