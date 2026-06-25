@@ -88,6 +88,9 @@ export class WebRTCManager {
     private voiceOfferTimer: ReturnType<typeof setTimeout> | null = null;
     private static readonly VOICE_OFFER_TIMEOUT_MS = 8000;
     private static readonly RESYNC_MIN_INTERVAL_MS = 250;
+    // Keep browser playout buffers tight for color-review A/B work. This is
+    // a best-effort Chrome hint; unsupported browsers ignore it.
+    private static readonly LOW_LATENCY_PLAYOUT_DELAY_SECONDS = 0.05;
     private lastResyncAt = 0;
     // Serialize all SDP operations to prevent concurrent modifications
     // to the PeerConnection's signaling state (e.g. handleOffer + handleRenegotiation
@@ -231,6 +234,7 @@ export class WebRTCManager {
             const streamId = event.streams[0]?.id ?? '';
             const trackId = event.track.id;
             console.log('Received track:', event.track.kind, 'trackId:', trackId, 'streamId:', streamId, 'streams:', event.streams.length);
+            this.tuneReceiverForLowLatency(event.receiver);
 
             // Identify screen share tracks by stream/track ID.
             // Server creates relay tracks with:
@@ -359,6 +363,21 @@ export class WebRTCManager {
         this.pc.onicegatheringstatechange = () => {
             console.log('ICE gathering state:', this.pc?.iceGatheringState);
         };
+    }
+
+    private tuneReceiverForLowLatency(receiver: RTCRtpReceiver): void {
+        type LowLatencyReceiver = RTCRtpReceiver & { playoutDelayHint?: number };
+        const lowLatencyReceiver = receiver as LowLatencyReceiver;
+
+        if (!('playoutDelayHint' in lowLatencyReceiver)) {
+            return;
+        }
+
+        try {
+            lowLatencyReceiver.playoutDelayHint = WebRTCManager.LOW_LATENCY_PLAYOUT_DELAY_SECONDS;
+        } catch (err) {
+            console.warn('Could not set low-latency receiver playout hint:', err);
+        }
     }
 
     // Perform ICE restart to recover from connection issues.

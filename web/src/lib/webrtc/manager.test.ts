@@ -315,6 +315,31 @@ describe('WebRTCManager subscriber signaling', () => {
             { type: 'signal:renegotiate-answer', payload: { sdp: 'subscriber-answer', offerId: 'renegotiate-456' } }
         ]);
     });
+
+    it('sets a low playout delay hint on inbound receivers when supported', () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: () => {}
+        });
+
+        const managerInternals = manager as unknown as {
+            createPeerConnection(): void;
+            pc: FakeSubscriberPeerConnection | null;
+        };
+        managerInternals.createPeerConnection();
+
+        const receiver = { playoutDelayHint: 1 };
+        managerInternals.pc?.ontrack?.({
+            track: { kind: 'video', id: 'main-video' },
+            streams: [{ id: 'main-stream' }],
+            receiver
+        } as unknown as RTCTrackEvent);
+
+        expect(receiver.playoutDelayHint).toBe(0.05);
+    });
 });
 
 describe('WebRTCManager resync signaling', () => {
