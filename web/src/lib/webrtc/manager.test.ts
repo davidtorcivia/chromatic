@@ -7,6 +7,7 @@ class FakePublisherPeerConnection {
     onconnectionstatechange: (() => void) | null = null;
     connectionState: RTCPeerConnectionState = 'new';
     signalingState: RTCSignalingState = 'stable';
+    configurationHistory: RTCConfiguration[] = [];
 
     async createOffer(): Promise<RTCSessionDescriptionInit> {
         return { type: 'offer', sdp: 'publisher-offer' };
@@ -22,6 +23,10 @@ class FakePublisherPeerConnection {
         });
     }
 
+    setConfiguration(configuration: RTCConfiguration): void {
+        this.configurationHistory.push(configuration);
+    }
+
     close() {}
 }
 
@@ -35,6 +40,7 @@ class FakeSubscriberPeerConnection {
     signalingState: RTCSignalingState = 'stable';
     closed = false;
     addedCandidates: RTCIceCandidateInit[] = [];
+    configurationHistory: RTCConfiguration[] = [];
 
     async createOffer(options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
         return { type: 'offer', sdp: options?.iceRestart ? 'ice-restart-offer' : 'offer' };
@@ -74,6 +80,10 @@ class FakeSubscriberPeerConnection {
 
     async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
         this.addedCandidates.push(candidate);
+    }
+
+    setConfiguration(configuration: RTCConfiguration): void {
+        this.configurationHistory.push(configuration);
     }
 
     close() {
@@ -339,6 +349,31 @@ describe('WebRTCManager subscriber signaling', () => {
         } as unknown as RTCTrackEvent);
 
         expect(receiver.playoutDelayHint).toBe(0.05);
+    });
+
+    it('refreshes ICE servers on both subscriber and publisher peer connections', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: () => {}
+        });
+
+        const managerInternals = manager as unknown as {
+            ensurePublisher(): RTCPeerConnection;
+            pc: FakeSubscriberPeerConnection | null;
+            publisherPc: FakeSubscriberPeerConnection | null;
+        };
+
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+        managerInternals.ensurePublisher();
+
+        const refreshed = [{ urls: 'turn:turn.example.test', username: 'fresh', credential: 'secret' }];
+        manager.updateICEServers(refreshed);
+
+        expect(managerInternals.pc?.configurationHistory).toEqual([{ iceServers: refreshed }]);
+        expect(managerInternals.publisherPc?.configurationHistory).toEqual([{ iceServers: refreshed }]);
     });
 });
 

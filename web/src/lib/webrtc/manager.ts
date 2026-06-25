@@ -466,9 +466,9 @@ export class WebRTCManager {
         this.sendSignal('signal:resync', {});
     }
 
-    // Apply a fresh set of ICE servers to the live peer connection AND to the
-    // stored options (so a subsequent resetPeerConnection rebuilds with the
-    // fresh credentials, not the originals).
+    // Apply a fresh set of ICE servers to the live peer connections AND to
+    // the stored options (so subsequent subscriber/publisher rebuilds use
+    // the fresh credentials, not the originals).
     //
     // Cloudflare TURN credentials have a default 1 h TTL; long grading
     // sessions outlive that. The active ICE allocation keeps working on
@@ -476,17 +476,24 @@ export class WebRTCManager {
     // valid creds — without this, an ICE restart on a >1 h session would
     // gather with expired credentials and fail.
     //
-    // pc.setConfiguration only affects subsequent gathering; it does not
-    // disrupt the running media relay.
+    // setConfiguration only affects subsequent gathering; it does not disrupt
+    // the running media relay.
     updateICEServers(iceServers: RTCIceServer[]): void {
         this.options = { ...this.options, iceServers };
-        if (this.pc) {
+        const refresh = (pc: RTCPeerConnection, label: string) => {
             try {
-                this.pc.setConfiguration({ iceServers });
-                console.log('Refreshed ICE servers on live peer connection');
+                pc.setConfiguration({ iceServers });
+                console.log(`Refreshed ICE servers on live ${label} peer connection`);
             } catch (err) {
-                console.warn('setConfiguration with fresh ICE servers failed:', err);
+                console.warn(`setConfiguration with fresh ICE servers failed on ${label} peer connection:`, err);
             }
+        };
+
+        if (this.pc) {
+            refresh(this.pc, 'subscriber');
+        }
+        if (this.publisherPc) {
+            refresh(this.publisherPc, 'publisher');
         }
     }
 
