@@ -67,6 +67,7 @@ func (c *Client) WritePump() {
 			// Client is shutting down — send close frame and exit.
 			// Send channel is intentionally never closed to avoid
 			// send-on-closed-channel panics in concurrent producers.
+			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 			c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
 			return
 
