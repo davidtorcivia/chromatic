@@ -238,6 +238,50 @@ func TestRejoinWhileLive_BeforeClose(t *testing.T) {
 	}
 }
 
+func TestDisconnect_RemovesPublisherSession(t *testing.T) {
+	env, cleanup := newRejoinTestEnv(t)
+	defer cleanup()
+
+	conn := env.dial()
+	waitForMessages(t, conn, 5*time.Second, "room:state", "signal:offer")
+	pub := publishAudio(t, conn, "publish-1")
+	defer pub.Close()
+
+	if !voiceSessionExists(env.sfu, env.slug, "part1") {
+		t.Fatal("publisher voice session was not created")
+	}
+
+	conn.Close()
+	time.Sleep(300 * time.Millisecond)
+
+	if voiceSessionExists(env.sfu, env.slug, "part1") {
+		t.Fatal("publisher voice session survived confirmed disconnect")
+	}
+}
+
+func TestRejoinWhileLive_DoesNotRemoveReplacementPublisherSession(t *testing.T) {
+	env, cleanup := newRejoinTestEnv(t)
+	defer cleanup()
+
+	conn1 := env.dial()
+	waitForMessages(t, conn1, 5*time.Second, "room:state", "signal:offer")
+	pub1 := publishAudio(t, conn1, "publish-1")
+	defer pub1.Close()
+
+	conn2 := env.dial()
+	defer conn2.Close()
+	waitForMessages(t, conn2, 5*time.Second, "room:state", "signal:offer")
+	pub2 := publishAudio(t, conn2, "publish-2")
+	defer pub2.Close()
+
+	conn1.Close()
+	time.Sleep(500 * time.Millisecond)
+
+	if !voiceSessionExists(env.sfu, env.slug, "part1") {
+		t.Fatal("replacement publisher voice session was removed by stale disconnect cleanup")
+	}
+}
+
 func subscriberExists(sfu *webrtc.SFU, slug, id string) bool {
 	room := sfu.GetRoomTracksForSlug(slug)
 	if room == nil {
@@ -246,6 +290,73 @@ func subscriberExists(sfu *webrtc.SFU, slug, id string) bool {
 	room.RLockVoiceTracks()
 	defer room.RUnlockVoiceTracks()
 	return room.Subscribers[id] != nil
+}
+
+func voiceSessionExists(sfu *webrtc.SFU, slug, id string) bool {
+	room := sfu.GetRoomTracksForSlug(slug)
+	if room == nil {
+		return false
+	}
+	room.RLockVoiceTracks()
+	defer room.RUnlockVoiceTracks()
+	return room.VoiceSessions[id] != nil
+}
+
+func sendWSMessage(t *testing.T, conn *gorillaws.Conn, msgType string, payload interface{}) {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	msg, err := json.Marshal(wsTestMessage{Type: msgType, Payload: raw})
+	if err != nil {
+		t.Fatalf("marshal message: %v", err)
+	}
+	if err := conn.WriteMessage(gorillaws.TextMessage, msg); err != nil {
+		t.Fatalf("write websocket message: %v", err)
+	}
+}
+
+func publishAudio(t *testing.T, conn *gorillaws.Conn, offerID string) *pionwebrtc.PeerConnection {
+	t.Helper()
+	pc, err := pionwebrtc.NewPeerConnection(pionwebrtc.Configuration{})
+	if err != nil {
+		t.Fatalf("failed to create publisher peer connection: %v", err)
+	}
+	track, err := pionwebrtc.NewTrackLocalStaticRTP(
+		pionwebrtc.RTPCodecCapability{MimeType: pionwebrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+		"voice-test",
+		"voice-stream-test")
+	if err != nil {
+		t.Fatalf("failed to create voice track: %v", err)
+	}
+	if _, err := pc.AddTrack(track); err != nil {
+		t.Fatalf("failed to add voice track: %v", err)
+	}
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("failed to create publisher offer: %v", err)
+	}
+	if err := pc.SetLocalDescription(offer); err != nil {
+		t.Fatalf("failed to set publisher local description: %v", err)
+	}
+	sendWSMessage(t, conn, "publish:offer", map[string]interface{}{"sdp": offer.SDP, "offerId": offerID})
+
+	msgs := waitForMessages(t, conn, 5*time.Second, "publish:answer")
+	var answer struct {
+		SDP     string `json:"sdp"`
+		OfferID string `json:"offerId"`
+	}
+	if err := json.Unmarshal(msgs["publish:answer"], &answer); err != nil {
+		t.Fatalf("invalid publish:answer payload: %v", err)
+	}
+	if answer.OfferID != offerID {
+		t.Fatalf("publish answer offer ID = %q, want %q", answer.OfferID, offerID)
+	}
+	if err := pc.SetRemoteDescription(pionwebrtc.SessionDescription{Type: pionwebrtc.SDPTypeAnswer, SDP: answer.SDP}); err != nil {
+		t.Fatalf("failed to apply publisher answer: %v", err)
+	}
+	return pc
 }
 
 // browserSim is a minimal stand-in for the web client: it answers server

@@ -331,6 +331,10 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 				logger.Info("Client replaced (page refresh), skipping cleanup", "participant_id", c.ID, "name", c.Name, "room", c.RoomSlug)
 				return
 			}
+			// This is a confirmed leave, not a replaced page refresh. Tear down
+			// the participant's publishing session immediately instead of
+			// waiting for WebRTC state callbacks to eventually observe Closed.
+			h.sfu.RemoveVoiceSession(c.RoomSlug, c.ID)
 			// Broadcast participant:left when client disconnects
 			h.hub.BroadcastJSON(c.RoomSlug, "participant:left", map[string]interface{}{
 				"participantId": c.ID,
