@@ -244,6 +244,46 @@ describe('WebRTCManager publisher signaling', () => {
         ]);
     });
 
+    it('defers publisher renegotiation while an offer is in flight', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakePublisherPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const manager = newManager((type, payload) => {
+            sent.push({ type, payload });
+        });
+
+        const managerInternals = manager as unknown as {
+            ensurePublisher(): FakePublisherPeerConnection;
+            negotiatePublisher(): Promise<boolean>;
+        };
+        managerInternals.ensurePublisher();
+
+        await managerInternals.negotiatePublisher();
+        expect(sent.map((msg) => msg.type)).toEqual(['publish:offer', 'publish:candidate']);
+        expect(sent[0].payload).toEqual({ sdp: 'publisher-offer', offerId: 'publish-1' });
+
+        const deferred = await managerInternals.negotiatePublisher();
+        expect(deferred).toBe(true);
+        expect(sent).toHaveLength(2);
+
+        await manager.handlePublishAnswer('publisher-answer', 'publish-1');
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+        expect(sent.map((msg) => msg.type)).toEqual([
+            'publish:offer',
+            'publish:candidate',
+            'publish:offer',
+            'publish:candidate'
+        ]);
+        expect(sent[2].payload).toEqual({ sdp: 'publisher-offer', offerId: 'publish-2' });
+        expect(sent[3].payload).toEqual({
+            candidate: 'candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host',
+            sdpMid: '0',
+            sdpMLineIndex: 0,
+            offerId: 'publish-2'
+        });
+    });
+
     it('rebuilds a live publisher after a short persistent disconnect', async () => {
         vi.useFakeTimers();
         vi.stubGlobal('RTCPeerConnection', FakePublisherPeerConnection);

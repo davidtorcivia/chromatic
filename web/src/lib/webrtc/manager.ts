@@ -103,6 +103,7 @@ export class WebRTCManager {
     private publisherOfferId: string | null = null;
     private publisherCandidateOfferId: string | null = null;
     private pendingPublisherCandidates: RTCIceCandidateInit[] = [];
+    private publisherNeedsRenegotiation: boolean = false;
     // Watchdog: rebuilds the publisher if an offer goes unanswered
     private voiceOfferTimer: ReturnType<typeof setTimeout> | null = null;
     private publisherDisconnectedTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -893,6 +894,11 @@ export class WebRTCManager {
             try {
                 this.publisherOfferSent = false;
                 this.pendingPublisherCandidates = [];
+                if (pc.signalingState !== 'stable') {
+                    this.publisherNeedsRenegotiation = true;
+                    console.log('Publisher offer already in flight; deferring renegotiation', { signalingState: pc.signalingState });
+                    return true;
+                }
                 const offerId = `publish-${++this.publisherOfferCounter}`;
                 this.publisherOfferId = offerId;
                 this.publisherCandidateOfferId = offerId;
@@ -921,6 +927,7 @@ export class WebRTCManager {
                 this.publisherOfferId = null;
                 this.publisherCandidateOfferId = null;
                 this.pendingPublisherCandidates = [];
+                this.publisherNeedsRenegotiation = false;
                 if (this.publisherPc === pc) {
                     this.clearPublisherDisconnectWatchdog();
                     try {
@@ -956,6 +963,10 @@ export class WebRTCManager {
             if (this.screenShareSender) {
                 await this.tuneShareSender(this.screenShareSender);
             }
+            if (this.publisherNeedsRenegotiation) {
+                this.publisherNeedsRenegotiation = false;
+                void this.negotiatePublisher();
+            }
             console.log('Publisher answer applied');
         });
     }
@@ -972,6 +983,7 @@ export class WebRTCManager {
         this.publisherOfferId = null;
         this.publisherCandidateOfferId = null;
         this.pendingPublisherCandidates = [];
+        this.publisherNeedsRenegotiation = false;
         this.audioSender = null;
         this.screenShareSender = null;
         try {
@@ -1270,8 +1282,11 @@ export class WebRTCManager {
                 // already closed
             }
             this.publisherPc = null;
+            this.publisherOfferSent = false;
             this.publisherOfferId = null;
             this.publisherCandidateOfferId = null;
+            this.pendingPublisherCandidates = [];
+            this.publisherNeedsRenegotiation = false;
         }
     }
 }
