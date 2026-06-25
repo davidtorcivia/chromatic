@@ -381,6 +381,36 @@ func TestHub_SendTo(t *testing.T) {
 	}
 }
 
+func TestHub_SendToFullBufferClosesClient(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+	defer stopHub(hub)
+
+	client := newTestClient("client-1", "Alice", "test-room", hub)
+	client.Send = make(chan []byte, 1)
+	hub.Register(client)
+	time.Sleep(10 * time.Millisecond)
+
+	client.Send <- []byte(`{"type":"queued"}`)
+	hub.SendTo("test-room", "client-1", []byte(`{"type":"signal:renegotiate"}`))
+
+	select {
+	case <-client.Done:
+		// Expected: direct critical sends must not be silently dropped.
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("full direct send buffer did not close the client")
+	}
+
+	select {
+	case msg := <-client.Send:
+		if string(msg) != `{"type":"queued"}` {
+			t.Fatalf("expected original queued message, got %s", msg)
+		}
+	default:
+		t.Fatal("expected original queued message to remain")
+	}
+}
+
 func TestHub_GetRoomClients(t *testing.T) {
 	hub := NewHub()
 	go hub.Run()

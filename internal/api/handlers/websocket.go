@@ -248,6 +248,12 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	// Register with hub
 	h.hub.Register(client)
 
+	// Start the writer before queuing initial snapshots or live-stream offers.
+	// Rejoin latency is dominated by how quickly room:state and signal:offer
+	// leave this buffer; with the writer idle until the end of setup, those
+	// messages could sit behind DB work and any same-connection setup burst.
+	go client.WritePump()
+
 	// Send initial room state and chat history
 	h.sendRoomState(client, slug)
 	h.sendChatHistory(client, slug)
@@ -278,9 +284,6 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	if roomStatus == "live" || h.sfu.IsRoomLive(slug) {
 		go h.ensureSubscription(client, slug)
 	}
-
-	// Start write pump
-	go client.WritePump()
 
 	// Start read pump with disconnect handler
 	go client.ReadPumpWithDisconnect(

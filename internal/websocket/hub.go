@@ -465,9 +465,18 @@ func (h *Hub) SendTo(roomSlug, clientID string, message []byte) {
 	if room, ok := h.rooms[roomSlug]; ok {
 		if client, ok := room.Clients[clientID]; ok {
 			select {
+			case <-client.Done:
 			case client.Send <- message:
 			default:
-				// Client's send buffer is full
+				// Direct sends carry critical one-client events (renegotiation,
+				// kick, approvals). Dropping them silently leaves the peer in a
+				// stale state, so close the connection and let reconnect repair it.
+				client.closeOnce.Do(func() {
+					close(client.Done)
+				})
+				if client.Conn != nil {
+					client.Conn.Close()
+				}
 			}
 		}
 	}
