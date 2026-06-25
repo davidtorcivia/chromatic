@@ -8,6 +8,8 @@ class FakePublisherPeerConnection {
     connectionState: RTCPeerConnectionState = 'new';
     signalingState: RTCSignalingState = 'stable';
     configurationHistory: RTCConfiguration[] = [];
+    addedTracks: MediaStreamTrack[] = [];
+    closed = false;
 
     async createOffer(): Promise<RTCSessionDescriptionInit> {
         return { type: 'offer', sdp: 'publisher-offer' };
@@ -27,7 +29,15 @@ class FakePublisherPeerConnection {
         this.configurationHistory.push(configuration);
     }
 
-    close() {}
+    addTrack(track: MediaStreamTrack): RTCRtpSender {
+        this.addedTracks.push(track);
+        return {} as RTCRtpSender;
+    }
+
+    close() {
+        this.closed = true;
+        this.connectionState = 'closed';
+    }
 }
 
 class FakeSubscriberPeerConnection {
@@ -150,6 +160,51 @@ describe('WebRTCManager publisher signaling', () => {
         expect(sent.map((msg) => msg.type)).toContain('publish:offer');
         expect(sent.map((msg) => msg.type)).not.toContain('publish:candidate');
         expect(managerInternals.ensurePublisher()).not.toBe(pc);
+    });
+
+    it('rebuilds a live publisher after a short persistent disconnect', async () => {
+        vi.useFakeTimers();
+        vi.stubGlobal('RTCPeerConnection', FakePublisherPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const manager = newManager((type, payload) => {
+            sent.push({ type, payload });
+        });
+
+        const audioTrack = { kind: 'audio', readyState: 'live' } as MediaStreamTrack;
+        const stream = {
+            getAudioTracks: () => [audioTrack],
+            getVideoTracks: () => [],
+            getTracks: () => [audioTrack]
+        } as unknown as MediaStream;
+
+        const managerInternals = manager as unknown as {
+            ensurePublisher(): FakePublisherPeerConnection;
+            negotiatePublisher(): Promise<boolean>;
+            localStream: MediaStream | null;
+            publisherPc: FakePublisherPeerConnection | null;
+        };
+
+        managerInternals.localStream = stream;
+        const oldPc = managerInternals.ensurePublisher();
+        oldPc.addTrack(audioTrack);
+
+        await managerInternals.negotiatePublisher();
+        sent.length = 0;
+
+        oldPc.connectionState = 'disconnected';
+        oldPc.onconnectionstatechange?.();
+        await vi.advanceTimersByTimeAsync(1999);
+
+        expect(sent).toEqual([]);
+        expect(managerInternals.publisherPc).toBe(oldPc);
+
+        await vi.advanceTimersByTimeAsync(1);
+
+        expect(oldPc.closed).toBe(true);
+        expect(managerInternals.publisherPc).not.toBe(oldPc);
+        expect(managerInternals.publisherPc?.addedTracks).toEqual([audioTrack]);
+        expect(sent.map((msg) => msg.type)).toEqual(['publish:offer', 'publish:candidate']);
     });
 });
 

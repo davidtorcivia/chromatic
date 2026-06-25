@@ -92,10 +92,12 @@ export class WebRTCManager {
     private pendingPublisherCandidates: RTCIceCandidateInit[] = [];
     // Watchdog: rebuilds the publisher if an offer goes unanswered
     private voiceOfferTimer: ReturnType<typeof setTimeout> | null = null;
+    private publisherDisconnectedTimeout: ReturnType<typeof setTimeout> | null = null;
     private static readonly VOICE_OFFER_TIMEOUT_MS = 8000;
     private static readonly RESYNC_MIN_INTERVAL_MS = 250;
     private static readonly DISCONNECTED_ICE_RESTART_MS = 2000;
     private static readonly ICE_RESTART_ANSWER_TIMEOUT_MS = 8000;
+    private static readonly PUBLISHER_DISCONNECTED_REBUILD_MS = 2000;
     // Keep browser playout buffers tight for color-review A/B work. This is
     // a best-effort Chrome hint; unsupported browsers ignore it.
     private static readonly LOW_LATENCY_PLAYOUT_DELAY_SECONDS = 0.05;
@@ -732,8 +734,24 @@ export class WebRTCManager {
         };
         pc.onconnectionstatechange = () => {
             console.log('Publisher connection state:', pc.connectionState);
-            if (pc.connectionState === 'failed' && this.publisherPc === pc) {
+            if (this.publisherPc !== pc) {
+                return;
+            }
+
+            if (pc.connectionState === 'disconnected') {
+                this.clearPublisherDisconnectWatchdog();
+                this.publisherDisconnectedTimeout = setTimeout(() => {
+                    this.publisherDisconnectedTimeout = null;
+                    if (this.publisherPc === pc && pc.connectionState === 'disconnected') {
+                        console.warn('Publisher remained disconnected; rebuilding publisher');
+                        this.rebuildPublisher();
+                    }
+                }, WebRTCManager.PUBLISHER_DISCONNECTED_REBUILD_MS);
+            } else if (pc.connectionState === 'failed') {
+                this.clearPublisherDisconnectWatchdog();
                 this.rebuildPublisher();
+            } else if (pc.connectionState === 'connected' || pc.connectionState === 'closed') {
+                this.clearPublisherDisconnectWatchdog();
             }
         };
         this.publisherPc = pc;
@@ -792,6 +810,7 @@ export class WebRTCManager {
                 this.publisherOfferSent = false;
                 this.pendingPublisherCandidates = [];
                 if (this.publisherPc === pc) {
+                    this.clearPublisherDisconnectWatchdog();
                     try {
                         pc.close();
                     } catch {
@@ -822,6 +841,7 @@ export class WebRTCManager {
     private rebuildPublisher(): void {
         console.warn('Rebuilding publisher peer connection');
         this.clearPublishAnswerWatchdog();
+        this.clearPublisherDisconnectWatchdog();
         const old = this.publisherPc;
         this.publisherPc = null;
         this.publisherOfferSent = false;
@@ -885,6 +905,13 @@ export class WebRTCManager {
         if (this.voiceOfferTimer) {
             clearTimeout(this.voiceOfferTimer);
             this.voiceOfferTimer = null;
+        }
+    }
+
+    private clearPublisherDisconnectWatchdog(): void {
+        if (this.publisherDisconnectedTimeout) {
+            clearTimeout(this.publisherDisconnectedTimeout);
+            this.publisherDisconnectedTimeout = null;
         }
     }
 
@@ -1064,6 +1091,7 @@ export class WebRTCManager {
     // Clean up
     close(): void {
         this.clearPublishAnswerWatchdog();
+        this.clearPublisherDisconnectWatchdog();
 
         if (this.connectionLostTimeout) {
             clearTimeout(this.connectionLostTimeout);
