@@ -471,8 +471,7 @@ export class WebRTCManager {
                     sdp: offer.sdp,
                     offerId
                 })) {
-                    console.warn('ICE restart offer was not sent; clearing pending restart state');
-                    this.resetPeerConnection();
+                    this.failIceRestart('ICE restart offer was not sent; rebuilding subscriber connection');
                     return;
                 }
 
@@ -486,18 +485,10 @@ export class WebRTCManager {
                 console.log('Sent ICE restart offer');
             } catch (err) {
                 console.error('Failed to perform ICE restart:', err);
-                this.iceRestartPending = false;
-                this.iceRestartAttempted = false;
-                this.iceRestartOfferId = null;
-                this.iceRestartOfferSent = false;
-                this.pendingIceRestartCandidates = [];
                 if (this.subscriberCandidateOfferId === offerId) {
                     this.subscriberCandidateOfferId = previousCandidateOfferId;
                 }
-                if (this.iceRestartTimeout) {
-                    clearTimeout(this.iceRestartTimeout);
-                    this.iceRestartTimeout = null;
-                }
+                this.failIceRestart('ICE restart setup failed; rebuilding subscriber connection');
             }
         });
     }

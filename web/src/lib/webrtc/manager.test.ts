@@ -456,6 +456,41 @@ describe('WebRTCManager ICE restart recovery', () => {
         ]);
     });
 
+    it('escalates immediately when the ICE restart offer cannot be sent', async () => {
+        vi.useFakeTimers();
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const onIceRestartFailed = vi.fn();
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: (type, payload) => {
+                sent.push({ type, payload });
+                return type !== 'signal:ice-restart';
+            },
+            onIceRestartFailed
+        });
+
+        const managerInternals = manager as unknown as {
+            createPeerConnection(): void;
+            performIceRestart(): Promise<void>;
+            pc: FakeSubscriberPeerConnection | null;
+        };
+        managerInternals.createPeerConnection();
+
+        await managerInternals.performIceRestart();
+
+        expect(sent).toEqual([
+            { type: 'signal:ice-restart', payload: { sdp: 'ice-restart-offer', offerId: 'ice-restart-1' } }
+        ]);
+        expect(onIceRestartFailed).toHaveBeenCalledTimes(1);
+        expect(managerInternals.pc).toBeNull();
+
+        vi.advanceTimersByTime(8000);
+        expect(onIceRestartFailed).toHaveBeenCalledTimes(1);
+    });
+
     it('ignores stale ICE restart answers from a replaced restart offer', async () => {
         vi.useFakeTimers();
         vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
