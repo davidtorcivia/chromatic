@@ -57,6 +57,12 @@ export interface WebRTCManagerOptions {
     onNegotiationWedged?: () => void;
 }
 
+export interface WebRTCStats {
+    rtt?: number;
+    videoJitterBufferDelay?: number;
+    videoFramesDropped?: number;
+}
+
 export class WebRTCManager {
     private pc: RTCPeerConnection | null = null;
     private subscriberOfferId: string | null = null;
@@ -502,8 +508,10 @@ export class WebRTCManager {
         return this.pc?.connectionState ?? null;
     }
 
-    // Get stats for latency display
-    async getStats(): Promise<{ rtt?: number }> {
+    // Get stats for latency/quality display. RTT is transport-only; inbound
+    // video jitter-buffer delay is the browser-side media buffering we can
+    // actively tune against for low-latency review.
+    async getStats(): Promise<WebRTCStats> {
         if (!this.pc) {
             return {};
         }
@@ -514,6 +522,8 @@ export class WebRTCManager {
         // marked nominated.
         let nominatedRtt: number | undefined;
         let fallbackRtt: number | undefined;
+        let videoJitterBufferDelay: number | undefined;
+        let videoFramesDropped: number | undefined;
 
         stats.forEach(report => {
             if (
@@ -528,9 +538,29 @@ export class WebRTCManager {
                     fallbackRtt = rttMs;
                 }
             }
+
+            if (
+                report.type === 'inbound-rtp' &&
+                (report.kind === 'video' || report.mediaType === 'video')
+            ) {
+                if (
+                    typeof report.jitterBufferDelay === 'number' &&
+                    typeof report.jitterBufferEmittedCount === 'number' &&
+                    report.jitterBufferEmittedCount > 0
+                ) {
+                    videoJitterBufferDelay = (report.jitterBufferDelay / report.jitterBufferEmittedCount) * 1000;
+                }
+                if (typeof report.framesDropped === 'number') {
+                    videoFramesDropped = report.framesDropped;
+                }
+            }
         });
 
-        return { rtt: nominatedRtt ?? fallbackRtt };
+        return {
+            rtt: nominatedRtt ?? fallbackRtt,
+            videoJitterBufferDelay,
+            videoFramesDropped
+        };
     }
 
     // Request microphone access and prepare for sending. Honors the persisted

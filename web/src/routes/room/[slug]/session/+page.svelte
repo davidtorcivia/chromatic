@@ -44,6 +44,7 @@
     let volumePopoverEl = $state<HTMLDivElement | null>(null);
     let participantListEl = $state<HTMLDivElement | null>(null);
     let currentRtt = $state<number | null>(null);
+    let currentVideoBufferDelay = $state<number | null>(null);
     let statsInterval: ReturnType<typeof setInterval> | null = null;
     // Cloudflare TURN credentials default to a 1 h TTL; long color-grading
     // sessions (4–8 h) outlive that. Refresh every 30 min over the existing
@@ -868,6 +869,7 @@
             try {
                 const stats = await webrtcManager.getStats();
                 currentRtt = stats.rtt ?? null;
+                currentVideoBufferDelay = stats.videoJitterBufferDelay ?? null;
             } finally {
                 inFlight = false;
             }
@@ -1170,6 +1172,7 @@
         clearMediaStallTimer();
         clearKeyframeNudge();
         currentRtt = null;
+        currentVideoBufferDelay = null;
         initialOfferHandled = false;
         micAutoEnablePending = false;
         clearMicPromptTimer();
@@ -1577,6 +1580,16 @@
     // B7: connection quality bucket from the existing RTT polling
     let connectionQuality = $derived(
         currentRtt === null ? null : currentRtt < 100 ? "good" : currentRtt < 300 ? "fair" : "poor"
+    );
+    let displayedLatency = $derived(currentVideoBufferDelay ?? currentRtt);
+    let displayedLatencySource = $derived(currentVideoBufferDelay === null ? "Network RTT" : "Video buffer");
+    let displayedLatencyTitle = $derived(
+        currentVideoBufferDelay === null
+            ? `Network RTT: ${Math.round(currentRtt ?? 0)}ms`
+            : `Video buffer: ${Math.round(currentVideoBufferDelay)}ms${currentRtt === null ? "" : `; network RTT: ${Math.round(currentRtt)}ms`}`
+    );
+    let displayedLatencyQuality = $derived(
+        displayedLatency === null ? null : displayedLatency < 100 ? "good" : displayedLatency < 300 ? "fair" : "poor"
     );
     // Surface WS connection trouble instead of leaving the misleading
     // "host hasn't started streaming" copy up forever (BUG 1 UX).
@@ -2258,9 +2271,16 @@
                             <span class="signal-bar"></span>
                         </div>
                     {/if}
-                    {#if isAdmin && currentRtt !== null}
-                        <div class="latency-display" class:good={currentRtt < 100} class:warning={currentRtt >= 100 && currentRtt < 300} class:bad={currentRtt >= 300}>
-                            ~{Math.round(currentRtt)}ms
+                    {#if isAdmin && displayedLatency !== null}
+                        <div
+                            class="latency-display"
+                            class:good={displayedLatencyQuality === "good"}
+                            class:warning={displayedLatencyQuality === "fair"}
+                            class:bad={displayedLatencyQuality === "poor"}
+                            title={displayedLatencyTitle}
+                            aria-label="{displayedLatencySource}: {Math.round(displayedLatency)}ms"
+                        >
+                            ~{Math.round(displayedLatency)}ms
                         </div>
                     {/if}
                 </div>

@@ -41,6 +41,7 @@ class FakeSubscriberPeerConnection {
     closed = false;
     addedCandidates: RTCIceCandidateInit[] = [];
     configurationHistory: RTCConfiguration[] = [];
+    statsReport = new Map<string, unknown>();
 
     async createOffer(options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
         return { type: 'offer', sdp: options?.iceRestart ? 'ice-restart-offer' : 'offer' };
@@ -80,6 +81,10 @@ class FakeSubscriberPeerConnection {
 
     async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
         this.addedCandidates.push(candidate);
+    }
+
+    async getStats(): Promise<Map<string, unknown>> {
+        return this.statsReport;
     }
 
     setConfiguration(configuration: RTCConfiguration): void {
@@ -374,6 +379,38 @@ describe('WebRTCManager subscriber signaling', () => {
 
         expect(managerInternals.pc?.configurationHistory).toEqual([{ iceServers: refreshed }]);
         expect(managerInternals.publisherPc?.configurationHistory).toEqual([{ iceServers: refreshed }]);
+    });
+
+    it('reports transport RTT and inbound video buffer delay from WebRTC stats', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: () => {}
+        });
+
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+        const pc = (manager as unknown as { pc: FakeSubscriberPeerConnection | null }).pc;
+        pc?.statsReport.set('candidate-pair-1', {
+            type: 'candidate-pair',
+            state: 'succeeded',
+            nominated: true,
+            currentRoundTripTime: 0.032
+        });
+        pc?.statsReport.set('inbound-video-1', {
+            type: 'inbound-rtp',
+            kind: 'video',
+            jitterBufferDelay: 0.36,
+            jitterBufferEmittedCount: 12,
+            framesDropped: 2
+        });
+
+        await expect(manager.getStats()).resolves.toEqual({
+            rtt: 32,
+            videoJitterBufferDelay: 30,
+            videoFramesDropped: 2
+        });
     });
 });
 
