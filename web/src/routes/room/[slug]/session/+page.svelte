@@ -68,7 +68,7 @@
     let playNudgeTimer: ReturnType<typeof setTimeout> | null = null;
     let playNudgeAttempts = 0;
     const PLAY_NUDGE_MAX_ATTEMPTS = 3;
-    const PLAY_NUDGE_INTERVAL_MS = 1000;
+    const PLAY_NUDGE_INTERVAL_MS = 350;
     const MEDIA_STALL_GRACE_MS = 750;
     let mediaStallTimer: ReturnType<typeof setTimeout> | null = null;
     // Full re-subscription fallback: when ICE restart can't repair the media
