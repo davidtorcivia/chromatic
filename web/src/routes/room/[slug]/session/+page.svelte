@@ -67,7 +67,7 @@
     let playNudgeTimer: ReturnType<typeof setTimeout> | null = null;
     let playNudgeAttempts = 0;
     const PLAY_NUDGE_MAX_ATTEMPTS = 3;
-    const PLAY_NUDGE_INTERVAL_MS = 2500;
+    const PLAY_NUDGE_INTERVAL_MS = 1000;
     const MEDIA_STALL_GRACE_MS = 750;
     let mediaStallTimer: ReturnType<typeof setTimeout> | null = null;
     // Full re-subscription fallback: when ICE restart can't repair the media
@@ -698,6 +698,11 @@
     function attemptAutoplay() {
         const el = videoElement;
         if (!el) return;
+        // Track binding is the earliest reliable browser-side signal that the
+        // media path exists. Ask for a keyframe immediately so late joiners
+        // and reloads do not sit on a black/connecting frame for the first
+        // nudge interval before the publisher is prodded.
+        webrtcManager?.requestResync();
         el.play()
             .then(() => {
                 needsPlayClick = false;
@@ -807,8 +812,9 @@
     });
 
     // If the stream is bound but never starts rendering, the decoder is most
-    // likely waiting on a keyframe that was lost in flight — ask the
-    // publisher for one (signal:resync → PLI), a few times with backoff.
+    // likely waiting on a keyframe that was lost in flight. attemptAutoplay()
+    // sends the first resync immediately; this loop sends a few quick follow-
+    // ups before escalating to a fresh subscriber.
     function scheduleKeyframeNudge() {
         if (playNudgeTimer) return;
         playNudgeAttempts = 0;
