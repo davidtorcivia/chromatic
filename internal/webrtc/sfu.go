@@ -122,6 +122,7 @@ type RoomTracks struct {
 	AudioTrack               *webrtc.TrackLocalStaticRTP
 	Subscribers              map[string]*Subscriber
 	VoiceSessions            map[string]*VoiceSession               // Participant voice connections (also hosts the server-side mute gate)
+	PendingPublisherICE      map[string][]webrtc.ICECandidateInit   // Publisher ICE that arrived before publish:offer.
 	VoiceRemoteTracks        map[string]*webrtc.TrackRemote         // Active voice remote tracks keyed by participant ID
 	VoiceLocalTracks         map[string]*webrtc.TrackLocalStaticRTP // Relay local tracks for voice fan-out
 	IngestPC                 *webrtc.PeerConnection                 // Reference to ingest PC for PLI requests
@@ -552,8 +553,9 @@ func (s *SFU) GetRoomTracks(roomSlug string) *RoomTracks {
 	}
 
 	room := &RoomTracks{
-		RoomSlug:    roomSlug,
-		Subscribers: make(map[string]*Subscriber),
+		RoomSlug:            roomSlug,
+		Subscribers:         make(map[string]*Subscriber),
+		PendingPublisherICE: make(map[string][]webrtc.ICECandidateInit),
 	}
 	s.rooms[roomSlug] = room
 	return room
@@ -1616,17 +1618,40 @@ func (s *SFU) HandlePublisherOffer(roomSlug, participantID, offerSDP string, onT
 // AddPublisherCandidate adds a trickled ICE candidate from the client to its
 // publisher peer connection.
 func (s *SFU) AddPublisherCandidate(roomSlug, participantID string, candidate webrtc.ICECandidateInit) error {
-	room := s.GetRoomTracksForSlug(roomSlug)
-	if room == nil {
-		return fmt.Errorf("room not found: %s", roomSlug)
-	}
-	room.mu.RLock()
+	room := s.GetRoomTracks(roomSlug)
+
+	room.mu.Lock()
 	vs := room.VoiceSessions[participantID]
-	room.mu.RUnlock()
 	if vs == nil || vs.PeerConnection == nil {
-		return fmt.Errorf("no publisher session for %s", participantID)
+		if room.PendingPublisherICE == nil {
+			room.PendingPublisherICE = make(map[string][]webrtc.ICECandidateInit)
+		}
+		pending := room.PendingPublisherICE[participantID]
+		if len(pending) >= MaxICECandidates {
+			room.mu.Unlock()
+			return fmt.Errorf("too many early publisher ICE candidates from %s", participantID)
+		}
+		room.PendingPublisherICE[participantID] = append(pending, candidate)
+		room.mu.Unlock()
+		return nil
 	}
-	return vs.PeerConnection.AddICECandidate(candidate)
+	pc := vs.PeerConnection
+	room.mu.Unlock()
+
+	return pc.AddICECandidate(candidate)
+}
+
+func (s *SFU) flushPendingPublisherCandidates(room *RoomTracks, participantID string, pc *webrtc.PeerConnection) {
+	room.mu.Lock()
+	pending := room.PendingPublisherICE[participantID]
+	delete(room.PendingPublisherICE, participantID)
+	room.mu.Unlock()
+
+	for _, candidate := range pending {
+		if err := pc.AddICECandidate(candidate); err != nil {
+			log.Printf("Failed to add buffered publisher ICE candidate for %s: %v", participantID, err)
+		}
+	}
 }
 
 // HandleVoiceOffer processes an offer from a client wanting to send media
@@ -1696,6 +1721,7 @@ func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP string, onTrack
 			_ = prev.PeerConnection.Close()
 		}
 	}
+	s.flushPendingPublisherCandidates(room, participantID, pc)
 
 	// Handle connection state. Only act on terminal states — "disconnected" is
 	// transient and can recover. Identity-check so a zombie callback from a
@@ -1743,6 +1769,7 @@ func (s *SFU) removeVoiceSessionIfSame(roomSlug, participantID string, expected 
 		return
 	}
 	delete(room.VoiceSessions, participantID)
+	delete(room.PendingPublisherICE, participantID)
 	delete(room.VoiceRemoteTracks, participantID)
 	delete(room.VoiceLocalTracks, participantID)
 	// Stop the relay goroutine for this participant, if any.

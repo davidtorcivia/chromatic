@@ -620,6 +620,61 @@ func TestSFU_AddSubscriberICECandidate_RoomNotFound(t *testing.T) {
 	}
 }
 
+func TestSFU_AddPublisherCandidate_BuffersBeforeSession(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	participantID := "speaker-1"
+	candidate := webrtc.ICECandidateInit{Candidate: "candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host"}
+
+	if err := sfu.AddPublisherCandidate(roomSlug, participantID, candidate); err != nil {
+		t.Fatalf("early publisher candidate should be buffered: %v", err)
+	}
+
+	room := sfu.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		t.Fatal("room should exist after buffering early publisher candidate")
+	}
+	room.mu.RLock()
+	pending := room.PendingPublisherICE[participantID]
+	room.mu.RUnlock()
+	if len(pending) != 1 {
+		t.Fatalf("expected one buffered publisher candidate, got %d", len(pending))
+	}
+
+	for i := 1; i < MaxICECandidates; i++ {
+		if err := sfu.AddPublisherCandidate(roomSlug, participantID, candidate); err != nil {
+			t.Fatalf("candidate %d unexpectedly rejected: %v", i, err)
+		}
+	}
+	if err := sfu.AddPublisherCandidate(roomSlug, participantID, candidate); err == nil {
+		t.Fatal("expected early publisher candidate over budget to be rejected")
+	}
+
+	room.mu.Lock()
+	room.PendingPublisherICE[participantID] = []webrtc.ICECandidateInit{candidate}
+	room.mu.Unlock()
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create peer connection: %v", err)
+	}
+	defer pc.Close()
+
+	sfu.flushPendingPublisherCandidates(room, participantID, pc)
+
+	room.mu.RLock()
+	_, stillPending := room.PendingPublisherICE[participantID]
+	room.mu.RUnlock()
+	if stillPending {
+		t.Fatal("buffered publisher candidates should be cleared after flush")
+	}
+}
+
 func TestSFU_HandleIceRestart_RoomNotFound(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)
