@@ -109,8 +109,16 @@ func (c *Client) SendJSON(msgType string, payload interface{}) error {
 		// Client disconnected, don't send
 	case c.Send <- msgBytes:
 	default:
-		// Buffer full, message dropped
-		log.Printf("Send buffer full for client %s", c.ID)
+		// Direct JSON sends are used for critical state/signaling. Dropping
+		// them silently can leave the browser stuck with stale WebRTC state,
+		// so close the connection and let reconnect rebuild a consistent path.
+		log.Printf("Send buffer full for client %s; closing connection", c.ID)
+		c.closeOnce.Do(func() {
+			close(c.Done)
+		})
+		if c.Conn != nil {
+			c.Conn.Close()
+		}
 	}
 
 	return nil

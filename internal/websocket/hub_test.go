@@ -411,6 +411,32 @@ func TestHub_SendToFullBufferClosesClient(t *testing.T) {
 	}
 }
 
+func TestClient_SendJSONFullBufferClosesClient(t *testing.T) {
+	client := newTestClient("client-1", "Alice", "test-room", nil)
+	client.Send = make(chan []byte, 1)
+	client.Send <- []byte(`{"type":"queued"}`)
+
+	if err := client.SendJSON("signal:offer", map[string]string{"sdp": "offer"}); err != nil {
+		t.Fatalf("SendJSON failed: %v", err)
+	}
+
+	select {
+	case <-client.Done:
+		// Expected: critical direct JSON sends must not disappear silently.
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("full SendJSON buffer did not close the client")
+	}
+
+	select {
+	case msg := <-client.Send:
+		if string(msg) != `{"type":"queued"}` {
+			t.Fatalf("expected original queued message, got %s", msg)
+		}
+	default:
+		t.Fatal("expected original queued message to remain")
+	}
+}
+
 func TestHub_GetRoomClients(t *testing.T) {
 	hub := NewHub()
 	go hub.Run()
