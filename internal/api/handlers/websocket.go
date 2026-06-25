@@ -466,7 +466,8 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 // audio → voice relay fan-out, video → screen share relay fan-out.
 func (h *WebSocketHandler) handlePublishOffer(client *websocket.Client, payload json.RawMessage) {
 	var data struct {
-		SDP string `json:"sdp"`
+		SDP     string `json:"sdp"`
+		OfferID string `json:"offerId"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil || data.SDP == "" {
 		logger.Warn("Invalid publish offer", "participant_id", client.ID)
@@ -495,9 +496,13 @@ func (h *WebSocketHandler) handlePublishOffer(client *websocket.Client, payload 
 		return
 	}
 
-	client.SendJSON("publish:answer", map[string]interface{}{
+	response := map[string]interface{}{
 		"sdp": answer,
-	})
+	}
+	if data.OfferID != "" {
+		response["offerId"] = data.OfferID
+	}
+	client.SendJSON("publish:answer", response)
 	logger.Debug("Publisher negotiated", "participant_id", client.ID, "room", roomSlug)
 }
 

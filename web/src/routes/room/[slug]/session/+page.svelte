@@ -298,9 +298,9 @@
         // Publisher PC answers (mic + screen share ride a dedicated
         // client-offers-only connection).
         session.onMessage("publish:answer", async (payload: unknown) => {
-            const data = payload as { sdp: string };
+            const data = payload as { sdp: string; offerId?: string };
             try {
-                if (webrtcManager) await webrtcManager.handlePublishAnswer(data.sdp);
+                if (webrtcManager) await webrtcManager.handlePublishAnswer(data.sdp, data.offerId);
             } catch (err) {
                 console.error('Failed to handle publish answer:', err);
             }

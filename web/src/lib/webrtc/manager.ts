@@ -89,6 +89,8 @@ export class WebRTCManager {
     // with the server as sole offerer. See ensurePublisher().
     private publisherPc: RTCPeerConnection | null = null;
     private publisherOfferSent: boolean = false;
+    private publisherOfferCounter = 0;
+    private publisherOfferId: string | null = null;
     private pendingPublisherCandidates: RTCIceCandidateInit[] = [];
     // Watchdog: rebuilds the publisher if an offer goes unanswered
     private voiceOfferTimer: ReturnType<typeof setTimeout> | null = null;
@@ -786,9 +788,11 @@ export class WebRTCManager {
             try {
                 this.publisherOfferSent = false;
                 this.pendingPublisherCandidates = [];
+                const offerId = `publish-${++this.publisherOfferCounter}`;
+                this.publisherOfferId = offerId;
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
-                if (!this.sendSignal('publish:offer', { sdp: offer.sdp })) {
+                if (!this.sendSignal('publish:offer', { sdp: offer.sdp, offerId })) {
                     throw new Error('publisher offer send failed');
                 }
                 this.publisherOfferSent = true;
@@ -808,6 +812,7 @@ export class WebRTCManager {
                     // diagnostics must never throw
                 }
                 this.publisherOfferSent = false;
+                this.publisherOfferId = null;
                 this.pendingPublisherCandidates = [];
                 if (this.publisherPc === pc) {
                     this.clearPublisherDisconnectWatchdog();
@@ -826,12 +831,21 @@ export class WebRTCManager {
     }
 
     // Apply the server's answer to the publisher offer.
-    async handlePublishAnswer(sdp: string): Promise<void> {
+    async handlePublishAnswer(sdp: string, offerId?: string): Promise<void> {
         return this.enqueueSignaling(async () => {
             const pc = this.publisherPc;
             if (!pc) return;
+            if (offerId && this.publisherOfferId && offerId !== this.publisherOfferId) {
+                console.warn('Ignoring stale publisher answer', { offerId });
+                return;
+            }
+            if (pc.signalingState !== 'have-local-offer') {
+                console.warn('Ignoring publisher answer with no local offer pending', { signalingState: pc.signalingState });
+                return;
+            }
             await pc.setRemoteDescription({ type: 'answer', sdp });
             this.clearPublishAnswerWatchdog();
+            this.publisherOfferId = null;
             console.log('Publisher answer applied');
         });
     }
@@ -845,6 +859,7 @@ export class WebRTCManager {
         const old = this.publisherPc;
         this.publisherPc = null;
         this.publisherOfferSent = false;
+        this.publisherOfferId = null;
         this.pendingPublisherCandidates = [];
         this.audioSender = null;
         this.screenShareSender = null;
@@ -1133,6 +1148,7 @@ export class WebRTCManager {
                 // already closed
             }
             this.publisherPc = null;
+            this.publisherOfferId = null;
         }
     }
 }

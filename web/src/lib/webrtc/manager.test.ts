@@ -16,6 +16,7 @@ class FakePublisherPeerConnection {
     }
 
     async setLocalDescription(): Promise<void> {
+        this.signalingState = 'have-local-offer';
         this.onicecandidate?.({
             candidate: {
                 candidate: 'candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host',
@@ -23,6 +24,15 @@ class FakePublisherPeerConnection {
                 sdpMLineIndex: 0
             }
         });
+    }
+
+    async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
+        if (description.type === 'answer') {
+            if (this.signalingState !== 'have-local-offer') {
+                throw new Error(`cannot apply answer in ${this.signalingState}`);
+            }
+            this.signalingState = 'stable';
+        }
     }
 
     setConfiguration(configuration: RTCConfiguration): void {
@@ -136,6 +146,7 @@ describe('WebRTCManager publisher signaling', () => {
 
         expect(negotiated).toBe(true);
         expect(sent.map((msg) => msg.type)).toEqual(['publish:offer', 'publish:candidate']);
+        expect(sent[0].payload).toEqual({ sdp: 'publisher-offer', offerId: 'publish-1' });
     });
 
     it('does not flush publisher ICE candidates when the offer send fails', async () => {
@@ -205,6 +216,50 @@ describe('WebRTCManager publisher signaling', () => {
         expect(managerInternals.publisherPc).not.toBe(oldPc);
         expect(managerInternals.publisherPc?.addedTracks).toEqual([audioTrack]);
         expect(sent.map((msg) => msg.type)).toEqual(['publish:offer', 'publish:candidate']);
+        expect(sent[0].payload).toEqual({ sdp: 'publisher-offer', offerId: 'publish-2' });
+    });
+
+    it('ignores stale publisher answers from a replaced offer', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakePublisherPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const manager = newManager((type, payload) => {
+            sent.push({ type, payload });
+        });
+
+        const managerInternals = manager as unknown as {
+            ensurePublisher(): FakePublisherPeerConnection;
+            negotiatePublisher(): Promise<boolean>;
+            rebuildPublisher(): void;
+            localStream: MediaStream | null;
+            publisherPc: FakePublisherPeerConnection | null;
+        };
+
+        const audioTrack = { kind: 'audio', readyState: 'live' } as MediaStreamTrack;
+        managerInternals.localStream = {
+            getAudioTracks: () => [audioTrack],
+            getVideoTracks: () => [],
+            getTracks: () => [audioTrack]
+        } as unknown as MediaStream;
+
+        const oldPc = managerInternals.ensurePublisher();
+        oldPc.addTrack(audioTrack);
+        await managerInternals.negotiatePublisher();
+        expect(sent[0].payload).toEqual({ sdp: 'publisher-offer', offerId: 'publish-1' });
+
+        managerInternals.rebuildPublisher();
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        const replacementPc = managerInternals.publisherPc;
+        expect(replacementPc).not.toBe(oldPc);
+        expect(sent[sent.length - 2]?.payload).toEqual({ sdp: 'publisher-offer', offerId: 'publish-2' });
+
+        await manager.handlePublishAnswer('stale-answer', 'publish-1');
+
+        expect(replacementPc?.signalingState).toBe('have-local-offer');
+
+        await manager.handlePublishAnswer('fresh-answer', 'publish-2');
+
+        expect(replacementPc?.signalingState).toBe('stable');
     });
 });
 
