@@ -446,9 +446,10 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 	// Wire the deferred-renegotiation push: tracks attached while another
 	// offer/answer exchange was in flight get their follow-up offer sent
 	// here once signaling settles, instead of being dropped.
-	h.sfu.SetSubscriberRenegotiationCallback(roomSlug, client.ID, func(sdp string) {
+	h.sfu.SetSubscriberRenegotiationCallback(roomSlug, client.ID, func(sdp, offerID string) {
 		client.SendJSON("signal:renegotiate", map[string]interface{}{
-			"sdp": sdp,
+			"sdp":     sdp,
+			"offerId": offerID,
 		})
 		logger.Debug("Sent deferred renegotiation offer", "participant_id", client.ID, "room", roomSlug)
 	})
@@ -1186,7 +1187,7 @@ func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID str
 		}
 
 		go func(c *websocket.Client) {
-			offerSDP, err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, c.ID, voiceOwnerID, localTrack)
+			offerSDP, offerID, err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, c.ID, voiceOwnerID, localTrack)
 			if err != nil {
 				logger.Warn("Failed to add voice track to subscriber", "subscriber_id", c.ID, "source_id", voiceOwnerID, "error", err)
 				return
@@ -1200,6 +1201,7 @@ func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID str
 
 			c.SendJSON("signal:renegotiate", map[string]interface{}{
 				"sdp":           offerSDP,
+				"offerId":       offerID,
 				"participantId": voiceOwnerID,
 			})
 
@@ -1298,7 +1300,8 @@ func (h *WebSocketHandler) handleIceRestart(client *websocket.Client, payload js
 
 func (h *WebSocketHandler) handleRenegotiateAnswer(client *websocket.Client, payload json.RawMessage) {
 	var data struct {
-		SDP string `json:"sdp"`
+		SDP     string `json:"sdp"`
+		OfferID string `json:"offerId"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		logger.Warn("Invalid renegotiate answer", "participant_id", client.ID, "error", err)
@@ -1308,7 +1311,11 @@ func (h *WebSocketHandler) handleRenegotiateAnswer(client *websocket.Client, pay
 	logger.Debug("Processing renegotiation answer", "participant_id", client.ID, "room", client.RoomSlug)
 
 	// Process the renegotiation answer
-	if err := h.sfu.HandleRenegotiationAnswer(client.RoomSlug, client.ID, data.SDP); err != nil {
+	if err := h.sfu.HandleRenegotiationAnswer(client.RoomSlug, client.ID, data.SDP, data.OfferID); err != nil {
+		if errors.Is(err, webrtc.ErrStaleRenegotiationAnswer) {
+			logger.Debug("Ignored stale renegotiation answer", "participant_id", client.ID, "offer_id", data.OfferID)
+			return
+		}
 		logger.Error("Failed to handle renegotiation answer", "participant_id", client.ID, "error", err)
 		return
 	}
@@ -1734,7 +1741,7 @@ func (h *WebSocketHandler) forwardScreenShareTrack(roomSlug, participantID strin
 			continue
 		}
 
-		offerSDP, err := h.sfu.AddScreenShareTrackToSubscriber(roomSlug, client.ID, participantID, relayTrack)
+		offerSDP, offerID, err := h.sfu.AddScreenShareTrackToSubscriber(roomSlug, client.ID, participantID, relayTrack)
 		if err != nil {
 			logger.Warn("Failed to add screen share track to subscriber", "subscriber_id", client.ID, "source_id", participantID, "error", err)
 			continue
@@ -1746,7 +1753,8 @@ func (h *WebSocketHandler) forwardScreenShareTrack(roomSlug, participantID strin
 		}
 
 		client.SendJSON("signal:renegotiate", map[string]interface{}{
-			"sdp": offerSDP,
+			"sdp":     offerSDP,
+			"offerId": offerID,
 		})
 	}
 
@@ -1773,7 +1781,7 @@ func (h *WebSocketHandler) forwardScreenShareTrack(roomSlug, participantID strin
 
 // renegotiateSubscriber creates a renegotiation offer for a subscriber and sends it
 func (h *WebSocketHandler) renegotiateSubscriber(roomSlug, subscriberID string) {
-	offerSDP, err := h.sfu.RenegotiateSubscriber(roomSlug, subscriberID)
+	offerSDP, offerID, err := h.sfu.RenegotiateSubscriber(roomSlug, subscriberID)
 	if err != nil {
 		logger.Warn("Failed to renegotiate subscriber", "subscriber_id", subscriberID, "error", err)
 		return
@@ -1782,7 +1790,8 @@ func (h *WebSocketHandler) renegotiateSubscriber(roomSlug, subscriberID string) 
 	client := h.hub.GetClient(roomSlug, subscriberID)
 	if client != nil {
 		client.SendJSON("signal:renegotiate", map[string]interface{}{
-			"sdp": offerSDP,
+			"sdp":     offerSDP,
+			"offerId": offerID,
 		})
 	}
 }

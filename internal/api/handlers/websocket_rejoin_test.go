@@ -353,7 +353,8 @@ func (b *browserSim) handleSignal(msg wsTestMessage) error {
 			}
 		}
 		var data struct {
-			SDP string `json:"sdp"`
+			SDP     string `json:"sdp"`
+			OfferID string `json:"offerId"`
 		}
 		json.Unmarshal(msg.Payload, &data)
 		if b.pc.SignalingState() == pionwebrtc.SignalingStateHaveLocalOffer {
@@ -374,9 +375,9 @@ func (b *browserSim) handleSignal(msg wsTestMessage) error {
 			return err
 		}
 		if msg.Type == "signal:offer" {
-			b.send("signal:answer", map[string]interface{}{"sdp": answer.SDP})
+			b.send("signal:answer", map[string]interface{}{"sdp": answer.SDP, "offerId": data.OfferID})
 		} else {
-			b.send("signal:renegotiate-answer", map[string]interface{}{"sdp": answer.SDP})
+			b.send("signal:renegotiate-answer", map[string]interface{}{"sdp": answer.SDP, "offerId": data.OfferID})
 		}
 	case "signal:voice-answer", "signal:answer":
 		var data struct {

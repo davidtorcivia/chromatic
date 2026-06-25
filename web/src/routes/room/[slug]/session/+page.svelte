@@ -311,9 +311,9 @@
         });
 
         session.onMessage("signal:renegotiate", async (payload: unknown) => {
-            const data = payload as { sdp: string; participantId?: string };
+            const data = payload as { sdp: string; participantId?: string; offerId?: string };
             try {
-                if (webrtcManager) await webrtcManager.handleRenegotiation(data.sdp, data.participantId);
+                if (webrtcManager) await webrtcManager.handleRenegotiation(data.sdp, data.participantId, data.offerId);
             } catch (err) {
                 console.error('Failed to handle renegotiation:', err);
             }

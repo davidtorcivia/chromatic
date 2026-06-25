@@ -169,4 +169,26 @@ describe('WebRTCManager subscriber signaling', () => {
 
         expect(sent).toEqual([{ type: 'signal:answer', payload: { sdp: 'subscriber-answer', offerId: 'offer-123' } }]);
     });
+
+    it('echoes the server offer ID with the renegotiation answer', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: (type, payload) => {
+                sent.push({ type, payload });
+            }
+        });
+
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+        sent.length = 0;
+
+        await manager.handleRenegotiation('renegotiation-offer', 'speaker-1', 'renegotiate-456');
+
+        expect(sent).toEqual([
+            { type: 'signal:renegotiate-answer', payload: { sdp: 'subscriber-answer', offerId: 'renegotiate-456' } }
+        ]);
+    });
 });

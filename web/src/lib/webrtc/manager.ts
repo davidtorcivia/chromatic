@@ -824,7 +824,7 @@ export class WebRTCManager {
     // Handle server-initiated renegotiation (e.g., when voice tracks are added).
     // The subscriber PC is receive-only with the server as sole offerer, so
     // this is a pure offer→answer exchange — no glare, no rollbacks.
-    async handleRenegotiation(sdp: string, participantId?: string): Promise<void> {
+    async handleRenegotiation(sdp: string, participantId?: string, offerId?: string): Promise<void> {
         return this.enqueueSignaling(async () => {
             if (!this.pc) {
                 console.warn('Received renegotiation but no peer connection');
@@ -839,9 +839,12 @@ export class WebRTCManager {
                 const answer = await this.pc.createAnswer();
                 await this.pc.setLocalDescription(answer);
 
-                if (!this.sendSignal('signal:renegotiate-answer', {
-                    sdp: answer.sdp
-                })) {
+                const payload: { sdp: string | undefined; offerId?: string } = { sdp: answer.sdp };
+                if (offerId) {
+                    payload.offerId = offerId;
+                }
+
+                if (!this.sendSignal('signal:renegotiate-answer', payload)) {
                     console.warn('Failed to send renegotiation answer; resetting subscriber connection');
                     this.resetPeerConnection();
                     return;

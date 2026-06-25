@@ -848,7 +848,7 @@ func TestSFU_RenegotiateSubscriber_RoomNotFound(t *testing.T) {
 	}
 	defer sfu.Shutdown()
 
-	_, err = sfu.RenegotiateSubscriber("nonexistent", "sub-1")
+	_, _, err = sfu.RenegotiateSubscriber("nonexistent", "sub-1")
 	if err == nil {
 		t.Error("expected error for nonexistent room")
 	}
@@ -862,9 +862,39 @@ func TestSFU_HandleRenegotiationAnswer_RoomNotFound(t *testing.T) {
 	}
 	defer sfu.Shutdown()
 
-	err = sfu.HandleRenegotiationAnswer("nonexistent", "sub-1", "")
+	err = sfu.HandleRenegotiationAnswer("nonexistent", "sub-1", "", "")
 	if err == nil {
 		t.Error("expected error for nonexistent room")
+	}
+}
+
+func TestSFU_HandleRenegotiationAnswer_IgnoresStaleOfferID(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	room := sfu.GetRoomTracks(roomSlug)
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create peer connection: %v", err)
+	}
+	defer pc.Close()
+
+	sub := &Subscriber{
+		ID:                   "sub-1",
+		PeerConnection:       pc,
+		done:                 make(chan struct{}),
+		RenegotiationOfferID: "current-offer",
+	}
+	room.AddSubscriber(sub)
+
+	err = sfu.HandleRenegotiationAnswer(roomSlug, "sub-1", "stale answer", "old-offer")
+	if !errors.Is(err, ErrStaleRenegotiationAnswer) {
+		t.Fatalf("expected stale renegotiation answer error, got %v", err)
 	}
 }
 
