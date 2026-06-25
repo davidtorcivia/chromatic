@@ -68,6 +68,8 @@
     let playNudgeAttempts = 0;
     const PLAY_NUDGE_MAX_ATTEMPTS = 3;
     const PLAY_NUDGE_INTERVAL_MS = 2500;
+    const MEDIA_STALL_GRACE_MS = 750;
+    let mediaStallTimer: ReturnType<typeof setTimeout> | null = null;
     // Full re-subscription fallback: when ICE restart can't repair the media
     // path (dead TURN allocation, server-side subscriber gone), ask the server
     // for a brand-new subscriber instead of stranding the viewer.
@@ -718,9 +720,34 @@
     function handleVideoPlaying() {
         isVideoPlaying = true;
         needsPlayClick = false;
+        clearMediaStallTimer();
         clearKeyframeNudge();
         // Media is flowing again — future failures get a fresh retry budget.
         resubscribeAttempts = 0;
+    }
+
+    function handleVideoStalled() {
+        if (!hasStream || needsPlayClick || streamPaused) return;
+
+        // Ask for a keyframe immediately. If playback resumes quickly, the
+        // grace timer is cleared by 'playing' and the user never sees a false
+        // reconnect overlay; if it does not, fall back to the existing
+        // keyframe-nudge -> resubscribe recovery path.
+        webrtcManager?.requestResync();
+        if (mediaStallTimer) return;
+        mediaStallTimer = setTimeout(() => {
+            mediaStallTimer = null;
+            if (!hasStream || needsPlayClick || streamPaused) return;
+            isVideoPlaying = false;
+            scheduleKeyframeNudge();
+        }, MEDIA_STALL_GRACE_MS);
+    }
+
+    function clearMediaStallTimer() {
+        if (mediaStallTimer) {
+            clearTimeout(mediaStallTimer);
+            mediaStallTimer = null;
+        }
     }
 
     // Ask the server for a brand-new subscriber (fresh offer/answer/ICE).
@@ -1126,6 +1153,7 @@
         hasStream = false;
         isVideoPlaying = false;
         needsPlayClick = false;
+        clearMediaStallTimer();
         clearKeyframeNudge();
         currentRtt = null;
         initialOfferHandled = false;
@@ -1692,6 +1720,8 @@
                 playsinline
                 muted={isMuted}
                 onplaying={handleVideoPlaying}
+                onwaiting={handleVideoStalled}
+                onstalled={handleVideoStalled}
             >
                 <track kind="captions" />
             </video>
