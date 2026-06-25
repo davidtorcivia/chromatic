@@ -72,6 +72,8 @@ var ErrStaleSubscriberCandidate = errors.New("stale subscriber candidate")
 
 var ErrStalePublisherCandidate = errors.New("stale publisher candidate")
 
+var ErrStalePublisherOffer = errors.New("stale publisher offer")
+
 // iceGatherTimeout bounds how long we wait for ICE gathering to complete before
 // returning the SDP with whatever candidates we already have. Host/srflx
 // candidates gather quickly and are usually sufficient; relay candidates can
@@ -1706,6 +1708,34 @@ func (s *SFU) HandlePublisherOffer(roomSlug, participantID, offerSDP, offerID st
 	}
 
 	return s.HandleVoiceOffer(roomSlug, participantID, offerSDP, offerID, onTrack)
+}
+
+// AbortPublisherOffer tears down the publisher session created/renegotiated
+// for an offer whose answer could not be delivered. Leaving it alive would
+// make the server think publishing is ready while the browser remains stuck
+// waiting for the missing answer.
+func (s *SFU) AbortPublisherOffer(roomSlug, participantID, offerID string) error {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return fmt.Errorf("room not found: %s", roomSlug)
+	}
+
+	room.mu.RLock()
+	session, ok := room.VoiceSessions[participantID]
+	room.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("publisher session not found: %s", participantID)
+	}
+
+	session.SignalingMu.Lock()
+	if offerID != "" && session.PublisherOfferID != "" && offerID != session.PublisherOfferID {
+		session.SignalingMu.Unlock()
+		return fmt.Errorf("%w: got %s, want %s", ErrStalePublisherOffer, offerID, session.PublisherOfferID)
+	}
+	session.SignalingMu.Unlock()
+
+	s.removeVoiceSessionIfSame(roomSlug, participantID, session)
+	return nil
 }
 
 // AddPublisherCandidate adds a trickled ICE candidate from the client to its

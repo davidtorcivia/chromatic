@@ -512,6 +512,57 @@ func TestSFU_RemoveVoiceSessionIfSame_IgnoresStaleCallback(t *testing.T) {
 	}
 }
 
+func TestSFU_AbortPublisherOffer_RemovesOnlyMatchingOffer(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	participantID := "p1"
+	room := sfu.GetRoomTracks(roomSlug)
+
+	current := &VoiceSession{
+		ParticipantID:    participantID,
+		PublisherOfferID: "publish-2",
+		done:             make(chan struct{}),
+	}
+	room.mu.Lock()
+	if room.VoiceSessions == nil {
+		room.VoiceSessions = make(map[string]*VoiceSession)
+	}
+	room.VoiceSessions[participantID] = current
+	room.mu.Unlock()
+
+	if err := sfu.AbortPublisherOffer(roomSlug, participantID, "publish-1"); !errors.Is(err, ErrStalePublisherOffer) {
+		t.Fatalf("expected stale publisher offer error, got %v", err)
+	}
+	room.mu.RLock()
+	got := room.VoiceSessions[participantID]
+	room.mu.RUnlock()
+	if got != current {
+		t.Fatal("stale publish answer cleanup removed the current publisher")
+	}
+
+	if err := sfu.AbortPublisherOffer(roomSlug, participantID, "publish-2"); err != nil {
+		t.Fatalf("abort current publisher failed: %v", err)
+	}
+	room.mu.RLock()
+	_, stillThere := room.VoiceSessions[participantID]
+	room.mu.RUnlock()
+	if stillThere {
+		t.Fatal("matching publish answer cleanup did not remove publisher")
+	}
+	select {
+	case <-current.done:
+		// closed as expected
+	default:
+		t.Fatal("publisher done channel was not closed")
+	}
+}
+
 func TestSFU_HandlePublisherOffer_WaitsForExistingSignaling(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)

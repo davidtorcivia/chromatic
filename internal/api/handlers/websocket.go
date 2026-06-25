@@ -512,7 +512,13 @@ func (h *WebSocketHandler) handlePublishOffer(client *websocket.Client, payload 
 	if data.OfferID != "" {
 		response["offerId"] = data.OfferID
 	}
-	client.SendJSON("publish:answer", response)
+	if err := client.SendJSON("publish:answer", response); err != nil {
+		logger.Warn("Failed to send publish answer", "participant_id", client.ID, "room", roomSlug, "offer_id", data.OfferID, "error", err)
+		if abortErr := h.sfu.AbortPublisherOffer(roomSlug, client.ID, data.OfferID); abortErr != nil {
+			logger.Warn("Failed to abort undelivered publish offer", "participant_id", client.ID, "room", roomSlug, "offer_id", data.OfferID, "error", abortErr)
+		}
+		return
+	}
 	logger.Debug("Publisher negotiated", "participant_id", client.ID, "room", roomSlug)
 }
 
