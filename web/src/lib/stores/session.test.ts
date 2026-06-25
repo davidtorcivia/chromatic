@@ -48,6 +48,7 @@ describe('SessionStore WebSocket sends', () => {
     });
 
     afterEach(() => {
+        vi.useRealTimers();
         vi.unstubAllGlobals();
     });
 
@@ -93,6 +94,20 @@ describe('SessionStore WebSocket sends', () => {
             type: 'signal:answer',
             payload: { sdp: 'answer-sdp' }
         });
+        store.disconnect();
+    });
+
+    it('retries the first dropped connection in under a third of a second', () => {
+        vi.useFakeTimers();
+        const { store, socket } = connectedStore();
+
+        socket.close(1006, 'abnormal close');
+
+        expect(FakeWebSocket.instances).toHaveLength(1);
+        vi.advanceTimersByTime(199);
+        expect(FakeWebSocket.instances).toHaveLength(1);
+        vi.advanceTimersByTime(101);
+        expect(FakeWebSocket.instances).toHaveLength(2);
         store.disconnect();
     });
 });

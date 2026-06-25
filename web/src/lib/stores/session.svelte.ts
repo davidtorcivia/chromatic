@@ -39,7 +39,9 @@ export interface SessionState {
 }
 
 // Reconnection configuration
-const RECONNECT_BASE_DELAY = 1000; // 1 second
+// Fast first retry keeps live review hiccups short; exponential backoff still
+// ramps quickly if the network or server is genuinely unavailable.
+const RECONNECT_BASE_DELAY = 250; // 200-300ms after jitter on the first retry
 const RECONNECT_MAX_DELAY = 30000; // 30 seconds
 const RECONNECT_MAX_ATTEMPTS = 10;
 
