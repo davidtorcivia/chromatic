@@ -2436,6 +2436,39 @@ func (s *SFU) RenegotiateSubscriber(roomSlug, subscriberID string) (string, stri
 	return offer.SDP, sub.RenegotiationOfferID, nil
 }
 
+// AbortSubscriberRenegotiation retires a subscriber whose server-created
+// renegotiation offer could not be delivered. Pion does not support local SDP
+// rollback here, so keeping the peer connection would leave it wedged in
+// have-local-offer until a reconnect.
+func (s *SFU) AbortSubscriberRenegotiation(roomSlug, subscriberID, offerID string) error {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return fmt.Errorf("room not found: %s", roomSlug)
+	}
+
+	room.mu.RLock()
+	sub, ok := room.Subscribers[subscriberID]
+	room.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("subscriber not found: %s", subscriberID)
+	}
+
+	sub.SignalingMu.Lock()
+
+	if offerID != "" && sub.RenegotiationOfferID != "" && offerID != sub.RenegotiationOfferID {
+		sub.SignalingMu.Unlock()
+		return fmt.Errorf("stale renegotiation offer: got %s, want %s", offerID, sub.RenegotiationOfferID)
+	}
+	if sub.PeerConnection.SignalingState() != webrtc.SignalingStateHaveLocalOffer {
+		sub.SignalingMu.Unlock()
+		return nil
+	}
+	sub.SignalingMu.Unlock()
+
+	room.removeSubscriberIfSame(subscriberID, sub)
+	return nil
+}
+
 // HandleRenegotiationAnswer processes an answer from a subscriber during renegotiation
 func (s *SFU) HandleRenegotiationAnswer(roomSlug, subscriberID, sdpAnswer, offerID string) error {
 	room := s.GetRoomTracksForSlug(roomSlug)

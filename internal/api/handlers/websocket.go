@@ -452,10 +452,16 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 	// offer/answer exchange was in flight get their follow-up offer sent
 	// here once signaling settles, instead of being dropped.
 	h.sfu.SetSubscriberRenegotiationCallback(roomSlug, client.ID, func(sdp, offerID string) {
-		client.SendJSON("signal:renegotiate", map[string]interface{}{
+		if err := client.SendJSON("signal:renegotiate", map[string]interface{}{
 			"sdp":     sdp,
 			"offerId": offerID,
-		})
+		}); err != nil {
+			logger.Warn("Failed to send deferred renegotiation offer", "participant_id", client.ID, "room", roomSlug, "offer_id", offerID, "error", err)
+			if abortErr := h.sfu.AbortSubscriberRenegotiation(roomSlug, client.ID, offerID); abortErr != nil {
+				logger.Warn("Failed to abort undelivered deferred renegotiation", "participant_id", client.ID, "room", roomSlug, "offer_id", offerID, "error", abortErr)
+			}
+			return
+		}
 		logger.Debug("Sent deferred renegotiation offer", "participant_id", client.ID, "room", roomSlug)
 	})
 
@@ -1227,11 +1233,17 @@ func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID str
 				return
 			}
 
-			c.SendJSON("signal:renegotiate", map[string]interface{}{
+			if err := c.SendJSON("signal:renegotiate", map[string]interface{}{
 				"sdp":           offerSDP,
 				"offerId":       offerID,
 				"participantId": voiceOwnerID,
-			})
+			}); err != nil {
+				logger.Warn("Failed to send voice renegotiation offer", "subscriber_id", c.ID, "source_id", voiceOwnerID, "offer_id", offerID, "error", err)
+				if abortErr := h.sfu.AbortSubscriberRenegotiation(roomSlug, c.ID, offerID); abortErr != nil {
+					logger.Warn("Failed to abort undelivered voice renegotiation", "subscriber_id", c.ID, "source_id", voiceOwnerID, "offer_id", offerID, "error", abortErr)
+				}
+				return
+			}
 
 			logger.Debug("Sent renegotiation offer for voice track", "subscriber_id", c.ID, "source_id", voiceOwnerID)
 		}(client)
@@ -1790,10 +1802,16 @@ func (h *WebSocketHandler) forwardScreenShareTrack(roomSlug, participantID strin
 			continue
 		}
 
-		client.SendJSON("signal:renegotiate", map[string]interface{}{
+		if err := client.SendJSON("signal:renegotiate", map[string]interface{}{
 			"sdp":     offerSDP,
 			"offerId": offerID,
-		})
+		}); err != nil {
+			logger.Warn("Failed to send screen share renegotiation offer", "subscriber_id", client.ID, "source_id", participantID, "offer_id", offerID, "error", err)
+			if abortErr := h.sfu.AbortSubscriberRenegotiation(roomSlug, client.ID, offerID); abortErr != nil {
+				logger.Warn("Failed to abort undelivered screen share renegotiation", "subscriber_id", client.ID, "source_id", participantID, "offer_id", offerID, "error", abortErr)
+			}
+			continue
+		}
 	}
 
 	// Broadcast that screen share has started
@@ -1827,9 +1845,14 @@ func (h *WebSocketHandler) renegotiateSubscriber(roomSlug, subscriberID string) 
 
 	client := h.hub.GetClient(roomSlug, subscriberID)
 	if client != nil {
-		client.SendJSON("signal:renegotiate", map[string]interface{}{
+		if err := client.SendJSON("signal:renegotiate", map[string]interface{}{
 			"sdp":     offerSDP,
 			"offerId": offerID,
-		})
+		}); err != nil {
+			logger.Warn("Failed to send renegotiation offer", "subscriber_id", subscriberID, "offer_id", offerID, "error", err)
+			if abortErr := h.sfu.AbortSubscriberRenegotiation(roomSlug, subscriberID, offerID); abortErr != nil {
+				logger.Warn("Failed to abort undelivered renegotiation", "subscriber_id", subscriberID, "offer_id", offerID, "error", abortErr)
+			}
+		}
 	}
 }

@@ -1023,6 +1023,56 @@ func TestSFU_HandleRenegotiationAnswer_IgnoresStaleOfferID(t *testing.T) {
 	}
 }
 
+func TestSFU_AbortSubscriberRenegotiation_RemovesUndeliveredOffer(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	room := sfu.GetRoomTracks(roomSlug)
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create peer connection: %v", err)
+	}
+	defer pc.Close()
+
+	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
+		t.Fatalf("failed to add transceiver: %v", err)
+	}
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("failed to create offer: %v", err)
+	}
+	if err := pc.SetLocalDescription(offer); err != nil {
+		t.Fatalf("failed to set local description: %v", err)
+	}
+
+	sub := &Subscriber{
+		ID:                   "sub-1",
+		PeerConnection:       pc,
+		done:                 make(chan struct{}),
+		RenegotiationOfferID: "renegotiate-1",
+		CandidateID:          "renegotiate-1",
+	}
+	room.AddSubscriber(sub)
+
+	if err := sfu.AbortSubscriberRenegotiation(roomSlug, "sub-1", "renegotiate-1"); err != nil {
+		t.Fatalf("abort failed: %v", err)
+	}
+	if _, ok := room.Subscribers["sub-1"]; ok {
+		t.Fatal("subscriber with undelivered offer was not removed")
+	}
+	select {
+	case <-sub.done:
+		// closed as expected
+	default:
+		t.Fatal("subscriber done channel was not closed")
+	}
+}
+
 func TestRoomTracks_RemoveSubscriberStopsVoiceRelay(t *testing.T) {
 	relayDone := make(chan struct{})
 	room := &RoomTracks{
