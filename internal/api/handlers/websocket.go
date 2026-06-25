@@ -548,6 +548,19 @@ func (h *WebSocketHandler) handleResubscribe(client *websocket.Client) {
 	roomSlug := client.RoomSlug
 	logger.Info("Client requested fresh subscription", "participant_id", client.ID, "room", roomSlug)
 
+	// A resubscribe usually follows a dead ICE path or expired TURN allocation.
+	// Send the current ICE server set immediately before the replacement offer
+	// so the browser updates its RTCPeerConnection config before handling the
+	// fresh SDP. This keeps recovery to one ordered websocket round trip and
+	// avoids racing a separate client-side ice-servers request against the offer.
+	servers := h.sfu.GetICEServers()
+	if err := client.SendJSON("signal:ice-servers", map[string]interface{}{
+		"iceServers": servers,
+	}); err != nil {
+		logger.Warn("Failed to queue ICE servers for resubscribe", "participant_id", client.ID, "room", roomSlug, "error", err)
+		return
+	}
+
 	h.subMu.Lock()
 	st, ok := h.subStates[client]
 	h.subMu.Unlock()

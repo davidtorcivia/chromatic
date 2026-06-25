@@ -161,6 +161,65 @@ func TestWebSocketHandler_InitiateSubscriptionCleansUpWhenOfferNotQueued(t *test
 	}
 }
 
+func TestWebSocketHandler_ResubscribeSendsIceServersBeforeOffer(t *testing.T) {
+	hub := websocket.NewHub()
+	sfu, err := webrtc.NewSFU(&config.Config{})
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	handler := NewWebSocketHandler(nil, hub, sfu, nil, false, []byte("test-secret"), nil)
+	roomSlug := "resubscribe-order-room"
+
+	videoTrack, err := pionwebrtc.NewTrackLocalStaticRTP(
+		pionwebrtc.RTPCodecCapability{MimeType: pionwebrtc.MimeTypeH264, ClockRate: 90000},
+		"video",
+		"stream",
+	)
+	if err != nil {
+		t.Fatalf("failed to create video track: %v", err)
+	}
+	room := sfu.GetRoomTracks(roomSlug)
+	room.VideoTrack = videoTrack
+
+	client := &websocket.Client{
+		ID:       "viewer-1",
+		Name:     "Viewer",
+		RoomSlug: roomSlug,
+		Hub:      hub,
+		Send:     make(chan []byte, 8),
+		Done:     make(chan struct{}),
+	}
+	handler.subStates[client] = &subscriptionState{}
+
+	handler.handleResubscribe(client)
+
+	first := decodeQueuedWSMessage(t, client)
+	second := decodeQueuedWSMessage(t, client)
+	if first.Type != "signal:ice-servers" || second.Type != "signal:offer" {
+		t.Fatalf("expected resubscribe to queue ice servers before offer, got %s then %s", first.Type, second.Type)
+	}
+	if !sfu.HasSubscriber(roomSlug, client.ID) {
+		t.Fatal("resubscribe did not create replacement subscriber")
+	}
+}
+
+func decodeQueuedWSMessage(t *testing.T, client *websocket.Client) websocket.Message {
+	t.Helper()
+	select {
+	case raw := <-client.Send:
+		var msg websocket.Message
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			t.Fatalf("invalid queued websocket message: %v", err)
+		}
+		return msg
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for queued websocket message")
+		return websocket.Message{}
+	}
+}
+
 // startIngest simulates OBS connecting via WHIP: it registers an ingest
 // session with bound local tracks and fires the stream-start hook, mirroring
 // what whip.go does when the publisher PC reaches Connected.

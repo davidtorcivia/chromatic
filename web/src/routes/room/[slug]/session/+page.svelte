@@ -770,9 +770,8 @@
         // connecting overlay until the new subscriber delivers frames.
         isVideoPlaying = false;
         streamError = null;
-        // Stale/expired TURN credentials are a common reason the old path
-        // died; refresh them before the new peer connection is built.
-        session.send("signal:ice-servers-request", {});
+        // The server replies to resubscribe with fresh ICE servers immediately
+        // before the replacement offer, preserving websocket message order.
         session.send("signal:resubscribe", {});
         return true;
     }
