@@ -46,7 +46,7 @@ export interface WebRTCManagerOptions {
     onTrack: (event: RTCTrackEvent) => void;
     onVoiceTrack?: (participantId: string, track: MediaStreamTrack) => void;
     onScreenShareTrack?: (participantId: string, track: MediaStreamTrack) => void;
-    sendSignal: (type: string, payload: unknown) => void;
+    sendSignal: (type: string, payload: unknown) => boolean | void;
     onConnectionStateChange?: (state: RTCPeerConnectionState) => void;
     onIceRestart?: () => void;
     onIceRestartFailed?: () => void;
@@ -93,6 +93,10 @@ export class WebRTCManager {
 
     constructor(options: WebRTCManagerOptions) {
         this.options = options;
+    }
+
+    private sendSignal(type: string, payload: unknown): boolean {
+        return this.options.sendSignal(type, payload) !== false;
     }
 
     // Enqueue an async signaling operation so SDP changes are serialized.
@@ -151,7 +155,11 @@ export class WebRTCManager {
             await pc.setLocalDescription(answer);
             console.log('Created and set local description (answer)');
 
-            this.options.sendSignal('signal:answer', { sdp: answer.sdp });
+            if (!this.sendSignal('signal:answer', { sdp: answer.sdp })) {
+                console.warn('Failed to send WebRTC answer; resetting subscriber connection');
+                this.resetPeerConnection();
+                return;
+            }
 
             // Outgoing media (mic, screen share) lives on the publisher PC,
             // which is independent of subscriber rebuilds — nothing to
@@ -259,7 +267,7 @@ export class WebRTCManager {
         this.pc.onicecandidate = (event) => {
             if (event.candidate) {
                 console.log('Sending ICE candidate to server');
-                this.options.sendSignal('signal:candidate', {
+                this.sendSignal('signal:candidate', {
                     candidate: event.candidate.candidate,
                     sdpMid: event.candidate.sdpMid,
                     sdpMLineIndex: event.candidate.sdpMLineIndex
@@ -378,9 +386,13 @@ export class WebRTCManager {
                 await this.pc.setLocalDescription(offer);
 
                 // Send offer to server for ICE restart
-                this.options.sendSignal('signal:ice-restart', {
+                if (!this.sendSignal('signal:ice-restart', {
                     sdp: offer.sdp
-                });
+                })) {
+                    console.warn('ICE restart offer was not sent; clearing pending restart state');
+                    this.resetPeerConnection();
+                    return;
+                }
 
                 // The restart has genuinely been attempted; a subsequent
                 // 'failed' state now means the restart itself failed.
@@ -402,7 +414,7 @@ export class WebRTCManager {
     // Request a stream resync (forces keyframe from publisher)
     requestResync(): void {
         console.log('Requesting stream resync (keyframe)');
-        this.options.sendSignal('signal:resync', {});
+        this.sendSignal('signal:resync', {});
     }
 
     // Apply a fresh set of ICE servers to the live peer connection AND to the
@@ -601,7 +613,9 @@ export class WebRTCManager {
             // Add new track on the publisher PC and negotiate
             const pub = this.ensurePublisher();
             this.audioSender = pub.addTrack(audioTrack, this.localStream);
-            await this.negotiatePublisher();
+            if (!(await this.negotiatePublisher())) {
+                throw new Error('publisher offer was not sent');
+            }
         }
     }
 
@@ -643,14 +657,14 @@ export class WebRTCManager {
             this.pendingPublisherCandidates.push(candidate);
             return;
         }
-        this.options.sendSignal('publish:candidate', candidate);
+        this.sendSignal('publish:candidate', candidate);
     }
 
     private flushPendingPublisherCandidates(): void {
         const pending = this.pendingPublisherCandidates;
         this.pendingPublisherCandidates = [];
         for (const candidate of pending) {
-            this.options.sendSignal('publish:candidate', candidate);
+            this.sendSignal('publish:candidate', candidate);
         }
     }
 
@@ -668,7 +682,9 @@ export class WebRTCManager {
                 this.pendingPublisherCandidates = [];
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
-                this.options.sendSignal('publish:offer', { sdp: offer.sdp });
+                if (!this.sendSignal('publish:offer', { sdp: offer.sdp })) {
+                    throw new Error('publisher offer send failed');
+                }
                 this.publisherOfferSent = true;
                 this.flushPendingPublisherCandidates();
                 this.startPublishAnswerWatchdog();
@@ -678,7 +694,7 @@ export class WebRTCManager {
                 const e = err as Error;
                 console.error('Failed to negotiate publisher:', err);
                 try {
-                    this.options.sendSignal('client:debug', {
+                    this.sendSignal('client:debug', {
                         event: 'publish-negotiate-failed',
                         detail: `${e?.name ?? 'Error'}: ${e?.message ?? String(err)} (state=${pc.signalingState})`
                     });
@@ -687,6 +703,16 @@ export class WebRTCManager {
                 }
                 this.publisherOfferSent = false;
                 this.pendingPublisherCandidates = [];
+                if (this.publisherPc === pc) {
+                    try {
+                        pc.close();
+                    } catch {
+                        // already closed
+                    }
+                    this.publisherPc = null;
+                    this.audioSender = null;
+                    this.screenShareSender = null;
+                }
                 return false;
             }
         });
@@ -807,9 +833,13 @@ export class WebRTCManager {
                 const answer = await this.pc.createAnswer();
                 await this.pc.setLocalDescription(answer);
 
-                this.options.sendSignal('signal:renegotiate-answer', {
+                if (!this.sendSignal('signal:renegotiate-answer', {
                     sdp: answer.sdp
-                });
+                })) {
+                    console.warn('Failed to send renegotiation answer; resetting subscriber connection');
+                    this.resetPeerConnection();
+                    return;
+                }
 
                 console.log('Sent renegotiation answer');
             } catch (err) {
@@ -825,7 +855,7 @@ export class WebRTCManager {
     private shareDebug(event: string, detail = ''): void {
         console.log(`[share] ${event}`, detail);
         try {
-            this.options.sendSignal('client:debug', { event: `share:${event}`, detail });
+            this.sendSignal('client:debug', { event: `share:${event}`, detail });
         } catch {
             // never let diagnostics break the share flow
         }

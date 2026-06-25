@@ -54,4 +54,28 @@ describe('WebRTCManager publisher signaling', () => {
         expect(negotiated).toBe(true);
         expect(sent.map((msg) => msg.type)).toEqual(['publish:offer', 'publish:candidate']);
     });
+
+    it('does not flush publisher ICE candidates when the offer send fails', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakePublisherPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const manager = newManager((type, payload) => {
+            sent.push({ type, payload });
+            return type !== 'publish:offer';
+        });
+
+        const managerInternals = manager as unknown as {
+            ensurePublisher(): RTCPeerConnection;
+            negotiatePublisher(): Promise<boolean>;
+        };
+        const pc = managerInternals.ensurePublisher();
+        expect(pc).toBeTruthy();
+
+        const negotiated = await managerInternals.negotiatePublisher();
+
+        expect(negotiated).toBe(false);
+        expect(sent.map((msg) => msg.type)).toContain('publish:offer');
+        expect(sent.map((msg) => msg.type)).not.toContain('publish:candidate');
+        expect(managerInternals.ensurePublisher()).not.toBe(pc);
+    });
 });
