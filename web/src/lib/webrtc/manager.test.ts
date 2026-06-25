@@ -185,9 +185,39 @@ describe('WebRTCManager ICE restart recovery', () => {
         expect(sent).toEqual([{ type: 'signal:ice-restart', payload: { sdp: 'ice-restart-offer' } }]);
         expect(onIceRestartFailed).not.toHaveBeenCalled();
 
-        vi.advanceTimersByTime(15000);
+        vi.advanceTimersByTime(7999);
+        expect(onIceRestartFailed).not.toHaveBeenCalled();
+
+        vi.advanceTimersByTime(1);
 
         expect(onIceRestartFailed).toHaveBeenCalledTimes(1);
+    });
+
+    it('starts an ICE restart after a short persistent disconnect', async () => {
+        vi.useFakeTimers();
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: (type, payload) => {
+                sent.push({ type, payload });
+            }
+        });
+
+        const managerInternals = manager as unknown as {
+            createPeerConnection(): void;
+            pc: FakeSubscriberPeerConnection | null;
+        };
+        managerInternals.createPeerConnection();
+
+        managerInternals.pc?.onconnectionstatechange?.();
+        await vi.advanceTimersByTimeAsync(1999);
+        expect(sent).toEqual([]);
+
+        await vi.advanceTimersByTimeAsync(1);
+        expect(sent).toEqual([{ type: 'signal:ice-restart', payload: { sdp: 'ice-restart-offer' } }]);
     });
 
     it('rolls back a pending ICE restart when server renegotiation arrives', async () => {
@@ -223,7 +253,7 @@ describe('WebRTCManager ICE restart recovery', () => {
             { type: 'signal:renegotiate-answer', payload: { sdp: 'subscriber-answer', offerId: 'renegotiate-456' } }
         ]);
 
-        vi.advanceTimersByTime(15000);
+        vi.advanceTimersByTime(8000);
         expect(onIceRestartFailed).not.toHaveBeenCalled();
     });
 });

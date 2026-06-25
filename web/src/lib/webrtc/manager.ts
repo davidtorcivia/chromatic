@@ -94,6 +94,8 @@ export class WebRTCManager {
     private voiceOfferTimer: ReturnType<typeof setTimeout> | null = null;
     private static readonly VOICE_OFFER_TIMEOUT_MS = 8000;
     private static readonly RESYNC_MIN_INTERVAL_MS = 250;
+    private static readonly DISCONNECTED_ICE_RESTART_MS = 2000;
+    private static readonly ICE_RESTART_ANSWER_TIMEOUT_MS = 8000;
     // Keep browser playout buffers tight for color-review A/B work. This is
     // a best-effort Chrome hint; unsupported browsers ignore it.
     private static readonly LOW_LATENCY_PLAYOUT_DELAY_SECONDS = 0.05;
@@ -324,9 +326,9 @@ export class WebRTCManager {
                         console.log('Connection still disconnected, attempting ICE restart');
                         this.performIceRestart();
                     }
-                }, 5000);
+                }, WebRTCManager.DISCONNECTED_ICE_RESTART_MS);
             } else if (state === 'failed') {
-                // Don't let the 5s 'disconnected' timer trigger a second
+                // Don't let the 'disconnected' timer trigger a second
                 // restart on top of the one handled here.
                 if (this.connectionLostTimeout) {
                     clearTimeout(this.connectionLostTimeout);
@@ -409,9 +411,9 @@ export class WebRTCManager {
         this.iceRestartTimeout = setTimeout(() => {
             this.iceRestartTimeout = null;
             if (this.iceRestartPending) {
-                this.failIceRestart('ICE restart answer not received within 15s');
+                this.failIceRestart('ICE restart answer not received within 8s');
             }
-        }, 15000);
+        }, WebRTCManager.ICE_RESTART_ANSWER_TIMEOUT_MS);
 
         return this.enqueueSignaling(async () => {
             if (!this.pc) return;
