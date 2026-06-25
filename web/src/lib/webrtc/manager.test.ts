@@ -25,6 +25,28 @@ class FakePublisherPeerConnection {
     close() {}
 }
 
+class FakeSubscriberPeerConnection {
+    ontrack: ((event: RTCTrackEvent) => void) | null = null;
+    onicecandidate: ((event: { candidate: RTCIceCandidateInit | null }) => void) | null = null;
+    onconnectionstatechange: (() => void) | null = null;
+    oniceconnectionstatechange: (() => void) | null = null;
+    onicegatheringstatechange: (() => void) | null = null;
+    connectionState: RTCPeerConnectionState = 'disconnected';
+    signalingState: RTCSignalingState = 'stable';
+    closed = false;
+
+    async createOffer(options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
+        return { type: 'offer', sdp: options?.iceRestart ? 'ice-restart-offer' : 'offer' };
+    }
+
+    async setLocalDescription(): Promise<void> {}
+
+    close() {
+        this.closed = true;
+        this.connectionState = 'closed';
+    }
+}
+
 function newManager(sendSignal: WebRTCManagerOptions['sendSignal']) {
     return new WebRTCManager({
         iceServers: [],
@@ -35,6 +57,7 @@ function newManager(sendSignal: WebRTCManagerOptions['sendSignal']) {
 
 describe('WebRTCManager publisher signaling', () => {
     afterEach(() => {
+        vi.useRealTimers();
         vi.unstubAllGlobals();
     });
 
@@ -77,5 +100,43 @@ describe('WebRTCManager publisher signaling', () => {
         expect(sent.map((msg) => msg.type)).toContain('publish:offer');
         expect(sent.map((msg) => msg.type)).not.toContain('publish:candidate');
         expect(managerInternals.ensurePublisher()).not.toBe(pc);
+    });
+});
+
+describe('WebRTCManager ICE restart recovery', () => {
+    afterEach(() => {
+        vi.useRealTimers();
+        vi.unstubAllGlobals();
+    });
+
+    it('escalates when an ICE restart offer receives no answer', async () => {
+        vi.useFakeTimers();
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const onIceRestartFailed = vi.fn();
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: (type, payload) => {
+                sent.push({ type, payload });
+            },
+            onIceRestartFailed
+        });
+
+        const managerInternals = manager as unknown as {
+            createPeerConnection(): void;
+            performIceRestart(): Promise<void>;
+        };
+        managerInternals.createPeerConnection();
+
+        await managerInternals.performIceRestart();
+
+        expect(sent).toEqual([{ type: 'signal:ice-restart', payload: { sdp: 'ice-restart-offer' } }]);
+        expect(onIceRestartFailed).not.toHaveBeenCalled();
+
+        vi.advanceTimersByTime(15000);
+
+        expect(onIceRestartFailed).toHaveBeenCalledTimes(1);
     });
 });

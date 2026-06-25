@@ -312,10 +312,7 @@ export class WebRTCManager {
                     if (this.iceRestartAttempted) {
                         // A restart offer was actually sent and the connection
                         // failed again - genuinely unrecoverable.
-                        console.log('ICE restart failed, connection unrecoverable');
-                        this.iceRestartPending = false;
-                        this.iceRestartAttempted = false;
-                        this.options.onIceRestartFailed?.();
+                        this.failIceRestart('ICE restart failed, connection unrecoverable');
                     } else {
                         // Restart is still being prepared (offer not yet
                         // sent) - don't declare failure prematurely.
@@ -373,8 +370,7 @@ export class WebRTCManager {
         this.iceRestartTimeout = setTimeout(() => {
             this.iceRestartTimeout = null;
             if (this.iceRestartPending) {
-                console.warn('ICE restart answer not received within 15s; clearing pending flag to allow retry');
-                this.iceRestartPending = false;
+                this.failIceRestart('ICE restart answer not received within 15s');
             }
         }, 15000);
 
@@ -409,6 +405,12 @@ export class WebRTCManager {
                 }
             }
         });
+    }
+
+    private failIceRestart(message: string): void {
+        console.warn(message);
+        this.resetPeerConnection();
+        this.options.onIceRestartFailed?.();
     }
 
     // Request a stream resync (forces keyframe from publisher)
