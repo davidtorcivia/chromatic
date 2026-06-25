@@ -81,6 +81,8 @@ export class WebRTCManager {
     // always the offerer here; the subscriber PC (this.pc) is receive-only
     // with the server as sole offerer. See ensurePublisher().
     private publisherPc: RTCPeerConnection | null = null;
+    private publisherOfferSent: boolean = false;
+    private pendingPublisherCandidates: RTCIceCandidateInit[] = [];
     // Watchdog: rebuilds the publisher if an offer goes unanswered
     private voiceOfferTimer: ReturnType<typeof setTimeout> | null = null;
     private static readonly VOICE_OFFER_TIMEOUT_MS = 8000;
@@ -619,7 +621,7 @@ export class WebRTCManager {
         const pc = new RTCPeerConnection({ iceServers: this.options.iceServers });
         pc.onicecandidate = (event) => {
             if (event.candidate) {
-                this.options.sendSignal('publish:candidate', {
+                this.sendPublisherCandidate({
                     candidate: event.candidate.candidate,
                     sdpMid: event.candidate.sdpMid,
                     sdpMLineIndex: event.candidate.sdpMLineIndex
@@ -636,6 +638,22 @@ export class WebRTCManager {
         return pc;
     }
 
+    private sendPublisherCandidate(candidate: RTCIceCandidateInit): void {
+        if (!this.publisherOfferSent) {
+            this.pendingPublisherCandidates.push(candidate);
+            return;
+        }
+        this.options.sendSignal('publish:candidate', candidate);
+    }
+
+    private flushPendingPublisherCandidates(): void {
+        const pending = this.pendingPublisherCandidates;
+        this.pendingPublisherCandidates = [];
+        for (const candidate of pending) {
+            this.options.sendSignal('publish:candidate', candidate);
+        }
+    }
+
     // Create and send an offer on the publisher PC. The server answers
     // immediately (no offer can ever be in flight from the server on this
     // PC), so an unanswered offer means a lost message or wedged PC — the
@@ -646,9 +664,13 @@ export class WebRTCManager {
             if (!pc) return false;
 
             try {
+                this.publisherOfferSent = false;
+                this.pendingPublisherCandidates = [];
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
                 this.options.sendSignal('publish:offer', { sdp: offer.sdp });
+                this.publisherOfferSent = true;
+                this.flushPendingPublisherCandidates();
                 this.startPublishAnswerWatchdog();
                 console.log('Sent publisher offer');
                 return true;
@@ -663,6 +685,8 @@ export class WebRTCManager {
                 } catch {
                     // diagnostics must never throw
                 }
+                this.publisherOfferSent = false;
+                this.pendingPublisherCandidates = [];
                 return false;
             }
         });
@@ -686,6 +710,8 @@ export class WebRTCManager {
         this.clearPublishAnswerWatchdog();
         const old = this.publisherPc;
         this.publisherPc = null;
+        this.publisherOfferSent = false;
+        this.pendingPublisherCandidates = [];
         this.audioSender = null;
         this.screenShareSender = null;
         try {
