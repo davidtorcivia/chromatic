@@ -206,7 +206,7 @@
 
         // Handle WebRTC offer from server
         session.onMessage("signal:offer", async (payload: unknown) => {
-            const data = payload as { sdp: string };
+            const data = payload as { sdp: string; offerId?: string };
             console.log('Received WebRTC offer');
 
             if (!webrtcManager) {
@@ -215,7 +215,7 @@
 
             if (webrtcManager) {
                 try {
-                    await webrtcManager.handleOffer(data.sdp);
+                    await webrtcManager.handleOffer(data.sdp, data.offerId);
                     initialOfferHandled = true;
                     tryEnablePendingAutoMic();
                 } catch (err) {

@@ -49,6 +49,8 @@ type SFU struct {
 
 	// Shutdown flag
 	shutdown bool
+
+	subscriberOfferID atomic.Uint64
 }
 
 // MaxICECandidates is the maximum number of ICE candidates allowed per
@@ -59,6 +61,8 @@ type SFU struct {
 // renegotiations, ICE restarts) and a never-resetting cap would eventually
 // reject all candidates and make ICE restarts fail permanently.
 const MaxICECandidates = 50
+
+var ErrStaleSubscriberAnswer = errors.New("stale subscriber answer")
 
 // iceGatherTimeout bounds how long we wait for ICE gathering to complete before
 // returning the SDP with whatever candidates we already have. Host/srflx
@@ -168,6 +172,7 @@ type Subscriber struct {
 	pendingMu             sync.Mutex
 	pendingTracks         []*webrtc.TrackLocalStaticRTP
 	OnRenegotiationNeeded func(offerSDP string)
+	OfferID               string
 }
 
 // pcHasTrack reports whether the peer connection already has a sender bound
@@ -953,13 +958,13 @@ func (s *SFU) HasSubscriber(roomSlug, subscriberID string) bool {
 }
 
 // CreateSubscriberConnection creates a new subscriber peer connection for a room.
-// Returns the peer connection and an SDP offer string to send to the client.
+// Returns the peer connection, SDP offer string and offer ID to send to the client.
 // ICE candidates are NOT included in the offer — they are trickled via
 // EnableSubscriberTrickleICE after the offer has been sent to the client.
-func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc.PeerConnection, string, error) {
+func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc.PeerConnection, string, string, error) {
 	room := s.GetRoomTracksForSlug(roomSlug)
 	if room == nil {
-		return nil, "", fmt.Errorf("room not found: %s", roomSlug)
+		return nil, "", "", fmt.Errorf("room not found: %s", roomSlug)
 	}
 
 	// Create the peer connection outside the lock — NewPeerConnection is a
@@ -967,7 +972,7 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 	// other subscribers while it runs.
 	pc, err := s.CreatePeerConnection()
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to create peer connection: %w", err)
+		return nil, "", "", fmt.Errorf("failed to create peer connection: %w", err)
 	}
 
 	// Create subscriber record
@@ -975,6 +980,7 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 		ID:             subscriberID,
 		PeerConnection: pc,
 		done:           make(chan struct{}),
+		OfferID:        s.nextSubscriberOfferID(),
 	}
 
 	// Set up trickle ICE: buffer candidates until EnableSubscriberTrickleICE is called.
@@ -1021,7 +1027,7 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 		if addErr != nil {
 			room.mu.Unlock()
 			pc.Close()
-			return nil, "", fmt.Errorf("failed to add video track: %w", addErr)
+			return nil, "", "", fmt.Errorf("failed to add video track: %w", addErr)
 		}
 		sub.VideoSender = sender
 		log.Printf("Added video track to subscriber %s", subscriberID)
@@ -1033,7 +1039,7 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 		if addErr != nil {
 			room.mu.Unlock()
 			pc.Close()
-			return nil, "", fmt.Errorf("failed to add audio track: %w", addErr)
+			return nil, "", "", fmt.Errorf("failed to add audio track: %w", addErr)
 		}
 		sub.AudioSender = sender
 		log.Printf("Added audio track to subscriber %s", subscriberID)
@@ -1119,7 +1125,7 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 	if err != nil {
 		room.removeSubscriberIfSame(subscriberID, sub)
 		pc.Close()
-		return nil, "", fmt.Errorf("failed to create offer: %w", err)
+		return nil, "", "", fmt.Errorf("failed to create offer: %w", err)
 	}
 
 	// Set local description — starts ICE gathering in the background.
@@ -1127,7 +1133,7 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 	if err := pc.SetLocalDescription(offer); err != nil {
 		room.removeSubscriberIfSame(subscriberID, sub)
 		pc.Close()
-		return nil, "", fmt.Errorf("failed to set local description: %w", err)
+		return nil, "", "", fmt.Errorf("failed to set local description: %w", err)
 	}
 
 	// Diagnostic: read the viewer's RTCP for the video stream. Receiver
@@ -1138,7 +1144,11 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 		go logSubscriberVideoRTCP(sub, subscriberID)
 	}
 
-	return pc, offer.SDP, nil
+	return pc, offer.SDP, sub.OfferID, nil
+}
+
+func (s *SFU) nextSubscriberOfferID() string {
+	return fmt.Sprintf("%d", s.subscriberOfferID.Add(1))
 }
 
 // logSubscriberVideoRTCP logs a bounded number of RTCP receiver reports and
@@ -1225,8 +1235,11 @@ func (s *SFU) EnableSubscriberTrickleICE(roomSlug, subscriberID string, onICECan
 	}
 }
 
-// SetSubscriberAnswer sets the answer from a subscriber client
-func (s *SFU) SetSubscriberAnswer(roomSlug, subscriberID string, answer webrtc.SessionDescription) error {
+// SetSubscriberAnswer sets the answer from a subscriber client.
+// When offerID is present, it must match the currently pending initial offer;
+// otherwise this is a delayed answer for a replaced subscriber and must not be
+// applied to the live PeerConnection.
+func (s *SFU) SetSubscriberAnswer(roomSlug, subscriberID string, answer webrtc.SessionDescription, offerID string) error {
 	room := s.GetRoomTracksForSlug(roomSlug)
 	if room == nil {
 		return fmt.Errorf("room not found: %s", roomSlug)
@@ -1242,6 +1255,10 @@ func (s *SFU) SetSubscriberAnswer(roomSlug, subscriberID string, answer webrtc.S
 
 	sub.SignalingMu.Lock()
 	defer sub.SignalingMu.Unlock()
+
+	if offerID != "" && sub.OfferID != "" && offerID != sub.OfferID {
+		return fmt.Errorf("%w: got %s, want %s", ErrStaleSubscriberAnswer, offerID, sub.OfferID)
+	}
 
 	if err := sub.PeerConnection.SetRemoteDescription(answer); err != nil {
 		return fmt.Errorf("failed to set remote description: %w", err)

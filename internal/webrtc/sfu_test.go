@@ -1,6 +1,7 @@
 package webrtc
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -717,9 +718,42 @@ func TestSFU_SetSubscriberAnswer_RoomNotFound(t *testing.T) {
 	err = sfu.SetSubscriberAnswer("nonexistent", "sub-1", webrtc.SessionDescription{
 		Type: webrtc.SDPTypeAnswer,
 		SDP:  "",
-	})
+	}, "")
 	if err == nil {
 		t.Error("expected error for nonexistent room")
+	}
+}
+
+func TestSFU_SetSubscriberAnswer_IgnoresStaleOfferID(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	room := sfu.GetRoomTracks(roomSlug)
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create peer connection: %v", err)
+	}
+	defer pc.Close()
+
+	sub := &Subscriber{
+		ID:             "sub-1",
+		PeerConnection: pc,
+		done:           make(chan struct{}),
+		OfferID:        "current-offer",
+	}
+	room.AddSubscriber(sub)
+
+	err = sfu.SetSubscriberAnswer(roomSlug, "sub-1", webrtc.SessionDescription{
+		Type: webrtc.SDPTypeAnswer,
+		SDP:  "stale answer",
+	}, "old-offer")
+	if !errors.Is(err, ErrStaleSubscriberAnswer) {
+		t.Fatalf("expected stale answer error, got %v", err)
 	}
 }
 

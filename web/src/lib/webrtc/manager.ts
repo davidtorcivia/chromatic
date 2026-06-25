@@ -122,7 +122,7 @@ export class WebRTCManager {
     // before accepting the new one. This is what unblocks viewers hanging on
     // reconnect: the old WS closed, the server replaced our subscriber, and
     // we must mirror that by abandoning the old PC.
-    async handleOffer(sdp: string): Promise<void> {
+    async handleOffer(sdp: string, offerId?: string): Promise<void> {
         return this.enqueueSignaling(async () => {
             console.log('Handling WebRTC offer');
 
@@ -155,7 +155,11 @@ export class WebRTCManager {
             await pc.setLocalDescription(answer);
             console.log('Created and set local description (answer)');
 
-            if (!this.sendSignal('signal:answer', { sdp: answer.sdp })) {
+            const payload: { sdp: string | undefined; offerId?: string } = { sdp: answer.sdp };
+            if (offerId) {
+                payload.offerId = offerId;
+            }
+            if (!this.sendSignal('signal:answer', payload)) {
                 console.warn('Failed to send WebRTC answer; resetting subscriber connection');
                 this.resetPeerConnection();
                 return;

@@ -39,6 +39,12 @@ class FakeSubscriberPeerConnection {
         return { type: 'offer', sdp: options?.iceRestart ? 'ice-restart-offer' : 'offer' };
     }
 
+    async createAnswer(): Promise<RTCSessionDescriptionInit> {
+        return { type: 'answer', sdp: 'subscriber-answer' };
+    }
+
+    async setRemoteDescription(): Promise<void> {}
+
     async setLocalDescription(): Promise<void> {}
 
     close() {
@@ -138,5 +144,29 @@ describe('WebRTCManager ICE restart recovery', () => {
         vi.advanceTimersByTime(15000);
 
         expect(onIceRestartFailed).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('WebRTCManager subscriber signaling', () => {
+    afterEach(() => {
+        vi.useRealTimers();
+        vi.unstubAllGlobals();
+    });
+
+    it('echoes the server offer ID with the subscriber answer', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: (type, payload) => {
+                sent.push({ type, payload });
+            }
+        });
+
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+
+        expect(sent).toEqual([{ type: 'signal:answer', payload: { sdp: 'subscriber-answer', offerId: 'offer-123' } }]);
     });
 });

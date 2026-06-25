@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -384,7 +385,7 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 	}
 
 	// Create subscriber connection and get offer (no ICE candidates yet — trickle ICE)
-	pc, offerSDP, err := h.sfu.CreateSubscriberConnection(roomSlug, client.ID)
+	pc, offerSDP, offerID, err := h.sfu.CreateSubscriberConnection(roomSlug, client.ID)
 	if err != nil {
 		logger.Error("Failed to create subscriber connection", "participant_id", client.ID, "room", roomSlug, "error", err)
 		// Tell the client the handshake failed so it can surface an error and
@@ -421,7 +422,8 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 	// be queued, tear down the just-created subscriber so the reconnect/retry
 	// path does not inherit a phantom SFU session that the browser never saw.
 	if err := client.SendJSON("signal:offer", map[string]interface{}{
-		"sdp": offerSDP,
+		"sdp":     offerSDP,
+		"offerId": offerID,
 	}); err != nil {
 		logger.Warn("Failed to queue WebRTC offer; removing subscriber",
 			"participant_id", client.ID, "room", roomSlug, "error", err)
@@ -1208,7 +1210,8 @@ func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID str
 
 func (h *WebSocketHandler) handleSignalAnswer(client *websocket.Client, payload json.RawMessage) {
 	var data struct {
-		SDP string `json:"sdp"`
+		SDP     string `json:"sdp"`
+		OfferID string `json:"offerId"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		logger.Warn("Invalid signal answer", "participant_id", client.ID, "error", err)
@@ -1220,7 +1223,11 @@ func (h *WebSocketHandler) handleSignalAnswer(client *websocket.Client, payload 
 		SDP:  data.SDP,
 	}
 
-	if err := h.sfu.SetSubscriberAnswer(client.RoomSlug, client.ID, answer); err != nil {
+	if err := h.sfu.SetSubscriberAnswer(client.RoomSlug, client.ID, answer, data.OfferID); err != nil {
+		if errors.Is(err, webrtc.ErrStaleSubscriberAnswer) {
+			logger.Debug("Ignored stale subscriber answer", "participant_id", client.ID, "offer_id", data.OfferID)
+			return
+		}
 		logger.Error("Failed to set subscriber answer", "participant_id", client.ID, "error", err)
 		return
 	}
