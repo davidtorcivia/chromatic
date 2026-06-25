@@ -62,28 +62,55 @@ func (c *Client) WritePump() {
 	}()
 
 	for {
+		if c.isDone() {
+			// Client is shutting down; do not drain stale queued messages before
+			// letting a replacement connection take over.
+			c.writeCloseFrame()
+			return
+		}
+
 		select {
 		case <-c.Done:
-			// Client is shutting down — send close frame and exit.
-			// Send channel is intentionally never closed to avoid
-			// send-on-closed-channel panics in concurrent producers.
-			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
-			c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+			c.writeCloseFrame()
 			return
 
 		case message := <-c.Send:
+			if c.isDone() {
+				c.writeCloseFrame()
+				return
+			}
 			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
 				return
 			}
 
 		case <-ticker.C:
+			if c.isDone() {
+				c.writeCloseFrame()
+				return
+			}
 			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
 		}
 	}
+}
+
+func (c *Client) isDone() bool {
+	select {
+	case <-c.Done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) writeCloseFrame() {
+	// Send channel is intentionally never closed to avoid send-on-closed-channel
+	// panics in concurrent producers.
+	c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+	_ = c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
 }
 
 // SendJSON sends a JSON message to this client
