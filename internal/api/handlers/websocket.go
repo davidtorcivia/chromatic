@@ -417,10 +417,19 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 		}
 	})
 
-	// Send offer to client FIRST (before enabling trickle ICE)
-	client.SendJSON("signal:offer", map[string]interface{}{
+	// Send offer to client FIRST (before enabling trickle ICE). If this cannot
+	// be queued, tear down the just-created subscriber so the reconnect/retry
+	// path does not inherit a phantom SFU session that the browser never saw.
+	if err := client.SendJSON("signal:offer", map[string]interface{}{
 		"sdp": offerSDP,
-	})
+	}); err != nil {
+		logger.Warn("Failed to queue WebRTC offer; removing subscriber",
+			"participant_id", client.ID, "room", roomSlug, "error", err)
+		if roomTracks := h.sfu.GetRoomTracksForSlug(roomSlug); roomTracks != nil {
+			roomTracks.RemoveSubscriber(client.ID)
+		}
+		return false
+	}
 
 	// Enable trickle ICE: flush any buffered candidates and send future ones directly.
 	// This must happen AFTER the offer is sent to guarantee correct message ordering.

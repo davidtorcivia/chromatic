@@ -115,6 +115,52 @@ func (env *streamStartTestEnv) dial() *gorillaws.Conn {
 	return conn
 }
 
+func TestWebSocketHandler_InitiateSubscriptionCleansUpWhenOfferNotQueued(t *testing.T) {
+	hub := websocket.NewHub()
+	sfu, err := webrtc.NewSFU(&config.Config{})
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	handler := NewWebSocketHandler(nil, hub, sfu, nil, false, []byte("test-secret"), nil)
+	roomSlug := "offer-send-failure-room"
+
+	videoTrack, err := pionwebrtc.NewTrackLocalStaticRTP(
+		pionwebrtc.RTPCodecCapability{MimeType: pionwebrtc.MimeTypeH264, ClockRate: 90000},
+		"video",
+		"stream",
+	)
+	if err != nil {
+		t.Fatalf("failed to create video track: %v", err)
+	}
+	room := sfu.GetRoomTracks(roomSlug)
+	room.VideoTrack = videoTrack
+
+	client := &websocket.Client{
+		ID:       "viewer-1",
+		Name:     "Viewer",
+		RoomSlug: roomSlug,
+		Hub:      hub,
+		Send:     make(chan []byte, 1),
+		Done:     make(chan struct{}),
+	}
+	client.Send <- []byte(`{"type":"queued"}`)
+
+	if handler.initiateSubscription(client, roomSlug) {
+		t.Fatal("subscription should not be marked created when offer cannot be queued")
+	}
+	if sfu.HasSubscriber(roomSlug, client.ID) {
+		t.Fatal("failed offer send left a phantom SFU subscriber")
+	}
+	select {
+	case <-client.Done:
+		// Expected: critical offer send failure closes the client for reconnect.
+	case <-time.After(time.Second):
+		t.Fatal("client was not closed after critical offer send failure")
+	}
+}
+
 // startIngest simulates OBS connecting via WHIP: it registers an ingest
 // session with bound local tracks and fires the stream-start hook, mirroring
 // what whip.go does when the publisher PC reaches Connected.

@@ -2,10 +2,16 @@ package websocket
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"time"
 
 	"github.com/gorilla/websocket"
+)
+
+var (
+	ErrClientClosed         = errors.New("websocket client closed")
+	ErrClientSendBufferFull = errors.New("websocket client send buffer full")
 )
 
 // OnDisconnect is a callback type for client disconnect events
@@ -135,7 +141,9 @@ func (c *Client) SendJSON(msgType string, payload interface{}) error {
 	select {
 	case <-c.Done:
 		// Client disconnected, don't send
+		return ErrClientClosed
 	case c.Send <- msgBytes:
+		return nil
 	default:
 		// Direct JSON sends are used for critical state/signaling. Dropping
 		// them silently can leave the browser stuck with stale WebRTC state,
@@ -147,7 +155,6 @@ func (c *Client) SendJSON(msgType string, payload interface{}) error {
 		if c.Conn != nil {
 			c.Conn.Close()
 		}
+		return ErrClientSendBufferFull
 	}
-
-	return nil
 }

@@ -422,8 +422,8 @@ func TestClient_SendJSONFullBufferClosesClient(t *testing.T) {
 	client.Send = make(chan []byte, 1)
 	client.Send <- []byte(`{"type":"queued"}`)
 
-	if err := client.SendJSON("signal:offer", map[string]string{"sdp": "offer"}); err != nil {
-		t.Fatalf("SendJSON failed: %v", err)
+	if err := client.SendJSON("signal:offer", map[string]string{"sdp": "offer"}); !errors.Is(err, ErrClientSendBufferFull) {
+		t.Fatalf("SendJSON error = %v, want %v", err, ErrClientSendBufferFull)
 	}
 
 	select {
