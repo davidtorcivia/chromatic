@@ -259,6 +259,25 @@ func TestDisconnect_RemovesPublisherSession(t *testing.T) {
 	}
 }
 
+func TestDisconnect_RemovesSubscriberSession(t *testing.T) {
+	env, cleanup := newRejoinTestEnv(t)
+	defer cleanup()
+
+	conn := env.dial()
+	waitForMessages(t, conn, 5*time.Second, "room:state", "signal:offer")
+
+	if !subscriberExists(env.sfu, env.slug, "part1") {
+		t.Fatal("subscriber was not created")
+	}
+
+	conn.Close()
+	time.Sleep(300 * time.Millisecond)
+
+	if subscriberExists(env.sfu, env.slug, "part1") {
+		t.Fatal("subscriber survived confirmed disconnect")
+	}
+}
+
 func TestRejoinWhileLive_DoesNotRemoveReplacementPublisherSession(t *testing.T) {
 	env, cleanup := newRejoinTestEnv(t)
 	defer cleanup()

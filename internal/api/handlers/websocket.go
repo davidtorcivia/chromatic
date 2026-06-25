@@ -57,8 +57,9 @@ type WebSocketHandler struct {
 // whole attempt and recording success in created guarantees the client ends
 // up with exactly one subscriber and one offer.
 type subscriptionState struct {
-	mu      sync.Mutex
-	created bool
+	mu         sync.Mutex
+	created    bool
+	subscriber *webrtc.Subscriber
 }
 
 // SetWaitingActions wires the shared waiting-room admit/deny implementation.
@@ -296,6 +297,7 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 			// so drop its subscription state. Keyed by pointer, so a refresh
 			// replacement (a different Client) keeps its own entry.
 			h.subMu.Lock()
+			st := h.subStates[c]
 			delete(h.subStates, c)
 			h.subMu.Unlock()
 
@@ -332,9 +334,17 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 				return
 			}
 			// This is a confirmed leave, not a replaced page refresh. Tear down
-			// the participant's publishing session immediately instead of
-			// waiting for WebRTC state callbacks to eventually observe Closed.
+			// the participant's SFU sessions immediately instead of waiting for
+			// WebRTC state callbacks to eventually observe Closed.
 			h.sfu.RemoveVoiceSession(c.RoomSlug, c.ID)
+			if st != nil {
+				st.mu.Lock()
+				sub := st.subscriber
+				st.subscriber = nil
+				st.created = false
+				st.mu.Unlock()
+				h.sfu.RemoveSubscriberIfSame(c.RoomSlug, c.ID, sub)
+			}
 			// Broadcast participant:left when client disconnects
 			h.hub.BroadcastJSON(c.RoomSlug, "participant:left", map[string]interface{}{
 				"participantId": c.ID,
@@ -368,7 +378,7 @@ func (h *WebSocketHandler) ensureSubscription(client *websocket.Client, roomSlug
 		// so creating a replacement here would force a needless re-handshake.
 		return
 	}
-	if h.initiateSubscription(client, roomSlug) {
+	if h.initiateSubscription(client, roomSlug, st) {
 		st.created = true
 	}
 }
@@ -377,7 +387,7 @@ func (h *WebSocketHandler) ensureSubscription(client *websocket.Client, roomSlug
 // true when a subscriber was created and the offer sent; false when the
 // attempt should be retried later (the stream isn't up yet, or subscriber
 // creation failed and the next stream-start may succeed).
-func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSlug string) bool {
+func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSlug string, st *subscriptionState) bool {
 	// Pre-stream state: the SFU has no ingest tracks bound for this room yet
 	// (viewer connected before OBS started, OBS reconnecting, or a server
 	// restart). This is normal, not an error — the stream-start path runs this
@@ -389,7 +399,7 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 	}
 
 	// Create subscriber connection and get offer (no ICE candidates yet — trickle ICE)
-	pc, offerSDP, offerID, err := h.sfu.CreateSubscriberConnection(roomSlug, client.ID)
+	pc, sub, offerSDP, offerID, err := h.sfu.CreateSubscriberConnection(roomSlug, client.ID)
 	if err != nil {
 		logger.Error("Failed to create subscriber connection", "participant_id", client.ID, "room", roomSlug, "error", err)
 		// Tell the client the handshake failed so it can surface an error and
@@ -431,10 +441,11 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 	}); err != nil {
 		logger.Warn("Failed to queue WebRTC offer; removing subscriber",
 			"participant_id", client.ID, "room", roomSlug, "error", err)
-		if roomTracks := h.sfu.GetRoomTracksForSlug(roomSlug); roomTracks != nil {
-			roomTracks.RemoveSubscriber(client.ID)
-		}
+		h.sfu.RemoveSubscriberIfSame(roomSlug, client.ID, sub)
 		return false
+	}
+	if st != nil {
+		st.subscriber = sub
 	}
 
 	// Enable trickle ICE: flush any buffered candidates and send future ones directly.
@@ -596,7 +607,7 @@ func (h *WebSocketHandler) handleResubscribe(client *websocket.Client) {
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	st.created = h.initiateSubscription(client, roomSlug)
+	st.created = h.initiateSubscription(client, roomSlug, st)
 }
 
 // InitiateSubscriptionsForRoom sends WebRTC offers to clients in a room that

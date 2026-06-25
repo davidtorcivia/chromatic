@@ -147,7 +147,7 @@ func TestWebSocketHandler_InitiateSubscriptionCleansUpWhenOfferNotQueued(t *test
 	}
 	client.Send <- []byte(`{"type":"queued"}`)
 
-	if handler.initiateSubscription(client, roomSlug) {
+	if handler.initiateSubscription(client, roomSlug, &subscriptionState{}) {
 		t.Fatal("subscription should not be marked created when offer cannot be queued")
 	}
 	if sfu.HasSubscriber(roomSlug, client.ID) {
