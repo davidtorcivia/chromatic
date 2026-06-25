@@ -495,6 +495,60 @@ func TestSFU_RemoveVoiceSessionIfSame_IgnoresStaleCallback(t *testing.T) {
 	}
 }
 
+func TestSFU_HandlePublisherOffer_WaitsForExistingSignaling(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	participantID := "p1"
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create peer connection: %v", err)
+	}
+	defer pc.Close()
+
+	room := sfu.GetRoomTracks(roomSlug)
+	vs := &VoiceSession{
+		ParticipantID:  participantID,
+		PeerConnection: pc,
+		done:           make(chan struct{}),
+	}
+	room.mu.Lock()
+	if room.VoiceSessions == nil {
+		room.VoiceSessions = make(map[string]*VoiceSession)
+	}
+	room.VoiceSessions[participantID] = vs
+	room.mu.Unlock()
+
+	vs.SignalingMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := sfu.HandlePublisherOffer(roomSlug, participantID, "not sdp", func(string, *webrtc.TrackRemote) {})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("HandlePublisherOffer returned before signaling lock released: %v", err)
+	case <-time.After(50 * time.Millisecond):
+		// Expected: an in-flight publisher SDP operation blocks renegotiation.
+	}
+
+	vs.SignalingMu.Unlock()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected invalid SDP error after signaling lock released")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HandlePublisherOffer did not resume after signaling lock released")
+	}
+}
+
 func TestSFU_BindIngestToRoom_NotFound(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)

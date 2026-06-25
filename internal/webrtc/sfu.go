@@ -1584,6 +1584,7 @@ type VoiceSession struct {
 	AudioTrack     *webrtc.TrackLocalStaticRTP
 	done           chan struct{}
 	closeOnce      sync.Once
+	SignalingMu    sync.Mutex
 	// Muted is the server-enforced gate for this participant's voice RTP.
 	// When true, the voice relay forwarder drops incoming packets instead of
 	// writing them to the local track — so admin:mute is effective even if a
@@ -1612,6 +1613,9 @@ func (s *SFU) HandlePublisherOffer(roomSlug, participantID, offerSDP string, onT
 	// Renegotiate a live publisher in place. The ICE/DTLS transport is
 	// already established, so the answer needs no candidate gathering.
 	if existing != nil && existing.PeerConnection != nil {
+		existing.SignalingMu.Lock()
+		defer existing.SignalingMu.Unlock()
+
 		state := existing.PeerConnection.ConnectionState()
 		if state != webrtc.PeerConnectionStateFailed && state != webrtc.PeerConnectionStateClosed {
 			pc := existing.PeerConnection
