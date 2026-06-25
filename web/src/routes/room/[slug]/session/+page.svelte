@@ -78,6 +78,7 @@
     const CONNECTING_WATCHDOG_MS = 15000;
     let resubscribeAttempts = $state(0);
     let connectingWatchdog: ReturnType<typeof setTimeout> | null = null;
+    let subscriptionRetryTimer: ReturnType<typeof setTimeout> | null = null;
     // Controls auto-hide (ITEM 3)
     let isPointerOverControls = $state(false);
     let controlsHaveFocus = $state(false);
@@ -485,7 +486,11 @@
             // before telling the user to refresh.
             if (data?.code === 'subscription-failed' && resubscribeAttempts < RESUBSCRIBE_MAX_ATTEMPTS) {
                 const delay = 2000 * (resubscribeAttempts + 1);
-                setTimeout(() => requestResubscribe('server subscription failure'), delay);
+                clearSubscriptionRetryTimer();
+                subscriptionRetryTimer = setTimeout(() => {
+                    subscriptionRetryTimer = null;
+                    requestResubscribe('server subscription failure');
+                }, delay);
                 return;
             }
             streamError = data?.message || 'Something interrupted the stream.';
@@ -524,6 +529,7 @@
         navigator.mediaDevices?.removeEventListener?.("devicechange", refreshAudioDevices);
         clearMicPromptTimer();
         clearConnectingWatchdog();
+        clearSubscriptionRetryTimer();
         if (controlsTimer) {
             clearTimeout(controlsTimer);
             controlsTimer = null;
@@ -542,6 +548,13 @@
         if (connectingWatchdog) {
             clearTimeout(connectingWatchdog);
             connectingWatchdog = null;
+        }
+    }
+
+    function clearSubscriptionRetryTimer() {
+        if (subscriptionRetryTimer) {
+            clearTimeout(subscriptionRetryTimer);
+            subscriptionRetryTimer = null;
         }
     }
 
@@ -772,6 +785,7 @@
         }
         resubscribeAttempts++;
         console.warn(`Requesting fresh subscription (${reason}, attempt ${resubscribeAttempts}/${RESUBSCRIBE_MAX_ATTEMPTS})`);
+        clearSubscriptionRetryTimer();
         // Reset the keyframe-nudge cycle: without this the stale attempt
         // counter immediately re-escalates on its next tick and the client
         // tears down each fresh subscription ~2.5s after it connects.
@@ -1171,6 +1185,7 @@
         needsPlayClick = false;
         clearMediaStallTimer();
         clearKeyframeNudge();
+        clearSubscriptionRetryTimer();
         currentRtt = null;
         currentVideoBufferDelay = null;
         initialOfferHandled = false;
