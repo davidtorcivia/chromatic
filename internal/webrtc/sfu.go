@@ -151,6 +151,11 @@ type PublisherICECandidate struct {
 	OfferID   string
 }
 
+type SubscriberICECandidate struct {
+	Candidate   webrtc.ICECandidateInit
+	CandidateID string
+}
+
 // Subscriber represents a client receiving the stream
 type Subscriber struct {
 	ID             string
@@ -162,8 +167,8 @@ type Subscriber struct {
 	SignalingMu    sync.Mutex // Serializes SDP operations to prevent concurrent signaling state changes
 	// Trickle ICE: callback for sending server-side ICE candidates to the client.
 	// Before the callback is set, candidates are buffered in pendingCandidates.
-	OnICECandidate    func(c *webrtc.ICECandidateInit)
-	pendingCandidates []*webrtc.ICECandidateInit
+	OnICECandidate    func(c *webrtc.ICECandidateInit, candidateID string)
+	pendingCandidates []SubscriberICECandidate
 	candidateMu       sync.Mutex
 	// Buffer client-to-server ICE candidates that arrive before SetRemoteDescription.
 	// These are flushed when the first answer/remote description is applied.
@@ -1019,13 +1024,14 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 			return
 		}
 		init := c.ToJSON()
+		candidateID := sub.CandidateID
 		sub.candidateMu.Lock()
 		if sub.OnICECandidate != nil {
 			cb := sub.OnICECandidate
 			sub.candidateMu.Unlock()
-			cb(&init)
+			cb(&init, candidateID)
 		} else {
-			sub.pendingCandidates = append(sub.pendingCandidates, &init)
+			sub.pendingCandidates = append(sub.pendingCandidates, SubscriberICECandidate{Candidate: init, CandidateID: candidateID})
 			sub.candidateMu.Unlock()
 		}
 	})
@@ -1241,7 +1247,7 @@ func popCount16(v uint16) int {
 // and flushes any candidates that were buffered before the offer was sent.
 // Must be called AFTER the offer SDP has been sent to the client to ensure
 // correct message ordering (offer arrives before candidates).
-func (s *SFU) EnableSubscriberTrickleICE(roomSlug, subscriberID string, onICECandidate func(*webrtc.ICECandidateInit)) {
+func (s *SFU) EnableSubscriberTrickleICE(roomSlug, subscriberID string, onICECandidate func(*webrtc.ICECandidateInit, string)) {
 	room := s.GetRoomTracksForSlug(roomSlug)
 	if room == nil {
 		return
@@ -1261,7 +1267,7 @@ func (s *SFU) EnableSubscriberTrickleICE(roomSlug, subscriberID string, onICECan
 	sub.candidateMu.Unlock()
 
 	for _, c := range pending {
-		onICECandidate(c)
+		onICECandidate(&c.Candidate, c.CandidateID)
 	}
 }
 
@@ -2272,6 +2278,7 @@ func (s *SFU) tryAddTrackAndRenegotiate(sub *Subscriber, localTrack *webrtc.Trac
 	}
 
 	sub.RenegotiationOfferID = s.nextSignalingOfferID()
+	sub.CandidateID = sub.RenegotiationOfferID
 
 	// ICE candidates are trickled via the subscriber's OnICECandidate callback
 	return offer.SDP, sub.RenegotiationOfferID, false, false, nil
@@ -2329,6 +2336,7 @@ func (s *SFU) flushPendingRenegotiationLocked(sub *Subscriber) {
 		return
 	}
 	sub.RenegotiationOfferID = s.nextSignalingOfferID()
+	sub.CandidateID = sub.RenegotiationOfferID
 	sub.needsRenegotiation = false
 	log.Printf("Flushed pending renegotiation for subscriber %s", sub.ID)
 	// Deliver outside the signaling-critical path.
@@ -2419,6 +2427,7 @@ func (s *SFU) RenegotiateSubscriber(roomSlug, subscriberID string) (string, stri
 	}
 
 	sub.RenegotiationOfferID = s.nextSignalingOfferID()
+	sub.CandidateID = sub.RenegotiationOfferID
 
 	// ICE candidates are trickled via the subscriber's OnICECandidate callback
 	log.Printf("Renegotiation offer created for subscriber %s", subscriberID)

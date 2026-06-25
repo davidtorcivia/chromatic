@@ -439,12 +439,12 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 
 	// Enable trickle ICE: flush any buffered candidates and send future ones directly.
 	// This must happen AFTER the offer is sent to guarantee correct message ordering.
-	h.sfu.EnableSubscriberTrickleICE(roomSlug, client.ID, func(init *pionwebrtc.ICECandidateInit) {
+	h.sfu.EnableSubscriberTrickleICE(roomSlug, client.ID, func(init *pionwebrtc.ICECandidateInit, candidateID string) {
 		client.SendJSON("signal:candidate", map[string]interface{}{
 			"candidate":     init.Candidate,
 			"sdpMid":        init.SDPMid,
 			"sdpMLineIndex": init.SDPMLineIndex,
-			"offerId":       offerID,
+			"offerId":       candidateID,
 		})
 	})
 

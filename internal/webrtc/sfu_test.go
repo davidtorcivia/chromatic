@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -810,6 +811,45 @@ func TestSFU_AddSubscriberICECandidate_IgnoresStaleCandidateID(t *testing.T) {
 	}
 	if len(sub.pendingRemoteCandidates) != 0 {
 		t.Fatalf("stale candidate should not be buffered, got %d pending", len(sub.pendingRemoteCandidates))
+	}
+}
+
+func TestSFU_EnableSubscriberTrickleICE_UsesDynamicCandidateIDs(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	room := sfu.GetRoomTracks(roomSlug)
+	initialCandidate := webrtc.ICECandidateInit{Candidate: "candidate:initial 1 udp 2122260223 192.0.2.1 54321 typ host"}
+	sub := &Subscriber{
+		ID:          "sub-1",
+		done:        make(chan struct{}),
+		CandidateID: "initial-offer",
+		pendingCandidates: []SubscriberICECandidate{{
+			Candidate:   initialCandidate,
+			CandidateID: "initial-offer",
+		}},
+	}
+	room.AddSubscriber(sub)
+
+	var delivered []string
+	sfu.EnableSubscriberTrickleICE(roomSlug, "sub-1", func(c *webrtc.ICECandidateInit, candidateID string) {
+		delivered = append(delivered, candidateID)
+	})
+
+	sub.CandidateID = "renegotiate-offer"
+	liveCandidate := webrtc.ICECandidateInit{Candidate: "candidate:renegotiate 1 udp 2122260223 192.0.2.2 54321 typ host"}
+	sub.candidateMu.Lock()
+	cb := sub.OnICECandidate
+	sub.candidateMu.Unlock()
+	cb(&liveCandidate, sub.CandidateID)
+
+	if got, want := delivered, []string{"initial-offer", "renegotiate-offer"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("delivered candidate IDs = %v, want %v", got, want)
 	}
 }
 
