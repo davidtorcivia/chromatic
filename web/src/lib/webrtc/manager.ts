@@ -91,6 +91,7 @@ export class WebRTCManager {
     private publisherOfferSent: boolean = false;
     private publisherOfferCounter = 0;
     private publisherOfferId: string | null = null;
+    private publisherCandidateOfferId: string | null = null;
     private pendingPublisherCandidates: RTCIceCandidateInit[] = [];
     // Watchdog: rebuilds the publisher if an offer goes unanswered
     private voiceOfferTimer: ReturnType<typeof setTimeout> | null = null;
@@ -783,7 +784,7 @@ export class WebRTCManager {
     private sendPublisherCandidateForCurrentOffer(candidate: RTCIceCandidateInit): void {
         this.sendSignal('publish:candidate', {
             ...candidate,
-            offerId: this.publisherOfferId ?? undefined
+            offerId: this.publisherCandidateOfferId ?? undefined
         });
     }
 
@@ -801,6 +802,7 @@ export class WebRTCManager {
                 this.pendingPublisherCandidates = [];
                 const offerId = `publish-${++this.publisherOfferCounter}`;
                 this.publisherOfferId = offerId;
+                this.publisherCandidateOfferId = offerId;
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
                 if (!this.sendSignal('publish:offer', { sdp: offer.sdp, offerId })) {
@@ -824,6 +826,7 @@ export class WebRTCManager {
                 }
                 this.publisherOfferSent = false;
                 this.publisherOfferId = null;
+                this.publisherCandidateOfferId = null;
                 this.pendingPublisherCandidates = [];
                 if (this.publisherPc === pc) {
                     this.clearPublisherDisconnectWatchdog();
@@ -871,6 +874,7 @@ export class WebRTCManager {
         this.publisherPc = null;
         this.publisherOfferSent = false;
         this.publisherOfferId = null;
+        this.publisherCandidateOfferId = null;
         this.pendingPublisherCandidates = [];
         this.audioSender = null;
         this.screenShareSender = null;
@@ -1160,6 +1164,7 @@ export class WebRTCManager {
             }
             this.publisherPc = null;
             this.publisherOfferId = null;
+            this.publisherCandidateOfferId = null;
         }
     }
 }

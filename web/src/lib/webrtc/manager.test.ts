@@ -179,6 +179,40 @@ describe('WebRTCManager publisher signaling', () => {
         expect(managerInternals.ensurePublisher()).not.toBe(pc);
     });
 
+    it('keeps tagging late publisher ICE candidates after the answer is applied', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakePublisherPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const manager = newManager((type, payload) => {
+            sent.push({ type, payload });
+        });
+
+        const pc = (manager as unknown as { ensurePublisher(): FakePublisherPeerConnection }).ensurePublisher();
+        await (manager as unknown as { negotiatePublisher(): Promise<boolean> }).negotiatePublisher();
+        await manager.handlePublishAnswer('publisher-answer', 'publish-1');
+        sent.length = 0;
+
+        pc.onicecandidate?.({
+            candidate: {
+                candidate: 'candidate:late 1 udp 2122260223 192.0.2.2 54321 typ host',
+                sdpMid: '0',
+                sdpMLineIndex: 0
+            }
+        });
+
+        expect(sent).toEqual([
+            {
+                type: 'publish:candidate',
+                payload: {
+                    candidate: 'candidate:late 1 udp 2122260223 192.0.2.2 54321 typ host',
+                    sdpMid: '0',
+                    sdpMLineIndex: 0,
+                    offerId: 'publish-1'
+                }
+            }
+        ]);
+    });
+
     it('rebuilds a live publisher after a short persistent disconnect', async () => {
         vi.useFakeTimers();
         vi.stubGlobal('RTCPeerConnection', FakePublisherPeerConnection);
