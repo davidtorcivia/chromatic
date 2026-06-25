@@ -316,3 +316,36 @@ describe('WebRTCManager subscriber signaling', () => {
         ]);
     });
 });
+
+describe('WebRTCManager resync signaling', () => {
+    afterEach(() => {
+        vi.useRealTimers();
+        vi.unstubAllGlobals();
+    });
+
+    it('throttles duplicate keyframe requests without delaying the first one', () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(1_700_000_000_000);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: (type, payload) => {
+                sent.push({ type, payload });
+            }
+        });
+
+        manager.requestResync();
+        manager.requestResync();
+        vi.advanceTimersByTime(249);
+        manager.requestResync();
+        vi.advanceTimersByTime(1);
+        manager.requestResync();
+
+        expect(sent).toEqual([
+            { type: 'signal:resync', payload: {} },
+            { type: 'signal:resync', payload: {} }
+        ]);
+    });
+});

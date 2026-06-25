@@ -87,6 +87,8 @@ export class WebRTCManager {
     // Watchdog: rebuilds the publisher if an offer goes unanswered
     private voiceOfferTimer: ReturnType<typeof setTimeout> | null = null;
     private static readonly VOICE_OFFER_TIMEOUT_MS = 8000;
+    private static readonly RESYNC_MIN_INTERVAL_MS = 250;
+    private lastResyncAt = 0;
     // Serialize all SDP operations to prevent concurrent modifications
     // to the PeerConnection's signaling state (e.g. handleOffer + handleRenegotiation
     // firing from separate WebSocket messages while awaiting).
@@ -436,6 +438,11 @@ export class WebRTCManager {
 
     // Request a stream resync (forces keyframe from publisher)
     requestResync(): void {
+        const now = Date.now();
+        if (this.lastResyncAt !== 0 && now - this.lastResyncAt < WebRTCManager.RESYNC_MIN_INTERVAL_MS) {
+            return;
+        }
+        this.lastResyncAt = now;
         console.log('Requesting stream resync (keyframe)');
         this.sendSignal('signal:resync', {});
     }
