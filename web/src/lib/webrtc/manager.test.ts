@@ -82,6 +82,7 @@ class FakeSubscriberPeerConnection {
     addedCandidates: RTCIceCandidateInit[] = [];
     configurationHistory: RTCConfiguration[] = [];
     statsReport = new Map<string, unknown>();
+    rejectRemoteOffers = false;
 
     async createOffer(options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
         return { type: 'offer', sdp: options?.iceRestart ? 'ice-restart-offer' : 'offer' };
@@ -93,6 +94,9 @@ class FakeSubscriberPeerConnection {
 
     async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
         if (description.type === 'offer') {
+            if (this.rejectRemoteOffers) {
+                throw new Error('remote offer rejected');
+            }
             this.signalingState = 'have-remote-offer';
             return;
         }
@@ -588,6 +592,33 @@ describe('WebRTCManager subscriber signaling', () => {
         expect(sent).toEqual([{ type: 'signal:answer', payload: { sdp: 'subscriber-answer', offerId: 'offer-123' } }]);
     });
 
+    it('resubscribes when a fresh subscriber offer cannot be applied', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const onNegotiationWedged = vi.fn();
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: () => {},
+            onNegotiationWedged
+        });
+
+        const managerInternals = manager as unknown as {
+            createPeerConnection(): void;
+            pc: FakeSubscriberPeerConnection | null;
+        };
+        managerInternals.createPeerConnection();
+        const pc = managerInternals.pc;
+        pc!.connectionState = 'new';
+        pc!.rejectRemoteOffers = true;
+
+        await manager.handleOffer('bad-subscriber-offer', 'offer-123');
+
+        expect(pc?.closed).toBe(true);
+        expect(managerInternals.pc).toBeNull();
+        expect(onNegotiationWedged).toHaveBeenCalledTimes(1);
+    });
+
     it('tags subscriber ICE candidates with the current server offer ID', async () => {
         vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
 
@@ -699,6 +730,29 @@ describe('WebRTCManager subscriber signaling', () => {
         expect(sent).toEqual([
             { type: 'signal:renegotiate-answer', payload: { sdp: 'subscriber-answer', offerId: 'renegotiate-456' } }
         ]);
+    });
+
+    it('resubscribes when a server renegotiation offer cannot be applied', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const onNegotiationWedged = vi.fn();
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: () => {},
+            onNegotiationWedged
+        });
+
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+        const managerInternals = manager as unknown as { pc: FakeSubscriberPeerConnection | null };
+        const pc = managerInternals.pc;
+        pc!.rejectRemoteOffers = true;
+
+        await manager.handleRenegotiation('bad-renegotiation-offer', 'speaker-1', 'renegotiate-456');
+
+        expect(pc?.closed).toBe(true);
+        expect(managerInternals.pc).toBeNull();
+        expect(onNegotiationWedged).toHaveBeenCalledTimes(1);
     });
 
     it('sets a low playout delay hint on inbound receivers when supported', () => {

@@ -170,24 +170,28 @@ export class WebRTCManager {
             this.subscriberCandidateOfferId = offerId ?? null;
             const pc = this.pc!;
 
-            // Set remote description (the offer from server). The subscriber
-            // PC is receive-only and the client never offers on it, so no
-            // pending-local-offer handling is needed here.
-            const offer: RTCSessionDescriptionInit = { type: 'offer', sdp };
-            await pc.setRemoteDescription(offer);
-            console.log('Set remote description');
+            try {
+                // Set remote description (the offer from server). The subscriber
+                // PC is receive-only and the client never offers on it, so no
+                // pending-local-offer handling is needed here.
+                const offer: RTCSessionDescriptionInit = { type: 'offer', sdp };
+                await pc.setRemoteDescription(offer);
+                console.log('Set remote description');
 
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            console.log('Created and set local description (answer)');
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                console.log('Created and set local description (answer)');
 
-            const payload: { sdp: string | undefined; offerId?: string } = { sdp: answer.sdp };
-            if (offerId) {
-                payload.offerId = offerId;
-            }
-            if (!this.sendSignal('signal:answer', payload)) {
-                console.warn('Failed to send WebRTC answer; resetting subscriber connection');
-                this.resetPeerConnection();
+                const payload: { sdp: string | undefined; offerId?: string } = { sdp: answer.sdp };
+                if (offerId) {
+                    payload.offerId = offerId;
+                }
+                if (!this.sendSignal('signal:answer', payload)) {
+                    this.failSubscriberNegotiation('Failed to send WebRTC answer; resetting subscriber connection');
+                    return;
+                }
+            } catch (err) {
+                this.failSubscriberNegotiation('Failed to handle WebRTC offer; resetting subscriber connection', err);
                 return;
             }
 
@@ -497,6 +501,16 @@ export class WebRTCManager {
         console.warn(message);
         this.resetPeerConnection();
         this.options.onIceRestartFailed?.();
+    }
+
+    private failSubscriberNegotiation(message: string, err?: unknown): void {
+        if (err !== undefined) {
+            console.error(message, err);
+        } else {
+            console.warn(message);
+        }
+        this.resetPeerConnection();
+        this.options.onNegotiationWedged?.();
     }
 
     private clearIceRestartAttempt(): void {
@@ -1054,15 +1068,14 @@ export class WebRTCManager {
                 }
 
                 if (!this.sendSignal('signal:renegotiate-answer', payload)) {
-                    console.warn('Failed to send renegotiation answer; resetting subscriber connection');
-                    this.resetPeerConnection();
+                    this.failSubscriberNegotiation('Failed to send renegotiation answer; resetting subscriber connection');
                     return;
                 }
 
                 console.log('Sent renegotiation answer');
             } catch (err) {
                 this.subscriberCandidateOfferId = previousCandidateOfferId;
-                console.error('Failed to handle renegotiation:', err);
+                this.failSubscriberNegotiation('Failed to handle renegotiation; resetting subscriber connection', err);
             }
         });
     }
