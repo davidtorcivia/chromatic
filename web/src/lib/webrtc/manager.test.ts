@@ -88,6 +88,13 @@ class FakeSubscriberPeerConnection {
         if (!description) return;
         if (description.type === 'offer') {
             this.signalingState = 'have-local-offer';
+            this.onicecandidate?.({
+                candidate: {
+                    candidate: 'candidate:restart 1 udp 2122260223 192.0.2.3 54321 typ host',
+                    sdpMid: '0',
+                    sdpMLineIndex: 0
+                }
+            });
             return;
         }
         if (description.type === 'answer') {
@@ -347,7 +354,18 @@ describe('WebRTCManager ICE restart recovery', () => {
 
         await managerInternals.performIceRestart();
 
-        expect(sent).toEqual([{ type: 'signal:ice-restart', payload: { sdp: 'ice-restart-offer' } }]);
+        expect(sent).toEqual([
+            { type: 'signal:ice-restart', payload: { sdp: 'ice-restart-offer', offerId: 'ice-restart-1' } },
+            {
+                type: 'signal:candidate',
+                payload: {
+                    candidate: 'candidate:restart 1 udp 2122260223 192.0.2.3 54321 typ host',
+                    sdpMid: '0',
+                    sdpMLineIndex: 0,
+                    offerId: 'ice-restart-1'
+                }
+            }
+        ]);
         expect(onIceRestartFailed).not.toHaveBeenCalled();
 
         vi.advanceTimersByTime(7999);
@@ -382,7 +400,45 @@ describe('WebRTCManager ICE restart recovery', () => {
         expect(sent).toEqual([]);
 
         await vi.advanceTimersByTimeAsync(1);
-        expect(sent).toEqual([{ type: 'signal:ice-restart', payload: { sdp: 'ice-restart-offer' } }]);
+        expect(sent).toEqual([
+            { type: 'signal:ice-restart', payload: { sdp: 'ice-restart-offer', offerId: 'ice-restart-1' } },
+            {
+                type: 'signal:candidate',
+                payload: {
+                    candidate: 'candidate:restart 1 udp 2122260223 192.0.2.3 54321 typ host',
+                    sdpMid: '0',
+                    sdpMLineIndex: 0,
+                    offerId: 'ice-restart-1'
+                }
+            }
+        ]);
+    });
+
+    it('ignores stale ICE restart answers from a replaced restart offer', async () => {
+        vi.useFakeTimers();
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: () => {}
+        });
+
+        const managerInternals = manager as unknown as {
+            createPeerConnection(): void;
+            performIceRestart(): Promise<void>;
+            pc: FakeSubscriberPeerConnection | null;
+        };
+        managerInternals.createPeerConnection();
+
+        await managerInternals.performIceRestart();
+        expect(managerInternals.pc?.signalingState).toBe('have-local-offer');
+
+        await manager.handleVoiceAnswer('stale-answer', 'ice-restart-0');
+        expect(managerInternals.pc?.signalingState).toBe('have-local-offer');
+
+        await manager.handleVoiceAnswer('fresh-answer', 'ice-restart-1');
+        expect(managerInternals.pc?.signalingState).toBe('stable');
     });
 
     it('rolls back a pending ICE restart when server renegotiation arrives', async () => {
@@ -414,7 +470,16 @@ describe('WebRTCManager ICE restart recovery', () => {
 
         expect(managerInternals.pc?.signalingState).toBe('stable');
         expect(sent).toEqual([
-            { type: 'signal:ice-restart', payload: { sdp: 'ice-restart-offer' } },
+            { type: 'signal:ice-restart', payload: { sdp: 'ice-restart-offer', offerId: 'ice-restart-1' } },
+            {
+                type: 'signal:candidate',
+                payload: {
+                    candidate: 'candidate:restart 1 udp 2122260223 192.0.2.3 54321 typ host',
+                    sdpMid: '0',
+                    sdpMLineIndex: 0,
+                    offerId: 'ice-restart-1'
+                }
+            },
             { type: 'signal:renegotiate-answer', payload: { sdp: 'subscriber-answer', offerId: 'renegotiate-456' } }
         ]);
 
@@ -502,6 +567,39 @@ describe('WebRTCManager subscriber signaling', () => {
         }, 'old-offer');
 
         expect(pc?.addedCandidates).toEqual([]);
+    });
+
+    it('accepts server ICE candidates tagged with the current renegotiation offer ID', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: () => {}
+        });
+
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+        const pc = (manager as unknown as { pc: FakeSubscriberPeerConnection | null }).pc;
+
+        await manager.handleRenegotiation('renegotiation-offer', 'speaker-1', 'renegotiate-456');
+        await manager.handleCandidate({
+            candidate: 'candidate:old 1 udp 2122260223 192.0.2.1 54321 typ host',
+            sdpMid: '0',
+            sdpMLineIndex: 0
+        }, 'offer-123');
+        await manager.handleCandidate({
+            candidate: 'candidate:new 1 udp 2122260223 192.0.2.2 54321 typ host',
+            sdpMid: '0',
+            sdpMLineIndex: 0
+        }, 'renegotiate-456');
+
+        expect(pc?.addedCandidates).toEqual([
+            {
+                candidate: 'candidate:new 1 udp 2122260223 192.0.2.2 54321 typ host',
+                sdpMid: '0',
+                sdpMLineIndex: 0
+            }
+        ]);
     });
 
     it('echoes the server offer ID with the renegotiation answer', async () => {

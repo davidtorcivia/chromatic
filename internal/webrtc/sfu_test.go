@@ -959,7 +959,7 @@ func TestSFU_HandleIceRestart_RoomNotFound(t *testing.T) {
 	}
 	defer sfu.Shutdown()
 
-	_, err = sfu.HandleIceRestart("nonexistent", "sub-1", "")
+	_, err = sfu.HandleIceRestart("nonexistent", "sub-1", "", "")
 	if err == nil {
 		t.Error("expected error for nonexistent room")
 	}

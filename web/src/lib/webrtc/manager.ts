@@ -66,6 +66,7 @@ export interface WebRTCStats {
 export class WebRTCManager {
     private pc: RTCPeerConnection | null = null;
     private subscriberOfferId: string | null = null;
+    private subscriberCandidateOfferId: string | null = null;
     private options: WebRTCManagerOptions;
     // localStream holds the stream whose audio track is SENT — the processed
     // output of the mic cleanup chain when available, the raw capture
@@ -79,6 +80,10 @@ export class WebRTCManager {
     private screenShareSender: RTCRtpSender | null = null;
     private isMicMuted: boolean = true;
     private iceRestartPending: boolean = false;
+    private iceRestartOfferCounter = 0;
+    private iceRestartOfferId: string | null = null;
+    private iceRestartOfferSent: boolean = false;
+    private pendingIceRestartCandidates: RTCIceCandidateInit[] = [];
     // True once an ICE restart offer has actually been sent to the server,
     // so a second 'failed' state can be attributed to a genuine restart
     // failure rather than firing onIceRestartFailed prematurely.
@@ -162,6 +167,7 @@ export class WebRTCManager {
             }
 
             this.subscriberOfferId = offerId ?? null;
+            this.subscriberCandidateOfferId = offerId ?? null;
             const pc = this.pc!;
 
             // Set remote description (the offer from server). The subscriber
@@ -205,6 +211,9 @@ export class WebRTCManager {
         }
         this.iceRestartPending = false;
         this.iceRestartAttempted = false;
+        this.iceRestartOfferId = null;
+        this.iceRestartOfferSent = false;
+        this.pendingIceRestartCandidates = [];
         // NOTE: audioSender/screenShareSender belong to the publisher PC,
         // which is independent of the subscriber PC reset here.
         if (this.pc) {
@@ -216,12 +225,13 @@ export class WebRTCManager {
             this.pc = null;
         }
         this.subscriberOfferId = null;
+        this.subscriberCandidateOfferId = null;
     }
 
     // Handle ICE candidate from server (if server sends any)
     async handleCandidate(candidate: RTCIceCandidateInit, offerId?: string): Promise<void> {
         return this.enqueueSignaling(async () => {
-            if (offerId && this.subscriberOfferId && offerId !== this.subscriberOfferId) {
+            if (offerId && this.subscriberCandidateOfferId && offerId !== this.subscriberCandidateOfferId) {
                 console.warn('Ignoring stale ICE candidate for replaced subscriber connection', { offerId });
                 return;
             }
@@ -297,11 +307,10 @@ export class WebRTCManager {
         this.pc.onicecandidate = (event) => {
             if (event.candidate) {
                 console.log('Sending ICE candidate to server');
-                this.sendSignal('signal:candidate', {
+                this.sendSubscriberCandidate({
                     candidate: event.candidate.candidate,
                     sdpMid: event.candidate.sdpMid,
-                    sdpMLineIndex: event.candidate.sdpMLineIndex,
-                    offerId: this.subscriberOfferId ?? undefined
+                    sdpMLineIndex: event.candidate.sdpMLineIndex
                 });
             }
         };
@@ -366,6 +375,9 @@ export class WebRTCManager {
                 }
                 this.iceRestartPending = false;
                 this.iceRestartAttempted = false;
+                this.iceRestartOfferId = null;
+                this.iceRestartOfferSent = false;
+                this.pendingIceRestartCandidates = [];
             }
         };
 
@@ -376,6 +388,26 @@ export class WebRTCManager {
         this.pc.onicegatheringstatechange = () => {
             console.log('ICE gathering state:', this.pc?.iceGatheringState);
         };
+    }
+
+    private sendSubscriberCandidate(candidate: RTCIceCandidateInit): void {
+        if (this.iceRestartPending && !this.iceRestartOfferSent) {
+            this.pendingIceRestartCandidates.push(candidate);
+            return;
+        }
+
+        this.sendSignal('signal:candidate', {
+            ...candidate,
+            offerId: this.subscriberCandidateOfferId ?? undefined
+        });
+    }
+
+    private flushPendingIceRestartCandidates(): void {
+        const pending = this.pendingIceRestartCandidates;
+        this.pendingIceRestartCandidates = [];
+        for (const candidate of pending) {
+            this.sendSubscriberCandidate(candidate);
+        }
     }
 
     private tuneReceiverForLowLatency(receiver: RTCRtpReceiver): void {
@@ -423,18 +455,29 @@ export class WebRTCManager {
         return this.enqueueSignaling(async () => {
             if (!this.pc) return;
 
+            const offerId = `ice-restart-${++this.iceRestartOfferCounter}`;
+            const previousCandidateOfferId = this.subscriberCandidateOfferId;
+            this.iceRestartOfferId = offerId;
+            this.iceRestartOfferSent = false;
+            this.pendingIceRestartCandidates = [];
+            this.subscriberCandidateOfferId = offerId;
+
             try {
                 const offer = await this.pc.createOffer({ iceRestart: true });
                 await this.pc.setLocalDescription(offer);
 
                 // Send offer to server for ICE restart
                 if (!this.sendSignal('signal:ice-restart', {
-                    sdp: offer.sdp
+                    sdp: offer.sdp,
+                    offerId
                 })) {
                     console.warn('ICE restart offer was not sent; clearing pending restart state');
                     this.resetPeerConnection();
                     return;
                 }
+
+                this.iceRestartOfferSent = true;
+                this.flushPendingIceRestartCandidates();
 
                 // The restart has genuinely been attempted; a subsequent
                 // 'failed' state now means the restart itself failed.
@@ -445,6 +488,12 @@ export class WebRTCManager {
                 console.error('Failed to perform ICE restart:', err);
                 this.iceRestartPending = false;
                 this.iceRestartAttempted = false;
+                this.iceRestartOfferId = null;
+                this.iceRestartOfferSent = false;
+                this.pendingIceRestartCandidates = [];
+                if (this.subscriberCandidateOfferId === offerId) {
+                    this.subscriberCandidateOfferId = previousCandidateOfferId;
+                }
                 if (this.iceRestartTimeout) {
                     clearTimeout(this.iceRestartTimeout);
                     this.iceRestartTimeout = null;
@@ -466,6 +515,9 @@ export class WebRTCManager {
         }
         this.iceRestartPending = false;
         this.iceRestartAttempted = false;
+        this.iceRestartOfferId = null;
+        this.iceRestartOfferSent = false;
+        this.pendingIceRestartCandidates = [];
     }
 
     // Request a stream resync (forces keyframe from publisher)
@@ -946,9 +998,14 @@ export class WebRTCManager {
     }
 
     // Handle answer for voice renegotiation
-    async handleVoiceAnswer(sdp: string): Promise<void> {
+    async handleVoiceAnswer(sdp: string, offerId?: string): Promise<void> {
         return this.enqueueSignaling(async () => {
             if (!this.pc) return;
+
+            if (offerId && this.iceRestartOfferId && offerId !== this.iceRestartOfferId) {
+                console.warn('Ignoring stale ICE restart answer', { offerId });
+                return;
+            }
 
             if (this.pc.signalingState !== 'have-local-offer') {
                 console.warn('Ignoring stale answer with no local offer pending', { signalingState: this.pc.signalingState });
@@ -961,6 +1018,10 @@ export class WebRTCManager {
             };
 
             await this.pc.setRemoteDescription(answer);
+            if (offerId) {
+                this.subscriberCandidateOfferId = offerId;
+            }
+            this.clearIceRestartAttempt();
             console.log('Set remote description for answer');
         });
     }
@@ -979,6 +1040,7 @@ export class WebRTCManager {
 
             console.log('Handling server-initiated renegotiation', participantId ? `for voice from ${participantId}` : '');
             this.options.onRenegotiation?.();
+            const previousCandidateOfferId = this.subscriberCandidateOfferId;
 
             try {
                 if (this.pc.signalingState === 'have-local-offer') {
@@ -987,6 +1049,7 @@ export class WebRTCManager {
                     this.clearIceRestartAttempt();
                 }
 
+                this.subscriberCandidateOfferId = offerId ?? null;
                 await this.pc.setRemoteDescription({ type: 'offer', sdp });
                 const answer = await this.pc.createAnswer();
                 await this.pc.setLocalDescription(answer);
@@ -1004,6 +1067,7 @@ export class WebRTCManager {
 
                 console.log('Sent renegotiation answer');
             } catch (err) {
+                this.subscriberCandidateOfferId = previousCandidateOfferId;
                 console.error('Failed to handle renegotiation:', err);
             }
         });

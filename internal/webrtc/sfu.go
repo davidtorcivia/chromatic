@@ -1485,7 +1485,7 @@ func (s *SFU) AddSubscriberICECandidate(roomSlug, subscriberID string, candidate
 }
 
 // HandleIceRestart handles an ICE restart request from a subscriber
-func (s *SFU) HandleIceRestart(roomSlug, subscriberID, sdpOffer string) (string, error) {
+func (s *SFU) HandleIceRestart(roomSlug, subscriberID, sdpOffer, offerID string) (string, error) {
 	room := s.GetRoomTracksForSlug(roomSlug)
 	if room == nil {
 		return "", fmt.Errorf("room not found: %s", roomSlug)
@@ -1527,6 +1527,8 @@ func (s *SFU) HandleIceRestart(roomSlug, subscriberID, sdpOffer string) (string,
 	if err := sub.PeerConnection.SetRemoteDescription(offer); err != nil {
 		return "", fmt.Errorf("failed to set remote description: %w", err)
 	}
+
+	sub.CandidateID = offerID
 
 	// An ICE restart starts a brand-new candidate exchange (fresh ufrag/pwd),
 	// so the per-negotiation candidate budget starts over too. Without this,

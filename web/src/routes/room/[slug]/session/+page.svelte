@@ -323,9 +323,9 @@
         // ICE restart answers — route to handleVoiceAnswer which applies the
         // answer SDP to the same peer connection (same setRemoteDescription call).
         session.onMessage("signal:answer", async (payload: unknown) => {
-            const data = payload as { sdp: string };
+            const data = payload as { sdp: string; offerId?: string };
             try {
-                if (webrtcManager) await webrtcManager.handleVoiceAnswer(data.sdp);
+                if (webrtcManager) await webrtcManager.handleVoiceAnswer(data.sdp, data.offerId);
             } catch (err) {
                 console.error('Failed to handle answer:', err);
             }

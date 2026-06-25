@@ -1303,7 +1303,8 @@ func (h *WebSocketHandler) handleSignalCandidate(client *websocket.Client, paylo
 
 func (h *WebSocketHandler) handleIceRestart(client *websocket.Client, payload json.RawMessage) {
 	var data struct {
-		SDP string `json:"sdp"`
+		SDP     string `json:"sdp"`
+		OfferID string `json:"offerId"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		logger.Warn("Invalid ICE restart request", "participant_id", client.ID, "error", err)
@@ -1313,16 +1314,20 @@ func (h *WebSocketHandler) handleIceRestart(client *websocket.Client, payload js
 	logger.Info("Processing ICE restart", "participant_id", client.ID, "room", client.RoomSlug)
 
 	// Handle the ICE restart offer and get answer
-	answer, err := h.sfu.HandleIceRestart(client.RoomSlug, client.ID, data.SDP)
+	answer, err := h.sfu.HandleIceRestart(client.RoomSlug, client.ID, data.SDP, data.OfferID)
 	if err != nil {
 		logger.Error("Failed to handle ICE restart", "participant_id", client.ID, "error", err)
 		return
 	}
 
 	// Send answer back to client
-	client.SendJSON("signal:answer", map[string]interface{}{
+	response := map[string]interface{}{
 		"sdp": answer,
-	})
+	}
+	if data.OfferID != "" {
+		response["offerId"] = data.OfferID
+	}
+	client.SendJSON("signal:answer", response)
 
 	logger.Debug("Sent ICE restart answer", "participant_id", client.ID)
 
