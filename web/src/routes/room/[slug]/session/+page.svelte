@@ -522,10 +522,7 @@
         window.removeEventListener("chromatic:tampering", handleTampering);
         navigator.mediaDevices?.removeEventListener?.("devicechange", refreshAudioDevices);
         clearMicPromptTimer();
-        if (connectingWatchdog) {
-            clearTimeout(connectingWatchdog);
-            connectingWatchdog = null;
-        }
+        clearConnectingWatchdog();
         if (controlsTimer) {
             clearTimeout(controlsTimer);
             controlsTimer = null;
@@ -539,6 +536,13 @@
             chatToastTimer = null;
         }
     });
+
+    function clearConnectingWatchdog() {
+        if (connectingWatchdog) {
+            clearTimeout(connectingWatchdog);
+            connectingWatchdog = null;
+        }
+    }
 
     function initializeWebRTC() {
         if (webrtcManager) return;
@@ -766,6 +770,12 @@
         // counter immediately re-escalates on its next tick and the client
         // tears down each fresh subscription ~2.5s after it connects.
         clearKeyframeNudge();
+        // Give the replacement subscriber a fresh recovery window. Otherwise
+        // a stall/connecting timer from the failed path can fire against the
+        // new offer and trigger another resubscribe before it has a chance to
+        // render.
+        clearMediaStallTimer();
+        clearConnectingWatchdog();
         // The frozen last frame must not read as "playing" — drop to the
         // connecting overlay until the new subscriber delivers frames.
         isVideoPlaying = false;
@@ -792,8 +802,7 @@
                 }, CONNECTING_WATCHDOG_MS);
             }
         } else if (connectingWatchdog) {
-            clearTimeout(connectingWatchdog);
-            connectingWatchdog = null;
+            clearConnectingWatchdog();
         }
     });
 
