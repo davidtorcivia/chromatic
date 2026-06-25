@@ -43,9 +43,33 @@ class FakeSubscriberPeerConnection {
         return { type: 'answer', sdp: 'subscriber-answer' };
     }
 
-    async setRemoteDescription(): Promise<void> {}
+    async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
+        if (description.type === 'offer') {
+            this.signalingState = 'have-remote-offer';
+            return;
+        }
+        if (description.type === 'answer') {
+            if (this.signalingState !== 'have-local-offer') {
+                throw new Error(`cannot apply answer in ${this.signalingState}`);
+            }
+            this.signalingState = 'stable';
+        }
+    }
 
-    async setLocalDescription(): Promise<void> {}
+    async setLocalDescription(description?: RTCSessionDescriptionInit): Promise<void> {
+        if (!description) return;
+        if (description.type === 'offer') {
+            this.signalingState = 'have-local-offer';
+            return;
+        }
+        if (description.type === 'answer') {
+            this.signalingState = 'stable';
+            return;
+        }
+        if (description.type === 'rollback') {
+            this.signalingState = 'stable';
+        }
+    }
 
     close() {
         this.closed = true;
@@ -144,6 +168,43 @@ describe('WebRTCManager ICE restart recovery', () => {
         vi.advanceTimersByTime(15000);
 
         expect(onIceRestartFailed).toHaveBeenCalledTimes(1);
+    });
+
+    it('rolls back a pending ICE restart when server renegotiation arrives', async () => {
+        vi.useFakeTimers();
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const onIceRestartFailed = vi.fn();
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: (type, payload) => {
+                sent.push({ type, payload });
+            },
+            onIceRestartFailed
+        });
+
+        const managerInternals = manager as unknown as {
+            createPeerConnection(): void;
+            performIceRestart(): Promise<void>;
+            pc: FakeSubscriberPeerConnection | null;
+        };
+        managerInternals.createPeerConnection();
+
+        await managerInternals.performIceRestart();
+        expect(managerInternals.pc?.signalingState).toBe('have-local-offer');
+
+        await manager.handleRenegotiation('renegotiation-offer', 'speaker-1', 'renegotiate-456');
+
+        expect(managerInternals.pc?.signalingState).toBe('stable');
+        expect(sent).toEqual([
+            { type: 'signal:ice-restart', payload: { sdp: 'ice-restart-offer' } },
+            { type: 'signal:renegotiate-answer', payload: { sdp: 'subscriber-answer', offerId: 'renegotiate-456' } }
+        ]);
+
+        vi.advanceTimersByTime(15000);
+        expect(onIceRestartFailed).not.toHaveBeenCalled();
     });
 });
 

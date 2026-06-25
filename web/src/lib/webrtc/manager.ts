@@ -417,6 +417,15 @@ export class WebRTCManager {
         this.options.onIceRestartFailed?.();
     }
 
+    private clearIceRestartAttempt(): void {
+        if (this.iceRestartTimeout) {
+            clearTimeout(this.iceRestartTimeout);
+            this.iceRestartTimeout = null;
+        }
+        this.iceRestartPending = false;
+        this.iceRestartAttempted = false;
+    }
+
     // Request a stream resync (forces keyframe from publisher)
     requestResync(): void {
         console.log('Requesting stream resync (keyframe)');
@@ -811,6 +820,11 @@ export class WebRTCManager {
         return this.enqueueSignaling(async () => {
             if (!this.pc) return;
 
+            if (this.pc.signalingState !== 'have-local-offer') {
+                console.warn('Ignoring stale answer with no local offer pending', { signalingState: this.pc.signalingState });
+                return;
+            }
+
             const answer: RTCSessionDescriptionInit = {
                 type: 'answer',
                 sdp: sdp
@@ -822,8 +836,10 @@ export class WebRTCManager {
     }
 
     // Handle server-initiated renegotiation (e.g., when voice tracks are added).
-    // The subscriber PC is receive-only with the server as sole offerer, so
-    // this is a pure offer→answer exchange — no glare, no rollbacks.
+    // If it collides with a client ICE-restart offer, the server offer wins:
+    // rollback the local offer, cancel that restart attempt, and answer the
+    // server immediately. The server already performs the matching rollback
+    // when it receives an ICE restart during its own pending offer.
     async handleRenegotiation(sdp: string, participantId?: string, offerId?: string): Promise<void> {
         return this.enqueueSignaling(async () => {
             if (!this.pc) {
@@ -835,6 +851,12 @@ export class WebRTCManager {
             this.options.onRenegotiation?.();
 
             try {
+                if (this.pc.signalingState === 'have-local-offer') {
+                    console.log('Rolling back local subscriber offer before server renegotiation');
+                    await this.pc.setLocalDescription({ type: 'rollback' });
+                    this.clearIceRestartAttempt();
+                }
+
                 await this.pc.setRemoteDescription({ type: 'offer', sdp });
                 const answer = await this.pc.createAnswer();
                 await this.pc.setLocalDescription(answer);
