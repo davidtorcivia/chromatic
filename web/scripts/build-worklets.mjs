@@ -16,6 +16,12 @@ const entries = [
     {
         in: resolve(root, 'src/lib/audio/rnnoise/worklet-entry.js'),
         out: resolve(root, 'static/audio/rnnoise-worklet.js')
+    },
+    {
+        // Served as a static file (not a blob: URL) so a strict CSP
+        // (script-src 'self') doesn't block the soft-gate worklet.
+        in: resolve(root, 'src/lib/audio/gate/worklet-entry.js'),
+        out: resolve(root, 'static/audio/gate-worklet.js')
     }
 ];
 

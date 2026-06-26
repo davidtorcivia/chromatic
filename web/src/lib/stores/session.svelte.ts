@@ -81,7 +81,7 @@ export function createSessionStore() {
     let hasConnectedOnce = false;
 
     // Store connection params for reconnection
-    let connectionParams: { roomSlug: string; token: string; name: string } | null = null;
+    let connectionParams: { roomSlug: string; token: string; name: string; participantId: string } | null = null;
 
     // Calculate exponential backoff delay with jitter
     function getReconnectDelay(attempt: number): number {
@@ -152,7 +152,7 @@ export function createSessionStore() {
             reconnectTimer = setTimeout(() => {
                 reconnectTimer = null;
                 if (connectionParams) {
-                    connect(connectionParams.roomSlug, connectionParams.token, connectionParams.name);
+                    connect(connectionParams.roomSlug, connectionParams.token, connectionParams.name, connectionParams.participantId);
                 }
             }, delay);
         } else {
@@ -177,17 +177,22 @@ export function createSessionStore() {
         state.error = null;
         state.reconnecting = true;
         state.reconnectAttempt = 0;
-        connect(connectionParams.roomSlug, connectionParams.token, connectionParams.name);
+        connect(connectionParams.roomSlug, connectionParams.token, connectionParams.name, connectionParams.participantId);
     }
 
-    function connect(roomSlug: string, token: string, name: string) {
+    function connect(roomSlug: string, token: string, name: string, participantId = '') {
         attachNetworkListeners();
         // Clear any pending reconnect timer so a manual connect plus a
         // pending timer can't create parallel sockets.
         clearReconnectTimer();
 
         // Store params for reconnection
-        connectionParams = { roomSlug, token, name };
+        connectionParams = { roomSlug, token, name, participantId };
+        // Our own participant id — used to identify the local cursor (laser),
+        // self in rosters, etc. Set here (and re-applied on every reconnect via
+        // connectionParams) so it survives socket drops. Empty string from
+        // legacy/test callers leaves it null.
+        state.participantId = participantId || null;
 
         if (ws) {
             // Detach the old socket's onclose to prevent spurious reconnection

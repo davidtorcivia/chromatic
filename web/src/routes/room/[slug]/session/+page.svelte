@@ -751,7 +751,9 @@
         });
 
         // Connect only after handlers are registered so early messages aren't dropped.
-        session.connect(slug, sessionData!.token, participantName);
+        // Pass our participant id so session.state.participantId is populated
+        // (the laser's local cursor, self-identification, etc. depend on it).
+        session.connect(slug, sessionData!.token, participantName, sessionData!.participantId);
 
         window.addEventListener("chromatic:tampering", handleTampering);
 
