@@ -1,8 +1,14 @@
 <script lang="ts">
-    import { onMount } from "svelte";
+    import { onDestroy, onMount } from "svelte";
     import { goto } from "$app/navigation";
     import { page } from "$app/stores";
     import { auth, rooms } from "$lib/api/client";
+
+    let destroyed = false;
+
+    onDestroy(() => {
+        destroyed = true;
+    });
 
     onMount(async () => {
         // Check if authenticated by making a test API call
@@ -10,7 +16,9 @@
         try {
             await rooms.list();
         } catch {
-            goto("/");
+            if (!destroyed) {
+                goto("/");
+            }
         }
     });
 
@@ -59,7 +67,9 @@
         try {
             await auth.logout();
         } finally {
-            goto("/");
+            if (!destroyed) {
+                goto("/");
+            }
         }
     }
 </script>

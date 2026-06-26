@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount } from "svelte";
+    import { onDestroy, onMount } from "svelte";
     import { fade, fly } from "svelte/transition";
     import { streamKeys, type StreamKey } from "$lib/api/client";
     import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
@@ -11,20 +11,38 @@
     let showCreateForm = $state(false);
     let newKeyName = $state("");
     let error = $state("");
+    let actionError = $state("");
     let revealedIds = $state<Set<string>>(new Set());
     let pendingDeleteId = $state<string | null>(null);
+    let destroyed = false;
+    let loadRequestId = 0;
+
+    onDestroy(() => {
+        destroyed = true;
+    });
 
     onMount(async () => {
         await loadKeys();
     });
 
+    function getErrorMessage(e: unknown, fallback: string) {
+        return e instanceof Error ? e.message : fallback;
+    }
+
     async function loadKeys() {
+        const requestId = ++loadRequestId;
         try {
-            keys = (await streamKeys.list()) ?? [];
+            const nextKeys = (await streamKeys.list()) ?? [];
+            if (destroyed || requestId !== loadRequestId) return;
+
+            keys = nextKeys;
         } catch (e) {
+            if (destroyed || requestId !== loadRequestId) return;
             console.error("Failed to load stream keys", e);
         } finally {
-            isLoading = false;
+            if (!destroyed && requestId === loadRequestId) {
+                isLoading = false;
+            }
         }
     }
 
@@ -34,16 +52,22 @@
 
         isCreating = true;
         error = "";
+        actionError = "";
 
         try {
             const newKey = await streamKeys.create(newKeyName.trim());
+            if (destroyed) return;
+
             keys = [...keys, newKey];
             newKeyName = "";
             showCreateForm = false;
-        } catch (e: any) {
-            error = e.message || "Failed to create stream key";
+        } catch (e) {
+            if (destroyed) return;
+            error = getErrorMessage(e, "Failed to create stream key");
         } finally {
-            isCreating = false;
+            if (!destroyed) {
+                isCreating = false;
+            }
         }
     }
 
@@ -51,11 +75,16 @@
         const id = pendingDeleteId;
         pendingDeleteId = null;
         if (!id) return;
+        actionError = "";
 
         try {
             await streamKeys.delete(id);
+            if (destroyed) return;
+
             keys = keys.filter((k) => k.id !== id);
         } catch (e) {
+            if (destroyed) return;
+            actionError = getErrorMessage(e, "Failed to delete stream key");
             console.error("Failed to delete stream key", e);
         }
     }
@@ -102,6 +131,10 @@
             New Stream Key
         </button>
     </header>
+
+    {#if actionError}
+        <div class="alert alert-error" transition:fade={{ duration: 150 }}>{actionError}</div>
+    {/if}
 
     {#if showCreateForm}
         <div class="card create-card" transition:fly={{ y: 8, duration: 200 }}>

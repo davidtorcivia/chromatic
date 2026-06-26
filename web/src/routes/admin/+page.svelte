@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount } from "svelte";
+    import { onDestroy, onMount } from "svelte";
     import { goto } from "$app/navigation";
     import {
         rooms,
@@ -13,6 +13,8 @@
     let keys = $state<StreamKey[]>([]);
     let isLoading = $state(true);
     let showSetupBanner = $state(false);
+    let destroyed = false;
+    let loadRequestId = 0;
 
     let recentRooms = $derived(allRooms.slice(0, 5));
     let liveCount = $derived(
@@ -22,12 +24,19 @@
         allRooms.filter((r) => r.status === "pending").length,
     );
 
+    onDestroy(() => {
+        destroyed = true;
+    });
+
     onMount(async () => {
+        const requestId = ++loadRequestId;
         try {
             const [roomsData, keysData] = await Promise.all([
                 rooms.list(),
                 streamKeys.list(),
             ]);
+            if (destroyed || requestId !== loadRequestId) return;
+
             allRooms = roomsData ?? [];
             keys = keysData ?? [];
             if (typeof localStorage !== "undefined") {
@@ -43,9 +52,12 @@
                 }
             }
         } catch (e) {
+            if (destroyed || requestId !== loadRequestId) return;
             console.error("Failed to load dashboard data", e);
         } finally {
-            isLoading = false;
+            if (!destroyed && requestId === loadRequestId) {
+                isLoading = false;
+            }
         }
     });
 

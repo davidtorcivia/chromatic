@@ -22,17 +22,31 @@
 
     let copied = $state(false);
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let destroyed = false;
 
     onDestroy(() => {
-        clearTimeout(timer);
+        destroyed = true;
+        clearCopiedTimer();
     });
+
+    function clearCopiedTimer() {
+        clearTimeout(timer);
+        timer = undefined;
+    }
 
     async function copy() {
         try {
             await navigator.clipboard.writeText(value);
+            if (destroyed) return;
+
             copied = true;
-            clearTimeout(timer);
-            timer = setTimeout(() => (copied = false), 2000);
+            clearCopiedTimer();
+            timer = setTimeout(() => {
+                timer = undefined;
+                if (!destroyed) {
+                    copied = false;
+                }
+            }, 2000);
         } catch (e) {
             console.error("Failed to copy to clipboard", e);
         }
