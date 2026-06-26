@@ -91,6 +91,9 @@
     let showShortcuts = $state(false);
     let showStats = $state(false);
     let displayFps = $state<number | null>(null);
+    let frameCaptureToDisplayDelay = $state<number | null>(null);
+    let frameReceiveToDisplayDelay = $state<number | null>(null);
+    let frameProcessingDelay = $state<number | null>(null);
     let grabBusy = $state(false);
     let grabFlash = $state(false);
     let grabToast = $state<string | null>(null);
@@ -1728,19 +1731,47 @@
         }
     }
 
-    // Display fps for the stats card, measured only while it's open.
+    function smoothFrameDelay(current: number | null, value: number): number {
+        return current === null ? value : current * 0.8 + value * 0.2;
+    }
+
+    function saneFrameDelay(value: number): number | null {
+        return Number.isFinite(value) && value >= 0 && value < 60_000 ? value : null;
+    }
+
+    // Display fps and browser-provided WebRTC frame timing for the stats card,
+    // measured only while it's open.
     $effect(() => {
         const video = videoElement;
         if (!showStats || !video || !("requestVideoFrameCallback" in video)) return;
         let frames = 0;
         let windowStart = performance.now();
         let handle = 0;
-        const tick = (now: number) => {
+        const tick = (now: number, metadata: VideoFrameCallbackMetadata) => {
             frames++;
             if (now - windowStart >= 1000) {
                 displayFps = Math.round((frames * 1000) / (now - windowStart));
                 frames = 0;
                 windowStart = now;
+            }
+            const displayTime = metadata.expectedDisplayTime;
+            if (typeof metadata.captureTime === "number") {
+                const delay = saneFrameDelay(displayTime - metadata.captureTime);
+                if (delay !== null) {
+                    frameCaptureToDisplayDelay = smoothFrameDelay(frameCaptureToDisplayDelay, delay);
+                }
+            }
+            if (typeof metadata.receiveTime === "number") {
+                const delay = saneFrameDelay(displayTime - metadata.receiveTime);
+                if (delay !== null) {
+                    frameReceiveToDisplayDelay = smoothFrameDelay(frameReceiveToDisplayDelay, delay);
+                }
+            }
+            if (typeof metadata.processingDuration === "number") {
+                frameProcessingDelay = smoothFrameDelay(
+                    frameProcessingDelay,
+                    metadata.processingDuration * 1000,
+                );
             }
             handle = (video as any).requestVideoFrameCallback(tick);
         };
@@ -1748,6 +1779,9 @@
         return () => {
             (video as any).cancelVideoFrameCallback?.(handle);
             displayFps = null;
+            frameCaptureToDisplayDelay = null;
+            frameReceiveToDisplayDelay = null;
+            frameProcessingDelay = null;
         };
     });
 
@@ -2697,6 +2731,18 @@
                             <div class="stats-row">
                                 <span>Network RTT</span>
                                 <span>{currentRtt !== null ? `~${Math.round(currentRtt)} ms` : "n/a"}</span>
+                            </div>
+                            <div class="stats-row">
+                                <span>Frame delay</span>
+                                <span>{frameCaptureToDisplayDelay !== null ? `~${Math.round(frameCaptureToDisplayDelay)} ms` : "n/a"}</span>
+                            </div>
+                            <div class="stats-row">
+                                <span>Post-receive</span>
+                                <span>{frameReceiveToDisplayDelay !== null ? `~${Math.round(frameReceiveToDisplayDelay)} ms` : "n/a"}</span>
+                            </div>
+                            <div class="stats-row">
+                                <span>Decode</span>
+                                <span>{frameProcessingDelay !== null ? `~${Math.round(frameProcessingDelay)} ms` : "n/a"}</span>
                             </div>
                             <div class="stats-row">
                                 <span>Connection</span>
