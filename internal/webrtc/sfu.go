@@ -177,6 +177,22 @@ type RoomTracks struct {
 	// here by participantID keeps the relay's captured *atomic.Bool and
 	// SetVoiceMuted referencing the same object across session replacements.
 	voiceMuteFlags map[string]*atomic.Bool
+	// Webcam presence relays, keyed by participant ID. Unlike the single room
+	// screen share, every participant may have a small cam, so these mirror the
+	// voice relay maps. No mute gate — presence cams are opt-in by the owner.
+	WebcamLocalTracks map[string]*webrtc.TrackLocalStaticRTP
+	webcamRelayDone   map[string]chan struct{}
+	// webcamTrackIDs maps participant ID -> the set of RTP track IDs the client
+	// announced (via webcam:start) as webcam tracks, so the publisher OnTrack
+	// handler can tell a cam video track apart from a screen-share one (both are
+	// VP8 video on the same publisher PC).
+	webcamTrackIDs map[string]map[string]bool
+	// webcamDisabled is the admin "camera off" gate per participant. While set,
+	// forwardWebcamTrack refuses to relay that participant's cam (so a client
+	// can't bypass it by re-announcing), and any live relay is torn down. It
+	// persists across a page refresh (admin intent) and is cleared on a
+	// confirmed leave or when the admin re-enables.
+	webcamDisabled map[string]bool
 }
 
 type PublisherICECandidate struct {
@@ -712,6 +728,10 @@ func (s *SFU) Shutdown() {
 			close(ch)
 			delete(room.voiceRelayDone, id)
 		}
+		for id, ch := range room.webcamRelayDone {
+			close(ch)
+			delete(room.webcamRelayDone, id)
+		}
 		if room.screenShareDone != nil {
 			close(room.screenShareDone)
 			room.screenShareDone = nil
@@ -848,6 +868,41 @@ func (rt *RoomTracks) removeSubscriberLocked(id string) (pcs []*webrtc.PeerConne
 	if ch, ok := rt.voiceRelayDone[id]; ok {
 		close(ch)
 		delete(rt.voiceRelayDone, id)
+	}
+	// Always drop any announced cam track ids for the departing participant —
+	// even when no relay was ever created (a webcam:start whose cam never
+	// arrived would otherwise leave a permanent entry).
+	delete(rt.webcamTrackIDs, id)
+	// Confirmed leave clears the admin camera gate (it intentionally persists
+	// across a page refresh, but not across a real departure/rejoin).
+	delete(rt.webcamDisabled, id)
+	// Clean up this participant's webcam relay and remove its sender from every
+	// other subscriber so they don't keep a frozen cam tile bound to a dead
+	// track. Mirrors the abrupt screen-share teardown below.
+	if webcamLocal, ok := rt.WebcamLocalTracks[id]; ok {
+		delete(rt.WebcamLocalTracks, id)
+		if ch, ok := rt.webcamRelayDone[id]; ok {
+			close(ch)
+			delete(rt.webcamRelayDone, id)
+		}
+		if webcamLocal != nil {
+			for otherID, other := range rt.Subscribers {
+				if otherID == id {
+					continue
+				}
+				for _, sender := range other.PeerConnection.GetSenders() {
+					if sender.Track() == webcamLocal {
+						if err := other.PeerConnection.RemoveTrack(sender); err != nil {
+							log.Printf("Failed to remove webcam sender from %s during participant removal: %v", otherID, err)
+						} else {
+							other.needsRenegotiation = true
+							affectedSharerRemoval = append(affectedSharerRemoval, otherID)
+						}
+						break
+					}
+				}
+			}
+		}
 	}
 	// Clean up screen share state if this participant was sharing. Remove the
 	// sender from every other subscriber BEFORE nulling the local track, so
@@ -1243,13 +1298,26 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 		}
 	}
 
+	// Add existing webcam relay tracks so late joiners see active cams in the
+	// initial offer (avoids a separate renegotiation racing the first exchange).
+	for pid, webcamTrack := range room.WebcamLocalTracks {
+		if pid == subscriberID {
+			continue
+		}
+		if _, addErr := pc.AddTrack(webcamTrack); addErr != nil {
+			log.Printf("Failed to add webcam relay track for %s to subscriber %s: %v", pid, subscriberID, addErr)
+		} else {
+			log.Printf("Added existing webcam relay track to subscriber %s", subscriberID)
+		}
+	}
+
 	// Pre-stream there may be no tracks at all, and an SDP without a
 	// single m-line carries no ICE credentials (clients reject it with
 	// "no ice-ufrag"). A recvonly audio transceiver guarantees a valid
 	// offer and matches this PC's design — it already receives the
 	// client's voice (see OnTrack in the ws handler); later relay
 	// AddTrack calls upgrade it to sendrecv.
-	if room.VideoTrack == nil && room.AudioTrack == nil && len(room.VoiceLocalTracks) == 0 {
+	if room.VideoTrack == nil && room.AudioTrack == nil && len(room.VoiceLocalTracks) == 0 && len(room.WebcamLocalTracks) == 0 {
 		if _, trErr := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
 			Direction: webrtc.RTPTransceiverDirectionRecvonly,
 		}); trErr != nil {
@@ -2925,4 +2993,230 @@ func (s *SFU) RemoveScreenShareTrack(roomSlug string) []string {
 
 	log.Printf("Removed screen share track from %s in room %s, affected %d subscribers", sharerID, roomSlug, len(affected))
 	return affected
+}
+
+// ---- Webcam presence relays ------------------------------------------------
+// A participant's webcam is a small VP8 video track that fans out to every
+// other participant. Architecturally it is the voice relay (per-participant
+// keyed maps) using the screen-share video machinery, with no mute gate.
+
+// RegisterWebcamTrackID records that a participant's RTP video track with the
+// given ID is a webcam (not a screen share). Called from the webcam:start
+// signal BEFORE the publish offer is negotiated, so the publisher OnTrack
+// handler (which otherwise treats all video as screen share) can route it.
+func (s *SFU) RegisterWebcamTrackID(roomSlug, participantID, trackID string) {
+	if trackID == "" {
+		return
+	}
+	// GetRoomTracks (not ...ForSlug) so a webcam:start that races ahead of room
+	// materialization on join still registers — otherwise the cam would be
+	// mis-routed to the screen-share path when OnTrack fires.
+	room := s.GetRoomTracks(roomSlug)
+	if room == nil {
+		return
+	}
+	room.mu.Lock()
+	defer room.mu.Unlock()
+	if room.webcamTrackIDs == nil {
+		room.webcamTrackIDs = make(map[string]map[string]bool)
+	}
+	ids := room.webcamTrackIDs[participantID]
+	if ids == nil {
+		ids = make(map[string]bool)
+		room.webcamTrackIDs[participantID] = ids
+	}
+	ids[trackID] = true
+}
+
+// IsWebcamTrack reports whether the given RTP track ID was announced as a
+// webcam for the participant. Reading from nil maps is safe and returns false.
+func (s *SFU) IsWebcamTrack(roomSlug, participantID, trackID string) bool {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return false
+	}
+	room.mu.RLock()
+	defer room.mu.RUnlock()
+	return room.webcamTrackIDs[participantID][trackID]
+}
+
+// CreateWebcamRelayTrack creates (or reuses) a per-participant webcam relay
+// track and starts a single forwarding goroutine. Mirrors CreateVoiceRelayTrack
+// without the mute gate. The bool reports whether a NEW relay was created (so
+// the caller knows to fan it out to subscribers).
+func (s *SFU) CreateWebcamRelayTrack(roomSlug, participantID string, remoteTrack *webrtc.TrackRemote) (*webrtc.TrackLocalStaticRTP, bool, error) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return nil, false, fmt.Errorf("room not found: %s", roomSlug)
+	}
+
+	done := make(chan struct{})
+
+	room.mu.Lock()
+	if room.WebcamLocalTracks == nil {
+		room.WebcamLocalTracks = make(map[string]*webrtc.TrackLocalStaticRTP)
+	}
+	existing, reused := room.WebcamLocalTracks[participantID]
+	var localTrack *webrtc.TrackLocalStaticRTP
+	if reused {
+		localTrack = existing
+	} else {
+		created, err := webrtc.NewTrackLocalStaticRTP(
+			remoteTrack.Codec().RTPCodecCapability,
+			fmt.Sprintf("webcam-%s", participantID),
+			fmt.Sprintf("webcam-stream-%s", participantID),
+		)
+		if err != nil {
+			room.mu.Unlock()
+			return nil, false, fmt.Errorf("failed to create webcam relay track: %w", err)
+		}
+		localTrack = created
+		room.WebcamLocalTracks[participantID] = localTrack
+	}
+	if room.webcamRelayDone == nil {
+		room.webcamRelayDone = make(map[string]chan struct{})
+	}
+	// Stop any previous relay goroutine for this participant before replacing it
+	// (cam restarted) so it can't leak or double-write the shared local track.
+	if prev, ok := room.webcamRelayDone[participantID]; ok {
+		close(prev)
+	}
+	room.webcamRelayDone[participantID] = done
+	room.mu.Unlock()
+
+	go relayTrackLoop(remoteTrack, localTrack, done, nil, "Webcam", participantID)
+
+	if reused {
+		log.Printf("Rebound webcam relay for %s in room %s", participantID, roomSlug)
+	} else {
+		log.Printf("Created webcam relay track for %s in room %s", participantID, roomSlug)
+	}
+	return localTrack, !reused, nil
+}
+
+// AddWebcamTrackToSubscriber adds a participant's webcam relay track to a
+// subscriber and creates a renegotiation offer. Same pattern as voice.
+func (s *SFU) AddWebcamTrackToSubscriber(roomSlug, subscriberID, ownerID string, localTrack *webrtc.TrackLocalStaticRTP) (string, string, error) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return "", "", fmt.Errorf("room not found: %s", roomSlug)
+	}
+	room.mu.RLock()
+	sub, ok := room.Subscribers[subscriberID]
+	room.mu.RUnlock()
+	if !ok {
+		return "", "", fmt.Errorf("subscriber not found: %s", subscriberID)
+	}
+	offerSDP, offerID, err := s.addTrackAndRenegotiate(sub, localTrack, "webcam")
+	if err != nil {
+		return "", "", err
+	}
+	log.Printf("Added webcam track from %s to subscriber %s", ownerID, subscriberID)
+	return offerSDP, offerID, nil
+}
+
+// RemoveWebcamTrack stops a participant's webcam relay and removes its sender
+// from all subscribers. Returns affected subscriber IDs for renegotiation.
+func (s *SFU) RemoveWebcamTrack(roomSlug, participantID string) []string {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return nil
+	}
+
+	room.mu.Lock()
+	localTrack := room.WebcamLocalTracks[participantID]
+	delete(room.WebcamLocalTracks, participantID)
+	delete(room.webcamTrackIDs, participantID)
+	if ch, ok := room.webcamRelayDone[participantID]; ok {
+		close(ch)
+		delete(room.webcamRelayDone, participantID)
+	}
+	room.mu.Unlock()
+
+	if localTrack == nil {
+		return nil
+	}
+
+	room.mu.RLock()
+	subIDs := make([]string, 0, len(room.Subscribers))
+	for id := range room.Subscribers {
+		subIDs = append(subIDs, id)
+	}
+	room.mu.RUnlock()
+
+	var affected []string
+	for _, subID := range subIDs {
+		room.mu.RLock()
+		sub, ok := room.Subscribers[subID]
+		room.mu.RUnlock()
+		if !ok {
+			continue
+		}
+		sub.SignalingMu.Lock()
+		for _, sender := range sub.PeerConnection.GetSenders() {
+			if sender.Track() == localTrack {
+				if err := sub.PeerConnection.RemoveTrack(sender); err != nil {
+					log.Printf("Failed to remove webcam sender from %s: %v", subID, err)
+				} else {
+					affected = append(affected, subID)
+				}
+				break
+			}
+		}
+		sub.SignalingMu.Unlock()
+	}
+	log.Printf("Removed webcam track from %s in room %s, affected %d subscribers", participantID, roomSlug, len(affected))
+	return affected
+}
+
+// SetWebcamDisabled is the admin camera gate. Disabling tears down any live
+// relay (returning affected subscriber IDs to renegotiate) and blocks future
+// relays for that participant until re-enabled. Enabling just clears the gate;
+// the participant may then turn their cam back on.
+func (s *SFU) SetWebcamDisabled(roomSlug, participantID string, disabled bool) []string {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return nil
+	}
+	room.mu.Lock()
+	if room.webcamDisabled == nil {
+		room.webcamDisabled = make(map[string]bool)
+	}
+	if disabled {
+		room.webcamDisabled[participantID] = true
+	} else {
+		delete(room.webcamDisabled, participantID)
+	}
+	room.mu.Unlock()
+
+	if disabled {
+		// Tear down whatever they currently have (RemoveWebcamTrack locks room.mu
+		// itself, hence the unlock above).
+		return s.RemoveWebcamTrack(roomSlug, participantID)
+	}
+	return nil
+}
+
+// IsWebcamDisabled reports whether an admin has gated this participant's camera.
+func (s *SFU) IsWebcamDisabled(roomSlug, participantID string) bool {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return false
+	}
+	room.mu.RLock()
+	defer room.mu.RUnlock()
+	return room.webcamDisabled[participantID]
+}
+
+// HasWebcam reports whether a participant currently has an active webcam relay.
+// Used by the disconnect path to tear cams down on a page refresh.
+func (s *SFU) HasWebcam(roomSlug, participantID string) bool {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return false
+	}
+	room.mu.RLock()
+	defer room.mu.RUnlock()
+	_, ok := room.WebcamLocalTracks[participantID]
+	return ok
 }

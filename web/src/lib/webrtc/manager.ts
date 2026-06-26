@@ -40,15 +40,56 @@ export function storeMicDeviceId(deviceId: string | null): void {
     }
 }
 
+// Preferred camera input device. Persisted so the user's choice survives
+// reloads; the camera itself stays OFF on join (privacy) — only the device
+// preference is remembered.
+export const CAMERA_DEVICE_STORAGE_KEY = 'chromatic_camera_device';
+
+export function getStoredCameraDeviceId(): string | null {
+    try {
+        return localStorage.getItem(CAMERA_DEVICE_STORAGE_KEY);
+    } catch {
+        return null;
+    }
+}
+
+export function storeCameraDeviceId(deviceId: string | null): void {
+    try {
+        if (deviceId) {
+            localStorage.setItem(CAMERA_DEVICE_STORAGE_KEY, deviceId);
+        } else {
+            localStorage.removeItem(CAMERA_DEVICE_STORAGE_KEY);
+        }
+    } catch {
+        // Storage unavailable (private mode) — the in-session choice still applies.
+    }
+}
+
+// Presence-cam capture constraints: deliberately tiny (small circular tiles) so
+// encode/bandwidth stay cheap. The display is ~96px; 320x240 is plenty.
+function camConstraints(deviceId?: string | null, exact = false): MediaTrackConstraints {
+    const constraints: MediaTrackConstraints = {
+        width: { ideal: 320 },
+        height: { ideal: 240 },
+        frameRate: { ideal: 24, max: 30 },
+        facingMode: 'user'
+    };
+    if (deviceId) {
+        constraints.deviceId = exact ? { exact: deviceId } : { ideal: deviceId };
+    }
+    return constraints;
+}
+
 export interface MicConstraintOptions {
     deviceId?: string | null;
     exact?: boolean;
     mode: AudioMode;
     studioHeadphones: boolean;
-    // True when an in-app denoiser will actually run; we then disable the
-    // browser's native noiseSuppression so the two don't stack (double NS
-    // compounds the "musical noise" artifacts).
-    inAppDenoise: boolean;
+    // Explicit native-noise-suppression decision made by the caller. In talkback
+    // this is OFF when our own denoiser will run (no double NS) and also OFF when
+    // the user explicitly chose "no noise reduction"; it is only ON as a fallback
+    // when an intended in-app denoiser failed to engage. Always OFF in studio.
+    noiseSuppression: boolean;
 }
 
 // Per-mode capture constraints. Talkback keeps native echo cancellation
@@ -64,10 +105,10 @@ export function micConstraints(opts: MicConstraintOptions): MediaTrackConstraint
 
     const constraints: MediaTrackConstraints & Record<string, unknown> = {
         echoCancellation,
-        // Studio: never suppress/AGC. Talkback: suppress natively only when our
-        // own denoiser isn't carrying that load; AGC stays native for level
-        // consistency (we add no gain stage in talkback, so it can't pump).
-        noiseSuppression: studio ? false : !opts.inAppDenoise,
+        // Studio: never suppress/AGC. Talkback: caller decides NS (see opts).
+        // AGC stays native for level consistency (we add no gain stage in
+        // talkback, so it can't pump).
+        noiseSuppression: studio ? false : opts.noiseSuppression,
         autoGainControl: studio ? false : true
     };
     if (echoCancellation) {
@@ -89,6 +130,10 @@ export interface WebRTCManagerOptions {
     onTrack: (event: RTCTrackEvent) => void;
     onVoiceTrack?: (participantId: string, track: MediaStreamTrack) => void;
     onScreenShareTrack?: (participantId: string, track: MediaStreamTrack) => void;
+    onWebcamTrack?: (participantId: string, track: MediaStreamTrack) => void;
+    /** Local cam capture ended on its own (device unplugged / OS revoked), so
+     *  the page can reset its camera UI state. */
+    onWebcamEnded?: () => void;
     sendSignal: (type: string, payload: unknown) => boolean | void;
     onConnectionStateChange?: (state: RTCPeerConnectionState) => void;
     onIceRestart?: () => void;
@@ -133,6 +178,9 @@ export class WebRTCManager {
     private studioHeadphones: boolean = false;
     private screenShareStream: MediaStream | null = null;
     private screenShareSender: RTCRtpSender | null = null;
+    // Presence webcam (small cam tile). Opt-in, off until startWebcam.
+    private cameraStream: MediaStream | null = null;
+    private cameraSender: RTCRtpSender | null = null;
     private isMicMuted: boolean = true;
     private iceRestartPending: boolean = false;
     private iceRestartOfferCounter = 0;
@@ -371,6 +419,22 @@ export class WebRTCManager {
             if (screenShareParticipantId) {
                 debugLog('Identified screen share track from participant:', screenShareParticipantId);
                 this.options.onScreenShareTrack?.(screenShareParticipantId, event.track);
+                return;
+            }
+
+            // Identify presence webcam tracks by stream/track ID.
+            //   track ID:  "webcam-{participantId}"
+            //   stream ID: "webcam-stream-{participantId}"
+            let webcamParticipantId: string | null = null;
+            if (streamId.startsWith('webcam-stream-')) {
+                webcamParticipantId = streamId.substring('webcam-stream-'.length);
+            } else if (trackId.startsWith('webcam-')) {
+                webcamParticipantId = trackId.substring('webcam-'.length);
+            }
+
+            if (webcamParticipantId) {
+                debugLog('Identified webcam track from participant:', webcamParticipantId);
+                this.options.onWebcamTrack?.(webcamParticipantId, event.track);
                 return;
             }
 
@@ -840,8 +904,18 @@ export class WebRTCManager {
         if (this.isClosed()) return false;
         const previousRaw = this.rawMicStream;
 
+        // Whether talkback intends to run an in-app denoiser at all (mode +
+        // chosen, implemented engine). When false (studio, or engine "off"), we
+        // do NOT turn native NS on — "off" means off.
+        const wantInApp = this.wantsInAppDenoise();
+
         for (let attempt = 0; attempt < 2; attempt++) {
-            const inAppDenoise = this.wantsInAppDenoise() && attempt === 0;
+            // Build the denoiser on attempt 0 only; attempt 1 is the fallback.
+            const useDenoiser = wantInApp && attempt === 0;
+            // Native NS is enabled ONLY as the fallback (attempt 1) when an
+            // intended in-app denoiser failed to engage — never alongside a
+            // working denoiser, and never when the user chose "off".
+            const noiseSuppression = wantInApp && attempt === 1;
             let raw: MediaStream;
             try {
                 raw = await navigator.mediaDevices.getUserMedia({
@@ -850,7 +924,7 @@ export class WebRTCManager {
                         exact,
                         mode: this.audioMode,
                         studioHeadphones: this.studioHeadphones,
-                        inAppDenoise
+                        noiseSuppression
                     }),
                     video: false
                 });
@@ -868,15 +942,16 @@ export class WebRTCManager {
                 return false;
             }
 
-            await this.installMicStream(raw);
+            await this.installMicStream(raw, useDenoiser);
             if (this.isClosed()) {
                 return false;
             }
 
             // Talkback wanted an in-app denoiser but it didn't engage — retry
-            // once with native noise suppression rather than shipping raw noisy
-            // speech. (rawMicStream now points at this attempt's capture.)
-            if (inAppDenoise && !(this.micChain?.denoiserActive ?? false)) {
+            // once with native noise suppression (and no in-app denoiser) rather
+            // than shipping raw noisy speech. (rawMicStream now points at this
+            // attempt's capture.)
+            if (useDenoiser && !(this.micChain?.denoiserActive ?? false)) {
                 console.warn('In-app denoiser inactive; re-acquiring mic with native noise suppression');
                 this.disposeMicChain();
                 this.stopStream(raw);
@@ -887,7 +962,17 @@ export class WebRTCManager {
 
             const newTrack = this.localStream?.getAudioTracks()[0] ?? null;
             if (this.audioSender && newTrack) {
-                await this.audioSender.replaceTrack(newTrack);
+                try {
+                    await this.audioSender.replaceTrack(newTrack);
+                } catch (err) {
+                    // Rare (same-kind replace). Don't leak the previous capture
+                    // and don't let the rejection escape as unhandled.
+                    console.error('Failed to replace mic track:', err);
+                    if (previousRaw && previousRaw !== raw) {
+                        this.stopStream(previousRaw);
+                    }
+                    return false;
+                }
                 if (this.isClosed()) return false;
             }
 
@@ -904,13 +989,14 @@ export class WebRTCManager {
     // Routes a fresh mic capture through the mode-aware cleanup chain (high-pass
     // + optional denoiser + soft gate in talkback; bypassed entirely in studio),
     // falls back to the raw capture on any failure, and applies the current mute
-    // state to whichever stream will be sent.
-    private async installMicStream(raw: MediaStream): Promise<void> {
+    // state to whichever stream will be sent. `useDenoiser` is false on the
+    // native-NS fallback attempt so RNNoise and native NS never stack.
+    private async installMicStream(raw: MediaStream, useDenoiser: boolean): Promise<void> {
         this.disposeMicChain();
         this.rawMicStream = raw;
         this.micChain = await createMicChain(raw, {
             mode: this.audioMode,
-            denoiser: this.denoiserEngine
+            denoiser: useDenoiser ? this.denoiserEngine : 'off'
         });
         if (this.isClosed()) {
             this.disposeMicChain();
@@ -1294,6 +1380,7 @@ export class WebRTCManager {
         this.publisherNeedsRenegotiation = false;
         this.audioSender = null;
         this.screenShareSender = null;
+        this.cameraSender = null;
         try {
             old?.close();
         } catch {
@@ -1302,8 +1389,13 @@ export class WebRTCManager {
 
         const audioTrack = this.localStream?.getAudioTracks()[0];
         const shareTrack = this.screenShareStream?.getVideoTracks()[0];
-        if (!audioTrack && !(shareTrack && shareTrack.readyState === 'live')) {
-            return; // nothing to publish; next mic/share enable recreates it
+        const camTrack = this.cameraStream?.getVideoTracks()[0];
+        if (
+            !audioTrack &&
+            !(shareTrack && shareTrack.readyState === 'live') &&
+            !(camTrack && camTrack.readyState === 'live')
+        ) {
+            return; // nothing to publish; next mic/share/cam enable recreates it
         }
 
         const pc = this.ensurePublisher();
@@ -1314,6 +1406,12 @@ export class WebRTCManager {
         if (shareTrack && shareTrack.readyState === 'live' && this.screenShareStream) {
             this.screenShareSender = pc.addTrack(shareTrack, this.screenShareStream);
             void this.tuneShareSender(this.screenShareSender);
+        }
+        if (camTrack && camTrack.readyState === 'live' && this.cameraStream) {
+            // The cam track id is unchanged across the rebuild, so the server's
+            // existing webcam mapping still matches when OnTrack re-fires.
+            this.cameraSender = pc.addTrack(camTrack, this.cameraStream);
+            void this.tuneWebcamSender(this.cameraSender);
         }
         void this.negotiatePublisher();
     }
@@ -1552,6 +1650,188 @@ export class WebRTCManager {
         debugLog('Screen share stopped');
     }
 
+    // ---- Presence webcam ----------------------------------------------------
+    // A small low-res cam published on the publisher PC. Both this and screen
+    // share are VP8 video, so we announce the cam track id via `webcam:start`
+    // BEFORE negotiating — the server routes by that id (see websocket.go).
+
+    isCameraOn(): boolean {
+        return this.cameraSender != null;
+    }
+
+    // Local capture for the user's own self-view tile.
+    getCameraStream(): MediaStream | null {
+        return this.cameraStream;
+    }
+
+    getCurrentCameraDeviceId(): string | null {
+        const track = this.cameraStream?.getVideoTracks()[0];
+        try {
+            return track?.getSettings().deviceId ?? null;
+        } catch {
+            return null;
+        }
+    }
+
+    async startWebcam(deviceId?: string | null): Promise<boolean> {
+        try {
+            if (this.isClosed()) return false;
+            if (this.cameraSender) return true; // already on
+            const preferred = deviceId ?? getStoredCameraDeviceId();
+            this.cameraStream = await navigator.mediaDevices.getUserMedia({
+                video: camConstraints(preferred),
+                audio: false
+            });
+            if (this.isClosed()) {
+                this.stopStream(this.cameraStream);
+                this.cameraStream = null;
+                return false;
+            }
+
+            const videoTrack = this.cameraStream.getVideoTracks()[0];
+            if (!videoTrack) {
+                this.stopStream(this.cameraStream);
+                this.cameraStream = null;
+                return false;
+            }
+
+            // Presence cam is motion content; let the encoder drop resolution
+            // before framerate so faces stay fluid.
+            try {
+                videoTrack.contentHint = 'motion';
+            } catch {
+                // older browsers — fine without the hint
+            }
+
+            videoTrack.onended = () => {
+                debugLog('Camera ended (device removed)');
+                this.stopWebcam();
+                this.options.onWebcamEnded?.();
+            };
+
+            // Announce the cam track id BEFORE negotiating so the server maps
+            // the incoming video track to the webcam path (not screen share).
+            this.sendSignal('webcam:start', { trackId: videoTrack.id });
+
+            const pub = this.ensurePublisher();
+            this.cameraSender = pub.addTrack(videoTrack, this.cameraStream);
+            void this.tuneWebcamSender(this.cameraSender);
+
+            const negotiated = await this.negotiatePublisher();
+            if (!negotiated) {
+                this.rebuildPublisher();
+            }
+            debugLog('Webcam started');
+            return true;
+        } catch (err) {
+            console.error('Failed to start webcam:', err);
+            if (this.cameraStream) {
+                this.stopStream(this.cameraStream);
+                this.cameraStream = null;
+            }
+            this.cameraSender = null;
+            return false;
+        }
+    }
+
+    stopWebcam(): void {
+        const needsRenegotiation = this.cameraSender != null && this.publisherPc != null;
+
+        if (this.cameraSender && this.publisherPc) {
+            try {
+                this.publisherPc.removeTrack(this.cameraSender);
+            } catch (err) {
+                console.error('Failed to remove webcam track:', err);
+            }
+        }
+        this.cameraSender = null;
+
+        if (this.cameraStream) {
+            this.stopStream(this.cameraStream);
+            this.cameraStream = null;
+        }
+
+        // Tell the server to tear down the relay + remove our tile everywhere.
+        this.sendSignal('webcam:stop', {});
+
+        if (needsRenegotiation) {
+            void this.negotiatePublisher();
+        }
+        debugLog('Webcam stopped');
+    }
+
+    // Switch camera device: re-capture and swap the track via replaceTrack. No
+    // renegotiation — the SDP msid (and thus the server's track-id mapping) is
+    // preserved, so the relay keeps flowing uninterrupted.
+    async setCameraDevice(deviceId: string): Promise<boolean> {
+        try {
+            if (this.isClosed() || !this.cameraSender) return false;
+            const newStream = await navigator.mediaDevices.getUserMedia({
+                video: camConstraints(deviceId, true),
+                audio: false
+            });
+            if (this.isClosed()) {
+                this.stopStream(newStream);
+                return false;
+            }
+            const newTrack = newStream.getVideoTracks()[0];
+            if (!newTrack) {
+                this.stopStream(newStream);
+                return false;
+            }
+            try {
+                newTrack.contentHint = 'motion';
+            } catch {
+                // fine without
+            }
+            newTrack.onended = () => {
+                debugLog('Camera ended (device removed)');
+                this.stopWebcam();
+                this.options.onWebcamEnded?.();
+            };
+
+            const oldStream = this.cameraStream;
+            try {
+                await this.cameraSender.replaceTrack(newTrack);
+            } catch (err) {
+                // Don't leak the freshly-opened device (camera light) if the
+                // swap fails; keep the previous capture running.
+                console.error('Failed to replace camera track:', err);
+                this.stopStream(newStream);
+                return false;
+            }
+            if (this.isClosed()) {
+                this.stopStream(newStream);
+                return false;
+            }
+            this.cameraStream = newStream;
+            if (oldStream && oldStream !== newStream) {
+                this.stopStream(oldStream);
+            }
+            debugLog('Switched camera device:', deviceId);
+            return true;
+        } catch (err) {
+            console.error('Failed to switch camera device:', err);
+            return false;
+        }
+    }
+
+    // Tiny presence cam: cap bitrate hard and keep framerate over resolution
+    // (faces should stay fluid; the tile is small so detail barely matters).
+    private async tuneWebcamSender(sender: RTCRtpSender): Promise<void> {
+        try {
+            const params = sender.getParameters();
+            params.degradationPreference = 'maintain-framerate';
+            if (!params.encodings || params.encodings.length === 0) {
+                params.encodings = [{}];
+            }
+            params.encodings[0].maxBitrate = 120_000;
+            await sender.setParameters(params);
+        } catch (err) {
+            console.warn('Could not tune webcam sender parameters:', err);
+        }
+    }
+
     // Clean up
     close(): void {
         this.closed = true;
@@ -1585,6 +1865,12 @@ export class WebRTCManager {
             this.screenShareStream = null;
         }
         this.screenShareSender = null;
+
+        if (this.cameraStream) {
+            this.stopStream(this.cameraStream);
+            this.cameraStream = null;
+        }
+        this.cameraSender = null;
 
         if (this.pc) {
             this.pc.close();

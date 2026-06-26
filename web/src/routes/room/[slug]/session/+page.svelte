@@ -8,7 +8,12 @@
     import { rooms, uploadFile } from "$lib/api/client";
     import { chatStore, type ChatMessage } from "$lib/stores/chat.svelte";
     import { unlockAudio, getAudioContext, closeAudioContext } from "$lib/audio/context";
-    import { WebRTCManager, getStoredMicDeviceId, storeMicDeviceId } from "$lib/webrtc/manager";
+    import {
+        WebRTCManager,
+        getStoredMicDeviceId,
+        storeMicDeviceId,
+        storeCameraDeviceId,
+    } from "$lib/webrtc/manager";
     import { loadAudioModeState, type AudioMode, type DenoiserEngine } from "$lib/audio/audio-mode";
     import { deriveStreamOverlayState } from "$lib/video/stream-overlay";
     import { AudioDuckingManager } from "$lib/audio/ducking";
@@ -186,6 +191,20 @@
     let denoiserEngine = $state<DenoiserEngine>(_savedAudioMode.denoiser);
     let studioHeadphones = $state(_savedAudioMode.studioHeadphones);
     let audioModePending = $state(false);
+    // Presence webcams (small circular tiles, top strip). Off by default; only
+    // the device preference persists. Remote cam streams keyed by participant id
+    // (reassigned for reactivity, mirroring speakingParticipants).
+    let isCameraOn = $state(false);
+    let cameraPending = $state(false);
+    let selfCamStream = $state<MediaStream | null>(null);
+    let activeCameraId = $state<string | null>(null);
+    let videoInputs = $state<MediaDeviceInfo[]>([]);
+    let remoteCamStreams = $state<Map<string, MediaStream>>(new Map());
+    let camsHidden = $state(false);
+    // Live preview for the camera picker. When the cam is already on we preview
+    // the published self stream; when off, we open a temporary preview stream
+    // while the settings popover is open (stopped as soon as it closes).
+    let previewStream = $state<MediaStream | null>(null);
     const SPEAKER_DEVICE_STORAGE_KEY = "chromatic_speaker_device";
     const supportsSinkSelection =
         typeof HTMLMediaElement !== "undefined" &&
@@ -212,6 +231,8 @@
     // the admin toggle must only offer Unmute where it was the admin who
     // muted — force-enabling a self-muted mic would be a hot-mic surprise).
     let adminMutedIds = $state<Set<string>>(new Set());
+    // Participants whose camera an admin has gated off (server-enforced).
+    let camDisabledIds = $state<Set<string>>(new Set());
     // Hot-mic guard: an admin unmute may only RESUME a mic that was live
     // when the admin muted it. Anything else (we were self-muted, or a
     // stray/forged unmute for someone never admin-muted) must not touch
@@ -452,6 +473,31 @@
             }
         });
 
+        // Admin camera gate. The server stops relaying the target's cam; the
+        // target also stops capturing locally so their light goes off. We do NOT
+        // auto-re-enable on un-gate (cam is opt-in/privacy) — the button just
+        // becomes usable again.
+        session.onMessage("webcam:disabled", (payload: unknown) => {
+            const data = payload as { participantId?: string; disabled?: boolean };
+            if (!data?.participantId) return;
+            const disabled = data.disabled !== false;
+            const next = new Set(camDisabledIds);
+            if (disabled) next.add(data.participantId);
+            else next.delete(data.participantId);
+            camDisabledIds = next;
+
+            if (disabled) {
+                // The relay teardown already drops the tile elsewhere; ensure
+                // ours goes too.
+                removeRemoteCam(data.participantId);
+                if (data.participantId === sessionData?.participantId && isCameraOn) {
+                    webrtcManager?.stopWebcam();
+                    isCameraOn = false;
+                    selfCamStream = null;
+                }
+            }
+        });
+
         session.onMessage("signal:voice-answer", async (payload: unknown) => {
             const data = payload as { sdp: string };
             try {
@@ -589,6 +635,13 @@
             if (data?.participantId) cleanupParticipantVoice(data.participantId);
         });
 
+        // A participant turned their cam off — drop their tile promptly (the
+        // relayed track also ends, but this is the explicit, immediate signal).
+        session.onMessage("webcam:stopped", (payload: unknown) => {
+            const data = payload as { participantId?: string };
+            if (data?.participantId) removeRemoteCam(data.participantId);
+        });
+
         // Chat handlers live here (always active) rather than in ChatPanel,
         // which is conditionally rendered — otherwise history/messages
         // arriving before the panel is first opened would be missed.
@@ -664,6 +717,14 @@
             selfShareStream = null;
             pendingScreenShareRequest = null;
             shareApprovedPrompt = false;
+            // The new manager has no camera capture (the old one was closed), so
+            // reset cam UI to off and drop stale remote tiles. Active remote cams
+            // re-arrive in the fresh subscriber offer; the user re-enables their
+            // own cam if they want it back (parity with screen share resetting).
+            isCameraOn = false;
+            selfCamStream = null;
+            remoteCamStreams = new Map();
+            camsHidden = false;
             streamPaused = false;
             streamError = null;
         });
@@ -781,6 +842,13 @@
             onTrack: handleTrack,
             onVoiceTrack: handleVoiceTrack,
             onScreenShareTrack: handleScreenShareTrack,
+            onWebcamTrack: handleWebcamTrack,
+            onWebcamEnded: () => {
+                // Local cam capture died (device unplugged / OS revoked) — reset
+                // the UI so it doesn't show "Cam On" over a frozen self-view.
+                isCameraOn = false;
+                selfCamStream = null;
+            },
             sendSignal: (type, payload) => session.send(type, payload),
             onConnectionStateChange: (state) => {
                 // The WebSocket can stay healthy while the media path dies (e.g.
@@ -1281,7 +1349,33 @@
         };
     }
 
+    function handleWebcamTrack(participantId: string, track: MediaStreamTrack) {
+        debugLog("Received webcam track from", participantId);
+        const stream = new MediaStream([track]);
+        const next = new Map(remoteCamStreams);
+        next.set(participantId, stream);
+        remoteCamStreams = next;
+
+        // Only remove on a real end (track stopped / relay torn down). A
+        // transient `mute` event fires on a brief network stall and is followed
+        // by `unmute` on recovery, so removing on mute would permanently drop a
+        // tile after one hiccup. The explicit-off case is covered by the
+        // webcam:stopped signal and participant:left.
+        track.onended = () => removeRemoteCam(participantId, stream);
+    }
+
+    function removeRemoteCam(participantId: string, only?: MediaStream) {
+        const current = remoteCamStreams.get(participantId);
+        if (!current) return;
+        // Guard against a stale end-event for a track that was already replaced.
+        if (only && current !== only) return;
+        const next = new Map(remoteCamStreams);
+        next.delete(participantId);
+        remoteCamStreams = next;
+    }
+
     function cleanupParticipantVoice(participantId: string) {
+        removeRemoteCam(participantId);
         // Marks any in-flight async analyser setup as cancelled
         activeVoicePids.delete(participantId);
         const entry = voiceAnalysers.get(participantId);
@@ -1306,6 +1400,129 @@
             next.delete(participantId);
             speakingParticipants = next;
         }
+    }
+
+    // ---- Presence webcam -----------------------------------------------------
+    async function toggleCamera() {
+        if (!webrtcManager || cameraPending) return;
+        const manager = webrtcManager;
+        cameraPending = true;
+        try {
+            if (isCameraOn) {
+                manager.stopWebcam();
+                isCameraOn = false;
+                selfCamStream = null;
+                return;
+            }
+            const ok = await manager.startWebcam();
+            if (destroyed || webrtcManager !== manager) {
+                manager.stopWebcam();
+                return;
+            }
+            if (ok) {
+                isCameraOn = true;
+                selfCamStream = manager.getCameraStream();
+                activeCameraId = manager.getCurrentCameraDeviceId();
+                // Labels become available after the first successful capture.
+                await refreshAudioDevices();
+            }
+        } finally {
+            if (!destroyed) cameraPending = false;
+        }
+    }
+
+    async function selectCameraDevice(deviceId: string) {
+        if (!webrtcManager || cameraPending || deviceId === activeCameraId) return;
+        const manager = webrtcManager;
+        cameraPending = true;
+        try {
+            storeCameraDeviceId(deviceId);
+            activeCameraId = deviceId;
+            if (isCameraOn) {
+                // Live switch the broadcast track.
+                const ok = await manager.setCameraDevice(deviceId);
+                if (destroyed || webrtcManager !== manager) return;
+                if (ok) {
+                    selfCamStream = manager.getCameraStream();
+                    activeCameraId = manager.getCurrentCameraDeviceId() ?? deviceId;
+                }
+            } else {
+                // Not broadcasting: just update the local preview + remembered
+                // device. The next "Cam On" uses the stored choice.
+                await startCameraPreview(deviceId);
+            }
+            await refreshAudioDevices();
+        } finally {
+            if (!destroyed) cameraPending = false;
+        }
+    }
+
+    // Open a temporary local preview stream for the camera picker (used only
+    // while the cam is OFF and the settings popover is open).
+    async function startCameraPreview(deviceId?: string | null) {
+        stopCameraPreview();
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                    width: { ideal: 320 },
+                    height: { ideal: 240 },
+                    deviceId: deviceId ? { ideal: deviceId } : undefined,
+                },
+                audio: false,
+            });
+            // The popover may have closed (or the cam turned on) during the
+            // await — don't leave an orphaned capture running.
+            if (destroyed || !showAudioSettings || isCameraOn) {
+                stream.getTracks().forEach((t) => t.stop());
+                return;
+            }
+            previewStream = stream;
+            activeCameraId =
+                stream.getVideoTracks()[0]?.getSettings().deviceId ?? activeCameraId;
+            await refreshAudioDevices();
+        } catch (err) {
+            console.warn("Camera preview unavailable:", err);
+        }
+    }
+
+    function stopCameraPreview() {
+        if (previewStream) {
+            previewStream.getTracks().forEach((t) => t.stop());
+            previewStream = null;
+        }
+    }
+
+    // Release the preview capture whenever the popover closes or the cam goes
+    // live (then we show the published self stream instead), and on unmount. We
+    // never auto-START the preview — that would silently switch the camera on
+    // when someone just opened settings for the volume slider. The preview is
+    // started explicitly via the "Test camera" button or by picking a device.
+    $effect(() => {
+        if (!showAudioSettings || isCameraOn) {
+            stopCameraPreview();
+        }
+        return stopCameraPreview;
+    });
+
+    function toggleCamsHidden() {
+        camsHidden = !camsHidden;
+    }
+
+    // Svelte action: attach a MediaStream to a <video> and keep it in sync.
+    function bindStream(node: HTMLVideoElement, stream: MediaStream | null) {
+        const apply = (s: MediaStream | null) => {
+            if (node.srcObject !== s) {
+                node.srcObject = s;
+                if (s) void node.play().catch(() => {});
+            }
+        };
+        apply(stream);
+        return {
+            update: apply,
+            destroy() {
+                node.srcObject = null;
+            },
+        };
     }
 
     function toggleScreenShare() {
@@ -1482,6 +1699,12 @@
         activeVoicePids.clear();
         pendingVoiceTracks.clear();
         speakingParticipants = new Set();
+        // Camera teardown: close() stops the local capture; drop the UI state and
+        // any remote cam tiles so nothing is left frozen/desynced.
+        stopCameraPreview();
+        isCameraOn = false;
+        selfCamStream = null;
+        remoteCamStreams = new Map();
         if (webrtcManager) {
             webrtcManager.close();
             webrtcManager = null;
@@ -1641,6 +1864,7 @@
             if (destroyed) return;
             audioInputs = devices.filter((d) => d.kind === "audioinput" && d.deviceId);
             audioOutputs = devices.filter((d) => d.kind === "audiooutput" && d.deviceId);
+            videoInputs = devices.filter((d) => d.kind === "videoinput" && d.deviceId);
         } catch (err) {
             console.warn("Failed to enumerate audio devices:", err);
         }
@@ -2014,6 +2238,11 @@
         session.send("admin:mute", { participantId, muted });
     }
 
+    function toggleParticipantCam(participantId: string) {
+        const disabled = !camDisabledIds.has(participantId);
+        session.send("admin:disable-cam", { participantId, disabled });
+    }
+
     function confirmKickParticipant() {
         if (kickTarget) {
             session.send("admin:kick", { participantId: kickTarget.id });
@@ -2128,6 +2357,14 @@
     let unreadCount = $derived(chatStore.unreadCount);
     let roomState = $derived(session.state.room);
     let participants = $derived(roomState?.participants || []);
+    // True when anyone (self or remote) has a cam on — gates the cam-strip
+    // sizing and the hide toggle.
+    let anyCamActive = $derived(isCameraOn || remoteCamStreams.size > 0);
+    // What the camera-picker preview shows: the live published stream if the cam
+    // is on, otherwise the temporary preview opened while the popover is open.
+    let cameraPreviewSource = $derived(isCameraOn ? selfCamStream : previewStream);
+    // True when an admin has gated this user's own camera off.
+    let myCamDisabled = $derived(camDisabledIds.has(sessionData?.participantId ?? ""));
 
     // Join/leave chimes for everyone: watch the roster for deltas rather
     // than a specific message type (joins arrive via roster broadcasts).
@@ -2605,19 +2842,56 @@
                 <div class="top-bar-right">
                     <!-- Compact presence row: one dot per participant, ring
                          glows in their color while speaking, slash = muted -->
-                    {#if participants.length > 1}
-                        <div class="presence-row" aria-hidden="true" bind:this={presenceRowEl}>
+                    {#if participants.length > 1 || isCameraOn}
+                        <div
+                            class="presence-row cam-strip"
+                            class:has-cams={anyCamActive}
+                            bind:this={presenceRowEl}
+                        >
                             {#each participants.slice(0, 8) as p (p.id)}
+                                {@const isSelf = p.id === sessionData?.participantId}
+                                {@const camStream = isSelf
+                                    ? (isCameraOn ? selfCamStream : null)
+                                    : (remoteCamStreams.get(p.id) ?? null)}
                                 <span
                                     class="presence-dot"
                                     class:speaking={speakingParticipants.has(p.id)}
                                     class:muted={!p.audioEnabled}
+                                    class:has-cam={!!camStream && !camsHidden}
                                     style="--participant-color: {p.color}"
-                                    title="{p.name}{p.audioEnabled ? '' : ' (muted)'}"
-                                >{p.name.charAt(0).toUpperCase()}</span>
+                                    title="{p.name}{isSelf ? ' (you)' : ''}{p.audioEnabled ? '' : ' (muted)'}"
+                                >
+                                    {#if camStream && !camsHidden}
+                                        <!-- svelte-ignore a11y_media_has_caption -->
+                                        <video
+                                            class="cam-video"
+                                            class:mirror={isSelf}
+                                            use:bindStream={camStream}
+                                            muted
+                                            autoplay
+                                            playsinline
+                                        ></video>
+                                    {:else}
+                                        {p.name.charAt(0).toUpperCase()}
+                                    {/if}
+                                </span>
                             {/each}
                             {#if participants.length > 8}
                                 <span class="presence-overflow">+{participants.length - 8}</span>
+                            {/if}
+                            {#if anyCamActive}
+                                <button
+                                    class="cam-hide-btn"
+                                    onclick={toggleCamsHidden}
+                                    aria-label={camsHidden ? "Show cameras" : "Hide cameras"}
+                                    title={camsHidden ? "Show cameras" : "Hide cameras"}
+                                >
+                                    {#if camsHidden}
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+                                    {:else}
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><line x1="2" x2="22" y1="2" y2="22"/></svg>
+                                    {/if}
+                                </button>
                             {/if}
                         </div>
                     {/if}
@@ -2721,6 +2995,52 @@
                                         {/if}
                                     </span>
                                     <span class="audio-device-label">{device.label || "Microphone"}</span>
+                                </button>
+                            {/each}
+                        </div>
+                        <div class="audio-settings-section">
+                            <span class="audio-settings-title">Camera</span>
+                            <div class="cam-preview">
+                                {#if cameraPreviewSource}
+                                    <!-- svelte-ignore a11y_media_has_caption -->
+                                    <video
+                                        class="cam-preview-video"
+                                        use:bindStream={cameraPreviewSource}
+                                        muted
+                                        autoplay
+                                        playsinline
+                                    ></video>
+                                {:else}
+                                    <button
+                                        class="cam-preview-empty"
+                                        onclick={() => startCameraPreview(activeCameraId)}
+                                        disabled={cameraPending}
+                                        title="Preview your camera without going live"
+                                    >
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="22" height="22"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+                                        <span>Test camera</span>
+                                    </button>
+                                {/if}
+                            </div>
+                            {#if videoInputs.length === 0}
+                                <p class="audio-settings-hint">
+                                    Allow camera access to pick a device. Cameras show as small circles up top.
+                                </p>
+                            {/if}
+                            {#each videoInputs as device (device.deviceId)}
+                                <button
+                                    class="audio-device-option"
+                                    class:selected={device.deviceId === activeCameraId}
+                                    disabled={cameraPending}
+                                    onclick={() => selectCameraDevice(device.deviceId)}
+                                    aria-pressed={device.deviceId === activeCameraId}
+                                >
+                                    <span class="audio-device-check" aria-hidden="true">
+                                        {#if device.deviceId === activeCameraId}
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12"><path d="M20 6 9 17l-5-5"/></svg>
+                                        {/if}
+                                    </span>
+                                    <span class="audio-device-label">{device.label || "Camera"}</span>
                                 </button>
                             {/each}
                         </div>
@@ -2847,6 +3167,31 @@
                             {/if}
                         </svg>
                         <span class="control-label">{isMicEnabled ? "Mic On" : "Mic Off"}</span>
+                    </button>
+
+                    <button
+                        class="control-btn"
+                        style="--stagger: 9ms"
+                        class:active={isCameraOn}
+                        class:off={!isCameraOn}
+                        onclick={toggleCamera}
+                        disabled={cameraPending || myCamDisabled}
+                        aria-pressed={isCameraOn}
+                        aria-label="Camera"
+                        use:tooltip={myCamDisabled
+                            ? "Camera disabled by host"
+                            : isCameraOn
+                              ? "Turn camera off"
+                              : "Turn camera on"}
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
+                            {#if isCameraOn}
+                                <path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+                            {:else}
+                                <line x1="2" x2="22" y1="2" y2="22"/><path d="M10.66 5H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"/><path d="M16 16a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/>
+                            {/if}
+                        </svg>
+                        <span class="control-label">{isCameraOn ? "Cam On" : "Cam Off"}</span>
                     </button>
 
                     <button
@@ -3264,6 +3609,11 @@
                                     onclick={() => toggleParticipantMute(p.id)}
                                     title={adminMutedIds.has(p.id) ? `Unmute ${p.name}` : `Mute ${p.name}`}
                                 >{adminMutedIds.has(p.id) ? "Unmute" : "Mute"}</button>
+                                <button
+                                    class="participant-action"
+                                    onclick={() => toggleParticipantCam(p.id)}
+                                    title={camDisabledIds.has(p.id) ? `Allow ${p.name}'s camera` : `Turn off ${p.name}'s camera`}
+                                >{camDisabledIds.has(p.id) ? "Allow cam" : "Disable cam"}</button>
                                 <button
                                     class="participant-action danger"
                                     onclick={() => (kickTarget = { id: p.id, name: p.name })}
@@ -3858,6 +4208,89 @@
         font-size: 0.625rem;
         font-weight: 600;
         color: var(--color-text-muted);
+    }
+
+    /* Presence cams: when any cam is on, the row expands the stacked dots into
+       a tidy strip of small circles (cam video or colored avatar). */
+    .cam-strip.has-cams {
+        gap: 4px;
+    }
+    .cam-strip.has-cams .presence-dot {
+        width: 2.5rem;
+        height: 2.5rem;
+        margin-left: 0;
+        font-size: 0.875rem;
+        overflow: hidden;
+    }
+    .presence-dot.has-cam {
+        background-color: #000;
+        border-color: rgba(0, 0, 0, 0.55);
+    }
+    .cam-video {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        border-radius: 50%;
+        display: block;
+    }
+    .cam-video.mirror {
+        transform: scaleX(-1);
+    }
+    .cam-hide-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 1.75rem;
+        height: 1.75rem;
+        margin-left: 2px;
+        border: none;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.08);
+        color: var(--color-text-muted);
+        cursor: pointer;
+        transition: background 0.12s ease, color 0.12s ease;
+    }
+    .cam-hide-btn:hover {
+        background: rgba(255, 255, 255, 0.16);
+        color: #fff;
+    }
+    .cam-preview {
+        width: 100%;
+        aspect-ratio: 4 / 3;
+        border-radius: var(--radius-sm);
+        overflow: hidden;
+        background: #000;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .cam-preview-video {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        transform: scaleX(-1); /* self-view mirror */
+        display: block;
+    }
+    .cam-preview-empty {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        color: var(--color-text-subtle);
+        font-size: 0.75rem;
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        transition: color 0.12s ease, background 0.12s ease;
+    }
+    .cam-preview-empty:hover {
+        color: var(--color-text);
+        background: rgba(255, 255, 255, 0.04);
+    }
+    .cam-preview-empty:disabled {
+        cursor: wait;
+        opacity: 0.6;
     }
 
     /* Live indicator dot in the sharer's split-pane label */

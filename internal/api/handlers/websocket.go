@@ -341,6 +341,22 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 				}
 			}
 
+			// Tear down the presence cam for the same reason and BEFORE the
+			// replaced-check: a page refresh replaces the Client but the cam
+			// capture died with the old page (and won't auto-re-enable), so the
+			// tile must be removed for everyone or it freezes on the last frame.
+			if roomTracks != nil && h.sfu.HasWebcam(c.RoomSlug, c.ID) {
+				affected := h.sfu.RemoveWebcamTrack(c.RoomSlug, c.ID)
+				h.hub.BroadcastJSON(c.RoomSlug, "webcam:stopped", map[string]interface{}{
+					"participantId": c.ID,
+				}, "")
+				for _, subID := range affected {
+					subIDCopy := subID
+					safeGo("renegotiateSubscriber", func() { h.renegotiateSubscriber(c.RoomSlug, subIDCopy) })
+				}
+				logger.Info("Webcam stopped (owner disconnected)", "owner", c.ID, "room", c.RoomSlug)
+			}
+
 			// Atomically unregister ONLY if this client is still current. If a
 			// new connection (page refresh) already replaced it, skip the
 			// remaining cleanup — the participant is still in the room. The
@@ -444,6 +460,12 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 		}
 
 		if track.Kind() == pionwebrtc.RTPCodecTypeVideo {
+			// A cam and a screen share are both VP8 video on this PC; the client
+			// announces its cam track id via webcam:start so we can tell them apart.
+			if h.sfu.IsWebcamTrack(roomSlug, client.ID, track.ID()) {
+				h.forwardWebcamTrack(roomSlug, client.ID, track)
+				return
+			}
 			// Video track from subscriber — must be screen share
 			h.forwardScreenShareTrack(roomSlug, client.ID, track)
 			return
@@ -539,6 +561,14 @@ func (h *WebSocketHandler) handlePublishOffer(client *websocket.Client, payload 
 	roomSlug := client.RoomSlug
 	answer, err := h.sfu.HandlePublisherOffer(roomSlug, client.ID, data.SDP, data.OfferID, func(pid string, track *pionwebrtc.TrackRemote) {
 		if track.Kind() == pionwebrtc.RTPCodecTypeVideo {
+			// A presence cam and a screen share are both VP8 video on the
+			// publisher PC. The client announces its cam track id via
+			// webcam:start (before negotiating), so route by that here. Cams
+			// are presence — allowed for everyone, no share permission needed.
+			if h.sfu.IsWebcamTrack(roomSlug, pid, track.ID()) {
+				h.forwardWebcamTrack(roomSlug, pid, track)
+				return
+			}
 			// Screen share — only forward when the participant holds share
 			// permission (admins implicitly do).
 			if !client.IsAdmin && !h.participantCanScreenshare(roomSlug, pid) {
@@ -997,6 +1027,13 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 		h.handleScreenShareRevoke(client, msg.Payload)
 	case "screenshare:stop":
 		h.handleScreenShareStop(client)
+	// Presence webcams (small cam tiles; opt-in, default off)
+	case "webcam:start":
+		h.handleWebcamStart(client, msg.Payload)
+	case "webcam:stop":
+		h.handleWebcamStop(client)
+	case "admin:disable-cam":
+		h.handleAdminDisableCam(client, msg.Payload)
 	default:
 		logger.Debug("Unknown message type", "type", msg.Type, "participant_id", client.ID)
 	}
@@ -1597,6 +1634,37 @@ func (h *WebSocketHandler) handleAdminMute(client *websocket.Client, payload jso
 	logger.Info("Admin mute toggle", "by", client.ID, "target", data.ParticipantID, "muted", muted, "room", client.RoomSlug)
 }
 
+// handleAdminDisableCam is the admin camera gate. Because a cam and a screen
+// share are indistinguishable VP8 video, the per-participant screenshare
+// permission can be sidestepped by labeling a capture as a webcam; this gives a
+// host hard recourse — the server stops relaying that participant's cam (and
+// tears down any live one) regardless of what their client does.
+func (h *WebSocketHandler) handleAdminDisableCam(client *websocket.Client, payload json.RawMessage) {
+	if !h.requireAdmin(client, "disable-cam") {
+		return
+	}
+	var data struct {
+		ParticipantID string `json:"participantId"`
+		// Omitted means true (disable); send false to re-enable.
+		Disabled *bool `json:"disabled,omitempty"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil || data.ParticipantID == "" {
+		return
+	}
+	disabled := data.Disabled == nil || *data.Disabled
+
+	affected := h.sfu.SetWebcamDisabled(client.RoomSlug, data.ParticipantID, disabled)
+	h.hub.BroadcastJSON(client.RoomSlug, "webcam:disabled", map[string]interface{}{
+		"participantId": data.ParticipantID,
+		"disabled":      disabled,
+	}, "")
+	for _, subID := range affected {
+		subIDCopy := subID
+		safeGo("renegotiateSubscriber", func() { h.renegotiateSubscriber(client.RoomSlug, subIDCopy) })
+	}
+	logger.Info("Admin camera toggle", "by", client.ID, "target", data.ParticipantID, "disabled", disabled, "room", client.RoomSlug)
+}
+
 func (h *WebSocketHandler) handleAdminKick(client *websocket.Client, payload json.RawMessage) {
 	if !h.requireAdmin(client, "kick") {
 		return
@@ -1907,6 +1975,89 @@ func (h *WebSocketHandler) handleScreenShareStop(client *websocket.Client) {
 	}
 
 	logger.Info("Screen share stopped", "stopped_by", client.ID, "sharer", sharerID, "room", client.RoomSlug)
+}
+
+// handleWebcamStart records the client's announced cam track id so the publisher
+// OnTrack handler can route the incoming VP8 video as a webcam (not a screen
+// share). The client sends this BEFORE negotiating the publish offer.
+func (h *WebSocketHandler) handleWebcamStart(client *websocket.Client, payload json.RawMessage) {
+	var data struct {
+		TrackID string `json:"trackId"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil || data.TrackID == "" {
+		logger.Warn("Invalid webcam:start", "participant_id", client.ID)
+		return
+	}
+	h.sfu.RegisterWebcamTrackID(client.RoomSlug, client.ID, data.TrackID)
+	logger.Debug("Registered webcam track id", "participant_id", client.ID, "room", client.RoomSlug)
+}
+
+// handleWebcamStop tears down the client's webcam relay and renegotiates the
+// affected subscribers so their cam tile is removed.
+func (h *WebSocketHandler) handleWebcamStop(client *websocket.Client) {
+	affected := h.sfu.RemoveWebcamTrack(client.RoomSlug, client.ID)
+	h.hub.BroadcastJSON(client.RoomSlug, "webcam:stopped", map[string]interface{}{
+		"participantId": client.ID,
+	}, "")
+	for _, subID := range affected {
+		safeGo("renegotiateSubscriber", func() { h.renegotiateSubscriber(client.RoomSlug, subID) })
+	}
+	logger.Info("Webcam stopped", "participant_id", client.ID, "room", client.RoomSlug)
+}
+
+// forwardWebcamTrack forwards a participant's webcam presence track to all other
+// participants. Mirrors forwardVoiceTrack: one shared relay track fanned out.
+func (h *WebSocketHandler) forwardWebcamTrack(roomSlug, participantID string, track *pionwebrtc.TrackRemote) {
+	// Admin camera gate: refuse to relay so a client can't bypass it by
+	// re-announcing a cam (or labeling a screen capture as one).
+	if h.sfu.IsWebcamDisabled(roomSlug, participantID) {
+		logger.Info("Ignoring webcam track from admin-disabled camera", "participant_id", participantID, "room", roomSlug)
+		return
+	}
+	logger.Debug("Forwarding webcam track", "participant_id", participantID, "room", roomSlug)
+
+	relayTrack, isNew, err := h.sfu.CreateWebcamRelayTrack(roomSlug, participantID, track)
+	if err != nil {
+		logger.Error("Failed to create webcam relay track", "participant_id", participantID, "error", err)
+		return
+	}
+	if !isNew {
+		// Cam restarted; subscribers' senders already carry the relay track.
+		return
+	}
+
+	clients := h.hub.GetRoomClients(roomSlug)
+	for _, client := range clients {
+		if client.ID == participantID {
+			continue
+		}
+		c := client
+		offerSDP, offerID, err := h.sfu.AddWebcamTrackToSubscriber(roomSlug, c.ID, participantID, relayTrack)
+		if err != nil {
+			logger.Warn("Failed to add webcam track to subscriber", "subscriber_id", c.ID, "source_id", participantID, "error", err)
+			continue
+		}
+		if offerSDP == "" {
+			// Attached/queued mid-negotiation; offer pushed via the subscriber's
+			// renegotiation callback when signaling settles.
+			continue
+		}
+		if err := c.SendJSON("signal:renegotiate", map[string]interface{}{
+			"sdp":           offerSDP,
+			"offerId":       offerID,
+			"participantId": participantID,
+		}); err != nil {
+			logger.Warn("Failed to send webcam renegotiation offer", "subscriber_id", c.ID, "source_id", participantID, "offer_id", offerID, "error", err)
+			if abortErr := h.sfu.AbortSubscriberRenegotiation(roomSlug, c.ID, offerID); abortErr != nil {
+				logger.Warn("Failed to abort undelivered webcam renegotiation", "subscriber_id", c.ID, "source_id", participantID, "offer_id", offerID, "error", abortErr)
+			}
+			continue
+		}
+	}
+
+	h.hub.BroadcastJSON(roomSlug, "webcam:started", map[string]interface{}{
+		"participantId": participantID,
+	}, "")
 }
 
 // forwardScreenShareTrack forwards a participant's screen share track to all other participants.

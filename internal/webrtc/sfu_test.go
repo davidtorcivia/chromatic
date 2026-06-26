@@ -213,6 +213,79 @@ func TestSFU_GetRoomTracks(t *testing.T) {
 	}
 }
 
+func TestSFU_WebcamTrackIDRegistry(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "cam-room"
+	_ = sfu.GetRoomTracks(roomSlug) // create room
+	pid := "p1"
+
+	// A cam and a screen share are both VP8 video on the publisher PC; only the
+	// announced track id should route to the webcam path.
+	if sfu.IsWebcamTrack(roomSlug, pid, "track-a") {
+		t.Error("track should not be a webcam before registration")
+	}
+	sfu.RegisterWebcamTrackID(roomSlug, pid, "track-a")
+	if !sfu.IsWebcamTrack(roomSlug, pid, "track-a") {
+		t.Error("registered track should be recognized as a webcam")
+	}
+	// A different track id from the same participant is the screen share.
+	if sfu.IsWebcamTrack(roomSlug, pid, "track-b") {
+		t.Error("unregistered track id should not be a webcam (screen share path)")
+	}
+	// Registration is per-participant.
+	if sfu.IsWebcamTrack(roomSlug, "p2", "track-a") {
+		t.Error("registration must be scoped to the participant")
+	}
+	// Removal clears the registration.
+	sfu.RemoveWebcamTrack(roomSlug, pid)
+	if sfu.IsWebcamTrack(roomSlug, pid, "track-a") {
+		t.Error("track should not be a webcam after RemoveWebcamTrack")
+	}
+	// Empty ids and unknown rooms never match.
+	sfu.RegisterWebcamTrackID(roomSlug, pid, "")
+	if sfu.IsWebcamTrack(roomSlug, pid, "") {
+		t.Error("empty track id must never match")
+	}
+	if sfu.IsWebcamTrack("no-such-room", pid, "track-a") {
+		t.Error("unknown room should return false")
+	}
+}
+
+func TestSFU_WebcamDisableGate(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "cam-disable-room"
+	_ = sfu.GetRoomTracks(roomSlug)
+	pid := "p1"
+
+	if sfu.IsWebcamDisabled(roomSlug, pid) {
+		t.Error("camera should not be disabled by default")
+	}
+	sfu.SetWebcamDisabled(roomSlug, pid, true)
+	if !sfu.IsWebcamDisabled(roomSlug, pid) {
+		t.Error("camera should be disabled after SetWebcamDisabled(true)")
+	}
+	sfu.SetWebcamDisabled(roomSlug, pid, false)
+	if sfu.IsWebcamDisabled(roomSlug, pid) {
+		t.Error("camera should be re-enabled after SetWebcamDisabled(false)")
+	}
+	// Unknown room is safe.
+	if sfu.IsWebcamDisabled("no-such-room", pid) {
+		t.Error("unknown room should return false")
+	}
+}
+
 func TestSFU_GetRoomTracksForSlug(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)

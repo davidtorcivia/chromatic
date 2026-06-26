@@ -7,23 +7,21 @@ function asRec(c: MediaTrackConstraints): Record<string, unknown> {
 }
 
 describe('micConstraints', () => {
-    it('talkback keeps native EC (system-preferred) and native NS when no in-app denoise', () => {
-        const c = micConstraints({ mode: 'talkback', studioHeadphones: false, inAppDenoise: false });
-        expect(c.echoCancellation).toBe(true);
-        expect(c.noiseSuppression).toBe(true); // native NS carries the load
-        expect(c.autoGainControl).toBe(true);
-        expect(asRec(c).echoCancellationType).toEqual({ ideal: 'system' });
+    it('talkback keeps native EC (system-preferred) and AGC, and passes NS through', () => {
+        const off = micConstraints({ mode: 'talkback', studioHeadphones: false, noiseSuppression: false });
+        expect(off.echoCancellation).toBe(true);
+        expect(off.noiseSuppression).toBe(false); // RNNoise handling, or user chose off
+        expect(off.autoGainControl).toBe(true);
+        expect(asRec(off).echoCancellationType).toEqual({ ideal: 'system' });
+
+        const on = micConstraints({ mode: 'talkback', studioHeadphones: false, noiseSuppression: true });
+        expect(on.noiseSuppression).toBe(true); // native-NS fallback
+        expect(on.echoCancellation).toBe(true);
     });
 
-    it('talkback disables native NS when our denoiser will run', () => {
-        const c = micConstraints({ mode: 'talkback', studioHeadphones: false, inAppDenoise: true });
-        expect(c.echoCancellation).toBe(true);
-        expect(c.noiseSuppression).toBe(false); // RNNoise handles it
-        expect(c.autoGainControl).toBe(true);
-    });
-
-    it('studio sends pristine: no NS/AGC, EC on by default', () => {
-        const c = micConstraints({ mode: 'studio', studioHeadphones: false, inAppDenoise: false });
+    it('studio sends pristine: NS/AGC always off, EC on by default', () => {
+        // Even if a caller passed noiseSuppression: true, studio forces it off.
+        const c = micConstraints({ mode: 'studio', studioHeadphones: false, noiseSuppression: true });
         expect(c.noiseSuppression).toBe(false);
         expect(c.autoGainControl).toBe(false);
         expect(c.echoCancellation).toBe(true);
@@ -31,7 +29,7 @@ describe('micConstraints', () => {
     });
 
     it('studio + headphones removes echo cancellation entirely', () => {
-        const c = micConstraints({ mode: 'studio', studioHeadphones: true, inAppDenoise: false });
+        const c = micConstraints({ mode: 'studio', studioHeadphones: true, noiseSuppression: false });
         expect(c.echoCancellation).toBe(false);
         expect(c.noiseSuppression).toBe(false);
         expect(c.autoGainControl).toBe(false);
@@ -40,9 +38,13 @@ describe('micConstraints', () => {
     });
 
     it('applies deviceId as ideal vs exact', () => {
-        expect(micConstraints({ mode: 'talkback', studioHeadphones: false, inAppDenoise: false, deviceId: 'mic1' }).deviceId)
-            .toEqual({ ideal: 'mic1' });
-        expect(micConstraints({ mode: 'talkback', studioHeadphones: false, inAppDenoise: false, deviceId: 'mic1', exact: true }).deviceId)
-            .toEqual({ exact: 'mic1' });
+        expect(
+            micConstraints({ mode: 'talkback', studioHeadphones: false, noiseSuppression: false, deviceId: 'mic1' })
+                .deviceId
+        ).toEqual({ ideal: 'mic1' });
+        expect(
+            micConstraints({ mode: 'talkback', studioHeadphones: false, noiseSuppression: false, deviceId: 'mic1', exact: true })
+                .deviceId
+        ).toEqual({ exact: 'mic1' });
     });
 });
