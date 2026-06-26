@@ -42,9 +42,16 @@ class FakeWebSocket {
 }
 
 describe('SessionStore WebSocket sends', () => {
+    let online = true;
+
     beforeEach(() => {
+        online = true;
         FakeWebSocket.instances = [];
         vi.stubGlobal('WebSocket', FakeWebSocket);
+        Object.defineProperty(window.navigator, 'onLine', {
+            configurable: true,
+            get: () => online
+        });
     });
 
     afterEach(() => {
@@ -108,6 +115,52 @@ describe('SessionStore WebSocket sends', () => {
         expect(FakeWebSocket.instances).toHaveLength(1);
         vi.advanceTimersByTime(101);
         expect(FakeWebSocket.instances).toHaveLength(2);
+        store.disconnect();
+    });
+
+    it('pauses reconnect attempts while the browser is offline', () => {
+        vi.useFakeTimers();
+        const { store, socket } = connectedStore();
+
+        online = false;
+        window.dispatchEvent(new Event('offline'));
+
+        expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
+        expect(socket.closeCode).toBe(4002);
+        expect(store.state.connected).toBe(false);
+        expect(store.state.reconnecting).toBe(true);
+        expect(store.state.networkOffline).toBe(true);
+        expect(store.state.reconnectAttempt).toBe(0);
+
+        vi.advanceTimersByTime(60_000);
+
+        expect(FakeWebSocket.instances).toHaveLength(1);
+        expect(store.state.reconnectAttempt).toBe(0);
+
+        online = true;
+        window.dispatchEvent(new Event('online'));
+
+        expect(FakeWebSocket.instances).toHaveLength(2);
+        expect(store.state.networkOffline).toBe(false);
+        expect(store.state.reconnectAttempt).toBe(0);
+        store.disconnect();
+    });
+
+    it('waits for the browser to come online before opening the first socket', () => {
+        online = false;
+        const store = createSessionStore();
+
+        store.connect('review-room', 'signed-token', 'Viewer One');
+
+        expect(FakeWebSocket.instances).toHaveLength(0);
+        expect(store.state.reconnecting).toBe(true);
+        expect(store.state.networkOffline).toBe(true);
+
+        online = true;
+        window.dispatchEvent(new Event('online'));
+
+        expect(FakeWebSocket.instances).toHaveLength(1);
+        expect(FakeWebSocket.instances[0].url).toContain('/ws/room/review-room');
         store.disconnect();
     });
 });

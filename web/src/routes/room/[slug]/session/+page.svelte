@@ -2256,9 +2256,17 @@
             <div class="stream-status-overlay" transition:fade={{ duration: 150 }}>
                 <div class="stream-card">
                     <div class="connect-dots" aria-hidden="true"><span></span><span></span><span></span></div>
-                    <h2 class="stream-card-title">Reconnecting</h2>
-                    <p class="stream-card-body">Restoring signaling and rebuilding the media path…</p>
-                    <p class="stream-card-meta">WebSocket attempt {session.state.reconnectAttempt} · media rebuilds {resubscribeEvents}</p>
+                    <h2 class="stream-card-title">{session.state.networkOffline ? "Network offline" : "Reconnecting"}</h2>
+                    <p class="stream-card-body">
+                        {session.state.networkOffline
+                            ? "Waiting for this browser's network to return. The session will reconnect automatically."
+                            : "Restoring signaling and rebuilding the media path..."}
+                    </p>
+                    <p class="stream-card-meta">
+                        {session.state.networkOffline
+                            ? `Standing by · media rebuilds ${resubscribeEvents}`
+                            : `WebSocket attempt ${session.state.reconnectAttempt} · media rebuilds ${resubscribeEvents}`}
+                    </p>
                 </div>
             </div>
         {:else if overlayState === 'paused'}

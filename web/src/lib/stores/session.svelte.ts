@@ -36,6 +36,7 @@ export interface SessionState {
     error: string | null;
     reconnecting: boolean;
     reconnectAttempt: number;
+    networkOffline: boolean;
 }
 
 // Reconnection configuration
@@ -52,6 +53,7 @@ const DISPOSABLE_MESSAGE_TYPES = new Set(['cursor', 'client:debug']);
 const DISPOSABLE_BUFFERED_DROP_BYTES = 16 * 1024;
 const CRITICAL_BUFFERED_RECONNECT_BYTES = 1024 * 1024;
 const CLIENT_RECONNECT_CLOSE_CODE = 4001;
+const CLIENT_OFFLINE_CLOSE_CODE = 4002;
 
 // Routine WS logging is dev-only; errors are always logged.
 const DEBUG = import.meta.env.DEV;
@@ -65,11 +67,13 @@ export function createSessionStore() {
         isAdmin: false,
         error: null,
         reconnecting: false,
-        reconnectAttempt: 0
+        reconnectAttempt: 0,
+        networkOffline: false
     });
 
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let networkListenersAttached = false;
     const messageHandlers = new Map<string, Array<(payload: unknown) => void>>();
     // Callbacks invoked after a successful re-open (NOT the first open)
     const reconnectCallbacks = new Set<() => void>();
@@ -90,13 +94,97 @@ export function createSessionStore() {
         return Math.round(jitter);
     }
 
-    function connect(roomSlug: string, token: string, name: string) {
-        // Clear any pending reconnect timer so a manual connect plus a
-        // pending timer can't create parallel sockets.
+    function browserOffline(): boolean {
+        return typeof navigator !== 'undefined' && navigator.onLine === false;
+    }
+
+    function clearReconnectTimer() {
         if (reconnectTimer) {
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
         }
+    }
+
+    function attachNetworkListeners() {
+        if (networkListenersAttached || typeof window === 'undefined') return;
+        window.addEventListener('offline', handleOffline);
+        window.addEventListener('online', handleOnline);
+        networkListenersAttached = true;
+    }
+
+    function detachNetworkListeners() {
+        if (!networkListenersAttached || typeof window === 'undefined') return;
+        window.removeEventListener('offline', handleOffline);
+        window.removeEventListener('online', handleOnline);
+        networkListenersAttached = false;
+    }
+
+    function pauseReconnectWhileOffline() {
+        clearReconnectTimer();
+        state.connected = false;
+        state.reconnecting = connectionParams !== null;
+        state.networkOffline = true;
+        state.error = null;
+    }
+
+    function scheduleReconnect(resetAttempt = false) {
+        if (!connectionParams) return;
+
+        if (browserOffline()) {
+            pauseReconnectWhileOffline();
+            return;
+        }
+
+        state.networkOffline = false;
+        state.error = null;
+        state.reconnecting = true;
+        if (resetAttempt) {
+            state.reconnectAttempt = 0;
+        }
+
+        if (state.reconnectAttempt < RECONNECT_MAX_ATTEMPTS) {
+            const delay = getReconnectDelay(state.reconnectAttempt);
+            state.reconnectAttempt++;
+
+            if (DEBUG) console.log(`Reconnecting in ${delay}ms (attempt ${state.reconnectAttempt}/${RECONNECT_MAX_ATTEMPTS})`);
+
+            clearReconnectTimer();
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                if (connectionParams) {
+                    connect(connectionParams.roomSlug, connectionParams.token, connectionParams.name);
+                }
+            }, delay);
+        } else {
+            state.reconnecting = false;
+            state.error = 'Connection lost. Please refresh the page.';
+            console.error('Max reconnection attempts reached');
+        }
+    }
+
+    function handleOffline() {
+        pauseReconnectWhileOffline();
+        if (ws && ws.readyState !== WebSocket.CLOSED && ws.readyState !== WebSocket.CLOSING) {
+            ws.close(CLIENT_OFFLINE_CLOSE_CODE, 'browser offline');
+        }
+    }
+
+    function handleOnline() {
+        state.networkOffline = false;
+        if (!connectionParams || state.connected) return;
+
+        clearReconnectTimer();
+        state.error = null;
+        state.reconnecting = true;
+        state.reconnectAttempt = 0;
+        connect(connectionParams.roomSlug, connectionParams.token, connectionParams.name);
+    }
+
+    function connect(roomSlug: string, token: string, name: string) {
+        attachNetworkListeners();
+        // Clear any pending reconnect timer so a manual connect plus a
+        // pending timer can't create parallel sockets.
+        clearReconnectTimer();
 
         // Store params for reconnection
         connectionParams = { roomSlug, token, name };
@@ -105,6 +193,11 @@ export function createSessionStore() {
             // Detach the old socket's onclose to prevent spurious reconnection
             ws.onclose = null;
             ws.close();
+        }
+
+        if (browserOffline()) {
+            pauseReconnectWhileOffline();
+            return;
         }
 
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -119,6 +212,7 @@ export function createSessionStore() {
             state.error = null;
             state.reconnecting = false;
             state.reconnectAttempt = 0;
+            state.networkOffline = false;
             if (DEBUG) console.log('WebSocket connected');
 
             // Notify listeners after a successful re-open (not the first open)
@@ -140,30 +234,15 @@ export function createSessionStore() {
 
             // Attempt reconnection if not intentional close
             if (e.code !== 1000 && connectionParams) {
-                if (state.reconnectAttempt < RECONNECT_MAX_ATTEMPTS) {
-                    state.reconnecting = true;
-                    const delay = getReconnectDelay(state.reconnectAttempt);
-                    state.reconnectAttempt++;
-
-                    if (DEBUG) console.log(`Reconnecting in ${delay}ms (attempt ${state.reconnectAttempt}/${RECONNECT_MAX_ATTEMPTS})`);
-
-                    reconnectTimer = setTimeout(() => {
-                        reconnectTimer = null;
-                        if (connectionParams) {
-                            connect(connectionParams.roomSlug, connectionParams.token, connectionParams.name);
-                        }
-                    }, delay);
-                } else {
-                    state.reconnecting = false;
-                    state.error = 'Connection lost. Please refresh the page.';
-                    console.error('Max reconnection attempts reached');
-                }
+                scheduleReconnect(e.code === CLIENT_OFFLINE_CLOSE_CODE);
             }
         };
 
         ws.onerror = (e) => {
             console.error('WebSocket error', e);
-            state.error = 'Connection error';
+            if (!browserOffline()) {
+                state.error = 'Connection error';
+            }
         };
 
         ws.onmessage = (e) => {
@@ -351,10 +430,8 @@ export function createSessionStore() {
     }
 
     function disconnect() {
-        if (reconnectTimer) {
-            clearTimeout(reconnectTimer);
-            reconnectTimer = null;
-        }
+        clearReconnectTimer();
+        detachNetworkListeners();
         connectionParams = null;
         hasConnectedOnce = false;
         if (ws) {
@@ -373,6 +450,7 @@ export function createSessionStore() {
         state.error = null;
         state.reconnecting = false;
         state.reconnectAttempt = 0;
+        state.networkOffline = false;
     }
 
     return {
