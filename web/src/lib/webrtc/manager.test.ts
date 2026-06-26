@@ -483,6 +483,54 @@ describe('WebRTCManager media capture lifetime', () => {
         expect(track.stop).toHaveBeenCalledTimes(1);
         expect(manager.getScreenShareStream()).toBeNull();
     });
+
+    it('does not create a publisher peer connection when the mic is enabled after close()', () => {
+        // Regression: setMicEnabled(true) fires addLocalAudioTrack() without
+        // awaiting it. If close() ran in between, ensurePublisher() used to see
+        // publisherPc === null and spin up a brand-new orphaned PC — leaking its
+        // tracks and sending publish:offer over a dead socket. Now the mic-enable
+        // path and ensurePublisher refuse to run after teardown.
+        vi.stubGlobal('RTCPeerConnection', FakePublisherPeerConnection);
+
+        const { stream } = fakeMediaStream('audio');
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const manager = newManager((type, payload) => {
+            sent.push({ type, payload });
+        });
+
+        const managerInternals = manager as unknown as {
+            localStream: MediaStream | null;
+            publisherPc: FakePublisherPeerConnection | null;
+            ensurePublisher(): FakePublisherPeerConnection;
+        };
+        managerInternals.localStream = stream;
+
+        // Teardown first — simulates a user toggling the mic on right as they
+        // leave the session.
+        manager.close();
+
+        // setMicEnabled must be a no-op for publishing (no publisher created,
+        // no publish:offer sent). It may still flip the mute flag.
+        expect(() => manager.setMicEnabled(true)).not.toThrow();
+
+        // Flush any microtasks the fire-and-forget addLocalAudioTrack scheduled.
+        return Promise.resolve().then(() => {
+            expect(managerInternals.publisherPc).toBeNull();
+            expect(sent.some((m) => m.type === 'publish:offer')).toBe(false);
+        });
+    });
+
+    it('ensurePublisher throws after close() so late callers cannot leak a PC', () => {
+        vi.stubGlobal('RTCPeerConnection', FakePublisherPeerConnection);
+        const manager = newManager(() => {});
+        manager.close();
+
+        const managerInternals = manager as unknown as {
+            ensurePublisher(): FakePublisherPeerConnection;
+        };
+        expect(() => managerInternals.ensurePublisher()).toThrow(/after close/);
+    });
 });
 
 describe('WebRTCManager ICE restart recovery', () => {

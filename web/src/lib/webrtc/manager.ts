@@ -858,8 +858,13 @@ export class WebRTCManager {
             });
         }
 
-        // Publishing rides its own PC — no subscriber connection needed
-        if (enabled && this.localStream) {
+        // Publishing rides its own PC — no subscriber connection needed.
+        // Guard against teardown: if close() ran between the user toggling the
+        // mic and this async path, localStream is already null and we must not
+        // spin up a publisher that would leak (and send publish:offer over a
+        // dead socket). The isClosed() check inside addLocalAudioTrack covers
+        // the await window too.
+        if (enabled && this.localStream && !this.isClosed()) {
             this.addLocalAudioTrack().catch(err => {
                 console.error('Failed to add local audio track, reverting mic state:', err);
                 this.isMicMuted = true;
@@ -879,7 +884,9 @@ export class WebRTCManager {
 
     // Add local audio track to the publisher connection
     private async addLocalAudioTrack(): Promise<void> {
-        if (!this.localStream) return;
+        // Bail immediately if teardown already happened (the caller's synchronous
+        // isClosed() check doesn't cover this async function's body).
+        if (this.isClosed() || !this.localStream) return;
 
         const audioTrack = this.localStream.getAudioTracks()[0];
         if (!audioTrack) return;
@@ -888,8 +895,12 @@ export class WebRTCManager {
         if (this.audioSender) {
             // Replace track
             await this.audioSender.replaceTrack(audioTrack);
+            // close() may have run during the await; don't touch publisher state.
+            if (this.isClosed()) return;
         } else {
-            // Add new track on the publisher PC and negotiate
+            // Add new track on the publisher PC and negotiate. ensurePublisher
+            // refuses to create a PC after close(), so a late mic-enable can't
+            // leak an orphaned publisher or send publish:offer on a dead socket.
             const pub = this.ensurePublisher();
             this.audioSender = pub.addTrack(audioTrack, this.localStream);
             if (!(await this.negotiatePublisher())) {
@@ -910,6 +921,15 @@ export class WebRTCManager {
 
     private ensurePublisher(): RTCPeerConnection {
         if (this.publisherPc) return this.publisherPc;
+
+        // Never (re)create a publisher after teardown. close() nulls publisherPc,
+        // so without this guard a late async caller (e.g. setMicEnabled →
+        // addLocalAudioTrack, or a screen-share start racing leave-session)
+        // would spin up an orphaned PC that is never closed, leaks its tracks,
+        // and tries to negotiate over a dead WebSocket.
+        if (this.isClosed()) {
+            throw new Error('cannot create publisher peer connection after close');
+        }
 
         const pc = new RTCPeerConnection({ iceServers: this.options.iceServers });
         pc.onicecandidate = (event) => {
@@ -1066,6 +1086,11 @@ export class WebRTCManager {
     // Tear down and recreate the publisher with the current local tracks.
     // Safe at any time: the publisher has no inbound state to lose.
     private rebuildPublisher(): void {
+        // Teardown wins: never rebuild a publisher after close(). The watchdog
+        // already guards on identity (this.publisherPc !== pc), but a callback
+        // racing close() could still reach here; bail instead of spinning up an
+        // orphaned PC.
+        if (this.isClosed()) return;
         console.warn('Rebuilding publisher peer connection');
         this.clearPublishAnswerWatchdog();
         this.clearPublisherDisconnectWatchdog();
