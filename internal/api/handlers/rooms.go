@@ -324,25 +324,40 @@ func (h *RoomHandler) handleRoomOpen(slug string) {
 	}
 
 	if waitingRoom {
-		// Switch lobby viewers to the normal approval flow.
+		// Switch lobby viewers to the normal approval flow. No admission here,
+		// so the SELECT list above is the notification source of truth.
 		h.waitingManager.NotifyEvent(waitingIDs, "open")
 		logger.Info("Room opened; lobby switched to approval flow", "room", slug, "waiting", len(waitingIDs))
 		return
 	}
 
-	// Auto-admit everyone in the lobby.
-	if _, err := h.db.Exec(`
+	// Auto-admit everyone in the lobby. Use UPDATE...RETURNING to admit and
+	// capture the set atomically — the SELECT above ran in a separate statement,
+	// so a participant joining between the SELECT and this UPDATE would be
+	// admitted but absent from waitingIDs (no notification, metric drift).
+	// RETURNING guarantees the notification list is exactly who we admitted.
+	admitRows, qErr := h.db.Query(`
 		UPDATE participants SET is_admitted = TRUE WHERE room_id = ? AND is_admitted = FALSE
-	`, roomID); err != nil {
-		logger.Error("Failed to auto-admit lobby participants", "room", slug, "error", err)
+		RETURNING id
+	`, roomID)
+	if qErr != nil {
+		logger.Error("Failed to auto-admit lobby participants", "room", slug, "error", qErr)
 		return
 	}
-	metrics.Get().WaitingParticipants.Add(-int64(len(waitingIDs)))
-	h.waitingManager.NotifyAllAdmitted(waitingIDs)
+	admittedIDs := waitingIDs[:0:0]
+	for admitRows.Next() {
+		var id string
+		if admitRows.Scan(&id) == nil {
+			admittedIDs = append(admittedIDs, id)
+		}
+	}
+	admitRows.Close()
+	metrics.Get().WaitingParticipants.Add(-int64(len(admittedIDs)))
+	h.waitingManager.NotifyAllAdmitted(admittedIDs)
 	if h.hub != nil {
 		h.hub.BroadcastToAdminsJSON(slug, "lobby:count", map[string]interface{}{"count": 0})
 	}
-	logger.Info("Room opened; lobby auto-admitted", "room", slug, "admitted", len(waitingIDs))
+	logger.Info("Room opened; lobby auto-admitted", "room", slug, "admitted", len(admittedIDs))
 }
 
 // maybeRunMissedOpen lazily recovers from a lost open timer (e.g. a server
@@ -1370,11 +1385,16 @@ func (h *RoomHandler) DenyParticipant(w http.ResponseWriter, r *http.Request) {
 func (h *RoomHandler) AdmitAll(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 
-	// First, get list of waiting participants for notification
+	// Atomically admit and return the admitted set in one statement. The
+	// previous SELECT-then-UPDATE was a TOCTOU: a participant joining between
+	// the two statements would be admitted by the UPDATE but absent from the
+	// notification list — their lobby UI never advanced, and the
+	// WaitingParticipants gauge drifted (decremented by the wrong count).
+	// UPDATE...RETURNING captures exactly the rows this call admitted.
 	rows, err := h.db.Query(`
-		SELECT p.id FROM participants p
-		JOIN rooms r ON r.id = p.room_id
-		WHERE r.slug = ? AND p.is_admitted = FALSE
+		UPDATE participants SET is_admitted = TRUE
+		WHERE room_id = (SELECT id FROM rooms WHERE slug = ?) AND is_admitted = FALSE
+		RETURNING id
 	`, slug)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
@@ -1389,17 +1409,6 @@ func (h *RoomHandler) AdmitAll(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	rows.Close()
-
-	// Update all to admitted
-	_, err = h.db.Exec(`
-		UPDATE participants SET is_admitted = TRUE
-		WHERE room_id = (SELECT id FROM rooms WHERE slug = ?) AND is_admitted = FALSE
-	`, slug)
-
-	if err != nil {
-		http.Error(w, "Database error", http.StatusInternalServerError)
-		return
-	}
 
 	// Track admitted participants
 	metrics.Get().WaitingParticipants.Add(-int64(len(waitingIDs)))
