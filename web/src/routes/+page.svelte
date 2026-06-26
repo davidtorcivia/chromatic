@@ -1,9 +1,17 @@
 <script lang="ts">
+  import { goto } from '$app/navigation';
   import { auth } from '$lib/api/client';
 
   let adminToken = $state('');
   let isLoading = $state(false);
   let error = $state('');
+  let destroyed = false;
+
+  $effect(() => {
+    return () => {
+      destroyed = true;
+    };
+  });
 
   async function handleLogin(e: SubmitEvent) {
     e.preventDefault();
@@ -13,9 +21,11 @@
     try {
       // Login via secure httpOnly cookie
       await auth.login(adminToken);
+      if (destroyed) return;
       // Redirect on success
-      window.location.href = '/admin';
+      void goto('/admin');
     } catch (err) {
+      if (destroyed) return;
       if (err instanceof Error) {
         error = err.message === 'Invalid token'
           ? 'Invalid admin token'
@@ -24,7 +34,7 @@
         error = 'Connection error. Is the server running?';
       }
     } finally {
-      isLoading = false;
+      if (!destroyed) isLoading = false;
     }
   }
 </script>

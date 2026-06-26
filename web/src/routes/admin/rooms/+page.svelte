@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount } from "svelte";
+    import { onMount, onDestroy } from "svelte";
     import { fade } from "svelte/transition";
     import { rooms, type Room } from "$lib/api/client";
     import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
@@ -15,6 +15,8 @@
     let bulkError = $state("");
     let bulkSuccess = $state("");
     let confirmBulkDeleteOpen = $state(false);
+    let destroyed = false;
+    let bulkSuccessTimer: ReturnType<typeof setTimeout> | null = null;
 
     let filteredRooms = $derived(
         statusFilter === "all"
@@ -29,13 +31,36 @@
 
     onMount(loadRooms);
 
+    onDestroy(() => {
+        destroyed = true;
+        clearBulkSuccessTimer();
+    });
+
+    function clearBulkSuccessTimer() {
+        if (!bulkSuccessTimer) return;
+        clearTimeout(bulkSuccessTimer);
+        bulkSuccessTimer = null;
+    }
+
+    function showBulkSuccess(message: string) {
+        clearBulkSuccessTimer();
+        bulkSuccess = message;
+        bulkSuccessTimer = setTimeout(() => {
+            bulkSuccess = "";
+            bulkSuccessTimer = null;
+        }, 4000);
+    }
+
     async function loadRooms() {
         try {
-            allRooms = (await rooms.list()) ?? [];
+            const result = (await rooms.list()) ?? [];
+            if (destroyed) return;
+            allRooms = result;
         } catch (e) {
+            if (destroyed) return;
             console.error("Failed to load rooms", e);
         } finally {
-            isLoading = false;
+            if (!destroyed) isLoading = false;
         }
     }
 
@@ -68,14 +93,14 @@
         const count = selected.length;
         const { failed } = await rooms.deleteMany(selected);
         await loadRooms();
+        if (destroyed) return;
         // Keep failures selected so the user can retry
         selected = failed;
 
         if (failed.length > 0) {
             bulkError = `Failed to delete ${failed.length} of ${count} room${count === 1 ? "" : "s"}: ${failed.join(", ")}`;
         } else {
-            bulkSuccess = `Deleted ${count} room${count === 1 ? "" : "s"}`;
-            setTimeout(() => (bulkSuccess = ""), 4000);
+            showBulkSuccess(`Deleted ${count} room${count === 1 ? "" : "s"}`);
         }
         bulkBusy = false;
     }
@@ -98,12 +123,12 @@
 
         const { failed } = await rooms.endMany(liveSlugs);
         await loadRooms();
+        if (destroyed) return;
 
         if (failed.length > 0) {
             bulkError = `Failed to end ${failed.length} of ${liveSlugs.length} session${liveSlugs.length === 1 ? "" : "s"}: ${failed.join(", ")}`;
         } else {
-            bulkSuccess = `Ended ${liveSlugs.length} session${liveSlugs.length === 1 ? "" : "s"}`;
-            setTimeout(() => (bulkSuccess = ""), 4000);
+            showBulkSuccess(`Ended ${liveSlugs.length} session${liveSlugs.length === 1 ? "" : "s"}`);
         }
         bulkBusy = false;
     }

@@ -1,6 +1,7 @@
 <script lang="ts">
+    import { goto } from "$app/navigation";
     import { rooms, streamKeys, appConfig, type StreamKey, type AppConfig } from "$lib/api/client";
-    import { onMount } from "svelte";
+    import { onMount, onDestroy } from "svelte";
     import WatermarkOverlay from "$lib/components/WatermarkOverlay.svelte";
 
     let keys = $state<StreamKey[]>([]);
@@ -38,6 +39,7 @@
     let isDraggingWatermark = $state(false);
     let dragOffsetX = 0;
     let dragOffsetY = 0;
+    let destroyed = false;
 
     function previewPoint(e: PointerEvent) {
         const rect = previewEl!.getBoundingClientRect();
@@ -102,16 +104,22 @@
                 streamKeys.list(),
                 appConfig.get().catch(() => null),
             ]);
+            if (destroyed) return;
             keys = keysData ?? [];
             config = configData;
             if (keys.length > 0) {
                 streamKeyId = keys[0].id;
             }
         } catch (e) {
+            if (destroyed) return;
             console.error("Failed to load stream keys", e);
         } finally {
-            isLoading = false;
+            if (!destroyed) isLoading = false;
         }
+    });
+
+    onDestroy(() => {
+        destroyed = true;
     });
 
     function generateSlug(text: string): string {
@@ -187,12 +195,14 @@
                 roomData.maxParticipants = maxParticipants;
             }
 
-            await rooms.create(roomData);
-            window.location.href = `/admin/rooms/${slug}`;
+            const created = await rooms.create(roomData);
+            if (destroyed) return;
+            void goto(`/admin/rooms/${created.slug || slug}`);
         } catch (e: any) {
+            if (destroyed) return;
             error = e.message || "Failed to create room";
         } finally {
-            isSaving = false;
+            if (!destroyed) isSaving = false;
         }
     }
 </script>
