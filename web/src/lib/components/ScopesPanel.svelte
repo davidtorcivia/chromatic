@@ -48,6 +48,7 @@
     let lastDrawAt = 0;
     let lastAnalyzed: ImageBitmap | null = null;
     let lastAnalyzedMode: Mode | null = null;
+    let pointerInteractionCleanup: (() => void) | null = null;
     // Reused across ticks: a fresh 131KB buffer per analysis was ~6MB/s
     // of garbage for the lifetime of an open scopes panel.
     const outBuf = new Uint8ClampedArray(OUT_W * OUT_H * 4);
@@ -84,10 +85,16 @@
         return { x: Math.min(Math.max(0, x), Math.max(0, maxX)), y: Math.min(Math.max(0, y), Math.max(0, maxY)) };
     }
 
+    function clearPointerInteraction() {
+        pointerInteractionCleanup?.();
+        pointerInteractionCleanup = null;
+    }
+
     function startDrag(e: PointerEvent) {
         if (e.button !== 0 || !panelEl) return;
         if ((e.target as HTMLElement).closest("button")) return;
         e.preventDefault();
+        clearPointerInteraction();
         const wrapper = panelEl.parentElement!;
         const wrapperRect = wrapper.getBoundingClientRect();
         const panelRect = panelEl.getBoundingClientRect();
@@ -97,31 +104,46 @@
             pos = clampPos(ev.clientX - wrapperRect.left - dx, ev.clientY - wrapperRect.top - dy);
         };
         const up = () => {
-            window.removeEventListener("pointermove", move);
-            window.removeEventListener("pointerup", up);
+            clearPointerInteraction();
             persistLayout();
         };
         window.addEventListener("pointermove", move);
         window.addEventListener("pointerup", up);
+        window.addEventListener("pointercancel", up);
+        window.addEventListener("blur", up);
+        pointerInteractionCleanup = () => {
+            window.removeEventListener("pointermove", move);
+            window.removeEventListener("pointerup", up);
+            window.removeEventListener("pointercancel", up);
+            window.removeEventListener("blur", up);
+        };
     }
 
     function startResize(e: PointerEvent) {
         if (e.button !== 0) return;
         e.preventDefault();
         e.stopPropagation();
+        clearPointerInteraction();
         const startX = e.clientX;
         const startW = width;
         const move = (ev: PointerEvent) => {
             width = Math.min(520, Math.max(220, startW + (ev.clientX - startX)));
         };
         const up = () => {
-            window.removeEventListener("pointermove", move);
-            window.removeEventListener("pointerup", up);
+            clearPointerInteraction();
             if (pos) pos = clampPos(pos.x, pos.y);
             persistLayout();
         };
         window.addEventListener("pointermove", move);
         window.addEventListener("pointerup", up);
+        window.addEventListener("pointercancel", up);
+        window.addEventListener("blur", up);
+        pointerInteractionCleanup = () => {
+            window.removeEventListener("pointermove", move);
+            window.removeEventListener("pointerup", up);
+            window.removeEventListener("pointercancel", up);
+            window.removeEventListener("blur", up);
+        };
     }
 
     function drawScope() {
@@ -262,9 +284,12 @@
         if (registered) setReviewToolActive("scopes", true);
         if (open) {
             if (!raf) raf = requestAnimationFrame(drawScope);
+        } else {
+            clearPointerInteraction();
         }
         return () => {
             if (registered) setReviewToolActive("scopes", false);
+            clearPointerInteraction();
             if (raf) cancelAnimationFrame(raf);
             raf = 0;
         };

@@ -11,6 +11,7 @@
      * clicking the picture exits. Pointer position is applied directly in
      * the input handler — never waits for a frame.
      */
+    import { onDestroy } from "svelte";
     import { fade } from "svelte/transition";
     import { degradedInterval, setReviewToolActive } from "$lib/perf/loadMonitor";
     import { IS_GECKO } from "$lib/platform";
@@ -90,6 +91,7 @@ void main() {
 
     let gl: WebGL2RenderingContext | null = null;
     let glTried = false;
+    let glProgram: WebGLProgram | null = null;
     let uTex: WebGLTexture | null = null;
     let uniforms: Record<string, WebGLUniformLocation | null> = {};
     let texIsNearest = false;
@@ -107,6 +109,7 @@ void main() {
             });
             if (!ctx) return;
             const prog = linkProgram(ctx, VERT, FRAG);
+            glProgram = prog;
             bindFullscreenTriangle(ctx, [prog]);
             ctx.useProgram(prog);
             uTex = ctx.createTexture()!;
@@ -319,6 +322,24 @@ void main() {
             cachedSource = null;
             if (registered) setReviewToolActive("loupe", false);
         };
+    });
+
+    onDestroy(() => {
+        if (raf) cancelAnimationFrame(raf);
+        raf = 0;
+        if (hintTimer) {
+            clearTimeout(hintTimer);
+            hintTimer = null;
+        }
+        if (gl) {
+            if (uTex) gl.deleteTexture(uTex);
+            if (glProgram) gl.deleteProgram(glProgram);
+            gl.getExtension("WEBGL_lose_context")?.loseContext();
+        }
+        gl = null;
+        uTex = null;
+        glProgram = null;
+        cachedSource = null;
     });
 </script>
 

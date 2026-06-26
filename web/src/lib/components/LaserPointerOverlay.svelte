@@ -395,6 +395,12 @@
 
         return () => {
             destroyed = true;
+            if (isPointing) {
+                activePointerId = null;
+                isPointing = false;
+                endLocalStroke();
+                sendCursorEnd();
+            }
             motionQuery.removeEventListener("change", handleMotionChange);
             videoElement.removeEventListener("loadedmetadata", updateVideoRect);
             window.removeEventListener("resize", updateVideoRect);
