@@ -136,28 +136,49 @@
     let pinnedToBottom = true;
     let autoScrolling = false;
     let autoScrollTimer: ReturnType<typeof setTimeout> | null = null;
+    let autoScrollFrame: ReturnType<typeof requestAnimationFrame> | null = null;
     let uploadAbortController: AbortController | null = null;
+    let destroyed = false;
 
     onDestroy(() => {
-        if (autoScrollTimer) {
-            clearTimeout(autoScrollTimer);
-            autoScrollTimer = null;
-        }
+        destroyed = true;
+        clearAutoScrollWork();
         uploadAbortController?.abort();
         uploadAbortController = null;
     });
 
+    function clearAutoScrollWork() {
+        if (autoScrollTimer) {
+            clearTimeout(autoScrollTimer);
+            autoScrollTimer = null;
+        }
+        if (autoScrollFrame !== null) {
+            cancelAnimationFrame(autoScrollFrame);
+            autoScrollFrame = null;
+        }
+    }
+
+    function clearUploadState() {
+        uploadProgress = null;
+        uploadName = "";
+    }
+
     function scrollToBottom(smooth = false) {
-        if (!messagesContainer) return;
+        if (!messagesContainer || destroyed) return;
         const container = messagesContainer;
         autoScrolling = true;
         // Safety: an interrupted smooth scroll never reaches the bottom,
         // which would leave the latch (and the pin) stuck true forever.
         if (autoScrollTimer) clearTimeout(autoScrollTimer);
         autoScrollTimer = setTimeout(() => {
+            if (destroyed) return;
             autoScrolling = false;
+            autoScrollTimer = null;
         }, 800);
-        requestAnimationFrame(() => {
+        if (autoScrollFrame !== null) cancelAnimationFrame(autoScrollFrame);
+        autoScrollFrame = requestAnimationFrame(() => {
+            autoScrollFrame = null;
+            if (destroyed || messagesContainer !== container) return;
             container.scrollTo({
                 top: container.scrollHeight,
                 behavior: smooth ? "smooth" : "auto",
@@ -245,6 +266,7 @@
         const controller = new AbortController();
         uploadAbortController = controller;
         uploadError = null;
+        clearUploadState();
 
         // Validate file type
         if (!ALLOWED_TYPES.includes(file.type)) {
@@ -275,7 +297,7 @@
                 controller.signal
             );
 
-            if (uploadAbortController !== controller) return;
+            if (destroyed || uploadAbortController !== controller) return;
 
             // Send chat:file message via WebSocket
             session.send("chat:file", {
@@ -289,12 +311,15 @@
 
             uploadProgress = null;
         } catch (err) {
-            if (uploadAbortController !== controller) return;
+            if (destroyed || uploadAbortController !== controller) return;
             uploadError = err instanceof Error ? err.message : "Upload failed";
             uploadProgress = null;
         } finally {
             if (uploadAbortController === controller) {
                 uploadAbortController = null;
+            }
+            if (!destroyed && uploadAbortController === null && uploadProgress === null) {
+                uploadName = "";
             }
         }
     }
