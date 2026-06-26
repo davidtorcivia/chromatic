@@ -125,7 +125,7 @@ type RoomHandler struct {
 	db  *database.DB
 	sfu interface {
 		BindIngestToRoom(streamKeyToken, roomSlug string) ([]string, error)
-		RenegotiateSubscriber(roomSlug, subscriberID string) (string, error)
+		RenegotiateSubscriber(roomSlug, subscriberID string) (string, string, error)
 	}
 	hub interface {
 		BroadcastJSON(roomSlug string, msgType string, payload interface{}, excludeID string) error
@@ -188,7 +188,7 @@ func (h *RoomHandler) hasAdminSession(r *http.Request) bool {
 // SetSFU sets the SFU reference (for stream binding)
 func (h *RoomHandler) SetSFU(sfu interface {
 	BindIngestToRoom(streamKeyToken, roomSlug string) ([]string, error)
-	RenegotiateSubscriber(roomSlug, subscriberID string) (string, error)
+	RenegotiateSubscriber(roomSlug, subscriberID string) (string, string, error)
 }) {
 	h.sfu = sfu
 }
@@ -1573,13 +1573,14 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 	// added by the bind (they had a subscriber but no tracks).
 	if h.sfu != nil && h.hub != nil {
 		for _, subID := range subsNeedingReneg {
-			offerSDP, err := h.sfu.RenegotiateSubscriber(roomSlug, subID)
+			offerSDP, offerID, err := h.sfu.RenegotiateSubscriber(roomSlug, subID)
 			if err != nil {
 				logger.Warn("Failed to renegotiate subscriber after ingest bind", "subscriber", subID, "error", err)
 				continue
 			}
 			h.hub.SendToJSON(roomSlug, subID, "signal:renegotiate", map[string]interface{}{
-				"sdp": offerSDP,
+				"sdp":     offerSDP,
+				"offerId": offerID,
 			})
 			logger.Debug("Sent renegotiation offer to subscriber", "subscriber", subID, "room", roomSlug)
 		}

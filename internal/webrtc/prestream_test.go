@@ -28,7 +28,7 @@ func TestSFU_PreStreamSubscriber(t *testing.T) {
 		t.Fatal("room must not be live before ingest binds")
 	}
 
-	pc, offerSDP, err := sfu.CreateSubscriberConnection(roomSlug, "viewer-1")
+	pc, _, offerSDP, _, err := sfu.CreateSubscriberConnection(roomSlug, "viewer-1")
 	if err != nil {
 		t.Fatalf("pre-stream subscriber creation failed: %v", err)
 	}

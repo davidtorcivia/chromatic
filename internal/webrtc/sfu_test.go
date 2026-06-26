@@ -1,8 +1,10 @@
 package webrtc
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -345,6 +347,84 @@ func TestRoomTracks_AddSubscriber_ReplacesOldOnRejoin(t *testing.T) {
 	}
 }
 
+func TestRoomTracks_ScreenShareKeyframeTargetPrefersPublisherPC(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	publisherPC, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create publisher PC: %v", err)
+	}
+	defer publisherPC.Close()
+
+	subscriberPC, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create subscriber PC: %v", err)
+	}
+	defer subscriberPC.Close()
+
+	room := &RoomTracks{
+		RoomSlug:                 "test-room",
+		ScreenShareParticipantID: "p1",
+		Subscribers: map[string]*Subscriber{
+			"p1": {ID: "p1", PeerConnection: subscriberPC},
+		},
+		VoiceSessions: map[string]*VoiceSession{
+			"p1": {ParticipantID: "p1", PeerConnection: publisherPC},
+		},
+	}
+
+	if got := room.screenShareKeyframePeerConnectionLocked("p1"); got != publisherPC {
+		t.Fatal("screen-share keyframe target should prefer the dedicated publisher PC")
+	}
+}
+
+func TestRoomTracks_ScreenShareKeyframeTargetFallsBackToSubscriberPC(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	subscriberPC, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create subscriber PC: %v", err)
+	}
+	defer subscriberPC.Close()
+
+	room := &RoomTracks{
+		RoomSlug:                 "test-room",
+		ScreenShareParticipantID: "p1",
+		Subscribers: map[string]*Subscriber{
+			"p1": {ID: "p1", PeerConnection: subscriberPC},
+		},
+	}
+
+	if got := room.screenShareKeyframePeerConnectionLocked("p1"); got != subscriberPC {
+		t.Fatal("screen-share keyframe target should fall back to the subscriber PC")
+	}
+}
+
+func TestRoomTracks_KeyframeRequestsAreCoalesced(t *testing.T) {
+	room := &RoomTracks{RoomSlug: "test-room"}
+	now := time.Unix(1_700_000_000, 0)
+
+	if !room.markKeyframeRequestLocked(now) {
+		t.Fatal("first keyframe request should pass")
+	}
+	if room.markKeyframeRequestLocked(now.Add(keyframeRequestMinInterval - time.Millisecond)) {
+		t.Fatal("duplicate keyframe request inside coalescing window should be skipped")
+	}
+	if !room.markKeyframeRequestLocked(now.Add(keyframeRequestMinInterval)) {
+		t.Fatal("keyframe request at coalescing boundary should pass")
+	}
+}
+
 func TestSFU_SetIngest_ReplacesOldOnReconnect(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)
@@ -429,6 +509,111 @@ func TestSFU_RemoveVoiceSessionIfSame_IgnoresStaleCallback(t *testing.T) {
 	room.mu.RUnlock()
 	if stillThere {
 		t.Fatal("matched removeVoiceSessionIfSame did not remove the session")
+	}
+}
+
+func TestSFU_AbortPublisherOffer_RemovesOnlyMatchingOffer(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	participantID := "p1"
+	room := sfu.GetRoomTracks(roomSlug)
+
+	current := &VoiceSession{
+		ParticipantID:    participantID,
+		PublisherOfferID: "publish-2",
+		done:             make(chan struct{}),
+	}
+	room.mu.Lock()
+	if room.VoiceSessions == nil {
+		room.VoiceSessions = make(map[string]*VoiceSession)
+	}
+	room.VoiceSessions[participantID] = current
+	room.mu.Unlock()
+
+	if err := sfu.AbortPublisherOffer(roomSlug, participantID, "publish-1"); !errors.Is(err, ErrStalePublisherOffer) {
+		t.Fatalf("expected stale publisher offer error, got %v", err)
+	}
+	room.mu.RLock()
+	got := room.VoiceSessions[participantID]
+	room.mu.RUnlock()
+	if got != current {
+		t.Fatal("stale publish answer cleanup removed the current publisher")
+	}
+
+	if err := sfu.AbortPublisherOffer(roomSlug, participantID, "publish-2"); err != nil {
+		t.Fatalf("abort current publisher failed: %v", err)
+	}
+	room.mu.RLock()
+	_, stillThere := room.VoiceSessions[participantID]
+	room.mu.RUnlock()
+	if stillThere {
+		t.Fatal("matching publish answer cleanup did not remove publisher")
+	}
+	select {
+	case <-current.done:
+		// closed as expected
+	default:
+		t.Fatal("publisher done channel was not closed")
+	}
+}
+
+func TestSFU_HandlePublisherOffer_WaitsForExistingSignaling(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	participantID := "p1"
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create peer connection: %v", err)
+	}
+	defer pc.Close()
+
+	room := sfu.GetRoomTracks(roomSlug)
+	vs := &VoiceSession{
+		ParticipantID:  participantID,
+		PeerConnection: pc,
+		done:           make(chan struct{}),
+	}
+	room.mu.Lock()
+	if room.VoiceSessions == nil {
+		room.VoiceSessions = make(map[string]*VoiceSession)
+	}
+	room.VoiceSessions[participantID] = vs
+	room.mu.Unlock()
+
+	vs.SignalingMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := sfu.HandlePublisherOffer(roomSlug, participantID, "not sdp", "publish-1", func(string, *webrtc.TrackRemote) {})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("HandlePublisherOffer returned before signaling lock released: %v", err)
+	case <-time.After(50 * time.Millisecond):
+		// Expected: an in-flight publisher SDP operation blocks renegotiation.
+	}
+
+	vs.SignalingMu.Unlock()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected invalid SDP error after signaling lock released")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HandlePublisherOffer did not resume after signaling lock released")
 	}
 }
 
@@ -600,9 +785,42 @@ func TestSFU_SetSubscriberAnswer_RoomNotFound(t *testing.T) {
 	err = sfu.SetSubscriberAnswer("nonexistent", "sub-1", webrtc.SessionDescription{
 		Type: webrtc.SDPTypeAnswer,
 		SDP:  "",
-	})
+	}, "")
 	if err == nil {
 		t.Error("expected error for nonexistent room")
+	}
+}
+
+func TestSFU_SetSubscriberAnswer_IgnoresStaleOfferID(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	room := sfu.GetRoomTracks(roomSlug)
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create peer connection: %v", err)
+	}
+	defer pc.Close()
+
+	sub := &Subscriber{
+		ID:             "sub-1",
+		PeerConnection: pc,
+		done:           make(chan struct{}),
+		OfferID:        "current-offer",
+	}
+	room.AddSubscriber(sub)
+
+	err = sfu.SetSubscriberAnswer(roomSlug, "sub-1", webrtc.SessionDescription{
+		Type: webrtc.SDPTypeAnswer,
+		SDP:  "stale answer",
+	}, "old-offer")
+	if !errors.Is(err, ErrStaleSubscriberAnswer) {
+		t.Fatalf("expected stale answer error, got %v", err)
 	}
 }
 
@@ -614,9 +832,173 @@ func TestSFU_AddSubscriberICECandidate_RoomNotFound(t *testing.T) {
 	}
 	defer sfu.Shutdown()
 
-	err = sfu.AddSubscriberICECandidate("nonexistent", "sub-1", webrtc.ICECandidateInit{Candidate: ""})
+	err = sfu.AddSubscriberICECandidate("nonexistent", "sub-1", webrtc.ICECandidateInit{Candidate: ""}, "")
 	if err == nil {
 		t.Error("expected error for nonexistent room")
+	}
+}
+
+func TestSFU_AddSubscriberICECandidate_IgnoresStaleCandidateID(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	room := sfu.GetRoomTracks(roomSlug)
+	sub := &Subscriber{
+		ID:          "sub-1",
+		done:        make(chan struct{}),
+		CandidateID: "current-offer",
+	}
+	room.AddSubscriber(sub)
+
+	candidate := webrtc.ICECandidateInit{Candidate: "candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host"}
+	err = sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate, "old-offer")
+	if !errors.Is(err, ErrStaleSubscriberCandidate) {
+		t.Fatalf("expected stale subscriber candidate error, got %v", err)
+	}
+	if len(sub.pendingRemoteCandidates) != 0 {
+		t.Fatalf("stale candidate should not be buffered, got %d pending", len(sub.pendingRemoteCandidates))
+	}
+}
+
+func TestSFU_EnableSubscriberTrickleICE_UsesDynamicCandidateIDs(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	room := sfu.GetRoomTracks(roomSlug)
+	initialCandidate := webrtc.ICECandidateInit{Candidate: "candidate:initial 1 udp 2122260223 192.0.2.1 54321 typ host"}
+	sub := &Subscriber{
+		ID:          "sub-1",
+		done:        make(chan struct{}),
+		CandidateID: "initial-offer",
+		pendingCandidates: []SubscriberICECandidate{{
+			Candidate:   initialCandidate,
+			CandidateID: "initial-offer",
+		}},
+	}
+	room.AddSubscriber(sub)
+
+	var delivered []string
+	sfu.EnableSubscriberTrickleICE(roomSlug, "sub-1", func(c *webrtc.ICECandidateInit, candidateID string) {
+		delivered = append(delivered, candidateID)
+	})
+
+	sub.CandidateID = "renegotiate-offer"
+	liveCandidate := webrtc.ICECandidateInit{Candidate: "candidate:renegotiate 1 udp 2122260223 192.0.2.2 54321 typ host"}
+	sub.candidateMu.Lock()
+	cb := sub.OnICECandidate
+	sub.candidateMu.Unlock()
+	cb(&liveCandidate, sub.CandidateID)
+
+	if got, want := delivered, []string{"initial-offer", "renegotiate-offer"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("delivered candidate IDs = %v, want %v", got, want)
+	}
+}
+
+func TestSFU_AddPublisherCandidate_BuffersBeforeSession(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	participantID := "speaker-1"
+	candidate := webrtc.ICECandidateInit{Candidate: "candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host"}
+
+	if err := sfu.AddPublisherCandidate(roomSlug, participantID, candidate, "publish-1"); err != nil {
+		t.Fatalf("early publisher candidate should be buffered: %v", err)
+	}
+
+	room := sfu.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		t.Fatal("room should exist after buffering early publisher candidate")
+	}
+	room.mu.RLock()
+	pending := room.PendingPublisherICE[participantID]
+	room.mu.RUnlock()
+	if len(pending) != 1 {
+		t.Fatalf("expected one buffered publisher candidate, got %d", len(pending))
+	}
+	if pending[0].OfferID != "publish-1" {
+		t.Fatalf("buffered publisher candidate offer ID = %q, want publish-1", pending[0].OfferID)
+	}
+
+	for i := 1; i < MaxICECandidates; i++ {
+		if err := sfu.AddPublisherCandidate(roomSlug, participantID, candidate, "publish-1"); err != nil {
+			t.Fatalf("candidate %d unexpectedly rejected: %v", i, err)
+		}
+	}
+	if err := sfu.AddPublisherCandidate(roomSlug, participantID, candidate, "publish-1"); err == nil {
+		t.Fatal("expected early publisher candidate over budget to be rejected")
+	}
+
+	room.mu.Lock()
+	room.PendingPublisherICE[participantID] = []PublisherICECandidate{{Candidate: candidate, OfferID: "publish-1"}}
+	if room.VoiceSessions == nil {
+		room.VoiceSessions = make(map[string]*VoiceSession)
+	}
+	room.VoiceSessions[participantID] = &VoiceSession{ParticipantID: participantID, PublisherOfferID: "publish-1", done: make(chan struct{})}
+	room.mu.Unlock()
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create peer connection: %v", err)
+	}
+	defer pc.Close()
+
+	sfu.flushPendingPublisherCandidates(room, participantID, pc)
+
+	room.mu.RLock()
+	_, stillPending := room.PendingPublisherICE[participantID]
+	room.mu.RUnlock()
+	if stillPending {
+		t.Fatal("buffered publisher candidates should be cleared after flush")
+	}
+}
+
+func TestSFU_AddPublisherCandidate_IgnoresStaleOfferID(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	participantID := "speaker-1"
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create peer connection: %v", err)
+	}
+	defer pc.Close()
+
+	room := sfu.GetRoomTracks(roomSlug)
+	if room.VoiceSessions == nil {
+		room.VoiceSessions = make(map[string]*VoiceSession)
+	}
+	room.mu.Lock()
+	room.VoiceSessions[participantID] = &VoiceSession{
+		ParticipantID:    participantID,
+		PeerConnection:   pc,
+		PublisherOfferID: "publish-current",
+		done:             make(chan struct{}),
+	}
+	room.mu.Unlock()
+
+	candidate := webrtc.ICECandidateInit{Candidate: "candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host"}
+	err = sfu.AddPublisherCandidate(roomSlug, participantID, candidate, "publish-old")
+	if !errors.Is(err, ErrStalePublisherCandidate) {
+		t.Fatalf("expected stale publisher candidate error, got %v", err)
 	}
 }
 
@@ -628,7 +1010,7 @@ func TestSFU_HandleIceRestart_RoomNotFound(t *testing.T) {
 	}
 	defer sfu.Shutdown()
 
-	_, err = sfu.HandleIceRestart("nonexistent", "sub-1", "")
+	_, err = sfu.HandleIceRestart("nonexistent", "sub-1", "", "")
 	if err == nil {
 		t.Error("expected error for nonexistent room")
 	}
@@ -642,7 +1024,7 @@ func TestSFU_RenegotiateSubscriber_RoomNotFound(t *testing.T) {
 	}
 	defer sfu.Shutdown()
 
-	_, err = sfu.RenegotiateSubscriber("nonexistent", "sub-1")
+	_, _, err = sfu.RenegotiateSubscriber("nonexistent", "sub-1")
 	if err == nil {
 		t.Error("expected error for nonexistent room")
 	}
@@ -656,9 +1038,89 @@ func TestSFU_HandleRenegotiationAnswer_RoomNotFound(t *testing.T) {
 	}
 	defer sfu.Shutdown()
 
-	err = sfu.HandleRenegotiationAnswer("nonexistent", "sub-1", "")
+	err = sfu.HandleRenegotiationAnswer("nonexistent", "sub-1", "", "")
 	if err == nil {
 		t.Error("expected error for nonexistent room")
+	}
+}
+
+func TestSFU_HandleRenegotiationAnswer_IgnoresStaleOfferID(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	room := sfu.GetRoomTracks(roomSlug)
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create peer connection: %v", err)
+	}
+	defer pc.Close()
+
+	sub := &Subscriber{
+		ID:                   "sub-1",
+		PeerConnection:       pc,
+		done:                 make(chan struct{}),
+		RenegotiationOfferID: "current-offer",
+	}
+	room.AddSubscriber(sub)
+
+	err = sfu.HandleRenegotiationAnswer(roomSlug, "sub-1", "stale answer", "old-offer")
+	if !errors.Is(err, ErrStaleRenegotiationAnswer) {
+		t.Fatalf("expected stale renegotiation answer error, got %v", err)
+	}
+}
+
+func TestSFU_AbortSubscriberRenegotiation_RemovesUndeliveredOffer(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	room := sfu.GetRoomTracks(roomSlug)
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create peer connection: %v", err)
+	}
+	defer pc.Close()
+
+	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
+		t.Fatalf("failed to add transceiver: %v", err)
+	}
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("failed to create offer: %v", err)
+	}
+	if err := pc.SetLocalDescription(offer); err != nil {
+		t.Fatalf("failed to set local description: %v", err)
+	}
+
+	sub := &Subscriber{
+		ID:                   "sub-1",
+		PeerConnection:       pc,
+		done:                 make(chan struct{}),
+		RenegotiationOfferID: "renegotiate-1",
+		CandidateID:          "renegotiate-1",
+	}
+	room.AddSubscriber(sub)
+
+	if err := sfu.AbortSubscriberRenegotiation(roomSlug, "sub-1", "renegotiate-1"); err != nil {
+		t.Fatalf("abort failed: %v", err)
+	}
+	if _, ok := room.Subscribers["sub-1"]; ok {
+		t.Fatal("subscriber with undelivered offer was not removed")
+	}
+	select {
+	case <-sub.done:
+		// closed as expected
+	default:
+		t.Fatal("subscriber done channel was not closed")
 	}
 }
 
@@ -868,27 +1330,27 @@ func TestSFU_AddSubscriberICECandidate_BudgetResetsPerNegotiation(t *testing.T) 
 	// Exhaust the budget. remoteDescSet is false, so candidates are buffered
 	// and never touch the PeerConnection.
 	for i := 0; i < MaxICECandidates; i++ {
-		if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate); err != nil {
+		if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate, ""); err != nil {
 			t.Fatalf("candidate %d unexpectedly rejected: %v", i, err)
 		}
 	}
-	if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate); err == nil {
+	if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate, ""); err == nil {
 		t.Fatal("expected candidate over budget to be rejected")
 	}
 
 	// A new negotiation resets the budget; candidates flow again.
 	sub.resetICECandidateBudget()
-	if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate); err != nil {
+	if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate, ""); err != nil {
 		t.Fatalf("candidate after budget reset unexpectedly rejected: %v", err)
 	}
 
 	// ...and the fresh budget is still bounded.
 	for i := 0; i < MaxICECandidates-1; i++ {
-		if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate); err != nil {
+		if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate, ""); err != nil {
 			t.Fatalf("candidate %d of fresh budget unexpectedly rejected: %v", i, err)
 		}
 	}
-	if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate); err == nil {
+	if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate, ""); err == nil {
 		t.Fatal("expected candidate over the fresh budget to be rejected")
 	}
 }

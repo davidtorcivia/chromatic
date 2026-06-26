@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -56,8 +57,9 @@ type WebSocketHandler struct {
 // whole attempt and recording success in created guarantees the client ends
 // up with exactly one subscriber and one offer.
 type subscriptionState struct {
-	mu      sync.Mutex
-	created bool
+	mu         sync.Mutex
+	created    bool
+	subscriber *webrtc.Subscriber
 }
 
 // SetWaitingActions wires the shared waiting-room admit/deny implementation.
@@ -248,6 +250,12 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	// Register with hub
 	h.hub.Register(client)
 
+	// Start the writer before queuing initial snapshots or live-stream offers.
+	// Rejoin latency is dominated by how quickly room:state and signal:offer
+	// leave this buffer; with the writer idle until the end of setup, those
+	// messages could sit behind DB work and any same-connection setup burst.
+	go client.WritePump()
+
 	// Send initial room state and chat history
 	h.sendRoomState(client, slug)
 	h.sendChatHistory(client, slug)
@@ -275,9 +283,6 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	// renegotiation (no reconnect, no second offer race).
 	go h.ensureSubscription(client, slug)
 
-	// Start write pump
-	go client.WritePump()
-
 	// Start read pump with disconnect handler
 	go client.ReadPumpWithDisconnect(
 		func(c *websocket.Client, msg websocket.Message) {
@@ -288,6 +293,7 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 			// so drop its subscription state. Keyed by pointer, so a refresh
 			// replacement (a different Client) keeps its own entry.
 			h.subMu.Lock()
+			st := h.subStates[c]
 			delete(h.subStates, c)
 			h.subMu.Unlock()
 
@@ -323,6 +329,18 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 				logger.Info("Client replaced (page refresh), skipping cleanup", "participant_id", c.ID, "name", c.Name, "room", c.RoomSlug)
 				return
 			}
+			// This is a confirmed leave, not a replaced page refresh. Tear down
+			// the participant's SFU sessions immediately instead of waiting for
+			// WebRTC state callbacks to eventually observe Closed.
+			h.sfu.RemoveVoiceSession(c.RoomSlug, c.ID)
+			if st != nil {
+				st.mu.Lock()
+				sub := st.subscriber
+				st.subscriber = nil
+				st.created = false
+				st.mu.Unlock()
+				h.sfu.RemoveSubscriberIfSame(c.RoomSlug, c.ID, sub)
+			}
 			// Broadcast participant:left when client disconnects
 			h.hub.BroadcastJSON(c.RoomSlug, "participant:left", map[string]interface{}{
 				"participantId": c.ID,
@@ -356,7 +374,7 @@ func (h *WebSocketHandler) ensureSubscription(client *websocket.Client, roomSlug
 		// so creating a replacement here would force a needless re-handshake.
 		return
 	}
-	if h.initiateSubscription(client, roomSlug) {
+	if h.initiateSubscription(client, roomSlug, st) {
 		st.created = true
 	}
 }
@@ -365,7 +383,7 @@ func (h *WebSocketHandler) ensureSubscription(client *websocket.Client, roomSlug
 // true when a subscriber was created and the offer sent; false when the
 // attempt should be retried later (the stream isn't up yet, or subscriber
 // creation failed and the next stream-start may succeed).
-func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSlug string) bool {
+func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSlug string, st *subscriptionState) bool {
 	// Subscribers are created even before the ingest binds (pre-stream the
 	// offer simply has no media sections): voice relay rides the subscriber
 	// PC, so participants must be able to hear each other in the lobby
@@ -374,7 +392,7 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 	// via AddTrack + renegotiation (covered by TestSFU_PreStreamSubscriber).
 
 	// Create subscriber connection and get offer (no ICE candidates yet — trickle ICE)
-	pc, offerSDP, err := h.sfu.CreateSubscriberConnection(roomSlug, client.ID)
+	pc, sub, offerSDP, offerID, err := h.sfu.CreateSubscriberConnection(roomSlug, client.ID)
 	if err != nil {
 		logger.Error("Failed to create subscriber connection", "participant_id", client.ID, "room", roomSlug, "error", err)
 		// Tell the client the handshake failed so it can surface an error and
@@ -407,28 +425,47 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 		}
 	})
 
-	// Send offer to client FIRST (before enabling trickle ICE)
-	client.SendJSON("signal:offer", map[string]interface{}{
-		"sdp": offerSDP,
-	})
+	// Send offer to client FIRST (before enabling trickle ICE). If this cannot
+	// be queued, tear down the just-created subscriber so the reconnect/retry
+	// path does not inherit a phantom SFU session that the browser never saw.
+	if err := client.SendJSON("signal:offer", map[string]interface{}{
+		"sdp":     offerSDP,
+		"offerId": offerID,
+	}); err != nil {
+		logger.Warn("Failed to queue WebRTC offer; removing subscriber",
+			"participant_id", client.ID, "room", roomSlug, "error", err)
+		h.sfu.RemoveSubscriberIfSame(roomSlug, client.ID, sub)
+		return false
+	}
+	if st != nil {
+		st.subscriber = sub
+	}
 
 	// Enable trickle ICE: flush any buffered candidates and send future ones directly.
 	// This must happen AFTER the offer is sent to guarantee correct message ordering.
-	h.sfu.EnableSubscriberTrickleICE(roomSlug, client.ID, func(init *pionwebrtc.ICECandidateInit) {
+	h.sfu.EnableSubscriberTrickleICE(roomSlug, client.ID, func(init *pionwebrtc.ICECandidateInit, candidateID string) {
 		client.SendJSON("signal:candidate", map[string]interface{}{
 			"candidate":     init.Candidate,
 			"sdpMid":        init.SDPMid,
 			"sdpMLineIndex": init.SDPMLineIndex,
+			"offerId":       candidateID,
 		})
 	})
 
 	// Wire the deferred-renegotiation push: tracks attached while another
 	// offer/answer exchange was in flight get their follow-up offer sent
 	// here once signaling settles, instead of being dropped.
-	h.sfu.SetSubscriberRenegotiationCallback(roomSlug, client.ID, func(sdp string) {
-		client.SendJSON("signal:renegotiate", map[string]interface{}{
-			"sdp": sdp,
-		})
+	h.sfu.SetSubscriberRenegotiationCallback(roomSlug, client.ID, func(sdp, offerID string) {
+		if err := client.SendJSON("signal:renegotiate", map[string]interface{}{
+			"sdp":     sdp,
+			"offerId": offerID,
+		}); err != nil {
+			logger.Warn("Failed to send deferred renegotiation offer", "participant_id", client.ID, "room", roomSlug, "offer_id", offerID, "error", err)
+			if abortErr := h.sfu.AbortSubscriberRenegotiation(roomSlug, client.ID, offerID); abortErr != nil {
+				logger.Warn("Failed to abort undelivered deferred renegotiation", "participant_id", client.ID, "room", roomSlug, "offer_id", offerID, "error", abortErr)
+			}
+			return
+		}
 		logger.Debug("Sent deferred renegotiation offer", "participant_id", client.ID, "room", roomSlug)
 	})
 
@@ -443,7 +480,8 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 // audio → voice relay fan-out, video → screen share relay fan-out.
 func (h *WebSocketHandler) handlePublishOffer(client *websocket.Client, payload json.RawMessage) {
 	var data struct {
-		SDP string `json:"sdp"`
+		SDP     string `json:"sdp"`
+		OfferID string `json:"offerId"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil || data.SDP == "" {
 		logger.Warn("Invalid publish offer", "participant_id", client.ID)
@@ -451,7 +489,7 @@ func (h *WebSocketHandler) handlePublishOffer(client *websocket.Client, payload 
 	}
 
 	roomSlug := client.RoomSlug
-	answer, err := h.sfu.HandlePublisherOffer(roomSlug, client.ID, data.SDP, func(pid string, track *pionwebrtc.TrackRemote) {
+	answer, err := h.sfu.HandlePublisherOffer(roomSlug, client.ID, data.SDP, data.OfferID, func(pid string, track *pionwebrtc.TrackRemote) {
 		if track.Kind() == pionwebrtc.RTPCodecTypeVideo {
 			// Screen share — only forward when the participant holds share
 			// permission (admins implicitly do).
@@ -472,9 +510,19 @@ func (h *WebSocketHandler) handlePublishOffer(client *websocket.Client, payload 
 		return
 	}
 
-	client.SendJSON("publish:answer", map[string]interface{}{
+	response := map[string]interface{}{
 		"sdp": answer,
-	})
+	}
+	if data.OfferID != "" {
+		response["offerId"] = data.OfferID
+	}
+	if err := client.SendJSON("publish:answer", response); err != nil {
+		logger.Warn("Failed to send publish answer", "participant_id", client.ID, "room", roomSlug, "offer_id", data.OfferID, "error", err)
+		if abortErr := h.sfu.AbortPublisherOffer(roomSlug, client.ID, data.OfferID); abortErr != nil {
+			logger.Warn("Failed to abort undelivered publish offer", "participant_id", client.ID, "room", roomSlug, "offer_id", data.OfferID, "error", abortErr)
+		}
+		return
+	}
 	logger.Debug("Publisher negotiated", "participant_id", client.ID, "room", roomSlug)
 }
 
@@ -483,6 +531,7 @@ func (h *WebSocketHandler) handlePublishCandidate(client *websocket.Client, payl
 		Candidate     string  `json:"candidate"`
 		SDPMid        *string `json:"sdpMid"`
 		SDPMLineIndex *uint16 `json:"sdpMLineIndex"`
+		OfferID       string  `json:"offerId"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return
@@ -491,7 +540,11 @@ func (h *WebSocketHandler) handlePublishCandidate(client *websocket.Client, payl
 		Candidate:     data.Candidate,
 		SDPMid:        data.SDPMid,
 		SDPMLineIndex: data.SDPMLineIndex,
-	}); err != nil {
+	}, data.OfferID); err != nil {
+		if errors.Is(err, webrtc.ErrStalePublisherCandidate) {
+			logger.Debug("Ignored stale publisher ICE candidate", "participant_id", client.ID, "offer_id", data.OfferID)
+			return
+		}
 		logger.Debug("Failed to add publisher ICE candidate", "participant_id", client.ID, "error", err)
 	}
 }
@@ -526,6 +579,19 @@ func (h *WebSocketHandler) handleResubscribe(client *websocket.Client) {
 	roomSlug := client.RoomSlug
 	logger.Info("Client requested fresh subscription", "participant_id", client.ID, "room", roomSlug)
 
+	// A resubscribe usually follows a dead ICE path or expired TURN allocation.
+	// Send the current ICE server set immediately before the replacement offer
+	// so the browser updates its RTCPeerConnection config before handling the
+	// fresh SDP. This keeps recovery to one ordered websocket round trip and
+	// avoids racing a separate client-side ice-servers request against the offer.
+	servers := h.sfu.GetICEServers()
+	if err := client.SendJSON("signal:ice-servers", map[string]interface{}{
+		"iceServers": servers,
+	}); err != nil {
+		logger.Warn("Failed to queue ICE servers for resubscribe", "participant_id", client.ID, "room", roomSlug, "error", err)
+		return
+	}
+
 	h.subMu.Lock()
 	st, ok := h.subStates[client]
 	h.subMu.Unlock()
@@ -534,7 +600,7 @@ func (h *WebSocketHandler) handleResubscribe(client *websocket.Client) {
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	st.created = h.initiateSubscription(client, roomSlug)
+	st.created = h.initiateSubscription(client, roomSlug, st)
 }
 
 // InitiateSubscriptionsForRoom sends WebRTC offers to clients in a room that
@@ -1062,9 +1128,12 @@ func (h *WebSocketHandler) handleCursor(client *websocket.Client, payload json.R
 		return
 	}
 
-	// Broadcast the batched shape to all. Top-level x/y mirror the newest
-	// point for backward compatibility with single-point consumers.
-	h.hub.BroadcastJSON(client.RoomSlug, "cursor", map[string]interface{}{
+	// Cursor updates are high-rate disposable state. Drop them for clients
+	// whose WebSocket send buffers are full instead of evicting viewers or
+	// letting stale cursor positions add backpressure to critical signaling.
+	// The batched payload keeps top-level x/y mirroring the newest point for
+	// backward compatibility with single-point consumers.
+	h.hub.BroadcastJSONDropIfFull(client.RoomSlug, "cursor", map[string]interface{}{
 		"participantId":   client.ID,
 		"participantName": client.Name,
 		"color":           client.Color,
@@ -1123,10 +1192,15 @@ func (h *WebSocketHandler) handleSignalOffer(client *websocket.Client, payload j
 		return
 	}
 
-	// Send answer back to client
-	client.SendJSON("signal:voice-answer", map[string]interface{}{
+	// Send answer back to client. If queuing fails, SendJSON has already
+	// closed the websocket for reconnect; do not flush follow-up signaling to
+	// a dead client.
+	if err := client.SendJSON("signal:voice-answer", map[string]interface{}{
 		"sdp": answer,
-	})
+	}); err != nil {
+		logger.Warn("Failed to send voice answer", "participant_id", client.ID, "room", client.RoomSlug, "error", err)
+		return
+	}
 
 	logger.Debug("Sent voice answer", "participant_id", client.ID, "rolled_back", rolledBack)
 
@@ -1179,7 +1253,7 @@ func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID str
 		}
 
 		go func(c *websocket.Client) {
-			offerSDP, err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, c.ID, voiceOwnerID, localTrack)
+			offerSDP, offerID, err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, c.ID, voiceOwnerID, localTrack)
 			if err != nil {
 				logger.Warn("Failed to add voice track to subscriber", "subscriber_id", c.ID, "source_id", voiceOwnerID, "error", err)
 				return
@@ -1191,10 +1265,17 @@ func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID str
 				return
 			}
 
-			c.SendJSON("signal:renegotiate", map[string]interface{}{
+			if err := c.SendJSON("signal:renegotiate", map[string]interface{}{
 				"sdp":           offerSDP,
+				"offerId":       offerID,
 				"participantId": voiceOwnerID,
-			})
+			}); err != nil {
+				logger.Warn("Failed to send voice renegotiation offer", "subscriber_id", c.ID, "source_id", voiceOwnerID, "offer_id", offerID, "error", err)
+				if abortErr := h.sfu.AbortSubscriberRenegotiation(roomSlug, c.ID, offerID); abortErr != nil {
+					logger.Warn("Failed to abort undelivered voice renegotiation", "subscriber_id", c.ID, "source_id", voiceOwnerID, "offer_id", offerID, "error", abortErr)
+				}
+				return
+			}
 
 			logger.Debug("Sent renegotiation offer for voice track", "subscriber_id", c.ID, "source_id", voiceOwnerID)
 		}(client)
@@ -1203,7 +1284,8 @@ func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID str
 
 func (h *WebSocketHandler) handleSignalAnswer(client *websocket.Client, payload json.RawMessage) {
 	var data struct {
-		SDP string `json:"sdp"`
+		SDP     string `json:"sdp"`
+		OfferID string `json:"offerId"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		logger.Warn("Invalid signal answer", "participant_id", client.ID, "error", err)
@@ -1215,7 +1297,11 @@ func (h *WebSocketHandler) handleSignalAnswer(client *websocket.Client, payload 
 		SDP:  data.SDP,
 	}
 
-	if err := h.sfu.SetSubscriberAnswer(client.RoomSlug, client.ID, answer); err != nil {
+	if err := h.sfu.SetSubscriberAnswer(client.RoomSlug, client.ID, answer, data.OfferID); err != nil {
+		if errors.Is(err, webrtc.ErrStaleSubscriberAnswer) {
+			logger.Debug("Ignored stale subscriber answer", "participant_id", client.ID, "offer_id", data.OfferID)
+			return
+		}
 		logger.Error("Failed to set subscriber answer", "participant_id", client.ID, "error", err)
 		return
 	}
@@ -1233,6 +1319,7 @@ func (h *WebSocketHandler) handleSignalCandidate(client *websocket.Client, paylo
 		SDPMid           *string `json:"sdpMid"`
 		SDPMLineIndex    *uint16 `json:"sdpMLineIndex"`
 		UsernameFragment *string `json:"usernameFragment,omitempty"`
+		OfferID          string  `json:"offerId"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		logger.Warn("Invalid ICE candidate", "participant_id", client.ID, "error", err)
@@ -1246,7 +1333,11 @@ func (h *WebSocketHandler) handleSignalCandidate(client *websocket.Client, paylo
 		UsernameFragment: data.UsernameFragment,
 	}
 
-	if err := h.sfu.AddSubscriberICECandidate(client.RoomSlug, client.ID, candidate); err != nil {
+	if err := h.sfu.AddSubscriberICECandidate(client.RoomSlug, client.ID, candidate, data.OfferID); err != nil {
+		if errors.Is(err, webrtc.ErrStaleSubscriberCandidate) {
+			logger.Debug("Ignored stale subscriber ICE candidate", "participant_id", client.ID, "offer_id", data.OfferID)
+			return
+		}
 		logger.Warn("Failed to add ICE candidate", "participant_id", client.ID, "error", err)
 		return
 	}
@@ -1256,7 +1347,8 @@ func (h *WebSocketHandler) handleSignalCandidate(client *websocket.Client, paylo
 
 func (h *WebSocketHandler) handleIceRestart(client *websocket.Client, payload json.RawMessage) {
 	var data struct {
-		SDP string `json:"sdp"`
+		SDP     string `json:"sdp"`
+		OfferID string `json:"offerId"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		logger.Warn("Invalid ICE restart request", "participant_id", client.ID, "error", err)
@@ -1266,16 +1358,23 @@ func (h *WebSocketHandler) handleIceRestart(client *websocket.Client, payload js
 	logger.Info("Processing ICE restart", "participant_id", client.ID, "room", client.RoomSlug)
 
 	// Handle the ICE restart offer and get answer
-	answer, err := h.sfu.HandleIceRestart(client.RoomSlug, client.ID, data.SDP)
+	answer, err := h.sfu.HandleIceRestart(client.RoomSlug, client.ID, data.SDP, data.OfferID)
 	if err != nil {
 		logger.Error("Failed to handle ICE restart", "participant_id", client.ID, "error", err)
 		return
 	}
 
 	// Send answer back to client
-	client.SendJSON("signal:answer", map[string]interface{}{
+	response := map[string]interface{}{
 		"sdp": answer,
-	})
+	}
+	if data.OfferID != "" {
+		response["offerId"] = data.OfferID
+	}
+	if err := client.SendJSON("signal:answer", response); err != nil {
+		logger.Warn("Failed to send ICE restart answer", "participant_id", client.ID, "room", client.RoomSlug, "offer_id", data.OfferID, "error", err)
+		return
+	}
 
 	logger.Debug("Sent ICE restart answer", "participant_id", client.ID)
 
@@ -1286,7 +1385,8 @@ func (h *WebSocketHandler) handleIceRestart(client *websocket.Client, payload js
 
 func (h *WebSocketHandler) handleRenegotiateAnswer(client *websocket.Client, payload json.RawMessage) {
 	var data struct {
-		SDP string `json:"sdp"`
+		SDP     string `json:"sdp"`
+		OfferID string `json:"offerId"`
 	}
 	if err := json.Unmarshal(payload, &data); err != nil {
 		logger.Warn("Invalid renegotiate answer", "participant_id", client.ID, "error", err)
@@ -1296,7 +1396,11 @@ func (h *WebSocketHandler) handleRenegotiateAnswer(client *websocket.Client, pay
 	logger.Debug("Processing renegotiation answer", "participant_id", client.ID, "room", client.RoomSlug)
 
 	// Process the renegotiation answer
-	if err := h.sfu.HandleRenegotiationAnswer(client.RoomSlug, client.ID, data.SDP); err != nil {
+	if err := h.sfu.HandleRenegotiationAnswer(client.RoomSlug, client.ID, data.SDP, data.OfferID); err != nil {
+		if errors.Is(err, webrtc.ErrStaleRenegotiationAnswer) {
+			logger.Debug("Ignored stale renegotiation answer", "participant_id", client.ID, "offer_id", data.OfferID)
+			return
+		}
 		logger.Error("Failed to handle renegotiation answer", "participant_id", client.ID, "error", err)
 		return
 	}
@@ -1734,7 +1838,7 @@ func (h *WebSocketHandler) forwardScreenShareTrack(roomSlug, participantID strin
 			continue
 		}
 
-		offerSDP, err := h.sfu.AddScreenShareTrackToSubscriber(roomSlug, client.ID, participantID, relayTrack)
+		offerSDP, offerID, err := h.sfu.AddScreenShareTrackToSubscriber(roomSlug, client.ID, participantID, relayTrack)
 		if err != nil {
 			logger.Warn("Failed to add screen share track to subscriber", "subscriber_id", client.ID, "source_id", participantID, "error", err)
 			continue
@@ -1745,9 +1849,16 @@ func (h *WebSocketHandler) forwardScreenShareTrack(roomSlug, participantID strin
 			continue
 		}
 
-		client.SendJSON("signal:renegotiate", map[string]interface{}{
-			"sdp": offerSDP,
-		})
+		if err := client.SendJSON("signal:renegotiate", map[string]interface{}{
+			"sdp":     offerSDP,
+			"offerId": offerID,
+		}); err != nil {
+			logger.Warn("Failed to send screen share renegotiation offer", "subscriber_id", client.ID, "source_id", participantID, "offer_id", offerID, "error", err)
+			if abortErr := h.sfu.AbortSubscriberRenegotiation(roomSlug, client.ID, offerID); abortErr != nil {
+				logger.Warn("Failed to abort undelivered screen share renegotiation", "subscriber_id", client.ID, "source_id", participantID, "offer_id", offerID, "error", abortErr)
+			}
+			continue
+		}
 	}
 
 	// Broadcast that screen share has started
@@ -1773,7 +1884,7 @@ func (h *WebSocketHandler) forwardScreenShareTrack(roomSlug, participantID strin
 
 // renegotiateSubscriber creates a renegotiation offer for a subscriber and sends it
 func (h *WebSocketHandler) renegotiateSubscriber(roomSlug, subscriberID string) {
-	offerSDP, err := h.sfu.RenegotiateSubscriber(roomSlug, subscriberID)
+	offerSDP, offerID, err := h.sfu.RenegotiateSubscriber(roomSlug, subscriberID)
 	if err != nil {
 		logger.Warn("Failed to renegotiate subscriber", "subscriber_id", subscriberID, "error", err)
 		return
@@ -1781,8 +1892,14 @@ func (h *WebSocketHandler) renegotiateSubscriber(roomSlug, subscriberID string) 
 
 	client := h.hub.GetClient(roomSlug, subscriberID)
 	if client != nil {
-		client.SendJSON("signal:renegotiate", map[string]interface{}{
-			"sdp": offerSDP,
-		})
+		if err := client.SendJSON("signal:renegotiate", map[string]interface{}{
+			"sdp":     offerSDP,
+			"offerId": offerID,
+		}); err != nil {
+			logger.Warn("Failed to send renegotiation offer", "subscriber_id", subscriberID, "offer_id", offerID, "error", err)
+			if abortErr := h.sfu.AbortSubscriberRenegotiation(roomSlug, subscriberID, offerID); abortErr != nil {
+				logger.Warn("Failed to abort undelivered renegotiation", "subscriber_id", subscriberID, "offer_id", offerID, "error", abortErr)
+			}
+		}
 	}
 }

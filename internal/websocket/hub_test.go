@@ -2,11 +2,17 @@ package websocket
 
 import (
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"chromatic/internal/metrics"
+
+	gorillawebsocket "github.com/gorilla/websocket"
 )
 
 func init() {
@@ -243,6 +249,34 @@ func TestHub_BroadcastWithExclude(t *testing.T) {
 	}
 }
 
+func TestHub_BroadcastDropIfFullDoesNotEvict(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+	defer stopHub(hub)
+
+	client := newTestClient("client-1", "Alice", "test-room", hub)
+	client.Send = make(chan []byte, 1)
+	hub.Register(client)
+	time.Sleep(10 * time.Millisecond)
+
+	client.Send <- []byte(`{"type":"queued"}`)
+	hub.BroadcastDropIfFull("test-room", []byte(`{"type":"cursor"}`), "")
+	time.Sleep(10 * time.Millisecond)
+
+	if hub.GetClient("test-room", "client-1") != client {
+		t.Fatal("drop-if-full broadcast evicted a client")
+	}
+
+	select {
+	case msg := <-client.Send:
+		if string(msg) != `{"type":"queued"}` {
+			t.Fatalf("expected original queued message, got %s", msg)
+		}
+	default:
+		t.Fatal("expected original queued message to remain")
+	}
+}
+
 func TestHub_BroadcastJSON(t *testing.T) {
 	hub := NewHub()
 	go hub.Run()
@@ -350,6 +384,124 @@ func TestHub_SendTo(t *testing.T) {
 		t.Error("client2 should not have received the private message")
 	case <-time.After(50 * time.Millisecond):
 		// Expected
+	}
+}
+
+func TestHub_SendToFullBufferClosesClient(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+	defer stopHub(hub)
+
+	client := newTestClient("client-1", "Alice", "test-room", hub)
+	client.Send = make(chan []byte, 1)
+	hub.Register(client)
+	time.Sleep(10 * time.Millisecond)
+
+	client.Send <- []byte(`{"type":"queued"}`)
+	hub.SendTo("test-room", "client-1", []byte(`{"type":"signal:renegotiate"}`))
+
+	select {
+	case <-client.Done:
+		// Expected: direct critical sends must not be silently dropped.
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("full direct send buffer did not close the client")
+	}
+
+	select {
+	case msg := <-client.Send:
+		if string(msg) != `{"type":"queued"}` {
+			t.Fatalf("expected original queued message, got %s", msg)
+		}
+	default:
+		t.Fatal("expected original queued message to remain")
+	}
+}
+
+func TestClient_SendJSONFullBufferClosesClient(t *testing.T) {
+	client := newTestClient("client-1", "Alice", "test-room", nil)
+	client.Send = make(chan []byte, 1)
+	client.Send <- []byte(`{"type":"queued"}`)
+
+	if err := client.SendJSON("signal:offer", map[string]string{"sdp": "offer"}); !errors.Is(err, ErrClientSendBufferFull) {
+		t.Fatalf("SendJSON error = %v, want %v", err, ErrClientSendBufferFull)
+	}
+
+	select {
+	case <-client.Done:
+		// Expected: critical direct JSON sends must not disappear silently.
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("full SendJSON buffer did not close the client")
+	}
+
+	select {
+	case msg := <-client.Send:
+		if string(msg) != `{"type":"queued"}` {
+			t.Fatalf("expected original queued message, got %s", msg)
+		}
+	default:
+		t.Fatal("expected original queued message to remain")
+	}
+}
+
+func TestClient_WritePumpDoesNotFlushQueuedMessagesAfterDone(t *testing.T) {
+	var serverConn *gorillawebsocket.Conn
+	accepted := make(chan struct{})
+	upgrader := gorillawebsocket.Upgrader{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade failed: %v", err)
+			close(accepted)
+			return
+		}
+		serverConn = conn
+		close(accepted)
+	}))
+	defer server.Close()
+
+	peer, _, err := gorillawebsocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer peer.Close()
+
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("websocket server did not accept connection")
+	}
+	if serverConn == nil {
+		t.Fatal("websocket server did not produce a connection")
+	}
+
+	client := newTestClient("client-1", "Alice", "test-room", nil)
+	client.Conn = serverConn
+	client.Send <- []byte(`{"type":"stale"}`)
+	close(client.Done)
+
+	done := make(chan struct{})
+	go func() {
+		client.WritePump()
+		close(done)
+	}()
+
+	if err := peer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("failed to set read deadline: %v", err)
+	}
+	_, msg, err := peer.ReadMessage()
+	if err == nil {
+		t.Fatalf("expected close frame, got message %s", msg)
+	}
+	var closeErr *gorillawebsocket.CloseError
+	if !errors.As(err, &closeErr) {
+		t.Fatalf("expected websocket close error, got %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("WritePump did not exit after Done closed")
 	}
 }
 

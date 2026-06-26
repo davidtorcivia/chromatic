@@ -341,14 +341,23 @@ func (h *Hub) UnregisterIfCurrent(client *Client) bool {
 // buffered Send channels decouple slow clients, and there is no shared
 // channel that could block forever after Shutdown.
 func (h *Hub) Broadcast(roomSlug string, message []byte, excludeID string) {
-	h.broadcastFiltered(roomSlug, message, func(c *Client) bool {
+	h.broadcastFiltered(roomSlug, message, false, func(c *Client) bool {
+		return c.ID != excludeID
+	})
+}
+
+// BroadcastDropIfFull sends a best-effort message to all clients in a room.
+// Recipients with full send buffers simply miss this update instead of being
+// disconnected. Use only for disposable high-rate state like cursor positions.
+func (h *Hub) BroadcastDropIfFull(roomSlug string, message []byte, excludeID string) {
+	h.broadcastFiltered(roomSlug, message, true, func(c *Client) bool {
 		return c.ID != excludeID
 	})
 }
 
 // broadcastFiltered fans a message out to every client in the room for which
 // the filter returns true. Shared by Broadcast and the admin-only broadcasts.
-func (h *Hub) broadcastFiltered(roomSlug string, message []byte, filter func(*Client) bool) {
+func (h *Hub) broadcastFiltered(roomSlug string, message []byte, dropIfFull bool, filter func(*Client) bool) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
@@ -373,6 +382,9 @@ func (h *Hub) broadcastFiltered(roomSlug string, message []byte, filter func(*Cl
 			continue
 		case client.Send <- message:
 		default:
+			if dropIfFull {
+				continue
+			}
 			// Client's send buffer is full — close Done so pumps exit.
 			// Do NOT delete from map here: we only hold RLock, and map
 			// mutation under RLock is a data race. unregisterClient will
@@ -390,6 +402,15 @@ func (h *Hub) broadcastFiltered(roomSlug string, message []byte, filter func(*Cl
 // BroadcastJSON sends a JSON message to all clients in a room.
 // Marshal errors are logged here because most callers ignore the return value.
 func (h *Hub) BroadcastJSON(roomSlug string, msgType string, payload interface{}, excludeID string) error {
+	return h.broadcastJSON(roomSlug, msgType, payload, excludeID, false)
+}
+
+// BroadcastJSONDropIfFull sends a disposable JSON message to all clients in a room.
+func (h *Hub) BroadcastJSONDropIfFull(roomSlug string, msgType string, payload interface{}, excludeID string) error {
+	return h.broadcastJSON(roomSlug, msgType, payload, excludeID, true)
+}
+
+func (h *Hub) broadcastJSON(roomSlug string, msgType string, payload interface{}, excludeID string, dropIfFull bool) error {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		log.Printf("BroadcastJSON: failed to marshal payload for %q in room %s: %v", msgType, roomSlug, err)
@@ -407,7 +428,11 @@ func (h *Hub) BroadcastJSON(roomSlug string, msgType string, payload interface{}
 		return err
 	}
 
-	h.Broadcast(roomSlug, msgBytes, excludeID)
+	if dropIfFull {
+		h.BroadcastDropIfFull(roomSlug, msgBytes, excludeID)
+	} else {
+		h.Broadcast(roomSlug, msgBytes, excludeID)
+	}
 	return nil
 }
 
@@ -426,7 +451,7 @@ func (h *Hub) BroadcastToAdminsJSON(roomSlug, msgType string, payload interface{
 		return err
 	}
 
-	h.broadcastFiltered(roomSlug, msgBytes, func(c *Client) bool {
+	h.broadcastFiltered(roomSlug, msgBytes, false, func(c *Client) bool {
 		return c.IsAdmin
 	})
 	return nil
@@ -440,9 +465,18 @@ func (h *Hub) SendTo(roomSlug, clientID string, message []byte) {
 	if room, ok := h.rooms[roomSlug]; ok {
 		if client, ok := room.Clients[clientID]; ok {
 			select {
+			case <-client.Done:
 			case client.Send <- message:
 			default:
-				// Client's send buffer is full
+				// Direct sends carry critical one-client events (renegotiation,
+				// kick, approvals). Dropping them silently leaves the peer in a
+				// stale state, so close the connection and let reconnect repair it.
+				client.closeOnce.Do(func() {
+					close(client.Done)
+				})
+				if client.Conn != nil {
+					client.Conn.Close()
+				}
 			}
 		}
 	}

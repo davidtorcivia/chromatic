@@ -76,6 +76,7 @@
     let statsPopoverEl = $state<HTMLDivElement | null>(null);
     let participantListEl = $state<HTMLDivElement | null>(null);
     let currentRtt = $state<number | null>(null);
+    let currentVideoBufferDelay = $state<number | null>(null);
     let statsInterval: ReturnType<typeof setInterval> | null = null;
     // Cloudflare TURN credentials default to a 1 h TTL; long color-grading
     // sessions (4–8 h) outlive that. Refresh every 30 min over the existing
@@ -111,7 +112,10 @@
     let playNudgeTimer: ReturnType<typeof setTimeout> | null = null;
     let playNudgeAttempts = 0;
     const PLAY_NUDGE_MAX_ATTEMPTS = 3;
-    const PLAY_NUDGE_INTERVAL_MS = 2500;
+    const PLAY_NUDGE_INTERVAL_MS = 350;
+    const MEDIA_STALL_GRACE_MS = 750;
+    const STATS_POLL_INTERVAL_MS = 1000;
+    let mediaStallTimer: ReturnType<typeof setTimeout> | null = null;
     // Full re-subscription fallback: when ICE restart can't repair the media
     // path (dead TURN allocation, server-side subscriber gone), ask the server
     // for a brand-new subscriber instead of stranding the viewer.
@@ -119,6 +123,7 @@
     const CONNECTING_WATCHDOG_MS = 15000;
     let resubscribeAttempts = $state(0);
     let connectingWatchdog: ReturnType<typeof setTimeout> | null = null;
+    let subscriptionRetryTimer: ReturnType<typeof setTimeout> | null = null;
     // Controls auto-hide (ITEM 3)
     let isPointerOverControls = $state(false);
     let controlsHaveFocus = $state(false);
@@ -283,7 +288,7 @@
 
         // Handle WebRTC offer from server
         session.onMessage("signal:offer", async (payload: unknown) => {
-            const data = payload as { sdp: string };
+            const data = payload as { sdp: string; offerId?: string };
             console.log('Received WebRTC offer');
 
             if (!webrtcManager) {
@@ -292,7 +297,8 @@
 
             if (webrtcManager) {
                 try {
-                    await webrtcManager.handleOffer(data.sdp);
+                    await webrtcManager.handleOffer(data.sdp, data.offerId);
+                    clearSubscriptionRetryTimer();
                     tryEnablePendingAutoMic();
                 } catch (err) {
                     console.error('Failed to handle offer:', err);
@@ -302,14 +308,14 @@
 
         // Handle ICE candidates from server
         session.onMessage("signal:candidate", async (payload: unknown) => {
-            const data = payload as { candidate: string; sdpMid?: string; sdpMLineIndex?: number };
+            const data = payload as { candidate: string; sdpMid?: string; sdpMLineIndex?: number; offerId?: string };
             if (webrtcManager) {
                 try {
                     await webrtcManager.handleCandidate({
                         candidate: data.candidate,
                         sdpMid: data.sdpMid ?? null,
                         sdpMLineIndex: data.sdpMLineIndex ?? null
-                    });
+                    }, data.offerId);
                 } catch (err) {
                     console.error('Failed to add ICE candidate:', err);
                 }
@@ -398,9 +404,9 @@
         // Publisher PC answers (mic + screen share ride a dedicated
         // client-offers-only connection).
         session.onMessage("publish:answer", async (payload: unknown) => {
-            const data = payload as { sdp: string };
+            const data = payload as { sdp: string; offerId?: string };
             try {
-                if (webrtcManager) await webrtcManager.handlePublishAnswer(data.sdp);
+                if (webrtcManager) await webrtcManager.handlePublishAnswer(data.sdp, data.offerId);
             } catch (err) {
                 console.error('Failed to handle publish answer:', err);
             }
@@ -412,9 +418,9 @@
         });
 
         session.onMessage("signal:renegotiate", async (payload: unknown) => {
-            const data = payload as { sdp: string; participantId?: string };
+            const data = payload as { sdp: string; participantId?: string; offerId?: string };
             try {
-                if (webrtcManager) await webrtcManager.handleRenegotiation(data.sdp, data.participantId);
+                if (webrtcManager) await webrtcManager.handleRenegotiation(data.sdp, data.participantId, data.offerId);
             } catch (err) {
                 console.error('Failed to handle renegotiation:', err);
             }
@@ -423,9 +429,9 @@
         // ICE restart answers — route to handleVoiceAnswer which applies the
         // answer SDP to the same peer connection (same setRemoteDescription call).
         session.onMessage("signal:answer", async (payload: unknown) => {
-            const data = payload as { sdp: string };
+            const data = payload as { sdp: string; offerId?: string };
             try {
-                if (webrtcManager) await webrtcManager.handleVoiceAnswer(data.sdp);
+                if (webrtcManager) await webrtcManager.handleVoiceAnswer(data.sdp, data.offerId);
             } catch (err) {
                 console.error('Failed to handle answer:', err);
             }
@@ -612,7 +618,11 @@
             // before telling the user to refresh.
             if (data?.code === 'subscription-failed' && resubscribeAttempts < RESUBSCRIBE_MAX_ATTEMPTS) {
                 const delay = 2000 * (resubscribeAttempts + 1);
-                setTimeout(() => requestResubscribe('server subscription failure'), delay);
+                clearSubscriptionRetryTimer();
+                subscriptionRetryTimer = setTimeout(() => {
+                    subscriptionRetryTimer = null;
+                    requestResubscribe('server subscription failure');
+                }, delay);
                 return;
             }
             streamError = data?.message || 'Something interrupted the stream.';
@@ -652,10 +662,8 @@
         window.removeEventListener("chromatic:tampering", handleTampering);
         navigator.mediaDevices?.removeEventListener?.("devicechange", refreshAudioDevices);
         clearMicPromptTimer();
-        if (connectingWatchdog) {
-            clearTimeout(connectingWatchdog);
-            connectingWatchdog = null;
-        }
+        clearConnectingWatchdog();
+        clearSubscriptionRetryTimer();
         if (controlsTimer) {
             clearTimeout(controlsTimer);
             controlsTimer = null;
@@ -673,6 +681,20 @@
             typingPruneInterval = null;
         }
     });
+
+    function clearConnectingWatchdog() {
+        if (connectingWatchdog) {
+            clearTimeout(connectingWatchdog);
+            connectingWatchdog = null;
+        }
+    }
+
+    function clearSubscriptionRetryTimer() {
+        if (subscriptionRetryTimer) {
+            clearTimeout(subscriptionRetryTimer);
+            subscriptionRetryTimer = null;
+        }
+    }
 
     function initializeWebRTC() {
         if (webrtcManager) return;
@@ -826,6 +848,11 @@
     function attemptAutoplay() {
         const el = videoElement;
         if (!el) return;
+        // Track binding is the earliest reliable browser-side signal that the
+        // media path exists. Ask for a keyframe immediately so late joiners
+        // and reloads do not sit on a black/connecting frame for the first
+        // nudge interval before the publisher is prodded.
+        webrtcManager?.requestResync();
         el.play()
             .then(() => {
                 needsPlayClick = false;
@@ -852,9 +879,35 @@
     function handleVideoPlaying() {
         isVideoPlaying = true;
         needsPlayClick = false;
+        clearMediaStallTimer();
         clearKeyframeNudge();
+        clearSubscriptionRetryTimer();
         // Media is flowing again — future failures get a fresh retry budget.
         resubscribeAttempts = 0;
+    }
+
+    function handleVideoStalled() {
+        if (!hasStream || needsPlayClick || streamPaused) return;
+
+        // Ask for a keyframe immediately. If playback resumes quickly, the
+        // grace timer is cleared by 'playing' and the user never sees a false
+        // reconnect overlay; if it does not, fall back to the existing
+        // keyframe-nudge -> resubscribe recovery path.
+        webrtcManager?.requestResync();
+        if (mediaStallTimer) return;
+        mediaStallTimer = setTimeout(() => {
+            mediaStallTimer = null;
+            if (!hasStream || needsPlayClick || streamPaused) return;
+            isVideoPlaying = false;
+            scheduleKeyframeNudge();
+        }, MEDIA_STALL_GRACE_MS);
+    }
+
+    function clearMediaStallTimer() {
+        if (mediaStallTimer) {
+            clearTimeout(mediaStallTimer);
+            mediaStallTimer = null;
+        }
     }
 
     // Ask the server for a brand-new subscriber (fresh offer/answer/ICE).
@@ -869,17 +922,23 @@
         }
         resubscribeAttempts++;
         console.warn(`Requesting fresh subscription (${reason}, attempt ${resubscribeAttempts}/${RESUBSCRIBE_MAX_ATTEMPTS})`);
+        clearSubscriptionRetryTimer();
         // Reset the keyframe-nudge cycle: without this the stale attempt
         // counter immediately re-escalates on its next tick and the client
         // tears down each fresh subscription ~2.5s after it connects.
         clearKeyframeNudge();
+        // Give the replacement subscriber a fresh recovery window. Otherwise
+        // a stall/connecting timer from the failed path can fire against the
+        // new offer and trigger another resubscribe before it has a chance to
+        // render.
+        clearMediaStallTimer();
+        clearConnectingWatchdog();
         // The frozen last frame must not read as "playing" — drop to the
         // connecting overlay until the new subscriber delivers frames.
         isVideoPlaying = false;
         streamError = null;
-        // Stale/expired TURN credentials are a common reason the old path
-        // died; refresh them before the new peer connection is built.
-        session.send("signal:ice-servers-request", {});
+        // The server replies to resubscribe with fresh ICE servers immediately
+        // before the replacement offer, preserving websocket message order.
         session.send("signal:resubscribe", {});
         return true;
     }
@@ -900,14 +959,14 @@
                 }, CONNECTING_WATCHDOG_MS);
             }
         } else if (connectingWatchdog) {
-            clearTimeout(connectingWatchdog);
-            connectingWatchdog = null;
+            clearConnectingWatchdog();
         }
     });
 
     // If the stream is bound but never starts rendering, the decoder is most
-    // likely waiting on a keyframe that was lost in flight — ask the
-    // publisher for one (signal:resync → PLI), a few times with backoff.
+    // likely waiting on a keyframe that was lost in flight. attemptAutoplay()
+    // sends the first resync immediately; this loop sends a few quick follow-
+    // ups before escalating to a fresh subscriber.
     function scheduleKeyframeNudge() {
         if (playNudgeTimer) return;
         playNudgeAttempts = 0;
@@ -955,16 +1014,21 @@
     function startStatsPolling() {
         if (statsInterval) return;
         let inFlight = false;
-        statsInterval = setInterval(async () => {
+        const poll = async () => {
             if (!webrtcManager || inFlight) return;
             inFlight = true;
             try {
                 const stats = await webrtcManager.getStats();
                 currentRtt = stats.rtt ?? null;
+                currentVideoBufferDelay = stats.videoJitterBufferDelay ?? null;
             } finally {
                 inFlight = false;
             }
-        }, 2000);
+        };
+        void poll();
+        statsInterval = setInterval(() => {
+            void poll();
+        }, STATS_POLL_INTERVAL_MS);
     }
 
     function stopStatsPolling() {
@@ -1275,8 +1339,11 @@
         hasStream = false;
         isVideoPlaying = false;
         needsPlayClick = false;
+        clearMediaStallTimer();
         clearKeyframeNudge();
+        clearSubscriptionRetryTimer();
         currentRtt = null;
+        currentVideoBufferDelay = null;
         micAutoEnablePending = false;
         clearMicPromptTimer();
         micPromptState = "hidden";
@@ -1852,6 +1919,16 @@
     let connectionQuality = $derived(
         currentRtt === null ? null : currentRtt < 100 ? "good" : currentRtt < 300 ? "fair" : "poor"
     );
+    let displayedLatency = $derived(currentVideoBufferDelay ?? currentRtt);
+    let displayedLatencySource = $derived(currentVideoBufferDelay === null ? "Network RTT" : "Video buffer");
+    let displayedLatencyTitle = $derived(
+        currentVideoBufferDelay === null
+            ? `Network RTT: ${Math.round(currentRtt ?? 0)}ms`
+            : `Video buffer: ${Math.round(currentVideoBufferDelay)}ms${currentRtt === null ? "" : `; network RTT: ${Math.round(currentRtt)}ms`}`
+    );
+    let displayedLatencyQuality = $derived(
+        displayedLatency === null ? null : displayedLatency < 100 ? "good" : displayedLatency <= 200 ? "fair" : "poor"
+    );
     // Surface WS connection trouble instead of leaving the misleading
     // "host hasn't started streaming" copy up forever (BUG 1 UX).
     let isReconnecting = $derived(session.state.reconnecting && !session.state.connected);
@@ -2022,6 +2099,8 @@
                 playsinline
                 muted={isMuted}
                 onplaying={handleVideoPlaying}
+                onwaiting={handleVideoStalled}
+                onstalled={handleVideoStalled}
             >
                 <track kind="captions" />
             </video>
@@ -2651,19 +2730,20 @@
                             <span class="signal-bar"></span>
                         </button>
                     {/if}
-                    {#if isAdmin && currentRtt !== null}
+                    {#if isAdmin && displayedLatency !== null}
                         <button
                             bind:this={latencyEl}
                             class="latency-display"
-                            class:good={currentRtt < 100}
-                            class:warning={currentRtt >= 100 && currentRtt < 300}
-                            class:bad={currentRtt >= 300}
+                            class:good={displayedLatencyQuality === "good"}
+                            class:warning={displayedLatencyQuality === "fair"}
+                            class:bad={displayedLatencyQuality === "poor"}
                             onclick={() => (showStats = !showStats)}
-                            use:tooltip={"Stream statistics"}
+                            use:tooltip={displayedLatencyTitle}
+                            aria-label="{displayedLatencySource}: {Math.round(displayedLatency)}ms"
                             aria-expanded={showStats}
                             aria-haspopup="dialog"
                         >
-                            ~{Math.round(currentRtt)}ms
+                            ~{Math.round(displayedLatency)}ms
                         </button>
                     {/if}
                 </div>

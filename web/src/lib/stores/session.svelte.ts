@@ -39,9 +39,19 @@ export interface SessionState {
 }
 
 // Reconnection configuration
-const RECONNECT_BASE_DELAY = 1000; // 1 second
+// Fast first retry keeps live review hiccups short; exponential backoff still
+// ramps quickly if the network or server is genuinely unavailable.
+const RECONNECT_BASE_DELAY = 250; // 200-300ms after jitter on the first retry
 const RECONNECT_MAX_DELAY = 30000; // 30 seconds
 const RECONNECT_MAX_ATTEMPTS = 10;
+
+// Browser-side WebSocket backpressure guardrails. `bufferedAmount` is bytes
+// queued in the browser but not yet written to the network; once it grows,
+// sending more real-time cursor samples only increases end-to-end latency.
+const DISPOSABLE_MESSAGE_TYPES = new Set(['cursor', 'client:debug']);
+const DISPOSABLE_BUFFERED_DROP_BYTES = 16 * 1024;
+const CRITICAL_BUFFERED_RECONNECT_BYTES = 1024 * 1024;
+const CLIENT_RECONNECT_CLOSE_CODE = 4001;
 
 // Routine WS logging is dev-only; errors are always logged.
 const DEBUG = import.meta.env.DEV;
@@ -273,9 +283,33 @@ export function createSessionStore() {
         }
     }
 
-    function send(type: string, payload: unknown) {
-        if (ws && ws.readyState === WebSocket.OPEN) {
+    function send(type: string, payload: unknown): boolean {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            return false;
+        }
+
+        const queuedBytes = ws.bufferedAmount;
+        if (DISPOSABLE_MESSAGE_TYPES.has(type) && queuedBytes > DISPOSABLE_BUFFERED_DROP_BYTES) {
+            if (DEBUG) console.debug('Dropping disposable WS message under backpressure', { type, queuedBytes });
+            return false;
+        }
+
+        if (queuedBytes > CRITICAL_BUFFERED_RECONNECT_BYTES) {
+            console.warn('WebSocket send buffer is congested; reconnecting before sending critical message', {
+                type,
+                queuedBytes
+            });
+            ws.close(CLIENT_RECONNECT_CLOSE_CODE, 'send buffer congested');
+            return false;
+        }
+
+        try {
             ws.send(JSON.stringify({ type, payload }));
+            return true;
+        } catch (err) {
+            console.error('WebSocket send failed', err);
+            ws.close(CLIENT_RECONNECT_CLOSE_CODE, 'send failed');
+            return false;
         }
     }
 
