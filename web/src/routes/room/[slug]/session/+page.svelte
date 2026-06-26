@@ -1421,11 +1421,35 @@
     }
 
     // ---- Presence webcam -----------------------------------------------------
-    // The mic→camera nudge: open the device picker (camera section + live
-    // preview) and stop nudging. Default-off; the user opts in here.
-    function openCameraSetup() {
+    // Open the centered camera modal: pick a device, preview, then Enable.
+    function openCameraModal() {
         camNudgeDismissed = true;
-        showAudioSettings = true;
+        showCameraModal = true;
+        void startCameraPreview(activeCameraId);
+        void refreshAudioDevices();
+    }
+
+    function closeCameraModal() {
+        showCameraModal = false;
+        stopCameraPreview();
+    }
+
+    // Camera control-bar button: when off, open the picker; when on, turn off.
+    function onCameraButton() {
+        camNudgeDismissed = true;
+        if (isCameraOn) {
+            void toggleCamera();
+        } else {
+            openCameraModal();
+        }
+    }
+
+    // Modal "Enable camera": go live with the selected device, then close.
+    async function enableCameraFromModal() {
+        if (cameraPending) return;
+        stopCameraPreview();
+        showCameraModal = false;
+        if (!isCameraOn) await toggleCamera();
     }
 
     async function toggleCamera() {
@@ -1483,10 +1507,11 @@
         }
     }
 
-    // Open a temporary local preview stream for the camera picker (used only
-    // while the cam is OFF and the settings popover is open).
+    // Open a temporary local preview stream for the camera modal (used only
+    // while the cam is OFF and the modal is open).
     async function startCameraPreview(deviceId?: string | null) {
         stopCameraPreview();
+        camCaptureDenied = false;
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
                 video: {
@@ -1496,9 +1521,9 @@
                 },
                 audio: false,
             });
-            // The popover may have closed (or the cam turned on) during the
+            // The modal may have closed (or the cam turned on) during the
             // await — don't leave an orphaned capture running.
-            if (destroyed || !showAudioSettings || isCameraOn) {
+            if (destroyed || !showCameraModal || isCameraOn) {
                 stream.getTracks().forEach((t) => t.stop());
                 return;
             }
@@ -1508,6 +1533,7 @@
             await refreshAudioDevices();
         } catch (err) {
             console.warn("Camera preview unavailable:", err);
+            if (!destroyed) camCaptureDenied = true;
         }
     }
 
@@ -1518,13 +1544,11 @@
         }
     }
 
-    // Release the preview capture whenever the popover closes or the cam goes
-    // live (then we show the published self stream instead), and on unmount. We
-    // never auto-START the preview — that would silently switch the camera on
-    // when someone just opened settings for the volume slider. The preview is
-    // started explicitly via the "Test camera" button or by picking a device.
+    // Release the preview capture whenever the camera modal closes or the cam
+    // goes live, and on unmount. Preview is started explicitly by openCameraModal
+    // / device selection — never auto-started.
     $effect(() => {
-        if (!showAudioSettings || isCameraOn) {
+        if (!showCameraModal || isCameraOn) {
             stopCameraPreview();
         }
         return stopCameraPreview;
@@ -2396,6 +2420,10 @@
     let showCamNudge = $derived(
         isMicEnabled && !isCameraOn && !camNudgeDismissed && !myCamDisabled,
     );
+    // Centered camera setup modal: pick a device, see a live preview, then
+    // Enable (broadcast) or Dismiss. This is the camera "selector".
+    let showCameraModal = $state(false);
+    let camCaptureDenied = $state(false);
 
     // Join/leave chimes for everyone: watch the roster for deltas rather
     // than a specific message type (joins arrive via roster broadcasts).
@@ -2850,13 +2878,71 @@
 
         <!-- Controls overlay -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <!-- Centered camera setup modal: device picker + live preview + Enable. -->
+        {#if showCameraModal}
+            <div
+                class="cam-modal-backdrop"
+                transition:fade={{ duration: 150 }}
+                role="presentation"
+                onclick={closeCameraModal}
+                onkeydown={(e) => {
+                    if (e.key === "Escape") closeCameraModal();
+                }}
+            >
+                <div
+                    class="cam-modal"
+                    role="dialog"
+                    aria-modal="true"
+                    aria-label="Camera setup"
+                    tabindex="-1"
+                    onclick={(e) => e.stopPropagation()}
+                    onkeydown={(e) => e.stopPropagation()}
+                >
+                    <h2 class="cam-modal-title">Camera</h2>
+                    <div class="cam-modal-preview">
+                        {#if cameraPreviewSource}
+                            <!-- svelte-ignore a11y_media_has_caption -->
+                            <video
+                                class="cam-modal-video"
+                                use:bindStream={cameraPreviewSource}
+                                muted
+                                autoplay
+                                playsinline
+                            ></video>
+                        {:else if camCaptureDenied}
+                            <span class="cam-modal-empty">Camera blocked — allow access in your browser.</span>
+                        {:else}
+                            <span class="cam-modal-empty">Starting preview…</span>
+                        {/if}
+                    </div>
+                    {#if videoInputs.length > 1}
+                        <select
+                            class="cam-modal-select"
+                            value={activeCameraId}
+                            onchange={(e) => selectCameraDevice((e.currentTarget as HTMLSelectElement).value)}
+                        >
+                            {#each videoInputs as d (d.deviceId)}
+                                <option value={d.deviceId}>{d.label || "Camera"}</option>
+                            {/each}
+                        </select>
+                    {/if}
+                    <div class="cam-modal-actions">
+                        <button class="btn btn-secondary" onclick={closeCameraModal}>Dismiss</button>
+                        <button class="btn btn-primary" onclick={enableCameraFromModal} disabled={cameraPending}>
+                            {isCameraOn ? "Done" : "Enable camera"}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        {/if}
+
         <!-- One-time nudge after the mic goes live: cameras are opt-in, so invite
              the user to turn theirs on. Clicking opens the camera picker/preview. -->
         {#if showCamNudge && isControlsVisible}
             <div class="cam-nudge" transition:fade={{ duration: 150 }}>
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
                 <span class="cam-nudge-text">Turn your camera on?</span>
-                <button class="cam-nudge-enable" onclick={openCameraSetup}>Set up camera</button>
+                <button class="cam-nudge-enable" onclick={openCameraModal}>Set up camera</button>
                 <button
                     class="cam-nudge-dismiss"
                     onclick={() => (camNudgeDismissed = true)}
@@ -3104,49 +3190,9 @@
                         </div>
                         <div class="audio-settings-section">
                             <span class="audio-settings-title">Camera</span>
-                            <div class="cam-preview">
-                                {#if cameraPreviewSource}
-                                    <!-- svelte-ignore a11y_media_has_caption -->
-                                    <video
-                                        class="cam-preview-video"
-                                        use:bindStream={cameraPreviewSource}
-                                        muted
-                                        autoplay
-                                        playsinline
-                                    ></video>
-                                {:else}
-                                    <button
-                                        class="cam-preview-empty"
-                                        onclick={() => startCameraPreview(activeCameraId)}
-                                        disabled={cameraPending}
-                                        title="Preview your camera without going live"
-                                    >
-                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="22" height="22"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
-                                        <span>Test camera</span>
-                                    </button>
-                                {/if}
-                            </div>
-                            {#if videoInputs.length === 0}
-                                <p class="audio-settings-hint">
-                                    Allow camera access to pick a device. Cameras show as small circles up top.
-                                </p>
-                            {/if}
-                            {#each videoInputs as device (device.deviceId)}
-                                <button
-                                    class="audio-device-option"
-                                    class:selected={device.deviceId === activeCameraId}
-                                    disabled={cameraPending}
-                                    onclick={() => selectCameraDevice(device.deviceId)}
-                                    aria-pressed={device.deviceId === activeCameraId}
-                                >
-                                    <span class="audio-device-check" aria-hidden="true">
-                                        {#if device.deviceId === activeCameraId}
-                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12"><path d="M20 6 9 17l-5-5"/></svg>
-                                        {/if}
-                                    </span>
-                                    <span class="audio-device-label">{device.label || "Camera"}</span>
-                                </button>
-                            {/each}
+                            <button class="audio-settings-grant" onclick={openCameraModal}>
+                                {isCameraOn ? "Camera settings" : "Set up camera"}
+                            </button>
                         </div>
                         <div class="audio-settings-section">
                             <span class="audio-settings-title">Audio mode</span>
@@ -3278,7 +3324,7 @@
                         style="--stagger: 9ms"
                         class:active={isCameraOn}
                         class:off={!isCameraOn}
-                        onclick={toggleCamera}
+                        onclick={onCameraButton}
                         disabled={cameraPending || myCamDisabled}
                         aria-pressed={isCameraOn}
                         aria-label="Camera"
@@ -4476,43 +4522,73 @@
         background: rgba(255, 255, 255, 0.1);
         color: #fff;
     }
-    .cam-preview {
+    /* Centered camera setup modal */
+    .cam-modal-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 60;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: var(--space-lg);
+        background: rgba(0, 0, 0, 0.55);
+        backdrop-filter: blur(3px);
+    }
+    .cam-modal {
+        width: 100%;
+        max-width: 380px;
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-md);
+        padding: var(--space-lg);
+        border-radius: var(--radius-lg, 16px);
+        background: rgba(20, 24, 28, 0.98);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+    }
+    .cam-modal-title {
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 600;
+        color: var(--color-text);
+    }
+    .cam-modal-preview {
         width: 100%;
         aspect-ratio: 4 / 3;
         border-radius: var(--radius-sm);
         overflow: hidden;
         background: #000;
         border: 1px solid rgba(255, 255, 255, 0.08);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        padding: var(--space-md);
     }
-    .cam-preview-video {
+    .cam-modal-video {
         width: 100%;
         height: 100%;
         object-fit: cover;
         transform: scaleX(-1); /* self-view mirror */
-        display: block;
     }
-    .cam-preview-empty {
-        width: 100%;
-        height: 100%;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        gap: 6px;
+    .cam-modal-empty {
+        font-size: 0.8125rem;
         color: var(--color-text-subtle);
-        font-size: 0.75rem;
-        background: transparent;
-        border: none;
-        cursor: pointer;
-        transition: color 0.12s ease, background 0.12s ease;
     }
-    .cam-preview-empty:hover {
+    .cam-modal-select {
+        width: 100%;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: var(--radius-sm);
         color: var(--color-text);
-        background: rgba(255, 255, 255, 0.04);
+        font-size: 0.8125rem;
+        padding: 8px 10px;
+        cursor: pointer;
     }
-    .cam-preview-empty:disabled {
-        cursor: wait;
-        opacity: 0.6;
+    .cam-modal-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: var(--space-sm);
     }
 
     /* Live indicator dot in the sharer's split-pane label */
