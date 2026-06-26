@@ -30,6 +30,7 @@
     import { releaseFrames } from "$lib/glass/frameSource";
     import { tooltip } from "$lib/ui/tooltip";
     import { parseStoredSession, type StoredSessionData } from "$lib/session/storedSession";
+    import { getStorageItem, removeStorageItem, setStorageItem } from "$lib/storage/safeStorage";
 
     const DEBUG = import.meta.env.DEV;
     const debugLog = (...args: unknown[]) => {
@@ -250,11 +251,11 @@
     onMount(async () => {
         startLoadMonitor();
         try {
-            if (localStorage.getItem("chromatic_reduce_transparency") === "on") {
+            if (getStorageItem("local", "chromatic_reduce_transparency") === "on") {
                 reduceTransparency = true;
                 document.documentElement.classList.add("reduce-transparency");
             }
-            const savedReviewMode = localStorage.getItem("chromatic_review_quality_mode");
+            const savedReviewMode = getStorageItem("local", "chromatic_review_quality_mode");
             if (
                 savedReviewMode === "performance" ||
                 savedReviewMode === "balanced" ||
@@ -267,7 +268,7 @@
         }
         setReviewQualityMode(reviewQualityMode);
         // Get session data
-        const stored = sessionStorage.getItem(`chromatic_session_${slug}`);
+        const stored = getStorageItem("session", `chromatic_session_${slug}`);
         if (!stored) {
             goto(`/room/${slug}`);
             return;
@@ -275,13 +276,13 @@
 
         const parsedSession = parseStoredSession(stored);
         if (!parsedSession) {
-            sessionStorage.removeItem(`chromatic_session_${slug}`);
+            removeStorageItem("session", `chromatic_session_${slug}`);
             goto(`/room/${slug}`);
             return;
         }
         sessionData = parsedSession;
 
-        const storedName = localStorage.getItem('chromatic_name');
+        const storedName = getStorageItem("local", "chromatic_name");
         if (storedName) {
             participantName = storedName;
         }
@@ -674,7 +675,7 @@
         // Audio device plumbing (ITEM 4): restore the persisted speaker choice
         // and keep the device lists fresh when hardware is (un)plugged.
         try {
-            selectedSpeakerId = localStorage.getItem(SPEAKER_DEVICE_STORAGE_KEY);
+            selectedSpeakerId = getStorageItem("local", SPEAKER_DEVICE_STORAGE_KEY);
         } catch {
             selectedSpeakerId = null;
         }
@@ -1457,7 +1458,7 @@
     // Leave control + end-state exit: clear stored credentials for this room
     // and return to the join page.
     function leaveToRoomPage() {
-        sessionStorage.removeItem(`chromatic_session_${slug}`);
+        removeStorageItem("session", `chromatic_session_${slug}`);
         goto(`/room/${slug}`);
     }
 
@@ -1621,11 +1622,7 @@
 
     async function selectSpeakerDevice(deviceId: string) {
         selectedSpeakerId = deviceId;
-        try {
-            localStorage.setItem(SPEAKER_DEVICE_STORAGE_KEY, deviceId);
-        } catch {
-            // Storage unavailable — the in-session choice still applies.
-        }
+        setStorageItem("local", SPEAKER_DEVICE_STORAGE_KEY, deviceId);
         await applySpeakerDevice(deviceId);
     }
 
@@ -1840,21 +1837,13 @@
     function toggleReduceTransparency() {
         reduceTransparency = !reduceTransparency;
         document.documentElement.classList.toggle("reduce-transparency", reduceTransparency);
-        try {
-            localStorage.setItem("chromatic_reduce_transparency", reduceTransparency ? "on" : "off");
-        } catch {
-            // In-session preference still applies.
-        }
+        setStorageItem("local", "chromatic_reduce_transparency", reduceTransparency ? "on" : "off");
     }
 
     function setReviewMode(mode: ReviewQualityMode) {
         reviewQualityMode = mode;
         setReviewQualityMode(mode);
-        try {
-            localStorage.setItem("chromatic_review_quality_mode", mode);
-        } catch {
-            // In-session mode still applies.
-        }
+        setStorageItem("local", "chromatic_review_quality_mode", mode);
     }
 
     function smoothFrameDelay(current: number | null, value: number): number {

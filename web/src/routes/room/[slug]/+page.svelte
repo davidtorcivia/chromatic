@@ -11,6 +11,7 @@
         serverClockOffset,
     } from "$lib/lobby";
     import StateCard from "$lib/components/StateCard.svelte";
+    import { getStorageItem, setStorageItem } from "$lib/storage/safeStorage";
 
     let roomInfo = $state<RoomInfo | null>(null);
     let error = $state("");
@@ -53,7 +54,7 @@
     onMount(async () => {
         const requestId = ++loadRequestId;
         // Pre-fill the name from a previous session
-        const storedName = localStorage.getItem("chromatic_name");
+        const storedName = getStorageItem("local", "chromatic_name");
         if (storedName) {
             name = storedName;
         }
@@ -99,7 +100,7 @@
     // needed. If the server doesn't grant the admin role (no/expired
     // session), fall back to the normal form with the token field revealed.
     async function attemptHostJoin() {
-        const hostName = localStorage.getItem("chromatic_name")?.trim() || "Host";
+        const hostName = getStorageItem("local", "chromatic_name")?.trim() || "Host";
         try {
             const result = await rooms.join(slug, hostName);
             if (!destroyed && result.role === "admin") {
@@ -119,13 +120,14 @@
 
         try {
             // Store sanitized participant name for future sessions
-            localStorage.setItem("chromatic_name", result.name || joinedName);
+            setStorageItem("local", "chromatic_name", result.name || joinedName);
 
             // Store session info (includes the server-assigned role and any
             // countdown-lobby payload for the waiting page)
-            sessionStorage.setItem(`chromatic_session_${slug}`, JSON.stringify(result));
-        } catch (e) {
-            console.error("Failed to store session", e);
+            if (!setStorageItem("session", `chromatic_session_${slug}`, JSON.stringify(result))) {
+                throw new Error("session storage unavailable");
+            }
+        } catch {
             error = "Browser storage is unavailable. Enable storage for this site and try again.";
             return;
         }

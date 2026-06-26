@@ -8,6 +8,7 @@
     import { countdownParts, formatScheduleLabel, serverClockOffset } from "$lib/lobby";
     import StateCard from "$lib/components/StateCard.svelte";
     import { parseStoredSession, type StoredSessionData } from "$lib/session/storedSession";
+    import { getStorageItem, removeStorageItem } from "$lib/storage/safeStorage";
 
     const slug = $page.params.slug!;
 
@@ -51,7 +52,7 @@
 
     onMount(async () => {
         // Get session data
-        const stored = sessionStorage.getItem(`chromatic_session_${slug}`);
+        const stored = getStorageItem("session", `chromatic_session_${slug}`);
         if (!stored) {
             void goto(`/room/${slug}`);
             return;
@@ -59,7 +60,7 @@
 
         const parsedSession = parseStoredSession(stored);
         if (!parsedSession) {
-            sessionStorage.removeItem(`chromatic_session_${slug}`);
+            removeStorageItem("session", `chromatic_session_${slug}`);
             void goto(`/room/${slug}`);
             return;
         }
@@ -344,7 +345,7 @@
     function handleLeave() {
         closeSSE();
         clearReconnectTimer();
-        sessionStorage.removeItem(`chromatic_session_${slug}`);
+        removeStorageItem("session", `chromatic_session_${slug}`);
         void goto(`/room/${slug}`);
     }
 </script>

@@ -1,21 +1,28 @@
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 
-const generatedServerInternal = '/.svelte-kit/generated/server/internal.js';
-const sharedServerRuntime = '/node_modules/@sveltejs/kit/src/runtime/shared-server.js';
+const generatedMarker = '/.svelte-kit/generated/';
+const kitPackageMarker = 'node_modules/@sveltejs/kit/';
 
 export default defineConfig({
 	plugins: [
 		{
-			name: 'chromatic-sveltekit-windows-shared-server-resolve',
+			name: 'chromatic-sveltekit-windows-generated-kit-resolve',
 			enforce: 'pre',
 			resolveId(source, importer) {
 				const normalizedImporter = importer?.replaceAll('\\', '/');
+				const normalizedSource = source.replaceAll('\\', '/');
+				const generatedAt = normalizedImporter?.indexOf(generatedMarker) ?? -1;
+				const kitAt = normalizedSource.indexOf(kitPackageMarker);
 				if (
-					normalizedImporter?.endsWith(generatedServerInternal) &&
-					source.includes('node_modules/@sveltejs/kit/src/runtime/shared-server.js')
+					normalizedImporter &&
+					generatedAt >= 0 &&
+					kitAt >= 0 &&
+					normalizedSource.includes('../')
 				) {
-					return `${normalizedImporter.slice(0, -generatedServerInternal.length)}${sharedServerRuntime}`;
+					const resolved = `${normalizedImporter.slice(0, generatedAt)}/${normalizedSource.slice(kitAt)}`;
+					const leaf = resolved.slice(resolved.lastIndexOf('/') + 1);
+					return leaf.includes('.') ? resolved : `${resolved}.js`;
 				}
 			}
 		},
