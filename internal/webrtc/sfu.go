@@ -74,6 +74,14 @@ var ErrStalePublisherCandidate = errors.New("stale publisher candidate")
 
 var ErrStalePublisherOffer = errors.New("stale publisher offer")
 
+// ErrClientOfferDeferred signals that a client-initiated offer (voice offer or
+// ICE restart) arrived while a server-initiated renegotiation offer was in
+// flight (HaveLocalOffer). Pion v4 cannot roll back a HaveLocalOffer, so the
+// client offer is queued and replayed once the in-flight server offer's answer
+// settles the PC back to Stable. Callers must NOT send an immediate answer;
+// the replay delivers it via OnDeferredClientOffer.
+var ErrClientOfferDeferred = errors.New("client offer deferred until in-flight server offer settles")
+
 // iceGatherTimeout bounds how long we wait for ICE gathering to complete before
 // returning the SDP with whatever candidates we already have. Host/srflx
 // candidates gather quickly and are usually sufficient; relay candidates can
@@ -206,6 +214,18 @@ type Subscriber struct {
 	OfferID               string
 	CandidateID           string
 	RenegotiationOfferID  string
+	// Deferred client offer (glare handling). Pion v4 cannot roll back a
+	// HaveLocalOffer, so when a client voice offer or ICE restart arrives while
+	// a server-initiated renegotiation offer is in flight, we queue the client
+	// offer here and replay it once the server offer's answer returns the PC to
+	// Stable (HandleRenegotiationAnswer). pendingClientOfferIsRestart records
+	// whether the queued offer was an ICE restart (so the replay uses the right
+	// answer transport and offerId). OnDeferredClientOffer delivers the replayed
+	// answer back to the client. All guarded by SignalingMu.
+	pendingClientOffer         string
+	pendingClientOfferID       string
+	pendingClientOfferIsRestart bool
+	OnDeferredClientOffer      func(isRestart bool, offerID, answerSDP string)
 }
 
 // pcHasTrack reports whether the peer connection already has a sender bound
@@ -1606,20 +1626,20 @@ func (s *SFU) HandleIceRestart(roomSlug, subscriberID, sdpOffer, offerID string)
 	sub.SignalingMu.Lock()
 	defer sub.SignalingMu.Unlock()
 
-	// If the server is still waiting on an answer for a prior renegotiation
-	// offer, Pion refuses SetRemoteDescription(offer) with an "offer collision"
-	// error and the ICE restart is silently lost. Roll the server's offer back
-	// so we can accept the client's restart — any tracks from that offer are
-	// still attached to the PC and will re-emerge in a follow-up renegotiation.
+	// Glare: an ICE restart arrived while a server-initiated renegotiation
+	// offer is in flight (HaveLocalOffer). Pion v4 cannot roll back a
+	// HaveLocalOffer, so we defer the restart exactly like a client voice offer:
+	// it is replayed once the in-flight server offer's answer settles the PC.
+	// The ICE restart's urgency (the connection is failing) is still served —
+	// the restart applies as soon as the server offer resolves, and the pending
+	// server offer's renegotiation (e.g. a voice track add) completes in the
+	// meantime rather than being destroyed by a rollback that can't happen.
 	if sub.PeerConnection.SignalingState() == webrtc.SignalingStateHaveLocalOffer {
-		log.Printf("ICE restart arrived during pending server offer; rolling back for subscriber %s", subscriberID)
-		if err := sub.PeerConnection.SetLocalDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}); err != nil {
-			return "", fmt.Errorf("failed to rollback server offer for ICE restart: %w", err)
-		}
-		sub.RenegotiationOfferID = ""
-		// Tracks from the rolled-back offer are still attached but were never
-		// negotiated — make sure a follow-up offer actually happens.
-		sub.needsRenegotiation = true
+		log.Printf("Deferring ICE restart for subscriber %s (server offer in flight)", subscriberID)
+		sub.pendingClientOffer = sdpOffer
+		sub.pendingClientOfferID = offerID
+		sub.pendingClientOfferIsRestart = true
+		return "", ErrClientOfferDeferred
 	}
 
 	// Set the new offer from the client
@@ -1675,22 +1695,20 @@ func (s *SFU) HandleSubscriberOffer(roomSlug, subscriberID, sdpOffer string) (st
 	sub.SignalingMu.Lock()
 	defer sub.SignalingMu.Unlock()
 
-	rolledBack := false
-
-	// Handle "glare": if the server has a pending offer (have-local-offer) when
-	// the client sends its own offer, rollback the server's offer to accept the
-	// client's. Tracks added by the rolled-back offer are still on the PC and
-	// will be included in a follow-up renegotiation.
+	// Glare: a client voice offer arrived while a server-initiated renegotiation
+	// offer is in flight (HaveLocalOffer). Pion v4 rejects SetLocalDescription
+	// (rollback) from HaveLocalOffer, so we CANNOT roll the server offer back to
+	// accept this one inline. Instead, defer the client offer: once the client
+	// answers our pending server offer (HandleRenegotiationAnswer), the PC
+	// returns to Stable and the deferred client offer is replayed there. Without
+	// this, the rollback would error out and the client's mic-enable would be
+	// silently dropped for the rest of the session.
 	if sub.PeerConnection.SignalingState() == webrtc.SignalingStateHaveLocalOffer {
-		log.Printf("Rolling back server offer for subscriber %s to handle client offer (glare)", subscriberID)
-		if err := sub.PeerConnection.SetLocalDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeRollback}); err != nil {
-			return "", false, fmt.Errorf("failed to rollback: %w", err)
-		}
-		sub.RenegotiationOfferID = ""
-		// Tracks from the rolled-back offer are still attached but were never
-		// negotiated — flag them for the post-answer flush.
-		sub.needsRenegotiation = true
-		rolledBack = true
+		log.Printf("Deferring client voice offer for subscriber %s (server offer in flight)", subscriberID)
+		sub.pendingClientOffer = sdpOffer
+		sub.pendingClientOfferID = ""
+		sub.pendingClientOfferIsRestart = false
+		return "", false, ErrClientOfferDeferred
 	}
 
 	offer := webrtc.SessionDescription{
@@ -1715,8 +1733,8 @@ func (s *SFU) HandleSubscriberOffer(roomSlug, subscriberID, sdpOffer string) (st
 	}
 
 	// ICE candidates are trickled via the subscriber's OnICECandidate callback
-	log.Printf("Renegotiation completed for subscriber %s (rolledBack=%v)", subscriberID, rolledBack)
-	return answer.SDP, rolledBack, nil
+	log.Printf("Voice renegotiation completed for subscriber %s", subscriberID)
+	return answer.SDP, false, nil
 }
 
 // GetIngestForRoom finds the ingest session bound to a room's stream key
@@ -2656,7 +2674,91 @@ func (s *SFU) HandleRenegotiationAnswer(roomSlug, subscriberID, sdpAnswer, offer
 	go s.probeOutboundVideo(sub, subscriberID)
 
 	log.Printf("Renegotiation answer processed for subscriber %s", subscriberID)
+
+	// Replay a client offer (voice offer or ICE restart) that was deferred
+	// because it arrived during this server offer (HaveLocalOffer glare that
+	// Pion v4 can't roll back). The PC is now Stable, so the deferred offer can
+	// finally be applied and answered. The answer is delivered via the
+	// subscriber's deferred-offer callback rather than returned here, since this
+	// handler's return value answers the *server* offer, not the client's.
+	s.replayDeferredClientOfferLocked(sub, subscriberID)
+
 	return nil
+}
+
+// replayDeferredClientOffer applies a client voice offer or ICE restart that was
+// queued while a server-initiated offer was in flight, now that the PC is Stable
+// again. Caller must hold sub.SignalingMu.
+func (s *SFU) replayDeferredClientOfferLocked(sub *Subscriber, subscriberID string) {
+	deferredSDP := sub.pendingClientOffer
+	deferredOfferID := sub.pendingClientOfferID
+	isRestart := sub.pendingClientOfferIsRestart
+	cb := sub.OnDeferredClientOffer
+	if deferredSDP == "" || cb == nil {
+		// Nothing deferred, or no way to deliver the answer yet. Leave it
+		// pending; SetDeferredClientOfferCallback flushes when wired.
+		return
+	}
+	// Guard against a caller that reaches us before the PC is Stable: applying
+	// an offer during HaveLocalOffer would collide and (since we clear pending
+	// state below) drop the deferred offer. Leave it pending for the next
+	// settling point instead.
+	if sub.PeerConnection.SignalingState() != webrtc.SignalingStateStable {
+		return
+	}
+	// Clear the pending state before replay so a failure doesn't loop.
+	sub.pendingClientOffer = ""
+	sub.pendingClientOfferID = ""
+	sub.pendingClientOfferIsRestart = false
+
+	offer := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: deferredSDP}
+	if err := sub.PeerConnection.SetRemoteDescription(offer); err != nil {
+		log.Printf("Failed to apply deferred client offer for %s: %v", subscriberID, err)
+		return
+	}
+	sub.CandidateID = deferredOfferID
+	sub.resetICECandidateBudget()
+
+	answer, err := sub.PeerConnection.CreateAnswer(nil)
+	if err != nil {
+		log.Printf("Failed to create deferred client offer answer for %s: %v", subscriberID, err)
+		return
+	}
+	if err := sub.PeerConnection.SetLocalDescription(answer); err != nil {
+		log.Printf("Failed to set deferred client offer answer for %s: %v", subscriberID, err)
+		return
+	}
+	log.Printf("Replayed deferred client offer for subscriber %s (restart=%v)", subscriberID, isRestart)
+	// Deliver outside the signaling lock to avoid re-entrancy into SendJSON paths.
+	go cb(isRestart, deferredOfferID, answer.SDP)
+}
+
+// SetDeferredClientOfferCallback wires the delivery path for a client voice
+// offer or ICE restart that was deferred during HaveLocalOffer glare. Flushes
+// immediately if a deferred offer is already waiting (e.g. the callback was
+// wired after the offer arrived).
+func (s *SFU) SetDeferredClientOfferCallback(roomSlug, subscriberID string, cb func(isRestart bool, offerID, answerSDP string)) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return
+	}
+	room.mu.RLock()
+	sub, ok := room.Subscribers[subscriberID]
+	room.mu.RUnlock()
+	if !ok {
+		return
+	}
+	sub.SignalingMu.Lock()
+	sub.OnDeferredClientOffer = cb
+	hasPending := sub.pendingClientOffer != ""
+	sub.SignalingMu.Unlock()
+	if hasPending {
+		// A deferred offer is waiting and the PC may already be Stable (server
+		// offer answered before the callback was wired). Replay it now.
+		sub.SignalingMu.Lock()
+		s.replayDeferredClientOfferLocked(sub, subscriberID)
+		sub.SignalingMu.Unlock()
+	}
 }
 
 // CreateScreenShareRelayTrack creates a relay track for screen share fan-out,

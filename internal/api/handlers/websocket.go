@@ -493,6 +493,25 @@ func (h *WebSocketHandler) initiateSubscription(client *websocket.Client, roomSl
 		logger.Debug("Sent deferred renegotiation offer", "participant_id", client.ID, "room", roomSlug)
 	})
 
+	// Wire the deferred client-offer delivery: a voice offer or ICE restart that
+	// arrived during an in-flight server offer (HaveLocalOffer glare Pion v4
+	// can't roll back) is replayed once that offer settles, and its answer is
+	// delivered here on the right transport — signal:voice-answer for a voice
+	// offer, signal:answer for an ICE restart.
+	h.sfu.SetDeferredClientOfferCallback(roomSlug, client.ID, func(isRestart bool, offerID, answerSDP string) {
+		msgType := "signal:voice-answer"
+		payload := map[string]interface{}{"sdp": answerSDP}
+		if isRestart {
+			msgType = "signal:answer"
+			if offerID != "" {
+				payload["offerId"] = offerID
+			}
+		}
+		if err := client.SendJSON(msgType, payload); err != nil {
+			logger.Warn("Failed to send deferred client offer answer", "participant_id", client.ID, "room", roomSlug, "is_restart", isRestart, "error", err)
+		}
+	})
+
 	logger.Debug("Sent WebRTC offer to client (trickle ICE)", "participant_id", client.ID, "room", roomSlug)
 	return true
 }
@@ -1212,6 +1231,14 @@ func (h *WebSocketHandler) handleSignalOffer(client *websocket.Client, payload j
 	answer, rolledBack, err := h.sfu.HandleSubscriberOffer(client.RoomSlug, client.ID, data.SDP)
 
 	if err != nil {
+		if errors.Is(err, webrtc.ErrClientOfferDeferred) {
+			// The offer arrived during an in-flight server offer (HaveLocalOffer
+			// glare). It is queued and replayed once the server offer settles;
+			// the answer is delivered via the deferred-offer callback, so do NOT
+			// send one here.
+			logger.Debug("Deferred voice offer (server renegotiation in flight)", "participant_id", client.ID)
+			return
+		}
 		logger.Error("Failed to handle voice offer", "participant_id", client.ID, "error", err)
 		return
 	}
@@ -1385,6 +1412,12 @@ func (h *WebSocketHandler) handleIceRestart(client *websocket.Client, payload js
 	// Handle the ICE restart offer and get answer
 	answer, err := h.sfu.HandleIceRestart(client.RoomSlug, client.ID, data.SDP, data.OfferID)
 	if err != nil {
+		if errors.Is(err, webrtc.ErrClientOfferDeferred) {
+			// Restart queued during in-flight server offer; replayed once it
+			// settles and the answer arrives via the deferred-offer callback.
+			logger.Debug("Deferred ICE restart (server renegotiation in flight)", "participant_id", client.ID)
+			return
+		}
 		logger.Error("Failed to handle ICE restart", "participant_id", client.ID, "error", err)
 		return
 	}

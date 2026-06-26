@@ -1248,6 +1248,182 @@ func TestSFU_HandleIceRestart_RoomNotFound(t *testing.T) {
 	}
 }
 
+// TestSFU_HandleSubscriberOffer_DefersDuringInFlightServerOffer is a regression
+// test for a session-breaking glare bug. Pion v4 cannot roll back a
+// HaveLocalOffer, so when a client voice offer (mic enable) arrived while a
+// server-initiated renegotiation offer was in flight, the rollback in
+// HandleSubscriberOffer always errored and the client's offer was silently
+// dropped — the participant couldn't enable their mic for the rest of the
+// session. The fix defers the client offer and replays it once the server
+// offer's answer settles the PC, delivering the answer via callback.
+func TestSFU_HandleSubscriberOffer_DefersDuringInFlightServerOffer(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "glare-room"
+	room := sfu.GetRoomTracks(roomSlug)
+
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("create pc: %v", err)
+	}
+	defer pc.Close()
+	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
+		t.Fatalf("add transceiver: %v", err)
+	}
+	sub := &Subscriber{ID: "sub-1", PeerConnection: pc, done: make(chan struct{})}
+	room.AddSubscriber(sub)
+
+	// Wire the deferred client-offer delivery callback.
+	replayed := make(chan struct{}, 1)
+	sfu.SetDeferredClientOfferCallback(roomSlug, "sub-1", func(isRestart bool, offerID, answerSDP string) {
+		if answerSDP != "" {
+			select {
+			case replayed <- struct{}{}:
+			default:
+			}
+		}
+	})
+
+	// Put the subscriber in HaveLocalOffer via a server-initiated renegotiation.
+	serverOffer, _, err := sfu.RenegotiateSubscriber(roomSlug, "sub-1")
+	if err != nil {
+		t.Fatalf("server renegotiate: %v", err)
+	}
+	if pc.SignalingState() != webrtc.SignalingStateHaveLocalOffer {
+		t.Fatalf("expected HaveLocalOffer, got %s", pc.SignalingState())
+	}
+
+	// Client voice offer arrives during the in-flight server offer. Previously
+	// this returned a hard "failed to rollback" error; now it must defer.
+	_, _, err = sfu.HandleSubscriberOffer(roomSlug, "sub-1", serverOffer)
+	if !errors.Is(err, ErrClientOfferDeferred) {
+		t.Fatalf("expected ErrClientOfferDeferred during in-flight server offer, got %v", err)
+	}
+
+	// The client answers the server offer → PC returns to Stable → the deferred
+	// client offer is replayed. Build a valid answer for the server offer.
+	answer, err := buildAnswer(pc, serverOffer)
+	if err != nil {
+		t.Fatalf("build server-answer: %v", err)
+	}
+	if err := sfu.HandleRenegotiationAnswer(roomSlug, "sub-1", answer, ""); err != nil {
+		t.Fatalf("handle renegotiation answer: %v", err)
+	}
+
+	// The deferred client offer must be replayed and its answer delivered.
+	select {
+	case <-replayed:
+		// success — the mic-enable offer was recovered, not dropped.
+	case <-time.After(2 * time.Second):
+		t.Fatal("deferred client offer was never replayed after the server offer settled")
+	}
+}
+
+// buildAnswer exchanges an offer with a fresh peer connection to produce a
+// valid answer SDP for the given subscriber PC's current offer.
+func buildAnswer(pc *webrtc.PeerConnection, offerSDP string) (string, error) {
+	answerer, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		return "", err
+	}
+	defer answerer.Close()
+	answerer.OnTrack(func(track *webrtc.TrackRemote, r *webrtc.RTPReceiver) {}) // noop
+	if err := answerer.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer, SDP: offerSDP,
+	}); err != nil {
+		return "", err
+	}
+	ans, err := answerer.CreateAnswer(nil)
+	if err != nil {
+		return "", err
+	}
+	if err := answerer.SetLocalDescription(ans); err != nil {
+		return "", err
+	}
+	return ans.SDP, nil
+}
+
+// TestSFU_HandleIceRestart_DefersDuringInFlightServerOffer mirrors the voice-
+// offer test for the ICE restart path. An ICE restart (network recovery) that
+// arrives during an in-flight server offer must be deferred and replayed —
+// previously the rollback errored and the restart was lost, leaving the viewer
+// stuck. The replayed answer is delivered as a restart (signal:answer).
+func TestSFU_HandleIceRestart_DefersDuringInFlightServerOffer(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "glare-restart-room"
+	room := sfu.GetRoomTracks(roomSlug)
+
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("create pc: %v", err)
+	}
+	defer pc.Close()
+	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
+		t.Fatalf("add transceiver: %v", err)
+	}
+	sub := &Subscriber{ID: "sub-1", PeerConnection: pc, done: make(chan struct{})}
+	room.AddSubscriber(sub)
+
+	replayed := make(chan restartResult, 1)
+	sfu.SetDeferredClientOfferCallback(roomSlug, "sub-1", func(isRestart bool, offerID, answerSDP string) {
+		select {
+		case replayed <- restartResult{isRestart: isRestart, offerID: offerID, sdp: answerSDP}:
+		default:
+		}
+	})
+
+	serverOffer, _, err := sfu.RenegotiateSubscriber(roomSlug, "sub-1")
+	if err != nil {
+		t.Fatalf("server renegotiate: %v", err)
+	}
+
+	// ICE restart arrives during the in-flight server offer → must defer.
+	if _, err := sfu.HandleIceRestart(roomSlug, "sub-1", serverOffer, "restart-7"); !errors.Is(err, ErrClientOfferDeferred) {
+		t.Fatalf("expected ErrClientOfferDeferred, got %v", err)
+	}
+
+	// Settle the server offer → deferred restart replays as a restart.
+	answer, err := buildAnswer(pc, serverOffer)
+	if err != nil {
+		t.Fatalf("build answer: %v", err)
+	}
+	if err := sfu.HandleRenegotiationAnswer(roomSlug, "sub-1", answer, ""); err != nil {
+		t.Fatalf("handle renegotiation answer: %v", err)
+	}
+
+	select {
+	case res := <-replayed:
+		if !res.isRestart {
+			t.Fatal("replayed client offer should be flagged as a restart")
+		}
+		if res.offerID != "restart-7" {
+			t.Fatalf("expected restart offerId 'restart-7', got %q", res.offerID)
+		}
+		if res.sdp == "" {
+			t.Fatal("replayed restart answer SDP should be non-empty")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("deferred ICE restart was never replayed after the server offer settled")
+	}
+}
+
+type restartResult struct {
+	isRestart bool
+	offerID   string
+	sdp       string
+}
+
 func TestSFU_RenegotiateSubscriber_RoomNotFound(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)
