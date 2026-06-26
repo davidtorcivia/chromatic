@@ -13,7 +13,6 @@ import (
 
 	"chromatic/internal/metrics"
 
-	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -174,12 +173,27 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 			return
 		}
 
-		// Forward RTP packets. Exits when the peer connection closes (Read/Write
-		// returns an error) or when session teardown closes session.done, whose
-		// PC.Close() cascades to ErrClosedPipe on the next Write.
+		// Decouple the OBS Read loop from WriteRTP fan-out. pion implements
+		// TrackLocalStaticRTP.WriteRTP as a synchronous per-subscriber encrypt +
+		// UDP socket write, so a single congested viewer's full send buffer
+		// would otherwise block this goroutine, back up OBS's read buffer, and
+		// stall media (and keyframes) for EVERY viewer. The forwarder queues
+		// packets and drains on its own goroutine; on a full buffer it drops the
+		// OLDEST packet (a stale live frame is worthless) so the ingest read
+		// never blocks and latency stays bounded to the buffer depth.
+		// Video: shallow buffer (drop stale frames fast). Audio: deeper (small
+		// packets; prefer buffering over dropping talk spurts).
+		forwarderBufSize := 32
+		if remoteTrack.Kind() == webrtc.RTPCodecTypeAudio {
+			forwarderBufSize = 128
+		}
+		forwarder := newAsyncForwarder(forwarderBufSize, localTrack.WriteRTP)
+
+		// Forward RTP packets. Exits when the peer connection closes (Read
+		// returns an error) or when session teardown closes session.done.
 		go func() {
+			defer forwarder.Close()
 			buf := make([]byte, 1500)
-			var pkt rtp.Packet
 			for {
 				n, _, err := remoteTrack.Read(buf)
 				if err != nil {
@@ -195,24 +209,10 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 					return
 				default:
 				}
-				if err := pkt.Unmarshal(buf[:n]); err != nil {
-					continue
-				}
-				// Strip the SOURCE's RTP header extensions before fan-out.
-				// Their IDs/values (MID, TWCC, ...) are scoped to the OBS↔SFU
-				// negotiation and mean something else — or something wrong —
-				// in each subscriber's own negotiation. Chrome's BUNDLE demux
-				// trusts an in-packet MID over the signaled SSRC, so a stale
-				// MID can silently misroute the whole stream (black video).
-				// pion re-stamps each subscriber's negotiated extensions on
-				// the way out.
-				stripHeaderExtensions(&pkt.Header)
-				if err := localTrack.WriteRTP(&pkt); err != nil {
-					if err != io.ErrClosedPipe {
-						log.Printf("Error writing to local track: %v", err)
-					}
-					return
-				}
+				// Hand the raw packet to the forwarder (never blocks; drop-oldest
+				// on full). Unmarshal + extension stripping + WriteRTP happen on
+				// the forwarder's drain goroutine, off the read loop.
+				forwarder.write(buf[:n])
 			}
 		}()
 	})
