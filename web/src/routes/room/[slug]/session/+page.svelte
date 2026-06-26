@@ -2691,7 +2691,11 @@
                                 <span>{displayFps !== null ? `${displayFps} fps` : "measuring"}</span>
                             </div>
                             <div class="stats-row">
-                                <span>Latency</span>
+                                <span>{displayedLatencySource}</span>
+                                <span>{displayedLatency !== null ? `~${Math.round(displayedLatency)} ms` : "n/a"}</span>
+                            </div>
+                            <div class="stats-row">
+                                <span>Network RTT</span>
                                 <span>{currentRtt !== null ? `~${Math.round(currentRtt)} ms` : "n/a"}</span>
                             </div>
                             <div class="stats-row">

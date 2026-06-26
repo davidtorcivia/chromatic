@@ -112,9 +112,12 @@ export class WebRTCManager {
     private static readonly DISCONNECTED_ICE_RESTART_MS = 2000;
     private static readonly ICE_RESTART_ANSWER_TIMEOUT_MS = 8000;
     private static readonly PUBLISHER_DISCONNECTED_REBUILD_MS = 2000;
-    // Keep browser playout buffers tight for color-review A/B work. This is
-    // a best-effort Chrome hint; unsupported browsers ignore it.
-    private static readonly LOW_LATENCY_PLAYOUT_DELAY_SECONDS = 0.05;
+    // Keep browser playout buffers tight for color-review A/B work. Modern
+    // browsers expose jitterBufferTarget in ms; Chromium also has the older
+    // seconds-based playoutDelayHint. Unsupported browsers ignore either hint.
+    private static readonly LOW_LATENCY_JITTER_BUFFER_TARGET_MS = 50;
+    private static readonly LOW_LATENCY_PLAYOUT_DELAY_SECONDS =
+        WebRTCManager.LOW_LATENCY_JITTER_BUFFER_TARGET_MS / 1000;
     private lastResyncAt = 0;
     // Serialize all SDP operations to prevent concurrent modifications
     // to the PeerConnection's signaling state (e.g. handleOffer + handleRenegotiation
@@ -426,14 +429,20 @@ export class WebRTCManager {
         type LowLatencyReceiver = RTCRtpReceiver & { playoutDelayHint?: number };
         const lowLatencyReceiver = receiver as LowLatencyReceiver;
 
-        if (!('playoutDelayHint' in lowLatencyReceiver)) {
-            return;
+        if ('jitterBufferTarget' in receiver) {
+            try {
+                receiver.jitterBufferTarget = WebRTCManager.LOW_LATENCY_JITTER_BUFFER_TARGET_MS;
+            } catch (err) {
+                console.warn('Could not set low-latency receiver jitter buffer target:', err);
+            }
         }
 
-        try {
-            lowLatencyReceiver.playoutDelayHint = WebRTCManager.LOW_LATENCY_PLAYOUT_DELAY_SECONDS;
-        } catch (err) {
-            console.warn('Could not set low-latency receiver playout hint:', err);
+        if ('playoutDelayHint' in lowLatencyReceiver) {
+            try {
+                lowLatencyReceiver.playoutDelayHint = WebRTCManager.LOW_LATENCY_PLAYOUT_DELAY_SECONDS;
+            } catch (err) {
+                console.warn('Could not set low-latency receiver playout hint:', err);
+            }
         }
     }
 

@@ -795,7 +795,7 @@ describe('WebRTCManager subscriber signaling', () => {
         expect(onNegotiationWedged).toHaveBeenCalledTimes(1);
     });
 
-    it('sets a low playout delay hint on inbound receivers when supported', () => {
+    it('sets low-latency jitter buffer targets on inbound receivers when supported', () => {
         vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
 
         const manager = new WebRTCManager({
@@ -810,13 +810,14 @@ describe('WebRTCManager subscriber signaling', () => {
         };
         managerInternals.createPeerConnection();
 
-        const receiver = { playoutDelayHint: 1 };
+        const receiver = { jitterBufferTarget: null, playoutDelayHint: 1 };
         managerInternals.pc?.ontrack?.({
             track: { kind: 'video', id: 'main-video' },
             streams: [{ id: 'main-stream' }],
             receiver
         } as unknown as RTCTrackEvent);
 
+        expect(receiver.jitterBufferTarget).toBe(50);
         expect(receiver.playoutDelayHint).toBe(0.05);
     });
 
