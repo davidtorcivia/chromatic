@@ -69,8 +69,13 @@
   --glass-bg: rgba(22, 22, 26, 0.4);
   --glass-bg-deep: rgba(15, 15, 18, 0.62);
   --glass-edge: rgba(255, 255, 255, 0.08);
-  --glass-backdrop: blur(12px) saturate(160%) brightness(1.06);
-  --glass-backdrop-deep: blur(16px) saturate(160%) brightness(1.06);
+  /* Color-critical: NO saturate/brightness here. backdrop-filter applies these
+     to the live video behind the bars, which visibly lightened/over-saturated
+     the reviewed image when the controls appeared (worst on Firefox). Frost
+     (blur) only — the dark --glass-bg tint provides legibility without shifting
+     the picture's color. */
+  --glass-backdrop: blur(12px);
+  --glass-backdrop-deep: blur(16px);
   /* Specular: a whisper of top light, nothing more. Bright edges read as
      cheap strokes, not depth, when there's no refraction behind them. */
   --glass-specular:

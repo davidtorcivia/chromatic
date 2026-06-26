@@ -1816,17 +1816,13 @@
     }
 
     function handleMouseMove(e: MouseEvent) {
-        // Tool mode: while the laser or loupe is in hand, moving over the
-        // picture is USING the tool, not asking for chrome. The controls
-        // only wake near the top/bottom edges (and the glass renderers
-        // sleep with them, which keeps strokes fluid on slower engines).
-        if (isLaserEnabled || isLoupeEnabled) {
-            // Wake zones track the real bar geometry (the bars stay laid
-            // out while hidden, so their rects are valid).
-            const topEdge = (topBarEl?.getBoundingClientRect().bottom ?? 110) + 24;
-            const bottomEdge = (bottomBarEl?.getBoundingClientRect().top ?? window.innerHeight - 130) - 24;
-            if (e.clientY > topEdge && e.clientY < bottomEdge) return;
-        }
+        // Tool mode: while a tool is ACTIVELY drawing (a mouse button is held),
+        // moving is USING the tool, not asking for chrome — so don't reveal.
+        // Plain movement (no button) always reveals, so the user is never locked
+        // out of the controls (e.g. to turn the laser back off). Previously any
+        // movement while the laser was merely SELECTED was suppressed except in
+        // narrow edge zones, which hid the controls with no easy way back.
+        if ((isLaserEnabled || isLoupeEnabled) && e.buttons !== 0) return;
         startControlsTimer();
     }
 

@@ -143,9 +143,10 @@ void main() {
   float lod = mix(mix(0.8, 2.0, u_ramp), mix(0.8, 3.4, u_ramp), t);
   vec3 c = sceneSample(uv, lod);
 
-  // saturate(1.6) brightness(1.06), matching the CSS material
-  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
-  c = clamp(mix(vec3(l), c, 1.6) * 1.06, 0.0, 1.0);
+  // Color-critical: NO saturate/brightness boost. This glass floats over the
+  // reviewed picture, so it must not shift its color — frost (the LOD blur
+  // above) and the dark adaptive fill below are the only treatment.
+  c = clamp(c, 0.0, 1.0);
 
   // Locally adaptive fill: each region of the glass responds to the
   // footage directly behind it (a bright window darkens only that end
