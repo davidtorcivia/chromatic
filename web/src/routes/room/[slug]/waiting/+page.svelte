@@ -7,6 +7,7 @@
     import { rooms, type LobbyInfo } from "$lib/api/client";
     import { countdownParts, formatScheduleLabel, serverClockOffset } from "$lib/lobby";
     import StateCard from "$lib/components/StateCard.svelte";
+    import { parseStoredSession, type StoredSessionData } from "$lib/session/storedSession";
 
     const slug = $page.params.slug!;
 
@@ -46,13 +47,7 @@
         window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
     // Get session data from storage
-    let sessionData: {
-        participantId: string;
-        token: string;
-        color: string;
-        serverTime?: string;
-        lobby?: LobbyInfo;
-    } | null = null;
+    let sessionData: StoredSessionData | null = null;
 
     onMount(async () => {
         // Get session data
@@ -62,14 +57,13 @@
             return;
         }
 
-        try {
-            sessionData = JSON.parse(stored);
-        } catch (e) {
-            console.error("Failed to parse waiting room session", e);
+        const parsedSession = parseStoredSession(stored);
+        if (!parsedSession) {
             sessionStorage.removeItem(`chromatic_session_${slug}`);
             void goto(`/room/${slug}`);
             return;
         }
+        sessionData = parsedSession;
 
         // Countdown lobby: anchor to the server clock captured at join time,
         // then refine with the fresher timestamp from /info below.

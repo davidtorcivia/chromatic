@@ -29,6 +29,7 @@
     } from "$lib/perf/loadMonitor";
     import { releaseFrames } from "$lib/glass/frameSource";
     import { tooltip } from "$lib/ui/tooltip";
+    import { parseStoredSession, type StoredSessionData } from "$lib/session/storedSession";
 
     const DEBUG = import.meta.env.DEV;
     const debugLog = (...args: unknown[]) => {
@@ -244,13 +245,7 @@
     let selfShareStream = $state<MediaStream | null>(null);
 
     // Get session data from storage
-    let sessionData = $state<{
-        participantId: string;
-        token: string;
-        color: string;
-        name?: string;
-        role?: "admin" | "viewer";
-    } | null>(null);
+    let sessionData = $state<StoredSessionData | null>(null);
 
     onMount(async () => {
         startLoadMonitor();
@@ -278,22 +273,13 @@
             return;
         }
 
-        try {
-            const parsed = JSON.parse(stored) as typeof sessionData;
-            if (
-                !parsed ||
-                typeof parsed.participantId !== "string" ||
-                typeof parsed.token !== "string" ||
-                typeof parsed.color !== "string"
-            ) {
-                throw new Error("invalid session payload");
-            }
-            sessionData = parsed;
-        } catch {
+        const parsedSession = parseStoredSession(stored);
+        if (!parsedSession) {
             sessionStorage.removeItem(`chromatic_session_${slug}`);
             goto(`/room/${slug}`);
             return;
         }
+        sessionData = parsedSession;
 
         const storedName = localStorage.getItem('chromatic_name');
         if (storedName) {
