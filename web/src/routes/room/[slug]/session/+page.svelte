@@ -278,7 +278,22 @@
             return;
         }
 
-        sessionData = JSON.parse(stored);
+        try {
+            const parsed = JSON.parse(stored) as typeof sessionData;
+            if (
+                !parsed ||
+                typeof parsed.participantId !== "string" ||
+                typeof parsed.token !== "string" ||
+                typeof parsed.color !== "string"
+            ) {
+                throw new Error("invalid session payload");
+            }
+            sessionData = parsed;
+        } catch {
+            sessionStorage.removeItem(`chromatic_session_${slug}`);
+            goto(`/room/${slug}`);
+            return;
+        }
 
         const storedName = localStorage.getItem('chromatic_name');
         if (storedName) {

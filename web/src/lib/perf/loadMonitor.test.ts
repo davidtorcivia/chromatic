@@ -7,6 +7,7 @@ import {
 	loadSnapshot,
 	setReviewQualityMode,
 	setReviewToolActive,
+	stopLoadMonitor,
 } from './loadMonitor';
 
 function clearTools() {
@@ -72,6 +73,22 @@ describe('loadMonitor review tool pressure', () => {
 			activeReviewToolCount: 1,
 			qualityMode: 'performance',
 			underPressure: false,
+		});
+	});
+
+	it('resets session-scoped tool state when the monitor stops', () => {
+		clearTools();
+
+		setReviewToolActive('laser', true);
+		setReviewToolActive('loupe', true);
+		expect(activeReviewToolCount()).toBe(2);
+
+		stopLoadMonitor();
+
+		expect(loadSnapshot()).toMatchObject({
+			activeReviewToolCount: 0,
+			longFrameCount: 0,
+			worstLongFrameMs: null,
 		});
 	});
 });

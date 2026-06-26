@@ -56,6 +56,12 @@ export function startLoadMonitor(): void {
 export function stopLoadMonitor(): void {
 	if (raf) cancelAnimationFrame(raf);
 	raf = 0;
+	busyUntil = 0;
+	lastNow = 0;
+	longFrameCount = 0;
+	lastLongFrameMs = 0;
+	worstLongFrameMs = 0;
+	activeReviewTools.clear();
 }
 
 /** True while recent frames have been running long. */
