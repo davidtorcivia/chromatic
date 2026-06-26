@@ -2,6 +2,11 @@
 
 import { createMicChain, type MicChain } from '$lib/audio/mic-chain';
 
+const DEBUG = import.meta.env.DEV;
+const debugLog = (...args: unknown[]) => {
+    if (DEBUG) console.log(...args);
+};
+
 // localStorage key for the preferred microphone input device. Read on every
 // getUserMedia call so the user's choice survives reloads and reconnects.
 export const MIC_DEVICE_STORAGE_KEY = 'chromatic_mic_device';
@@ -160,7 +165,7 @@ export class WebRTCManager {
     // we must mirror that by abandoning the old PC.
     async handleOffer(sdp: string, offerId?: string): Promise<void> {
         return this.enqueueSignaling(async () => {
-            console.log('Handling WebRTC offer');
+            debugLog('Handling WebRTC offer');
 
             if (this.pc) {
                 const state = this.pc.connectionState;
@@ -169,7 +174,7 @@ export class WebRTCManager {
                 // yet), reuse the pc. Otherwise assume this is a reconnect-initiated
                 // fresh session and rebuild.
                 if (state !== 'new' || sig !== 'stable') {
-                    console.log('Resetting stale peer connection before fresh offer', { state, sig });
+                    debugLog('Resetting stale peer connection before fresh offer', { state, sig });
                     this.resetPeerConnection();
                 }
             }
@@ -188,11 +193,11 @@ export class WebRTCManager {
                 // pending-local-offer handling is needed here.
                 const offer: RTCSessionDescriptionInit = { type: 'offer', sdp };
                 await pc.setRemoteDescription(offer);
-                console.log('Set remote description');
+                debugLog('Set remote description');
 
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                console.log('Created and set local description (answer)');
+                debugLog('Created and set local description (answer)');
 
                 const payload: { sdp: string | undefined; offerId?: string } = { sdp: answer.sdp };
                 if (offerId) {
@@ -258,12 +263,12 @@ export class WebRTCManager {
             }
 
             await this.pc.addIceCandidate(candidate);
-            console.log('Added ICE candidate from server');
+            debugLog('Added ICE candidate from server');
         });
     }
 
     private createPeerConnection(): void {
-        console.log('Creating peer connection with ICE servers:', this.options.iceServers);
+        debugLog('Creating peer connection with ICE servers:', this.options.iceServers);
 
         this.pc = new RTCPeerConnection({
             iceServers: this.options.iceServers
@@ -273,7 +278,7 @@ export class WebRTCManager {
         this.pc.ontrack = (event) => {
             const streamId = event.streams[0]?.id ?? '';
             const trackId = event.track.id;
-            console.log('Received track:', event.track.kind, 'trackId:', trackId, 'streamId:', streamId, 'streams:', event.streams.length);
+            debugLog('Received track:', event.track.kind, 'trackId:', trackId, 'streamId:', streamId, 'streams:', event.streams.length);
             this.tuneReceiverForLowLatency(event.receiver);
 
             // Identify screen share tracks by stream/track ID.
@@ -289,7 +294,7 @@ export class WebRTCManager {
             }
 
             if (screenShareParticipantId) {
-                console.log('Identified screen share track from participant:', screenShareParticipantId);
+                debugLog('Identified screen share track from participant:', screenShareParticipantId);
                 this.options.onScreenShareTrack?.(screenShareParticipantId, event.track);
                 return;
             }
@@ -309,7 +314,7 @@ export class WebRTCManager {
             }
 
             if (voiceParticipantId) {
-                console.log('Identified voice track from participant:', voiceParticipantId);
+                debugLog('Identified voice track from participant:', voiceParticipantId);
                 if (this.options.onVoiceTrack) {
                     this.options.onVoiceTrack(voiceParticipantId, event.track);
                 }
@@ -323,7 +328,7 @@ export class WebRTCManager {
         // Handle ICE candidates
         this.pc.onicecandidate = (event) => {
             if (event.candidate) {
-                console.log('Sending ICE candidate to server');
+                debugLog('Sending ICE candidate to server');
                 this.sendSubscriberCandidate({
                     candidate: event.candidate.candidate,
                     sdpMid: event.candidate.sdpMid,
@@ -335,7 +340,7 @@ export class WebRTCManager {
         // Handle connection state changes
         this.pc.onconnectionstatechange = () => {
             const state = this.pc?.connectionState;
-            console.log('Connection state:', state);
+            debugLog('Connection state:', state);
 
             // Notify callback
             if (state) {
@@ -354,7 +359,7 @@ export class WebRTCManager {
                 this.connectionLostTimeout = setTimeout(() => {
                     this.connectionLostTimeout = null;
                     if (this.pc?.connectionState === 'disconnected') {
-                        console.log('Connection still disconnected, attempting ICE restart');
+                        debugLog('Connection still disconnected, attempting ICE restart');
                         this.performIceRestart();
                     }
                 }, WebRTCManager.DISCONNECTED_ICE_RESTART_MS);
@@ -373,11 +378,11 @@ export class WebRTCManager {
                     } else {
                         // Restart is still being prepared (offer not yet
                         // sent) - don't declare failure prematurely.
-                        console.log('Connection failed while ICE restart is being prepared, waiting');
+                        debugLog('Connection failed while ICE restart is being prepared, waiting');
                     }
                 } else {
                     // First failure - attempt ICE restart
-                    console.log('Connection failed, attempting ICE restart');
+                    debugLog('Connection failed, attempting ICE restart');
                     this.performIceRestart();
                 }
             } else if (state === 'connected') {
@@ -399,11 +404,11 @@ export class WebRTCManager {
         };
 
         this.pc.oniceconnectionstatechange = () => {
-            console.log('ICE connection state:', this.pc?.iceConnectionState);
+            debugLog('ICE connection state:', this.pc?.iceConnectionState);
         };
 
         this.pc.onicegatheringstatechange = () => {
-            console.log('ICE gathering state:', this.pc?.iceGatheringState);
+            debugLog('ICE gathering state:', this.pc?.iceGatheringState);
         };
     }
 
@@ -488,7 +493,7 @@ export class WebRTCManager {
 
         this.iceRestartPending = true;
         this.iceRestartAttempted = false;
-        console.log('Performing ICE restart...');
+        debugLog('Performing ICE restart...');
         this.options.onIceRestart?.();
 
         if (this.iceRestartTimeout) {
@@ -531,7 +536,7 @@ export class WebRTCManager {
                 // 'failed' state now means the restart itself failed.
                 this.iceRestartAttempted = true;
 
-                console.log('Sent ICE restart offer');
+                debugLog('Sent ICE restart offer');
             } catch (err) {
                 console.error('Failed to perform ICE restart:', err);
                 if (this.subscriberCandidateOfferId === offerId) {
@@ -577,7 +582,7 @@ export class WebRTCManager {
             return;
         }
         this.lastResyncAt = now;
-        console.log('Requesting stream resync (keyframe)');
+        debugLog('Requesting stream resync (keyframe)');
         this.sendSignal('signal:resync', {});
     }
 
@@ -598,7 +603,7 @@ export class WebRTCManager {
         const refresh = (pc: RTCPeerConnection, label: string) => {
             try {
                 pc.setConfiguration({ iceServers });
-                console.log(`Refreshed ICE servers on live ${label} peer connection`);
+                debugLog(`Refreshed ICE servers on live ${label} peer connection`);
             } catch (err) {
                 console.warn(`setConfiguration with fresh ICE servers failed on ${label} peer connection:`, err);
             }
@@ -717,7 +722,7 @@ export class WebRTCManager {
 
             await this.installMicStream(raw);
 
-            console.log('Microphone access granted');
+            debugLog('Microphone access granted');
             return true;
         } catch (err) {
             console.error('Failed to get microphone access:', err);
@@ -777,7 +782,7 @@ export class WebRTCManager {
                 oldRaw.getTracks().forEach(t => t.stop());
             }
 
-            console.log('Switched microphone device:', deviceId);
+            debugLog('Switched microphone device:', deviceId);
             return true;
         } catch (err) {
             console.error('Failed to switch microphone device:', err);
@@ -817,7 +822,7 @@ export class WebRTCManager {
             });
         }
 
-        console.log('Microphone', enabled ? 'enabled' : 'muted');
+        debugLog('Microphone', enabled ? 'enabled' : 'muted');
     }
 
     // Check if mic is currently enabled
@@ -870,7 +875,7 @@ export class WebRTCManager {
             }
         };
         pc.onconnectionstatechange = () => {
-            console.log('Publisher connection state:', pc.connectionState);
+            debugLog('Publisher connection state:', pc.connectionState);
             if (this.publisherPc !== pc) {
                 return;
             }
@@ -936,7 +941,7 @@ export class WebRTCManager {
                 this.pendingPublisherCandidates = [];
                 if (pc.signalingState !== 'stable') {
                     this.publisherNeedsRenegotiation = true;
-                    console.log('Publisher offer already in flight; deferring renegotiation', { signalingState: pc.signalingState });
+                    debugLog('Publisher offer already in flight; deferring renegotiation', { signalingState: pc.signalingState });
                     return true;
                 }
                 const offerId = `publish-${++this.publisherOfferCounter}`;
@@ -950,7 +955,7 @@ export class WebRTCManager {
                 this.publisherOfferSent = true;
                 this.flushPendingPublisherCandidates();
                 this.startPublishAnswerWatchdog();
-                console.log('Sent publisher offer');
+                debugLog('Sent publisher offer');
                 return true;
             } catch (err) {
                 const e = err as Error;
@@ -1007,7 +1012,7 @@ export class WebRTCManager {
                 this.publisherNeedsRenegotiation = false;
                 void this.negotiatePublisher();
             }
-            console.log('Publisher answer applied');
+            debugLog('Publisher answer applied');
         });
     }
 
@@ -1118,7 +1123,7 @@ export class WebRTCManager {
                 this.subscriberCandidateOfferId = offerId;
             }
             this.clearIceRestartAttempt();
-            console.log('Set remote description for answer');
+            debugLog('Set remote description for answer');
         });
     }
 
@@ -1134,13 +1139,13 @@ export class WebRTCManager {
                 return;
             }
 
-            console.log('Handling server-initiated renegotiation', participantId ? `for voice from ${participantId}` : '');
+            debugLog('Handling server-initiated renegotiation', participantId ? `for voice from ${participantId}` : '');
             this.options.onRenegotiation?.();
             const previousCandidateOfferId = this.subscriberCandidateOfferId;
 
             try {
                 if (this.pc.signalingState === 'have-local-offer') {
-                    console.log('Rolling back local subscriber offer before server renegotiation');
+                    debugLog('Rolling back local subscriber offer before server renegotiation');
                     await this.pc.setLocalDescription({ type: 'rollback' });
                     this.clearIceRestartAttempt();
                 }
@@ -1160,7 +1165,7 @@ export class WebRTCManager {
                     return;
                 }
 
-                console.log('Sent renegotiation answer');
+                debugLog('Sent renegotiation answer');
             } catch (err) {
                 this.subscriberCandidateOfferId = previousCandidateOfferId;
                 this.failSubscriberNegotiation('Failed to handle renegotiation; resetting subscriber connection', err);
@@ -1173,7 +1178,7 @@ export class WebRTCManager {
     // failures on remote testers' machines are diagnosable without console
     // access (multiple field reports of shares silently not arriving).
     private shareDebug(event: string, detail = ''): void {
-        console.log(`[share] ${event}`, detail);
+        debugLog(`[share] ${event}`, detail);
         try {
             this.sendSignal('client:debug', { event: `share:${event}`, detail });
         } catch {
@@ -1206,7 +1211,7 @@ export class WebRTCManager {
 
             // Listen for browser "Stop sharing" button
             videoTrack.onended = () => {
-                console.log('Screen share ended by user (browser chrome)');
+                debugLog('Screen share ended by user (browser chrome)');
                 this.stopScreenShare();
                 this.options.onScreenShareEnded?.();
             };
@@ -1235,7 +1240,7 @@ export class WebRTCManager {
                 this.shareDebug('offer-sent', `publisher=${this.publisherPc?.signalingState ?? 'gone'}`);
             }
 
-            console.log('Screen share started');
+            debugLog('Screen share started');
             return true;
         } catch (err) {
             const e = err as Error;
@@ -1274,7 +1279,7 @@ export class WebRTCManager {
             void this.negotiatePublisher();
         }
 
-        console.log('Screen share stopped');
+        debugLog('Screen share stopped');
     }
 
     // Clean up

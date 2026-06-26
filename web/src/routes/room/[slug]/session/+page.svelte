@@ -30,6 +30,11 @@
     import { releaseFrames } from "$lib/glass/frameSource";
     import { tooltip } from "$lib/ui/tooltip";
 
+    const DEBUG = import.meta.env.DEV;
+    const debugLog = (...args: unknown[]) => {
+        if (DEBUG) console.log(...args);
+    };
+
     const slug = $page.params.slug!;
 
     let videoElement = $state<HTMLVideoElement | null>(null);
@@ -299,7 +304,7 @@
         // Handle ICE servers from room state (initial delivery in room:state)
         session.onMessage("iceServers", (servers: unknown) => {
             iceServers = servers as RTCIceServer[];
-            console.log('Received ICE servers:', iceServers);
+            debugLog('Received ICE servers:', iceServers);
             initializeWebRTC();
             // Start the periodic refresh only once we have a live manager.
             startICEServerRefresh();
@@ -316,7 +321,7 @@
         // Handle WebRTC offer from server
         session.onMessage("signal:offer", async (payload: unknown) => {
             const data = payload as { sdp: string; offerId?: string };
-            console.log('Received WebRTC offer');
+            debugLog('Received WebRTC offer');
 
             if (!webrtcManager) {
                 initializeWebRTC();
@@ -350,14 +355,14 @@
         });
 
         session.onMessage("room:live", () => {
-            console.log('Room is now live');
+            debugLog('Room is now live');
         });
 
         session.onMessage("stream:paused", (payload: unknown) => {
             const data = payload as { message?: string };
             streamError = null;
             streamPaused = true;
-            if (data?.message) console.log(data.message);
+            if (data?.message) debugLog(data.message);
         });
 
         session.onMessage("stream:resumed", () => {
@@ -483,7 +488,7 @@
             screenShareRequested = false;
             shareApprovedPrompt = false;
             const data = payload as { reason?: string };
-            console.log('Screen share denied:', data.reason || 'Request denied by admin');
+            debugLog('Screen share denied:', data.reason || 'Request denied by admin');
         });
 
         session.onMessage("screenshare:started", (payload: unknown) => {
@@ -611,7 +616,7 @@
             // The session was terminated (ended/kicked) — don't resurrect it.
             if (endState) return;
             reconnectEvents++;
-            console.log("WebSocket reconnected, resetting WebRTC state");
+            debugLog("WebSocket reconnected, resetting WebRTC state");
             cleanupWebRTC();
             if (audioDuckingManager) {
                 audioDuckingManager.destroy();
@@ -748,7 +753,7 @@
             }
         });
 
-        console.log('WebRTC manager initialized');
+        debugLog('WebRTC manager initialized');
         setSelfAudio(false);
         void startAutoMicConnection();
     }
@@ -826,7 +831,7 @@
     }
 
     function handleTrack(event: RTCTrackEvent) {
-        console.log('Received track:', event.track.kind, event.streams);
+        debugLog('Received track:', event.track.kind, event.streams);
         streamError = null;
 
         if (!videoElement) {
@@ -1009,7 +1014,7 @@
                 return;
             }
             playNudgeAttempts++;
-            console.log(`Video not rendering yet, requesting keyframe (attempt ${playNudgeAttempts}/${PLAY_NUDGE_MAX_ATTEMPTS})`);
+            debugLog(`Video not rendering yet, requesting keyframe (attempt ${playNudgeAttempts}/${PLAY_NUDGE_MAX_ATTEMPTS})`);
             webrtcManager.requestResync();
             playNudgeTimer = setTimeout(tick, PLAY_NUDGE_INTERVAL_MS * playNudgeAttempts);
         };
@@ -1162,7 +1167,7 @@
     }
 
     function handleScreenShareTrack(participantId: string, track: MediaStreamTrack) {
-        console.log('Received screen share track from', participantId);
+        debugLog('Received screen share track from', participantId);
         const stream = new MediaStream([track]);
         // Binding to the video element happens in the $effect below once the
         // element is rendered — no separate RAF path racing it.
@@ -4407,25 +4412,6 @@
     }
     .audio-device-option {
         border-radius: 10px;
-    }
-
-    /* Continuous (superellipse) corners where the engine has them.
-       NOT the control bar: its WebGL glass draws circular corners, and a
-       squircle CSS border over a circular shader edge doubles the corner. */
-    @supports (corner-shape: squircle) {
-        .control-btn,
-        .stream-card,
-        .mic-prompt,
-        .screenshare-approval,
-        .open-early-banner,
-        .waiting-request-card,
-        .stats-popover,
-        .audio-settings-popover,
-        .participant-list,
-        .room-name,
-        .participant-count {
-            corner-shape: squircle;
-        }
     }
 
     /* Bars host a shared glass canvas as their first child; real content
