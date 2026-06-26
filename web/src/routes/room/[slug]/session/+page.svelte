@@ -4405,8 +4405,9 @@
         gap: 10px;
         padding: 8px 10px;
         border-radius: var(--radius-md);
-        background: rgba(0, 0, 0, 0.28);
-        backdrop-filter: blur(6px);
+        /* No backdrop-filter: over the color-critical video it would re-sample
+           and shift the image (badly in Firefox). Solid scrim instead. */
+        background: rgba(0, 0, 0, 0.42);
         pointer-events: none;
         transition: top 0.3s var(--ease-out, ease), right 0.3s var(--ease-out, ease),
             background 0.3s ease;
@@ -4481,11 +4482,10 @@
         gap: 10px;
         padding: 8px 8px 8px 14px;
         border-radius: var(--radius-full);
-        background: rgba(20, 28, 34, 0.92);
+        background: rgba(20, 28, 34, 0.97);
         border: 1px solid rgba(255, 255, 255, 0.12);
         box-shadow: 0 8px 28px rgba(0, 0, 0, 0.4);
         color: var(--color-text);
-        backdrop-filter: blur(10px);
     }
     .cam-nudge-text {
         font-size: 0.8125rem;
@@ -4532,7 +4532,6 @@
         justify-content: center;
         padding: var(--space-lg);
         background: rgba(0, 0, 0, 0.55);
-        backdrop-filter: blur(3px);
     }
     .cam-modal {
         width: 100%;
