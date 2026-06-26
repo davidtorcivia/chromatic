@@ -720,15 +720,36 @@ export class WebRTCManager {
         const previous = this.videoJitterBufferSamples.get(id);
         this.videoJitterBufferSamples.set(id, { delay, emittedCount });
 
-        if (
-            previous &&
-            emittedCount > previous.emittedCount &&
-            delay >= previous.delay
-        ) {
-            return ((delay - previous.delay) / (emittedCount - previous.emittedCount)) * 1000;
+        if (!previous) {
+            // First sample for this report id: the cumulative average IS the
+            // current average (fresh receiver), not a smoothed-over-fore value.
+            return (delay / emittedCount) * 1000;
         }
 
-        return (delay / emittedCount) * 1000;
+        const countDelta = emittedCount - previous.emittedCount;
+        if (countDelta <= 0) {
+            // No new packets, or the counter went backwards (receiver recycled
+            // under the same report id). With no new interval to measure, the
+            // cumulative average reflects only what's accumulated so far — for a
+            // recycled receiver the denominator is small, so this is the current
+            // average, not a lifetime smoothing. Report it rather than the stale
+            // previous value.
+            return (delay / emittedCount) * 1000;
+        }
+
+        if (delay >= previous.delay) {
+            // Monotonic cumulative counters: the per-packet delay over the last
+            // interval is the real-time latency signal we want to surface.
+            return ((delay - previous.delay) / countDelta) * 1000;
+        }
+
+        // delay decreased while emittedCount increased: a per-packet delta would
+        // be negative (meaningless for a delay). Previously this fell back to the
+        // cumulative average, which over a long session converges toward the
+        // all-time mean and hides real-time latency spikes. Clamp the interval
+        // contribution to zero instead — "no additional delay this interval" —
+        // so a spike on the next monotonic sample still surfaces cleanly.
+        return 0;
     }
 
     // Request microphone access and prepare for sending. Honors the persisted

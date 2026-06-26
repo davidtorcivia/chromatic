@@ -1088,6 +1088,96 @@ describe('WebRTCManager subscriber signaling', () => {
         expect(refreshedStats.receiverJitterBufferTarget).toBe(20);
         expect(refreshedStats.receiverPlayoutDelayHint).toBe(0.02);
     });
+
+    it('surfaces a real-time jitter-buffer spike instead of smoothing it to the cumulative average', async () => {
+        // Regression: when the cumulative jitterBufferDelay decreased between
+        // polls (a browser reporting quirk, or a receiver recycled under the
+        // same report id), videoJitterBufferDelayForReport used to fall back to
+        // delay/emittedCount — the all-time cumulative average. Over a long
+        // session that converges toward the lifetime mean and hides the spike a
+        // low-latency review client needs to surface. The fix clamps the
+        // negative interval contribution to 0 so the NEXT monotonic sample
+        // reports the real per-packet delay.
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: () => {}
+        });
+
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+        const pc = (manager as unknown as { pc: FakeSubscriberPeerConnection | null }).pc;
+        pc?.statsReport.set('inbound-video-1', {
+            type: 'inbound-rtp',
+            kind: 'video',
+            jitterBufferDelay: 5.0,     // long-running session: large cumulative
+            jitterBufferEmittedCount: 200
+        });
+        // First sample: cumulative average is the current average (fresh) = 25ms.
+        let stats = await manager.getStats();
+        expect(stats.videoJitterBufferDelay).toBeCloseTo(25);
+
+        // Cumulative delay DECREASES while count increases (the quirk). The old
+        // code returned 5.0/210*1000 ≈ 23.8ms (smoothed mean, hiding any spike).
+        // The fix returns 0 (no positive interval contribution), so a later
+        // spike is not averaged away.
+        pc?.statsReport.set('inbound-video-1', {
+            type: 'inbound-rtp',
+            kind: 'video',
+            jitterBufferDelay: 4.8,     // decreased
+            jitterBufferEmittedCount: 210
+        });
+        stats = await manager.getStats();
+        expect(stats.videoJitterBufferDelay).toBe(0);
+
+        // A subsequent genuine spike must surface at full real-time value, not
+        // be dragged back toward the lifetime mean.
+        pc?.statsReport.set('inbound-video-1', {
+            type: 'inbound-rtp',
+            kind: 'video',
+            jitterBufferDelay: 5.5,     // monotonic again
+            jitterBufferEmittedCount: 215
+        });
+        stats = await manager.getStats();
+        // ((5.5 - 4.8) / (215 - 210)) * 1000 = 140ms — the spike shows.
+        expect(stats.videoJitterBufferDelay).toBeCloseTo(140);
+    });
+
+    it('reseeds the jitter-buffer estimate when a receiver resets its counters', async () => {
+        // When a receiver is recycled under the same report id, emittedCount
+        // jumps backwards. The estimate must reseed to the fresh cumulative
+        // average (small denominator = current average), not report a stale or
+        // nonsensical value.
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: () => {}
+        });
+
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+        const pc = (manager as unknown as { pc: FakeSubscriberPeerConnection | null }).pc;
+        pc?.statsReport.set('inbound-video-1', {
+            type: 'inbound-rtp',
+            kind: 'video',
+            jitterBufferDelay: 8.0,
+            jitterBufferEmittedCount: 400
+        });
+        await manager.getStats(); // seed previous = {8.0, 400}
+
+        // Receiver recycled: counters drop to small fresh values.
+        pc?.statsReport.set('inbound-video-1', {
+            type: 'inbound-rtp',
+            kind: 'video',
+            jitterBufferDelay: 0.3,
+            jitterBufferEmittedCount: 10
+        });
+        const stats = await manager.getStats();
+        // Reseeds to the fresh cumulative average: 0.3/10*1000 = 30ms.
+        expect(stats.videoJitterBufferDelay).toBeCloseTo(30);
+    });
 });
 
 describe('WebRTCManager resync signaling', () => {
