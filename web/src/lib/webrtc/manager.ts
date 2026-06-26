@@ -111,6 +111,7 @@ export class WebRTCManager {
     private publisherCandidateOfferId: string | null = null;
     private pendingPublisherCandidates: RTCIceCandidateInit[] = [];
     private publisherNeedsRenegotiation: boolean = false;
+    private closed: boolean = false;
     // Watchdog: rebuilds the publisher if an offer goes unanswered
     private voiceOfferTimer: ReturnType<typeof setTimeout> | null = null;
     private publisherDisconnectedTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -134,6 +135,14 @@ export class WebRTCManager {
 
     constructor(options: WebRTCManagerOptions) {
         this.options = options;
+    }
+
+    private isClosed(): boolean {
+        return this.closed;
+    }
+
+    private stopStream(stream: MediaStream | null): void {
+        stream?.getTracks().forEach(track => track.stop());
     }
 
     private sendSignal(type: string, payload: unknown): boolean {
@@ -714,13 +723,22 @@ export class WebRTCManager {
     // passed.
     async requestMicrophone(deviceId?: string | null): Promise<boolean> {
         try {
+            if (this.isClosed()) return false;
             const preferred = deviceId ?? getStoredMicDeviceId();
             const raw = await navigator.mediaDevices.getUserMedia({
                 audio: micConstraints(preferred),
                 video: false
             });
 
+            if (this.isClosed()) {
+                this.stopStream(raw);
+                return false;
+            }
+
             await this.installMicStream(raw);
+            if (this.isClosed()) {
+                return false;
+            }
 
             debugLog('Microphone access granted');
             return true;
@@ -737,6 +755,13 @@ export class WebRTCManager {
         this.disposeMicChain();
         this.rawMicStream = raw;
         this.micChain = await createMicChain(raw);
+        if (this.isClosed()) {
+            this.disposeMicChain();
+            this.stopStream(raw);
+            this.rawMicStream = null;
+            this.localStream = null;
+            return;
+        }
         this.localStream = this.micChain ? this.micChain.stream : raw;
 
         // Respect current mic mute state so permission can be requested
@@ -758,10 +783,16 @@ export class WebRTCManager {
     // replaceTrack — same kind, same m-line, so NO renegotiation is needed.
     async setMicDevice(deviceId: string): Promise<boolean> {
         try {
+            if (this.isClosed()) return false;
             const newRaw = await navigator.mediaDevices.getUserMedia({
                 audio: micConstraints(deviceId, true),
                 video: false
             });
+
+            if (this.isClosed()) {
+                this.stopStream(newRaw);
+                return false;
+            }
 
             if (newRaw.getAudioTracks().length === 0) {
                 newRaw.getTracks().forEach(t => t.stop());
@@ -770,6 +801,9 @@ export class WebRTCManager {
 
             const oldRaw = this.rawMicStream;
             await this.installMicStream(newRaw);
+            if (this.isClosed()) {
+                return false;
+            }
 
             const newTrack = this.localStream?.getAudioTracks()[0] ?? null;
             if (this.audioSender && newTrack) {
@@ -1188,6 +1222,7 @@ export class WebRTCManager {
 
     async startScreenShare(): Promise<boolean> {
         try {
+            if (this.isClosed()) return false;
             this.shareDebug('capture-requested');
             this.screenShareStream = await navigator.mediaDevices.getDisplayMedia({
                 // Capture at native resolution up to 4K; review content is
@@ -1199,6 +1234,11 @@ export class WebRTCManager {
                 },
                 audio: false
             });
+            if (this.isClosed()) {
+                this.stopStream(this.screenShareStream);
+                this.screenShareStream = null;
+                return false;
+            }
 
             const videoTrack = this.screenShareStream.getVideoTracks()[0];
             if (!videoTrack) {
@@ -1284,6 +1324,7 @@ export class WebRTCManager {
 
     // Clean up
     close(): void {
+        this.closed = true;
         this.clearPublishAnswerWatchdog();
         this.clearPublisherDisconnectWatchdog();
 
@@ -1297,13 +1338,13 @@ export class WebRTCManager {
         }
 
         if (this.localStream) {
-            this.localStream.getTracks().forEach(track => track.stop());
+            this.stopStream(this.localStream);
             this.localStream = null;
         }
         // The processed stream above doesn't hold the device — stop the raw
         // capture too so the browser's mic indicator goes away.
         if (this.rawMicStream) {
-            this.rawMicStream.getTracks().forEach(track => track.stop());
+            this.stopStream(this.rawMicStream);
             this.rawMicStream = null;
         }
         this.disposeMicChain();

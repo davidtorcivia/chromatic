@@ -805,10 +805,12 @@
 
     async function startAutoMicConnection() {
         if (!webrtcManager || micAutoRequestStarted || hasMicPermission) return;
+        const manager = webrtcManager;
         micAutoRequestStarted = true;
         micPromptState = "requesting";
 
-        const granted = await webrtcManager.requestMicrophone();
+        const granted = await manager.requestMicrophone();
+        if (destroyed || webrtcManager !== manager) return;
         if (!granted) {
             micPromptState = "denied";
             micAutoEnablePending = false;
@@ -1249,11 +1251,17 @@
     // Open the OS share picker. Must be called directly from a click handler —
     // getDisplayMedia needs the gesture's transient activation.
     async function startApprovedShare() {
+        const manager = webrtcManager;
+        if (!manager) return;
         shareApprovedPrompt = false;
-        const ok = await webrtcManager?.startScreenShare();
+        const ok = await manager.startScreenShare();
+        if (destroyed || webrtcManager !== manager) {
+            manager.stopScreenShare();
+            return;
+        }
         if (ok) {
             screenShareActive = true;
-            selfShareStream = webrtcManager?.getScreenShareStream() ?? null;
+            selfShareStream = manager.getScreenShareStream() ?? null;
         } else {
             screenShareActive = false;
             selfShareStream = null;
@@ -1549,6 +1557,7 @@
     async function refreshAudioDevices() {
         try {
             const devices = await navigator.mediaDevices.enumerateDevices();
+            if (destroyed) return;
             audioInputs = devices.filter((d) => d.kind === "audioinput" && d.deviceId);
             audioOutputs = devices.filter((d) => d.kind === "audiooutput" && d.deviceId);
         } catch (err) {
@@ -1569,9 +1578,11 @@
 
     async function selectMicDevice(deviceId: string) {
         if (!webrtcManager || micSwitchPending || deviceId === activeMicId) return;
+        const manager = webrtcManager;
         micSwitchPending = true;
         try {
-            const ok = await webrtcManager.setMicDevice(deviceId);
+            const ok = await manager.setMicDevice(deviceId);
+            if (destroyed || webrtcManager !== manager) return;
             if (!ok) {
                 console.warn("Could not switch to the selected microphone");
                 return;
@@ -1579,12 +1590,14 @@
             // setMicDevice acquired the mic, so permission is granted even if
             // the auto-request flow hadn't completed yet.
             hasMicPermission = true;
-            activeMicId = webrtcManager.getCurrentMicDeviceId() ?? deviceId;
+            activeMicId = manager.getCurrentMicDeviceId() ?? deviceId;
             storeMicDeviceId(deviceId);
             // Labels become available after the first successful capture.
             await refreshAudioDevices();
         } finally {
-            micSwitchPending = false;
+            if (!destroyed) {
+                micSwitchPending = false;
+            }
         }
     }
 
@@ -1690,14 +1703,16 @@
 
     async function toggleMic() {
         if (!webrtcManager) return;
+        const manager = webrtcManager;
 
         if (!hasMicPermission) {
-            const granted = await webrtcManager.requestMicrophone();
+            const granted = await manager.requestMicrophone();
+            if (destroyed || webrtcManager !== manager) return;
             if (granted) {
                 hasMicPermission = true;
                 micAutoEnablePending = false;
                 isMicEnabled = true;
-                webrtcManager.setMicEnabled(true);
+                manager.setMicEnabled(true);
                 setSelfAudio(true);
                 micPromptState = "granted";
                 hideMicPromptLater();

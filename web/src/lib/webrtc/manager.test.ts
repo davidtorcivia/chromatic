@@ -161,6 +161,32 @@ function newManager(sendSignal: WebRTCManagerOptions['sendSignal']) {
     });
 }
 
+function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+    });
+    return { promise, resolve, reject };
+}
+
+function fakeMediaStream(kind: 'audio' | 'video') {
+    const track = {
+        kind,
+        enabled: true,
+        readyState: 'live',
+        stop: vi.fn(),
+        getSettings: () => ({ deviceId: `${kind}-device` })
+    } as unknown as MediaStreamTrack;
+    const stream = {
+        getTracks: () => [track],
+        getAudioTracks: () => (kind === 'audio' ? [track] : []),
+        getVideoTracks: () => (kind === 'video' ? [track] : [])
+    } as unknown as MediaStream;
+    return { stream, track };
+}
+
 describe('WebRTCManager publisher signaling', () => {
     afterEach(() => {
         vi.useRealTimers();
@@ -413,6 +439,49 @@ describe('WebRTCManager publisher signaling', () => {
         expect(shareSender.setParametersCalls).toHaveLength(1);
         expect(shareSender.parameters.degradationPreference).toBe('maintain-resolution');
         expect(shareSender.parameters.encodings[0]?.maxBitrate).toBe(8_000_000);
+    });
+});
+
+describe('WebRTCManager media capture lifetime', () => {
+    afterEach(() => {
+        vi.useRealTimers();
+        vi.restoreAllMocks();
+        vi.unstubAllGlobals();
+    });
+
+    it('stops a microphone capture that resolves after the manager is closed', async () => {
+        const capture = deferred<MediaStream>();
+        const { stream, track } = fakeMediaStream('audio');
+        vi.stubGlobal('RTCPeerConnection', FakePublisherPeerConnection);
+        vi.spyOn(navigator.mediaDevices, 'getUserMedia').mockImplementation(() => capture.promise);
+
+        const manager = newManager(() => {});
+        const request = manager.requestMicrophone();
+        manager.close();
+        capture.resolve(stream);
+
+        await expect(request).resolves.toBe(false);
+        expect(track.stop).toHaveBeenCalledTimes(1);
+        expect(manager.getCurrentMicDeviceId()).toBeNull();
+    });
+
+    it('stops a screen-share capture that resolves after the manager is closed', async () => {
+        const capture = deferred<MediaStream>();
+        const { stream, track } = fakeMediaStream('video');
+        vi.stubGlobal('RTCPeerConnection', FakePublisherPeerConnection);
+        Object.defineProperty(navigator.mediaDevices, 'getDisplayMedia', {
+            configurable: true,
+            value: vi.fn(() => capture.promise)
+        });
+
+        const manager = newManager(() => {});
+        const request = manager.startScreenShare();
+        manager.close();
+        capture.resolve(stream);
+
+        await expect(request).resolves.toBe(false);
+        expect(track.stop).toHaveBeenCalledTimes(1);
+        expect(manager.getScreenShareStream()).toBeNull();
     });
 });
 
