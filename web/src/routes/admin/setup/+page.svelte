@@ -1267,8 +1267,9 @@
                                             <li>
                                                 <span>Bitrate</span>
                                                 <strong
-                                                    >8000&ndash;10000 Kbps for
-                                                    1080p</strong
+                                                    >8000&ndash;12000 Kbps for
+                                                    1080p48; 10000&ndash;15000
+                                                    Kbps for 1080p60</strong
                                                 >
                                             </li>
                                             <li>
@@ -1307,11 +1308,22 @@
                                             <li>
                                                 <span>FPS</span>
                                                 <strong
-                                                    >24 or 30, matching your
-                                                    footage</strong
+                                                    >48/47.952 for clean 24p;
+                                                    60/59.94 for lowest
+                                                    latency</strong
                                                 >
                                             </li>
                                         </ul>
+                                        <div class="preset-grid">
+                                            <div class="preset">
+                                                <strong>Color-review cadence</strong>
+                                                <span>1080p48 or 47.952, superfast, 8-12 Mbps. Each 24p frame repeats evenly.</span>
+                                            </div>
+                                            <div class="preset">
+                                                <strong>Lowest latency</strong>
+                                                <span>1080p60 or 59.94, superfast/ultrafast, 10-15 Mbps. Faster browser playout, possible 24p judder.</span>
+                                            </div>
+                                        </div>
                                     </li>
                                     <li>
                                         <span class="obs-step-title">
@@ -2025,6 +2037,32 @@
     .obs-settings li strong {
         font-weight: 500;
         text-align: right;
+    }
+
+    .preset-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: var(--space-sm);
+        margin-top: var(--space-md);
+    }
+
+    .preset {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        padding: var(--space-sm);
+        border: 1px solid var(--color-border-subtle);
+        border-radius: var(--radius-md);
+        background: var(--color-surface-elevated);
+    }
+
+    .preset strong {
+        font-size: 0.8125rem;
+    }
+
+    .preset span {
+        font-size: 0.75rem;
+        color: var(--color-text-muted);
     }
 
     .slug-preview {

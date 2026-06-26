@@ -410,6 +410,36 @@
                         Viewers can now join and watch the stream.
                     </p>
                 </div>
+                <div class="card health-card">
+                    <div class="card-header">
+                        <h3>Room Health</h3>
+                        <a href="/room/{slug}?host=1" target="_blank" class="btn btn-secondary btn-sm">
+                            Open Host Diagnostics
+                        </a>
+                    </div>
+                    <div class="health-grid">
+                        <div>
+                            <span>Target latency</span>
+                            <strong>&lt; 250 ms glass-to-glass</strong>
+                        </div>
+                        <div>
+                            <span>Browser buffer</span>
+                            <strong>&lt; 100 ms preferred</strong>
+                        </div>
+                        <div>
+                            <span>Network RTT</span>
+                            <strong>&lt; 50 ms</strong>
+                        </div>
+                        <div>
+                            <span>Review tools</span>
+                            <strong>Use Performance mode if load appears</strong>
+                        </div>
+                    </div>
+                    <p class="health-note">
+                        Host diagnostics show live video buffer, post-receive delay, long frames,
+                        reconnects, media rebuilds, and review-tool pressure during the session.
+                    </p>
+                </div>
             {/if}
 
             <!-- Scheduled session: open ahead of the countdown -->
@@ -526,14 +556,16 @@
                                     <strong>Settings &rarr; Output</strong> (Output Mode: Advanced, Streaming tab):
                                     Encoder <strong>x264</strong> or hardware H.264 (NVENC/AMF/QSV),
                                     Rate Control <strong>CBR</strong>,
-                                    Bitrate <strong>8000&ndash;10000 Kbps</strong>,
+                                    Bitrate <strong>8000&ndash;12000 Kbps for 48 fps</strong> or <strong>10000&ndash;15000 Kbps for 60 fps</strong>,
                                     Keyframe Interval <strong>1 s</strong> (2 s max &mdash; viewers join on the next keyframe),
                                     Profile <strong>baseline</strong> (required &mdash; Main/High are rejected),
                                     Tune <strong>zerolatency</strong>, B-frames <strong>0</strong>.
                                 </li>
                                 <li>
                                     <strong>Settings &rarr; Video:</strong>
-                                    Output 1920x1080 at 24 or 30 fps to match your footage.
+                                    Use <strong>48/47.952 fps</strong> for clean 24p cadence, or
+                                    <strong>60/59.94 fps</strong> for lowest latency. 60 fps can add
+                                    uneven cadence to true 24p footage.
                                 </li>
                                 <li>
                                     <strong>Settings &rarr; Advanced &rarr; Video:</strong>
@@ -924,6 +956,43 @@
         color: var(--color-text-muted);
         font-size: var(--text-body);
         margin: 0;
+    }
+
+    .health-card {
+        border: 1px solid rgba(72, 182, 166, 0.35);
+    }
+
+    .health-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: var(--space-sm);
+    }
+
+    .health-grid div {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        padding: var(--space-sm);
+        border-radius: var(--radius-md);
+        background: var(--color-surface-elevated);
+    }
+
+    .health-grid span {
+        font-size: 0.72rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--color-text-subtle);
+    }
+
+    .health-grid strong {
+        font-size: 0.875rem;
+        font-weight: 600;
+    }
+
+    .health-note {
+        margin: var(--space-md) 0 0;
+        color: var(--color-text-muted);
+        font-size: var(--text-meta);
     }
 
     .scheduled-card {

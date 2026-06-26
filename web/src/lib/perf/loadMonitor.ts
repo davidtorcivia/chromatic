@@ -22,14 +22,27 @@ const LONG_FRAME_MS = 40; // ~2.5 dropped frames at 60Hz
 const IDLE_GAP_MS = 800; // rAF was simply paused; not load
 const LATCH_MS = 250;
 
+export type ReviewQualityMode = "performance" | "balanced" | "fidelity";
+type ToolTier = "loupe" | "scopes";
+type ReviewTool = "laser" | ToolTier;
+
 let busyUntil = 0;
 let lastNow = 0;
 let raf = 0;
-const activeReviewTools = new Map<"laser" | "loupe" | "scopes", number>();
+let longFrameCount = 0;
+let lastLongFrameMs = 0;
+let worstLongFrameMs = 0;
+let qualityMode: ReviewQualityMode = "balanced";
+const activeReviewTools = new Map<ReviewTool, number>();
 
 function loop(now: number) {
 	const gap = lastNow ? now - lastNow : 0;
-	if (gap > LONG_FRAME_MS && gap < IDLE_GAP_MS) busyUntil = now + LATCH_MS;
+	if (gap > LONG_FRAME_MS && gap < IDLE_GAP_MS) {
+		busyUntil = now + LATCH_MS;
+		longFrameCount++;
+		lastLongFrameMs = gap;
+		worstLongFrameMs = Math.max(worstLongFrameMs, gap);
+	}
 	lastNow = now;
 	raf = requestAnimationFrame(loop);
 }
@@ -50,7 +63,15 @@ export function underPressure(): boolean {
 	return performance.now() < busyUntil;
 }
 
-export function setReviewToolActive(tool: "laser" | "loupe" | "scopes", active: boolean): void {
+export function setReviewQualityMode(mode: ReviewQualityMode): void {
+	qualityMode = mode;
+}
+
+export function getReviewQualityMode(): ReviewQualityMode {
+	return qualityMode;
+}
+
+export function setReviewToolActive(tool: ReviewTool, active: boolean): void {
 	const count = activeReviewTools.get(tool) ?? 0;
 	if (active) {
 		activeReviewTools.set(tool, count + 1);
@@ -65,22 +86,42 @@ export function activeReviewToolCount(): number {
 	return activeReviewTools.size;
 }
 
+export function loadSnapshot() {
+	return {
+		underPressure: underPressure(),
+		activeReviewToolCount: activeReviewToolCount(),
+		qualityMode,
+		longFrameCount,
+		lastLongFrameMs: lastLongFrameMs || null,
+		worstLongFrameMs: worstLongFrameMs || null,
+	};
+}
+
 /* The executable ladder: per-tier backoff multipliers applied to a
  * consumer's base interval while under pressure. Defining them here keeps
  * the documented ordering and the shipped behavior the same artifact. */
-const TIER_BACKOFF: Record<"loupe" | "scopes", number> = {
+const TIER_BACKOFF: Record<ToolTier, number> = {
 	loupe: 2,
 	scopes: 2.4,
 };
 
-const COLOAD_BACKOFF: Record<"loupe" | "scopes", number> = {
+const COLOAD_BACKOFF: Record<ToolTier, number> = {
 	loupe: 1.4,
 	scopes: 1.8,
 };
 
+const MODE_BACKOFF: Record<ReviewQualityMode, Record<ToolTier, number>> = {
+	performance: { loupe: 1.6, scopes: 2.2 },
+	balanced: { loupe: 1, scopes: 1 },
+	fidelity: { loupe: 0.85, scopes: 0.85 },
+};
+
 /** A consumer's effective frame interval given the current load. */
-export function degradedInterval(tier: keyof typeof TIER_BACKOFF, baseMs: number): number {
-	let multiplier = underPressure() ? TIER_BACKOFF[tier] : 1;
+export function degradedInterval(tier: ToolTier, baseMs: number): number {
+	let multiplier = MODE_BACKOFF[qualityMode][tier];
+	if (underPressure()) {
+		multiplier *= TIER_BACKOFF[tier];
+	}
 	if (activeReviewToolCount() >= 2) {
 		multiplier *= COLOAD_BACKOFF[tier];
 	}

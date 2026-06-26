@@ -20,7 +20,13 @@
     import WatermarkOverlay from "$lib/components/WatermarkOverlay.svelte";
     import { liquidLens } from "$lib/glass/lens";
     import { videoGlassGroup } from "$lib/glass/videoGlass";
-    import { startLoadMonitor, stopLoadMonitor } from "$lib/perf/loadMonitor";
+    import {
+        loadSnapshot,
+        setReviewQualityMode,
+        startLoadMonitor,
+        stopLoadMonitor,
+        type ReviewQualityMode,
+    } from "$lib/perf/loadMonitor";
     import { releaseFrames } from "$lib/glass/frameSource";
     import { tooltip } from "$lib/ui/tooltip";
 
@@ -79,6 +85,12 @@
     let currentVideoBufferDelay = $state<number | null>(null);
     let currentReceiverJitterTarget = $state<number | null>(null);
     let currentReceiverPlayoutHint = $state<number | null>(null);
+    let loadUnderPressure = $state(false);
+    let activeReviewToolCount = $state(0);
+    let longFrameCount = $state(0);
+    let worstLongFrameMs = $state<number | null>(null);
+    let reconnectEvents = $state(0);
+    let resubscribeEvents = $state(0);
     let statsInterval: ReturnType<typeof setInterval> | null = null;
     // Cloudflare TURN credentials default to a 1 h TTL; long color-grading
     // sessions (4–8 h) outlive that. Refresh every 30 min over the existing
@@ -92,6 +104,7 @@
     let showScopes = $state(false);
     let showShortcuts = $state(false);
     let showStats = $state(false);
+    let reviewQualityMode = $state<ReviewQualityMode>("balanced");
     let displayFps = $state<number | null>(null);
     let frameCaptureToDisplayDelay = $state<number | null>(null);
     let frameReceiveToDisplayDelay = $state<number | null>(null);
@@ -237,9 +250,18 @@
                 reduceTransparency = true;
                 document.documentElement.classList.add("reduce-transparency");
             }
+            const savedReviewMode = localStorage.getItem("chromatic_review_quality_mode");
+            if (
+                savedReviewMode === "performance" ||
+                savedReviewMode === "balanced" ||
+                savedReviewMode === "fidelity"
+            ) {
+                reviewQualityMode = savedReviewMode;
+            }
         } catch {
             // Storage unavailable; default applies.
         }
+        setReviewQualityMode(reviewQualityMode);
         // Get session data
         const stored = sessionStorage.getItem(`chromatic_session_${slug}`);
         if (!stored) {
@@ -588,6 +610,7 @@
         session.onReconnect(() => {
             // The session was terminated (ended/kicked) — don't resurrect it.
             if (endState) return;
+            reconnectEvents++;
             console.log("WebSocket reconnected, resetting WebRTC state");
             cleanupWebRTC();
             if (audioDuckingManager) {
@@ -926,6 +949,7 @@
             return false;
         }
         resubscribeAttempts++;
+        resubscribeEvents++;
         console.warn(`Requesting fresh subscription (${reason}, attempt ${resubscribeAttempts}/${RESUBSCRIBE_MAX_ATTEMPTS})`);
         clearSubscriptionRetryTimer();
         // Reset the keyframe-nudge cycle: without this the stale attempt
@@ -1031,6 +1055,11 @@
                     stats.receiverPlayoutDelayHint === undefined
                         ? null
                         : stats.receiverPlayoutDelayHint * 1000;
+                const load = loadSnapshot();
+                loadUnderPressure = load.underPressure;
+                activeReviewToolCount = load.activeReviewToolCount;
+                longFrameCount = load.longFrameCount;
+                worstLongFrameMs = load.worstLongFrameMs;
             } finally {
                 inFlight = false;
             }
@@ -1354,6 +1383,10 @@
         clearSubscriptionRetryTimer();
         currentRtt = null;
         currentVideoBufferDelay = null;
+        currentReceiverJitterTarget = null;
+        currentReceiverPlayoutHint = null;
+        loadUnderPressure = false;
+        activeReviewToolCount = 0;
         micAutoEnablePending = false;
         clearMicPromptTimer();
         micPromptState = "hidden";
@@ -1735,6 +1768,16 @@
             localStorage.setItem("chromatic_reduce_transparency", reduceTransparency ? "on" : "off");
         } catch {
             // In-session preference still applies.
+        }
+    }
+
+    function setReviewMode(mode: ReviewQualityMode) {
+        reviewQualityMode = mode;
+        setReviewQualityMode(mode);
+        try {
+            localStorage.setItem("chromatic_review_quality_mode", mode);
+        } catch {
+            // In-session mode still applies.
         }
     }
 
@@ -2203,7 +2246,7 @@
                         <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22"><path d="M11 7h2v6h-2zM11 15h2v2h-2z"/><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>
                     </div>
                     <h2 class="stream-card-title">Connection lost</h2>
-                    <p class="stream-card-body">We couldn't reach the session. Refresh the page to reconnect.</p>
+                    <p class="stream-card-body">We couldn't reach the session after automatic recovery attempts.</p>
                     <button class="btn btn-primary" onclick={() => window.location.reload()}>
                         Refresh page
                     </button>
@@ -2214,8 +2257,8 @@
                 <div class="stream-card">
                     <div class="connect-dots" aria-hidden="true"><span></span><span></span><span></span></div>
                     <h2 class="stream-card-title">Reconnecting</h2>
-                    <p class="stream-card-body">Restoring your connection to the session…</p>
-                    <p class="stream-card-meta">Attempt {session.state.reconnectAttempt}</p>
+                    <p class="stream-card-body">Restoring signaling and rebuilding the media path…</p>
+                    <p class="stream-card-meta">WebSocket attempt {session.state.reconnectAttempt} · media rebuilds {resubscribeEvents}</p>
                 </div>
             </div>
         {:else if overlayState === 'paused'}
@@ -2759,6 +2802,30 @@
                                 <span>Connection</span>
                                 <span class="stats-quality {connectionQuality ?? ''}">{connectionQuality ?? "n/a"}</span>
                             </div>
+                            <div class="stats-row">
+                                <span>Load</span>
+                                <span>{loadUnderPressure ? "pressure" : "normal"} · {activeReviewToolCount} tools</span>
+                            </div>
+                            <div class="stats-row">
+                                <span>Long frames</span>
+                                <span>{longFrameCount}{worstLongFrameMs !== null ? ` · worst ${Math.round(worstLongFrameMs)} ms` : ""}</span>
+                            </div>
+                            <div class="stats-row">
+                                <span>Recovery</span>
+                                <span>{reconnectEvents} ws · {resubscribeEvents} media</span>
+                            </div>
+                            <label class="stats-mode">
+                                <span>Review mode</span>
+                                <select
+                                    aria-label="Review tool performance mode"
+                                    value={reviewQualityMode}
+                                    onchange={(e) => setReviewMode((e.currentTarget as HTMLSelectElement).value as ReviewQualityMode)}
+                                >
+                                    <option value="performance">Performance</option>
+                                    <option value="balanced">Balanced</option>
+                                    <option value="fidelity">Max fidelity</option>
+                                </select>
+                            </label>
                             <button
                                 class="stats-reload"
                                 onclick={() => {
@@ -4460,7 +4527,7 @@
         position: absolute;
         bottom: calc(100% + 8px);
         right: 0;
-        width: 230px;
+        width: 270px;
         display: flex;
         flex-direction: column;
         gap: 7px;
@@ -4479,6 +4546,24 @@
     .stats-row span:last-child {
         color: var(--color-text);
         font-variant-numeric: tabular-nums;
+    }
+    .stats-mode {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        font-size: 0.75rem;
+        color: var(--color-text-muted);
+    }
+    .stats-mode select {
+        max-width: 132px;
+        min-width: 0;
+        padding: 4px 8px;
+        border-radius: var(--radius-full);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(255, 255, 255, 0.08);
+        color: var(--color-text);
+        font-size: 0.75rem;
     }
     .stats-quality { text-transform: capitalize; }
     .stats-quality.good { color: var(--color-success) !important; }

@@ -34,14 +34,17 @@ let latest: ImageBitmap | null = null;
 let lastVideo: HTMLVideoElement | null = null;
 let pending = false;
 let lastDrawAt = 0;
+let generation = 0;
 
 /** Drop the cached frame (leaving a room / stream teardown): without
  *  this the last frame of the previous source could briefly drive the
  *  glass and scopes of the next one, and the bitmap leaks tab-wide. */
 export function releaseFrames(): void {
+	generation++;
 	latest?.close();
 	latest = null;
 	lastVideo = null;
+	pending = false;
 }
 
 function targetHeight(video: HTMLVideoElement): number {
@@ -54,7 +57,7 @@ function captureInterval(): number {
 	return MIN_INTERVAL_MS;
 }
 
-function captureViaCanvas(video: HTMLVideoElement, h: number): void {
+function captureViaCanvas(video: HTMLVideoElement, h: number, captureGeneration: number): void {
 	if (typeof OffscreenCanvas === "undefined") {
 		mode = "unsupported";
 		pending = false;
@@ -73,6 +76,10 @@ function captureViaCanvas(video: HTMLVideoElement, h: number): void {
 	ctx.drawImage(video, 0, 0, TARGET_WIDTH, h);
 	createImageBitmap(canvas)
 		.then((bmp) => {
+			if (captureGeneration !== generation) {
+				bmp.close();
+				return;
+			}
 			latest?.close();
 			latest = bmp;
 		})
@@ -80,7 +87,7 @@ function captureViaCanvas(video: HTMLVideoElement, h: number): void {
 			// Keep the previous frame; try again next tick.
 		})
 		.finally(() => {
-			pending = false;
+			if (captureGeneration === generation) pending = false;
 		});
 }
 
@@ -102,8 +109,9 @@ export function getFrameBitmap(video: HTMLVideoElement): ImageBitmap | null {
 		lastDrawAt = now;
 		pending = true;
 		const h = targetHeight(video);
+		const captureGeneration = generation;
 		if (mode === "canvas") {
-			captureViaCanvas(video, h);
+			captureViaCanvas(video, h, captureGeneration);
 		} else {
 			createImageBitmap(video, {
 				resizeWidth: TARGET_WIDTH,
@@ -111,6 +119,10 @@ export function getFrameBitmap(video: HTMLVideoElement): ImageBitmap | null {
 				resizeQuality: "low",
 			})
 				.then((bmp) => {
+					if (captureGeneration !== generation) {
+						bmp.close();
+						return;
+					}
 					mode = "direct";
 					latest?.close();
 					latest = bmp;
@@ -118,7 +130,7 @@ export function getFrameBitmap(video: HTMLVideoElement): ImageBitmap | null {
 				})
 				.catch(() => {
 					// Engine rejects the direct video path; fall back once.
-					captureViaCanvas(video, h);
+					if (captureGeneration === generation) captureViaCanvas(video, h, captureGeneration);
 				});
 		}
 	}

@@ -1,11 +1,19 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { activeReviewToolCount, degradedInterval, setReviewToolActive } from './loadMonitor';
+import {
+	activeReviewToolCount,
+	degradedInterval,
+	getReviewQualityMode,
+	loadSnapshot,
+	setReviewQualityMode,
+	setReviewToolActive,
+} from './loadMonitor';
 
 function clearTools() {
 	for (const tool of ['laser', 'loupe', 'scopes'] as const) {
 		for (let i = 0; i < 5; i++) setReviewToolActive(tool, false);
 	}
+	setReviewQualityMode('balanced');
 }
 
 describe('loadMonitor review tool pressure', () => {
@@ -40,5 +48,30 @@ describe('loadMonitor review tool pressure', () => {
 
 		expect(degradedInterval('loupe', 32)).toBeCloseTo(62.72);
 		expect(degradedInterval('scopes', 42)).toBeCloseTo(136.08);
+	});
+
+	it('applies review quality mode multipliers', () => {
+		clearTools();
+
+		setReviewQualityMode('performance');
+		expect(getReviewQualityMode()).toBe('performance');
+		expect(degradedInterval('loupe', 32)).toBeCloseTo(51.2);
+		expect(degradedInterval('scopes', 42)).toBeCloseTo(92.4);
+
+		setReviewQualityMode('fidelity');
+		expect(degradedInterval('loupe', 32)).toBeCloseTo(27.2);
+		expect(degradedInterval('scopes', 42)).toBeCloseTo(35.7);
+	});
+
+	it('exposes a load snapshot for diagnostics', () => {
+		clearTools();
+		setReviewQualityMode('performance');
+		setReviewToolActive('laser', true);
+
+		expect(loadSnapshot()).toMatchObject({
+			activeReviewToolCount: 1,
+			qualityMode: 'performance',
+			underPressure: false,
+		});
 	});
 });
