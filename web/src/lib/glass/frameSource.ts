@@ -15,12 +15,15 @@
  */
 
 import { IS_GECKO } from "$lib/platform";
+import { activeReviewToolCount, underPressure } from "$lib/perf/loadMonitor";
 
 const TARGET_WIDTH = 1024;
 // ~30fps; frost and scopes don't need 60. Gecko pays more per handoff
 // (bitmap creation + texture upload), so it gets 20fps — invisible
 // through frost, meaningful on its main thread.
 const MIN_INTERVAL_MS = IS_GECKO ? 50 : 33;
+const PRESSURE_INTERVAL_MS = IS_GECKO ? 100 : 66;
+const STACKED_TOOLS_INTERVAL_MS = IS_GECKO ? 120 : 80;
 
 type Mode = "direct" | "canvas" | "unsupported";
 let mode: Mode | null = null;
@@ -43,6 +46,12 @@ export function releaseFrames(): void {
 
 function targetHeight(video: HTMLVideoElement): number {
 	return Math.max(1, Math.round((TARGET_WIDTH * video.videoHeight) / video.videoWidth));
+}
+
+function captureInterval(): number {
+	if (activeReviewToolCount() >= 3) return STACKED_TOOLS_INTERVAL_MS;
+	if (underPressure() || activeReviewToolCount() >= 2) return PRESSURE_INTERVAL_MS;
+	return MIN_INTERVAL_MS;
 }
 
 function captureViaCanvas(video: HTMLVideoElement, h: number): void {
@@ -89,7 +98,7 @@ export function getFrameBitmap(video: HTMLVideoElement): ImageBitmap | null {
 	if (!vw || !video.videoHeight) return latest;
 
 	const now = performance.now();
-	if (!pending && now - lastDrawAt >= MIN_INTERVAL_MS) {
+	if (!pending && now - lastDrawAt >= captureInterval()) {
 		lastDrawAt = now;
 		pending = true;
 		const h = targetHeight(video);
