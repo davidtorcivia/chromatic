@@ -1,6 +1,7 @@
 <script lang="ts">
     import { onMount, onDestroy } from "svelte";
     import { fade } from "svelte/transition";
+    import { goto } from "$app/navigation";
     import { page } from "$app/stores";
     import { rooms, streamKeys, appConfig, roomFiles, type Room, type StreamKey, type AppConfig, type RoomFile } from "$lib/api/client";
     import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
@@ -54,6 +55,8 @@
     let isDraggingWatermark = $state(false);
     let dragOffsetX = 0;
     let dragOffsetY = 0;
+    let destroyed = false;
+    let successTimer: ReturnType<typeof setTimeout> | null = null;
 
     function previewPoint(e: PointerEvent) {
         const rect = previewEl!.getBoundingClientRect();
@@ -113,7 +116,7 @@
     }
 
     // Polling interval for waiting room
-    let pollInterval: ReturnType<typeof setInterval>;
+    let pollInterval: ReturnType<typeof setInterval> | null = null;
 
     onMount(async () => {
         try {
@@ -123,6 +126,7 @@
                 appConfig.get().catch(() => null)
             ]);
 
+            if (destroyed) return;
             room = roomData;
             keys = keysData;
             config = configData;
@@ -144,37 +148,81 @@
 
             // Start polling waiting room if enabled
             if (room.waitingRoomEnabled && room.status !== "ended") {
-                await loadWaitingRoom();
-                pollInterval = setInterval(loadWaitingRoom, 5000);
+                startWaitingRoomPolling();
             }
 
             void loadFiles();
         } catch (e) {
+            if (destroyed) return;
             error = "Failed to load room";
             console.error(e);
         } finally {
-            isLoading = false;
+            if (!destroyed) isLoading = false;
         }
     });
 
     onDestroy(() => {
-        if (pollInterval) {
-            clearInterval(pollInterval);
-        }
+        destroyed = true;
+        stopWaitingRoomPolling();
+        clearSuccessTimer();
     });
+
+    function clearSuccessTimer() {
+        if (!successTimer) return;
+        clearTimeout(successTimer);
+        successTimer = null;
+    }
+
+    function showSuccess(message: string) {
+        clearSuccessTimer();
+        successMessage = message;
+        successTimer = setTimeout(() => {
+            successMessage = "";
+            successTimer = null;
+        }, 4000);
+    }
+
+    function stopWaitingRoomPolling() {
+        if (!pollInterval) return;
+        clearInterval(pollInterval);
+        pollInterval = null;
+    }
+
+    function startWaitingRoomPolling() {
+        if (pollInterval || destroyed) return;
+        void loadWaitingRoom();
+        pollInterval = setInterval(() => {
+            void loadWaitingRoom();
+        }, 5000);
+    }
+
+    function reconcileWaitingRoomPolling() {
+        if (room?.waitingRoomEnabled && room.status !== "ended") {
+            startWaitingRoomPolling();
+        } else {
+            stopWaitingRoomPolling();
+            waitingParticipants = [];
+        }
+    }
 
     async function loadWaitingRoom() {
         try {
-            waitingParticipants = (await rooms.listWaiting(slug)) ?? [];
+            const participants = (await rooms.listWaiting(slug)) ?? [];
+            if (destroyed) return;
+            waitingParticipants = participants;
         } catch (e) {
+            if (destroyed) return;
             console.error("Failed to load waiting room", e);
         }
     }
 
     async function loadFiles() {
         try {
-            files = (await roomFiles.list(slug))?.files ?? [];
+            const result = (await roomFiles.list(slug))?.files ?? [];
+            if (destroyed) return;
+            files = result;
         } catch (e) {
+            if (destroyed) return;
             console.error("Failed to load room files", e);
         }
     }
@@ -219,23 +267,27 @@
         error = "";
         try {
             const result = await rooms.open(slug);
+            if (destroyed) return;
             if (room) {
                 room.openedAt = result.openedAt;
             }
             waitingParticipants = [];
-            successMessage = "Room opened. Waiting guests have been let in.";
+            showSuccess("Room opened. Waiting guests have been let in.");
         } catch (e: any) {
+            if (destroyed) return;
             error = e.message || "Failed to open the room";
         } finally {
-            isOpeningRoom = false;
+            if (!destroyed) isOpeningRoom = false;
         }
     }
 
     async function handleDeny(participantId: string) {
         try {
             await rooms.deny(slug, participantId);
+            if (destroyed) return;
             waitingParticipants = waitingParticipants.filter(p => p.id !== participantId);
         } catch (e) {
+            if (destroyed) return;
             console.error("Failed to deny participant", e);
         }
     }
@@ -289,21 +341,27 @@
                     ? maxParticipants
                     : null;
 
-            room = await rooms.update(slug, updateData);
-            successMessage = "Room updated successfully";
+            const updatedRoom = await rooms.update(slug, updateData);
+            if (destroyed) return;
+            room = updatedRoom;
+            reconcileWaitingRoomPolling();
+            showSuccess("Room updated successfully");
             password = ""; // Clear password field after save
         } catch (e: any) {
+            if (destroyed) return;
             error = e.message || "Failed to update room";
         } finally {
-            isSaving = false;
+            if (!destroyed) isSaving = false;
         }
     }
 
     async function handleAdmit(participantId: string) {
         try {
             await rooms.admit(slug, participantId);
+            if (destroyed) return;
             waitingParticipants = waitingParticipants.filter(p => p.id !== participantId);
         } catch (e) {
+            if (destroyed) return;
             console.error("Failed to admit participant", e);
         }
     }
@@ -311,8 +369,10 @@
     async function handleAdmitAll() {
         try {
             await rooms.admitAll(slug);
+            if (destroyed) return;
             waitingParticipants = [];
         } catch (e) {
+            if (destroyed) return;
             console.error("Failed to admit all", e);
         }
     }
@@ -321,10 +381,13 @@
         confirmEndOpen = false;
         try {
             await rooms.end(slug);
+            if (destroyed) return;
             if (room) {
                 room.status = "ended";
             }
+            reconcileWaitingRoomPolling();
         } catch (e) {
+            if (destroyed) return;
             console.error("Failed to end session", e);
         }
     }
@@ -333,8 +396,9 @@
         confirmDeleteOpen = false;
         try {
             await rooms.delete(slug, deleteRoomFiles);
-            window.location.href = "/admin/rooms";
+            if (!destroyed) void goto("/admin/rooms");
         } catch (e: any) {
+            if (destroyed) return;
             error = e.message || "Failed to delete room";
         }
     }
