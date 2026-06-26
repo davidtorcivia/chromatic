@@ -141,6 +141,12 @@ export default function (data) {
         let roomStateReceived = false;
         let messagesSent = 0;
         let messagesReceived = 0;
+        // Track only THIS VU's own echoed messages for the delivery-rate
+        // metric. Counting every chat:message (which carries every other VU's
+        // broadcasts too) against this VU's messagesSent made
+        // messageDeliveryRate trivially >1 in a multi-VU run and measured
+        // nothing useful.
+        let ownMessagesReceived = 0;
 
         socket.on('open', function () {
           check(null, {
@@ -165,6 +171,12 @@ export default function (data) {
               const latency = Date.now() - parseInt(data.payload?.timestamp || '0');
               if (latency > 0 && latency < 10000) {
                 wsMessageLatency.add(latency);
+              }
+              // Only count our own broadcasts (the server echoes our
+              // participantId back) so the delivery rate reflects whether OUR
+              // messages round-trip, not total room chatter.
+              if (data.payload?.participantId === participantId) {
+                ownMessagesReceived++;
               }
             }
           } catch (e) {
@@ -211,8 +223,12 @@ export default function (data) {
 
         // Keep connection open for test duration
         socket.setTimeout(function () {
-          const deliveryRate = messagesSent > 0 ? messagesReceived / messagesSent : 0;
-          messageDeliveryRate.add(deliveryRate > 0.5);
+          // Delivery rate is the fraction of THIS VU's sent messages that
+          // came back to it — a real round-trip delivery signal. The previous
+          // logic divided room-wide received by per-VU sent, which was >1 and
+          // meaningless under load.
+          const deliveryRate = messagesSent > 0 ? ownMessagesReceived / messagesSent : 0;
+          messageDeliveryRate.add(deliveryRate >= 0.5);
 
           socket.close();
         }, 30000); // 30 seconds per session
