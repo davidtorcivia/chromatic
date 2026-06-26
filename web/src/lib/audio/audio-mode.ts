@@ -96,3 +96,25 @@ export function saveAudioModeState(state: AudioModeState): void {
         // Storage unavailable (private mode) — the in-session choice still applies.
     }
 }
+
+// "Join with camera on" preference, set in the waiting-room green room. When
+// true, the session auto-enables the presence cam on join (otherwise cameras
+// stay off until the user opts in via the mic→camera nudge). Persisted so the
+// choice carries across joins.
+const JOIN_CAM_KEY = 'chromatic_join_cam';
+
+export function getJoinWithCamera(): boolean {
+    try {
+        return localStorage.getItem(JOIN_CAM_KEY) === '1';
+    } catch {
+        return false;
+    }
+}
+
+export function setJoinWithCamera(on: boolean): void {
+    try {
+        localStorage.setItem(JOIN_CAM_KEY, on ? '1' : '0');
+    } catch {
+        // Storage unavailable — the in-session default (off) applies.
+    }
+}

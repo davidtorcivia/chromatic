@@ -7,6 +7,7 @@
     import { rooms, type LobbyInfo } from "$lib/api/client";
     import { countdownParts, formatScheduleLabel, serverClockOffset } from "$lib/lobby";
     import StateCard from "$lib/components/StateCard.svelte";
+    import DeviceSetup from "$lib/components/DeviceSetup.svelte";
     import { parseStoredSession, type StoredSessionData } from "$lib/session/storedSession";
     import { getStorageItem, removeStorageItem } from "$lib/storage/safeStorage";
 
@@ -410,6 +411,7 @@
                     <p class="lobby-hint">You'll be taken in automatically.</p>
                 {/if}
 
+                <DeviceSetup />
                 <button class="btn btn-secondary waiting-leave" onclick={handleLeave}>
                     Leave
                 </button>
@@ -435,6 +437,7 @@
                         </p>
                     {/key}
                 </div>
+                <DeviceSetup />
                 <button class="btn btn-secondary waiting-leave" onclick={handleLeave}>
                     Leave waiting room
                 </button>

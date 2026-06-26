@@ -14,7 +14,7 @@
         storeMicDeviceId,
         storeCameraDeviceId,
     } from "$lib/webrtc/manager";
-    import { loadAudioModeState, type AudioMode, type DenoiserEngine } from "$lib/audio/audio-mode";
+    import { loadAudioModeState, getJoinWithCamera, type AudioMode, type DenoiserEngine } from "$lib/audio/audio-mode";
     import { deriveStreamOverlayState } from "$lib/video/stream-overlay";
     import { AudioDuckingManager } from "$lib/audio/ducking";
     import { playShareRequestChime, playWaitingRoomChime, playJoinChime, playLeaveChime, playChatReceiveChime, getUiSoundsEnabled, setUiSoundsEnabled } from "$lib/audio/chimes";
@@ -886,6 +886,19 @@
         debugLog('WebRTC manager initialized');
         setSelfAudio(false);
         void startAutoMicConnection();
+        void maybeAutoStartCamera();
+    }
+
+    // Honor the waiting-room "join with camera on" choice: turn the presence cam
+    // on once after join (permission was already granted in the green room, so
+    // no prompt). Runs at most once; respects an admin camera gate.
+    let camAutoStartTried = false;
+    async function maybeAutoStartCamera() {
+        if (camAutoStartTried) return;
+        camAutoStartTried = true;
+        if (!getJoinWithCamera() || !webrtcManager || isCameraOn || myCamDisabled) return;
+        camNudgeDismissed = true; // they already opted in; no nudge needed
+        await toggleCamera();
     }
 
     // Broadcasts the local mic state AND mirrors it into our own participant
