@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -385,6 +386,15 @@ func (h *FileHandler) ListRoomFiles(w http.ResponseWriter, r *http.Request) {
 // Admin-only (registered under the auth-protected mux).
 func (h *FileHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// Reject anything that isn't a real file id. The id is interpolated into a
+	// LIKE pattern below to remove the file's chat message; a value containing
+	// LIKE metacharacters (%) would over-match and delete unrelated file
+	// messages in the room. Validating the format up front (and escaping the
+	// LIKE pattern defensively) makes that impossible.
+	if !validFileID(id) {
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
 
 	var storedPath, roomID string
 	var thumbnailPath *string
@@ -416,9 +426,11 @@ func (h *FileHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// File chat messages store the file reference as JSON in content; remove
-	// them so reloaded transcripts don't render broken attachments.
-	h.db.Exec(`DELETE FROM messages WHERE room_id = ? AND type = 'file' AND content LIKE ?`,
-		roomID, `%"`+id+`"%`)
+	// them so reloaded transcripts don't render broken attachments. Escape LIKE
+	// metacharacters in the id (defence in depth on top of validFileID) so the
+	// pattern can only ever match this exact file's reference.
+	h.db.Exec(`DELETE FROM messages WHERE room_id = ? AND type = 'file' AND content LIKE ? ESCAPE '\'`,
+		roomID, `%"`+escapeLikeForID(id)+`"%`)
 
 	logger.Info("File deleted by admin", "file_id", id, "room_id", roomID)
 	w.WriteHeader(http.StatusNoContent)
@@ -479,6 +491,32 @@ func generateFileID() string {
 	bytes := make([]byte, 16)
 	rand.Read(bytes)
 	return hex.EncodeToString(bytes)
+}
+
+// fileIDRe matches the format generateFileID produces: 32 lowercase hex chars.
+// Used to validate admin-supplied file ids before they reach a LIKE pattern so
+// a path value containing LIKE metacharacters (%, _) cannot over-match and
+// delete unrelated file chat messages.
+var fileIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// validFileID reports whether id is a plausibly-real file id (32 hex chars).
+func validFileID(id string) bool { return fileIDRe.MatchString(id) }
+
+// escapeLikeForID escapes LIKE metacharacters in a file id destined for a LIKE
+// pattern (defence in depth on top of validFileID). % and _ are escaped with a
+// backslash; the caller must pair this with ESCAPE '\' on the LIKE clause.
+func escapeLikeForID(id string) string {
+	// strings.ReplaceAll would suffice, but build the escaped form explicitly to
+	// keep the escape char handling obvious.
+	r := make([]byte, 0, len(id)+4)
+	for i := 0; i < len(id); i++ {
+		switch id[i] {
+		case '%', '_', '\\':
+			r = append(r, '\\')
+		}
+		r = append(r, id[i])
+	}
+	return string(r)
 }
 
 func getExtensionForMIME(mimeType string) string {
