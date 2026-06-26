@@ -7,7 +7,15 @@ export interface DuckingConfig {
     attackTime: number;     // 50ms ramp down
     releaseTime: number;    // 200ms ramp up
     holdTime: number;       // 800ms before release
-    vadThreshold: number;   // -50dB activation threshold
+    // Voice-activity threshold expressed as a mean byte level over the analyser's
+    // getByteFrequencyData output (0-255, where 0 = minDecibels and 255 =
+    // maxDecibels of the AnalyserNode). Speech concentrates energy in a handful
+    // of bins, so the average across all bins stays low until someone actually
+    // speaks; ~10 is a calibrated "speaking" floor that ignores room noise/hum
+    // but catches normal speech. (The previous -50dB value fed the byte average
+    // through a second 20·log10 conversion, which is meaningless after the
+    // analyser's own dB→byte mapping and triggered on near-silence.)
+    vadByteThreshold: number;
 }
 
 const DEFAULT_CONFIG: DuckingConfig = {
@@ -15,7 +23,7 @@ const DEFAULT_CONFIG: DuckingConfig = {
     attackTime: 50,
     releaseTime: 200,
     holdTime: 800,
-    vadThreshold: -50
+    vadByteThreshold: 10
 };
 
 export class AudioDuckingManager {
@@ -35,6 +43,14 @@ export class AudioDuckingManager {
     private baseStreamVolume: number = 1.0;
     private voiceVolume: number = 1.0;
     private vadBuffer: Uint8Array<ArrayBuffer> | null = null;
+    // True once destroy() has torn the manager down. addVoiceTrack bails at
+    // entry and re-checks after its await so a late-resolving setup can't
+    // resurrect a zombie manager (orphaned sinks/sources/RAF loop).
+    private destroyed: boolean = false;
+    // Participant IDs whose addVoiceTrack setup is past the await. removeVoiceTrack
+    // / destroy record cancellation here so the post-await code knows to abort
+    // instead of building a graph for a departed participant.
+    private addCancelled: Set<string> = new Set();
 
     constructor(streamElement: HTMLMediaElement, isAdmin: boolean, config?: Partial<DuckingConfig>) {
         this.streamElement = streamElement;
@@ -76,6 +92,8 @@ export class AudioDuckingManager {
             // Non-browser test/runtime environments may not expose MediaStream.
             return;
         }
+        // Never start work on a torn-down manager.
+        if (this.destroyed) return;
 
         // If the participant already has a track registered (e.g. reconnect /
         // renegotiation), tear down the old nodes first so we don't leak audio
@@ -84,7 +102,20 @@ export class AudioDuckingManager {
             this.removeVoiceTrack(participantId);
         }
 
+        // Mark this setup as in-flight. removeVoiceTrack/destroy clear the flag
+        // so a setup that resolves AFTER the participant left (or the manager
+        // was destroyed) aborts instead of building an orphaned graph.
+        this.addCancelled.delete(participantId);
+
         const ctx = await getAudioContext();
+
+        // The await above can stay pending for a long time under the autoplay
+        // policy (context resume needs a gesture). Re-check that we're still
+        // wanted before creating any nodes.
+        if (this.destroyed || this.addCancelled.has(participantId)) {
+            this.addCancelled.delete(participantId);
+            return;
+        }
 
         const stream = new MediaStreamCtor([track]);
 
@@ -120,13 +151,21 @@ export class AudioDuckingManager {
         this.voiceGainNodes.set(participantId, gainNode);
         this.voiceSources.set(participantId, source);
 
-        // Start monitoring if not already
+        // Start monitoring if not already. Guard against a concurrent
+        // addVoiceTrack that started its own loop during the await: by reading
+        // this.monitorFrame here (after node creation), only the first caller
+        // through actually arms the loop.
         if (!this.monitorFrame) {
             this.startMonitoring();
         }
     }
 
     removeVoiceTrack(participantId: string): void {
+        // Signal any in-flight addVoiceTrack for this participant to abort once
+        // its await resolves (it would otherwise build a graph for a track we
+        // are now removing).
+        this.addCancelled.add(participantId);
+
         const sink = this.voiceSinks.get(participantId);
         if (sink) {
             sink.srcObject = null;
@@ -184,13 +223,16 @@ export class AudioDuckingManager {
             }
             analyser.getByteFrequencyData(this.vadBuffer);
 
-            // Calculate average volume in dB
+            // Mean byte level across frequency bins. getByteFrequencyData already
+            // maps the analyser's [minDecibels, maxDecibels] onto 0-255, so the
+            // average is a direct energy proxy — compare it to vadByteThreshold
+            // directly. (Re-deriving dB via 20·log10(avg/255) was meaningless
+            // double conversion that fired on near-silence.)
             let sum = 0;
             for (let i = 0; i < this.vadBuffer.length; i++) sum += this.vadBuffer[i];
             const avg = sum / this.vadBuffer.length;
-            const db = 20 * Math.log10(avg / 255);
 
-            if (db > this.config.vadThreshold) {
+            if (avg > this.config.vadByteThreshold) {
                 return true;
             }
         }
@@ -255,6 +297,14 @@ export class AudioDuckingManager {
     }
 
     destroy(): void {
+        // Mark the manager dead so any addVoiceTrack awaiting getAudioContext()
+        // aborts on resolution instead of resurrecting an orphaned graph + RAF
+        // loop on an object the caller believes is gone.
+        this.destroyed = true;
+        // Cancel every in-flight setup so the post-await guard fires for all.
+        for (const pid of this.voiceSources.keys()) this.addCancelled.add(pid);
+        for (const pid of this.voiceAnalysers.keys()) this.addCancelled.add(pid);
+
         for (const sink of this.voiceSinks.values()) {
             sink.srcObject = null;
         }

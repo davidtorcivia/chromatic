@@ -52,7 +52,7 @@ describe('AudioDuckingManager', () => {
             attackTime: 100,
             releaseTime: 300,
             holdTime: 1000,
-            vadThreshold: -40
+            vadByteThreshold: 8
         };
 
         manager = new AudioDuckingManager(mockStreamElement, false, customConfig);
@@ -170,6 +170,111 @@ describe('AudioDuckingManager', () => {
 
             // t=1 -> 1
             expect(1 * (2 - 1)).toBe(1);
+        });
+    });
+
+    describe('async teardown safety', () => {
+        // Regression: addVoiceTrack awaits getAudioContext(), which can stay
+        // pending under the autoplay policy. If destroy()/removeVoiceTrack ran
+        // during that await, the resolved setup used to build a complete orphaned
+        // voice graph (sink + source + analyser + gain + RAF loop) for a
+        // departed participant / dead manager. The post-await guard must abort.
+        it('does not build a voice graph when destroy() ran during the await', async () => {
+            // A deferred getAudioContext so we control when the await resolves.
+            const { getAudioContext } = await import('./context');
+            const realMock = vi.mocked(getAudioContext);
+            let resolveCtx!: (v: unknown) => void;
+            const pending = new Promise<unknown>((res) => { resolveCtx = res; });
+            realMock.mockReturnValueOnce(pending as never);
+
+            manager = new AudioDuckingManager(mockStreamElement, false);
+            const addPromise = manager.addVoiceTrack('p1', {} as MediaStreamTrack);
+
+            // Tear down while the await is still pending.
+            manager.destroy();
+            resolveCtx({
+                createMediaStreamSource: vi.fn(),
+                createAnalyser: vi.fn(),
+                createGain: vi.fn(),
+                destination: {}
+            });
+
+            await expect(addPromise).resolves.toBeUndefined();
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const m = manager as any;
+            expect(m.voiceSinks.size).toBe(0);
+            expect(m.voiceSources.size).toBe(0);
+            expect(m.voiceAnalysers.size).toBe(0);
+            expect(m.monitorFrame).toBeNull();
+        });
+
+        it('does not build a voice graph when removeVoiceTrack ran during the await', async () => {
+            const { getAudioContext } = await import('./context');
+            const realMock = vi.mocked(getAudioContext);
+            let resolveCtx!: (v: unknown) => void;
+            const pending = new Promise<unknown>((res) => { resolveCtx = res; });
+            realMock.mockReturnValueOnce(pending as never);
+
+            manager = new AudioDuckingManager(mockStreamElement, false);
+            const addPromise = manager.addVoiceTrack('p1', {} as MediaStreamTrack);
+
+            // Participant leaves while the await is still pending.
+            manager.removeVoiceTrack('p1');
+            resolveCtx({
+                createMediaStreamSource: vi.fn(),
+                createAnalyser: vi.fn(),
+                createGain: vi.fn(),
+                destination: {}
+            });
+
+            await expect(addPromise).resolves.toBeUndefined();
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const m = manager as any;
+            expect(m.voiceSinks.has('p1')).toBe(false);
+            expect(m.voiceSources.has('p1')).toBe(false);
+            expect(m.voiceAnalysers.has('p1')).toBe(false);
+        });
+    });
+
+    describe('VAD byte threshold', () => {
+        // Regression: detectVoiceActivity used to re-derive dB via
+        // 20·log10(avgByte/255) on getByteFrequencyData output, which is a
+        // meaningless double conversion after the analyser's own dB→byte
+        // mapping — it fired on near-silence and ducked the stream almost
+        // continuously. The fix compares the byte average directly to
+        // vadByteThreshold.
+        it('reports no voice when the byte average is below the threshold', () => {
+            manager = new AudioDuckingManager(mockStreamElement, false);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const m = manager as any;
+
+            // Fill the VAD buffer with low values (room noise): avg = 3 < 10.
+            const buf = new Uint8Array(128);
+            buf.fill(3);
+            m.vadBuffer = buf;
+            // No analysers registered → detectVoiceActivity returns false
+            // regardless, but the calibration we care about is that a low byte
+            // average does not trip a negative-dB quirk. Register a stub
+            // analyser whose getByteFrequencyData writes the buffer.
+            m.voiceAnalysers.set('p1', {
+                getByteFrequencyData: (target: Uint8Array) => { target.fill(3); },
+                frequencyBinCount: 128,
+                disconnect: () => {}
+            });
+            expect(m.detectVoiceActivity()).toBe(false);
+        });
+
+        it('reports voice when the byte average exceeds the threshold', () => {
+            manager = new AudioDuckingManager(mockStreamElement, false);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const m = manager as any;
+            m.voiceAnalysers.set('p1', {
+                // Speech concentrates energy: avg = 40 > 10.
+                getByteFrequencyData: (target: Uint8Array) => { target.fill(40); },
+                frequencyBinCount: 128,
+                disconnect: () => {}
+            });
+            expect(m.detectVoiceActivity()).toBe(true);
         });
     });
 });

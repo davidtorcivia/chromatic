@@ -119,6 +119,11 @@ export async function createMicChain(raw: MediaStream): Promise<MicChain | null>
                     source.disconnect();
                     highpass.disconnect();
                     gate.disconnect();
+                    // Disconnect the destination too: it holds the processed
+                    // MediaStream the sender referenced, and without this the
+                    // node lingers in the shared AudioContext across repeated
+                    // mic-device switches (a slow graph leak on long sessions).
+                    destination.disconnect();
                 } catch {
                     // nodes already disconnected
                 }
