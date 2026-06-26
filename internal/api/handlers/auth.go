@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -51,7 +52,9 @@ func NewAuthHandler(db *database.DB, adminToken string, productionMode bool) *Au
 func (h *AuthHandler) cleanupExpiredSessions() {
 	ticker := time.NewTicker(15 * time.Minute)
 	for range ticker.C {
-		result, err := h.db.Exec("DELETE FROM sessions WHERE expires_at < ?", time.Now())
+		ctx, cancel := database.WithTimeout(context.Background())
+		result, err := h.db.ExecContext(ctx, "DELETE FROM sessions WHERE expires_at < ?", time.Now())
+		cancel()
 		if err != nil {
 			logger.Error("Failed to cleanup expired sessions", "error", err)
 			continue
@@ -94,10 +97,12 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 
 	// Create session in database
 	expiresAt := time.Now().Add(SessionDuration)
-	_, err = h.db.Exec(
+	ctx, cancel := database.WithTimeout(r.Context())
+	_, err = h.db.ExecContext(ctx,
 		"INSERT INTO sessions (id, expires_at) VALUES (?, ?)",
 		sessionID, expiresAt,
 	)
+	cancel()
 	if err != nil {
 		logger.Error("Failed to create session", "error", err)
 		http.Error(w, "Authentication service temporarily unavailable", http.StatusInternalServerError)
@@ -136,7 +141,9 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	cookie, err := r.Cookie(SessionCookieName)
 	if err == nil {
 		// Remove session from database
-		_, err = h.db.Exec("DELETE FROM sessions WHERE id = ?", cookie.Value)
+		ctx, cancel := database.WithTimeout(r.Context())
+		_, err = h.db.ExecContext(ctx, "DELETE FROM sessions WHERE id = ?", cookie.Value)
+		cancel()
 		if err != nil {
 			logger.Warn("Failed to delete session from database", "error", err)
 		}
@@ -162,8 +169,10 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 
 // ValidateSession checks if a session ID is valid
 func (h *AuthHandler) ValidateSession(sessionID string) bool {
+	ctx, cancel := database.WithTimeout(context.Background())
+	defer cancel()
 	var expiresAt time.Time
-	err := h.db.QueryRow(
+	err := h.db.QueryRowContext(ctx,
 		"SELECT expires_at FROM sessions WHERE id = ?",
 		sessionID,
 	).Scan(&expiresAt)
@@ -175,7 +184,9 @@ func (h *AuthHandler) ValidateSession(sessionID string) bool {
 
 	if time.Now().After(expiresAt) {
 		// Session expired, clean it up
-		h.db.Exec("DELETE FROM sessions WHERE id = ?", sessionID)
+		ctx2, cancel2 := database.WithTimeout(context.Background())
+		_, _ = h.db.ExecContext(ctx2, "DELETE FROM sessions WHERE id = ?", sessionID)
+		cancel2()
 		return false
 	}
 

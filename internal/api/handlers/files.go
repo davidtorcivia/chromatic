@@ -128,12 +128,14 @@ func (h *FileHandler) authorizeParticipant(r *http.Request, roomSlug string) (st
 
 	var isAdmitted bool
 	var roomStatus string
-	err = h.db.QueryRow(`
+	ctx, cancel := database.WithTimeout(r.Context())
+	err = h.db.QueryRowContext(ctx, `
 		SELECT p.is_admitted, r.status
 		FROM participants p
 		JOIN rooms r ON r.id = p.room_id
 		WHERE p.id = ? AND r.slug = ?
 	`, payload.ParticipantID, roomSlug).Scan(&isAdmitted, &roomStatus)
+	cancel()
 	if err != nil {
 		return "", err
 	}
@@ -160,7 +162,9 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 
 	// Get room ID
 	var roomID string
-	err = h.db.QueryRow("SELECT id FROM rooms WHERE slug = ?", slug).Scan(&roomID)
+	roomCtx, roomCancel := database.WithTimeout(r.Context())
+	err = h.db.QueryRowContext(roomCtx, "SELECT id FROM rooms WHERE slug = ?", slug).Scan(&roomID)
+	roomCancel()
 	if err != nil {
 		http.Error(w, "Room not found", http.StatusNotFound)
 		return
@@ -235,10 +239,12 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Insert into database
-	_, err = h.db.Exec(`
+	insertCtx, insertCancel := database.WithTimeout(r.Context())
+	_, err = h.db.ExecContext(insertCtx, `
 		INSERT INTO files (id, room_id, uploader_id, original_name, stored_path, mime_type, size_bytes)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, fileID, roomID, uploaderID, originalName, storedPath, mimeType, header.Size)
+	insertCancel()
 
 	if err != nil {
 		os.Remove(storedPath)
@@ -255,7 +261,9 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 			// Don't fail the upload, just skip thumbnail
 		} else {
 			// Update database with thumbnail path
-			h.db.Exec("UPDATE files SET thumbnail_path = ? WHERE id = ?", thumbnailPath, fileID)
+			thCtx, thCancel := database.WithTimeout(r.Context())
+			_, _ = h.db.ExecContext(thCtx, "UPDATE files SET thumbnail_path = ? WHERE id = ?", thumbnailPath, fileID)
+			thCancel()
 		}
 	}
 
@@ -283,12 +291,14 @@ func (h *FileHandler) Download(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var storedPath, mimeType, originalName, roomSlug string
-	err := h.db.QueryRow(`
+	dlCtx, dlCancel := database.WithTimeout(r.Context())
+	err := h.db.QueryRowContext(dlCtx, `
 		SELECT f.stored_path, f.mime_type, f.original_name, r.slug
 		FROM files f
 		JOIN rooms r ON r.id = f.room_id
 		WHERE f.id = ?
 	`, id).Scan(&storedPath, &mimeType, &originalName, &roomSlug)
+	dlCancel()
 
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
@@ -334,12 +344,16 @@ func (h *FileHandler) ListRoomFiles(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 
 	var roomID string
-	if err := h.db.QueryRow("SELECT id FROM rooms WHERE slug = ?", slug).Scan(&roomID); err != nil {
+	roomCtx, roomCancel := database.WithTimeout(r.Context())
+	if err := h.db.QueryRowContext(roomCtx, "SELECT id FROM rooms WHERE slug = ?", slug).Scan(&roomID); err != nil {
+		roomCancel()
 		http.Error(w, "Room not found", http.StatusNotFound)
 		return
 	}
+	roomCancel()
 
-	rows, err := h.db.Query(`
+	listCtx, listCancel := database.WithTimeout(r.Context())
+	rows, err := h.db.QueryContext(listCtx, `
 		SELECT f.id, f.original_name, f.mime_type, f.size_bytes, f.created_at,
 		       COALESCE(p.name, 'Unknown')
 		FROM files f
@@ -348,10 +362,12 @@ func (h *FileHandler) ListRoomFiles(w http.ResponseWriter, r *http.Request) {
 		ORDER BY f.created_at DESC
 	`, roomID)
 	if err != nil {
+		listCancel()
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
+	defer listCancel()
 
 	files := []map[string]interface{}{}
 	for rows.Next() {
@@ -398,9 +414,11 @@ func (h *FileHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 
 	var storedPath, roomID string
 	var thumbnailPath *string
-	err := h.db.QueryRow(`
+	getCtx, getCancel := database.WithTimeout(r.Context())
+	err := h.db.QueryRowContext(getCtx, `
 		SELECT stored_path, thumbnail_path, room_id FROM files WHERE id = ?
 	`, id).Scan(&storedPath, &thumbnailPath, &roomID)
+	getCancel()
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
@@ -421,7 +439,9 @@ func (h *FileHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if _, err := h.db.Exec("DELETE FROM files WHERE id = ?", id); err != nil {
+	delCtx, delCancel := database.WithTimeout(r.Context())
+	if _, err := h.db.ExecContext(delCtx, "DELETE FROM files WHERE id = ?", id); err != nil {
+		delCancel()
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
@@ -429,8 +449,9 @@ func (h *FileHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 	// them so reloaded transcripts don't render broken attachments. Escape LIKE
 	// metacharacters in the id (defence in depth on top of validFileID) so the
 	// pattern can only ever match this exact file's reference.
-	h.db.Exec(`DELETE FROM messages WHERE room_id = ? AND type = 'file' AND content LIKE ? ESCAPE '\'`,
+	_, _ = h.db.ExecContext(delCtx, `DELETE FROM messages WHERE room_id = ? AND type = 'file' AND content LIKE ? ESCAPE '\'`,
 		roomID, `%"`+escapeLikeForID(id)+`"%`)
+	delCancel()
 
 	logger.Info("File deleted by admin", "file_id", id, "room_id", roomID)
 	w.WriteHeader(http.StatusNoContent)
@@ -442,12 +463,14 @@ func (h *FileHandler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 
 	var storedPath, mimeType, roomSlug string
 	var thumbnailPath *string
-	err := h.db.QueryRow(`
+	thCtx, thCancel := database.WithTimeout(r.Context())
+	err := h.db.QueryRowContext(thCtx, `
 		SELECT f.stored_path, f.mime_type, f.thumbnail_path, r.slug
 		FROM files f
 		JOIN rooms r ON r.id = f.room_id
 		WHERE f.id = ?
 	`, id).Scan(&storedPath, &mimeType, &thumbnailPath, &roomSlug)
+	thCancel()
 
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)

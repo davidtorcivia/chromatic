@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"database/sql"
@@ -230,10 +231,12 @@ func (h *RoomHandler) scheduleStreamEnd(roomSlug string) {
 
 	h.streamEndTimers[roomSlug] = time.AfterFunc(h.obsReconnectTimeout, func() {
 		now := time.Now()
-		result, err := h.db.Exec(`
+		ctx, cancel := database.WithTimeout(context.Background())
+		result, err := h.db.ExecContext(ctx, `
 			UPDATE rooms SET status = 'ended', ended_at = ?
 			WHERE slug = ? AND status = 'live'
 		`, now, roomSlug)
+		cancel()
 		if err != nil {
 			logger.Error("Failed to end room after reconnect timeout", "room", roomSlug, "error", err)
 			return
@@ -298,15 +301,19 @@ func (h *RoomHandler) handleRoomOpen(slug string) {
 	var roomID string
 	var waitingRoom bool
 	var roomStatus string
-	err := h.db.QueryRow(`
+	roomCtx, roomCancel := database.WithTimeout(context.Background())
+	err := h.db.QueryRowContext(roomCtx, `
 		SELECT id, waiting_room_enabled, status FROM rooms WHERE slug = ?
 	`, slug).Scan(&roomID, &waitingRoom, &roomStatus)
+	roomCancel()
 	if err != nil || roomStatus == "ended" {
 		return
 	}
 
-	rows, err := h.db.Query(`SELECT id FROM participants WHERE room_id = ? AND is_admitted = FALSE`, roomID)
+	waitCtx, waitCancel := database.WithTimeout(context.Background())
+	rows, err := h.db.QueryContext(waitCtx, `SELECT id FROM participants WHERE room_id = ? AND is_admitted = FALSE`, roomID)
 	if err != nil {
+		waitCancel()
 		logger.Error("Failed to list lobby participants on room open", "room", slug, "error", err)
 		return
 	}
@@ -318,6 +325,7 @@ func (h *RoomHandler) handleRoomOpen(slug string) {
 		}
 	}
 	rows.Close()
+	waitCancel()
 
 	if len(waitingIDs) == 0 {
 		return
@@ -336,11 +344,13 @@ func (h *RoomHandler) handleRoomOpen(slug string) {
 	// so a participant joining between the SELECT and this UPDATE would be
 	// admitted but absent from waitingIDs (no notification, metric drift).
 	// RETURNING guarantees the notification list is exactly who we admitted.
-	admitRows, qErr := h.db.Query(`
+	admitCtx, admitCancel := database.WithTimeout(context.Background())
+	admitRows, qErr := h.db.QueryContext(admitCtx, `
 		UPDATE participants SET is_admitted = TRUE WHERE room_id = ? AND is_admitted = FALSE
 		RETURNING id
 	`, roomID)
 	if qErr != nil {
+		admitCancel()
 		logger.Error("Failed to auto-admit lobby participants", "room", slug, "error", qErr)
 		return
 	}
@@ -352,6 +362,7 @@ func (h *RoomHandler) handleRoomOpen(slug string) {
 		}
 	}
 	admitRows.Close()
+	admitCancel()
 	metrics.Get().WaitingParticipants.Add(-int64(len(admittedIDs)))
 	h.waitingManager.NotifyAllAdmitted(admittedIDs)
 	if h.hub != nil {
@@ -370,10 +381,12 @@ func (h *RoomHandler) maybeRunMissedOpen(slug string) {
 	var waitingRoom bool
 	var scheduledAt, openedAt *time.Time
 	var roomStatus string
-	err := h.db.QueryRow(`
+	ctx, cancel := database.WithTimeout(context.Background())
+	err := h.db.QueryRowContext(ctx, `
 		SELECT id, waiting_room_enabled, scheduled_at, opened_at, status
 		FROM rooms WHERE slug = ?
 	`, slug).Scan(&roomID, &waitingRoom, &scheduledAt, &openedAt, &roomStatus)
+	cancel()
 	if err != nil || roomStatus == "ended" || scheduledAt == nil {
 		return
 	}
@@ -396,7 +409,9 @@ func (h *RoomHandler) OpenRoom(w http.ResponseWriter, r *http.Request) {
 
 	var roomStatus string
 	var openedAt *time.Time
-	err := h.db.QueryRow(`SELECT status, opened_at FROM rooms WHERE slug = ?`, slug).Scan(&roomStatus, &openedAt)
+	getCtx, getCancel := database.WithTimeout(r.Context())
+	err := h.db.QueryRowContext(getCtx, `SELECT status, opened_at FROM rooms WHERE slug = ?`, slug).Scan(&roomStatus, &openedAt)
+	getCancel()
 	if err != nil {
 		http.Error(w, "Room not found", http.StatusNotFound)
 		return
@@ -408,9 +423,12 @@ func (h *RoomHandler) OpenRoom(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 	if openedAt == nil {
-		if _, err := h.db.Exec(`
+		updCtx, updCancel := database.WithTimeout(r.Context())
+		_, err := h.db.ExecContext(updCtx, `
 			UPDATE rooms SET opened_at = ? WHERE slug = ? AND opened_at IS NULL
-		`, now, slug); err != nil {
+		`, now, slug)
+		updCancel()
+		if err != nil {
 			http.Error(w, "Database error", http.StatusInternalServerError)
 			return
 		}
@@ -448,13 +466,16 @@ func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	query += " ORDER BY created_at DESC"
 
-	rows, err := h.db.Query(query, args...)
+	listCtx, listCancel := database.WithTimeout(r.Context())
+	rows, err := h.db.QueryContext(listCtx, query, args...)
 	if err != nil {
+		listCancel()
 		logger.Error("Failed to list rooms", "error", err, "status_filter", status)
 		http.Error(w, "Failed to retrieve rooms", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
+	defer listCancel()
 
 	rooms := []models.Room{}
 	for rows.Next() {
@@ -623,7 +644,8 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Insert room
-	_, err := h.db.Exec(`
+	insertCtx, insertCancel := database.WithTimeout(r.Context())
+	_, err := h.db.ExecContext(insertCtx, `
 		INSERT INTO rooms (
 			id, slug, name, scheduled_at, duration_minutes, early_open_minutes,
 			password_hash,
@@ -636,6 +658,7 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 		req.WaitingRoomEnabled, req.StreamKeyID, req.WatermarkMode, req.WatermarkText,
 		req.WatermarkLogoPosition, watermarkOpacity, req.WatermarkPosX,
 		req.WatermarkPosY, watermarkScale, req.MaxParticipants)
+	insertCancel()
 
 	if err != nil {
 		// Check for unique constraint violation
@@ -923,7 +946,9 @@ func (h *RoomHandler) Update(w http.ResponseWriter, r *http.Request) {
 	query := "UPDATE rooms SET " + strings.Join(setClauses, ", ") + " WHERE slug = ?"
 	args = append(args, slug)
 
-	result, err := h.db.Exec(query, args...)
+	updCtx, updCancel := database.WithTimeout(r.Context())
+	result, err := h.db.ExecContext(updCtx, query, args...)
+	updCancel()
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -950,12 +975,17 @@ func (h *RoomHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	// Resolve the room ID before the row disappears — the upload directory
 	// is keyed by ID, not slug.
 	var roomID string
-	if err := h.db.QueryRow("SELECT id FROM rooms WHERE slug = ?", slug).Scan(&roomID); err != nil {
+	idCtx, idCancel := database.WithTimeout(r.Context())
+	if err := h.db.QueryRowContext(idCtx, "SELECT id FROM rooms WHERE slug = ?", slug).Scan(&roomID); err != nil {
+		idCancel()
 		http.Error(w, "Room not found", http.StatusNotFound)
 		return
 	}
+	idCancel()
 
-	result, err := h.db.Exec("DELETE FROM rooms WHERE slug = ?", slug)
+	delCtx, delCancel := database.WithTimeout(r.Context())
+	result, err := h.db.ExecContext(delCtx, "DELETE FROM rooms WHERE slug = ?", slug)
+	delCancel()
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -990,9 +1020,11 @@ func (h *RoomHandler) EndSession(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 
 	now := time.Now()
-	result, err := h.db.Exec(`
+	endCtx, endCancel := database.WithTimeout(r.Context())
+	result, err := h.db.ExecContext(endCtx, `
 		UPDATE rooms SET status = 'ended', ended_at = ? WHERE slug = ? AND status = 'live'
 	`, now, slug)
+	endCancel()
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -1030,12 +1062,14 @@ func (h *RoomHandler) PublicInfo(w http.ResponseWriter, r *http.Request) {
 		ServerTime         time.Time  `json:"serverTime"`
 	}
 
-	err := h.db.QueryRow(`
+	infoCtx, infoCancel := database.WithTimeout(r.Context())
+	err := h.db.QueryRowContext(infoCtx, `
 		SELECT name, password_hash IS NOT NULL, waiting_room_enabled, status, scheduled_at,
 		       COALESCE(early_open_minutes, 10), opened_at
 		FROM rooms WHERE slug = ?
 	`, slug).Scan(&info.Name, &info.HasPassword, &info.WaitingRoomEnabled, &info.Status, &info.ScheduledAt,
 		&info.EarlyOpenMinutes, &info.OpenedAt)
+	infoCancel()
 
 	if err != nil {
 		http.Error(w, "Room not found", http.StatusNotFound)
@@ -1078,12 +1112,14 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 	var earlyOpenMinutes int
 	var roomMaxParticipants *int
 
-	err := h.db.QueryRow(`
+	joinCtx, joinCancel := database.WithTimeout(r.Context())
+	err := h.db.QueryRowContext(joinCtx, `
 		SELECT id, COALESCE(password_hash, ''), waiting_room_enabled, status, scheduled_at,
 		       COALESCE(early_open_minutes, 10), opened_at, max_participants
 		FROM rooms WHERE slug = ?
 	`, slug).Scan(&roomID, &passwordHash, &waitingRoom, &roomStatus, &scheduledAt,
 		&earlyOpenMinutes, &openedAt, &roomMaxParticipants)
+	joinCancel()
 
 	if err != nil {
 		http.Error(w, "Room not found", http.StatusNotFound)
@@ -1165,10 +1201,12 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 		role = "admin"
 	}
 
-	_, err = h.db.Exec(`
+	insCtx, insCancel := database.WithTimeout(r.Context())
+	_, err = h.db.ExecContext(insCtx, `
 		INSERT INTO participants (id, room_id, name, role, color, is_admitted)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, participantID, roomID, req.Name, role, color, isAdmitted)
+	insCancel()
 
 	if err != nil {
 		http.Error(w, "Failed to join room", http.StatusInternalServerError)
@@ -1236,7 +1274,10 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 // countWaiting returns the number of unadmitted participants in a room.
 func (h *RoomHandler) countWaiting(roomID string) int {
 	var n int
-	if err := h.db.QueryRow(`SELECT COUNT(*) FROM participants WHERE room_id = ? AND is_admitted = FALSE`, roomID).Scan(&n); err != nil {
+	ctx, cancel := database.WithTimeout(context.Background())
+	err := h.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM participants WHERE room_id = ? AND is_admitted = FALSE`, roomID).Scan(&n)
+	cancel()
+	if err != nil {
 		return 0
 	}
 	return n
@@ -1246,7 +1287,8 @@ func (h *RoomHandler) countWaiting(roomID string) int {
 func (h *RoomHandler) ListWaiting(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 
-	rows, err := h.db.Query(`
+	listCtx, listCancel := database.WithTimeout(r.Context())
+	rows, err := h.db.QueryContext(listCtx, `
 		SELECT p.id, p.name, p.joined_at
 		FROM participants p
 		JOIN rooms r ON r.id = p.room_id
@@ -1254,10 +1296,12 @@ func (h *RoomHandler) ListWaiting(w http.ResponseWriter, r *http.Request) {
 		ORDER BY p.joined_at
 	`, slug)
 	if err != nil {
+		listCancel()
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
+	defer listCancel()
 
 	participants := []map[string]interface{}{}
 	for rows.Next() {
@@ -1282,11 +1326,13 @@ func (h *RoomHandler) ListWaiting(w http.ResponseWriter, r *http.Request) {
 // admin:waiting-approve WebSocket command. Returns false when no waiting
 // participant matched.
 func (h *RoomHandler) AdmitWaitingParticipant(slug, participantID string) (bool, error) {
-	result, err := h.db.Exec(`
+	ctx, cancel := database.WithTimeout(context.Background())
+	result, err := h.db.ExecContext(ctx, `
 		UPDATE participants SET is_admitted = TRUE
 		WHERE id = ? AND is_admitted = FALSE
 		  AND room_id = (SELECT id FROM rooms WHERE slug = ?)
 	`, participantID, slug)
+	cancel()
 	if err != nil {
 		return false, err
 	}
@@ -1318,11 +1364,13 @@ func (h *RoomHandler) AdmitWaitingParticipant(slug, participantID string) (bool,
 func (h *RoomHandler) DenyWaitingParticipant(slug, participantID string) (bool, error) {
 	// Notify before deleting the row so the SSE handler can still validate
 	// the subscription; the connection closes right after the event anyway.
-	result, err := h.db.Exec(`
+	ctx, cancel := database.WithTimeout(context.Background())
+	result, err := h.db.ExecContext(ctx, `
 		DELETE FROM participants
 		WHERE id = ? AND is_admitted = FALSE
 		  AND room_id = (SELECT id FROM rooms WHERE slug = ?)
 	`, participantID, slug)
+	cancel()
 	if err != nil {
 		return false, err
 	}
@@ -1391,16 +1439,17 @@ func (h *RoomHandler) AdmitAll(w http.ResponseWriter, r *http.Request) {
 	// notification list — their lobby UI never advanced, and the
 	// WaitingParticipants gauge drifted (decremented by the wrong count).
 	// UPDATE...RETURNING captures exactly the rows this call admitted.
-	rows, err := h.db.Query(`
+	admitCtx, admitCancel := database.WithTimeout(r.Context())
+	rows, err := h.db.QueryContext(admitCtx, `
 		UPDATE participants SET is_admitted = TRUE
 		WHERE room_id = (SELECT id FROM rooms WHERE slug = ?) AND is_admitted = FALSE
 		RETURNING id
 	`, slug)
 	if err != nil {
+		admitCancel()
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
-
 	var waitingIDs []string
 	for rows.Next() {
 		var id string
@@ -1409,6 +1458,7 @@ func (h *RoomHandler) AdmitAll(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	rows.Close()
+	admitCancel()
 
 	// Track admitted participants
 	metrics.Get().WaitingParticipants.Add(-int64(len(waitingIDs)))
@@ -1457,12 +1507,14 @@ func (h *RoomHandler) CheckParticipantStatus(w http.ResponseWriter, r *http.Requ
 	var isAdmitted bool
 	var roomStatus string
 
-	err = h.db.QueryRow(`
+	statusCtx, statusCancel := database.WithTimeout(r.Context())
+	err = h.db.QueryRowContext(statusCtx, `
 		SELECT p.is_admitted, r.status
 		FROM participants p
 		JOIN rooms r ON r.id = p.room_id
 		WHERE r.slug = ? AND p.id = ?
 	`, slug, participantID).Scan(&isAdmitted, &roomStatus)
+	statusCancel()
 
 	if err != nil {
 		http.Error(w, "Participant not found", http.StatusNotFound)
@@ -1482,7 +1534,9 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 
 	// Use transaction to ensure atomicity of room lookup and status update
 	// This prevents race conditions with multiple OBS connections
-	tx, err := h.db.Begin()
+	ctx, cancel := database.WithTimeout(context.Background())
+	defer cancel()
+	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -1495,7 +1549,7 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 	// Find the room bound to this stream key (prefer live room on reconnect)
 	var roomSlug string
 	var roomStatus string
-	err = tx.QueryRow(`
+	err = tx.QueryRowContext(ctx, `
 		SELECT r.slug, r.status FROM rooms r
 		JOIN stream_keys sk ON sk.id = r.stream_key_id
 		WHERE sk.key_token = ? AND r.status IN ('pending', 'live')
@@ -1518,7 +1572,7 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 
 	// Update room status to live when transitioning from pending
 	if roomStatus == "pending" {
-		result, err := tx.Exec(`
+		result, err := tx.ExecContext(ctx, `
 			UPDATE rooms SET status = 'live', started_at = ?
 			WHERE slug = ? AND status = 'pending'
 		`, now, roomSlug)
@@ -1549,10 +1603,13 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 	// lobby auto-admission flow. Only relevant while scheduled_at is still in
 	// the future — past that point the open timer / join gating already
 	// treats the room as open.
-	if res, err := h.db.Exec(`
+	openCtx, openCancel := database.WithTimeout(context.Background())
+	res, err := h.db.ExecContext(openCtx, `
 		UPDATE rooms SET opened_at = ?
 		WHERE slug = ? AND opened_at IS NULL AND scheduled_at IS NOT NULL AND scheduled_at > ?
-	`, now, roomSlug, now); err == nil {
+	`, now, roomSlug, now)
+	openCancel()
+	if err == nil {
 		if affected, _ := res.RowsAffected(); affected > 0 {
 			h.handleRoomOpen(roomSlug)
 		}
@@ -1612,11 +1669,13 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 func (h *RoomHandler) OnStreamEnd(streamKeyToken string) {
 	// Find the room associated with this stream key
 	var roomSlug string
-	err := h.db.QueryRow(`
+	ctx, cancel := database.WithTimeout(context.Background())
+	err := h.db.QueryRowContext(ctx, `
 		SELECT r.slug FROM rooms r
 		JOIN stream_keys sk ON sk.id = r.stream_key_id
 		WHERE sk.key_token = ? AND r.status = 'live'
 	`, streamKeyToken).Scan(&roomSlug)
+	cancel()
 
 	if err != nil {
 		// No live room for this stream key - that's fine
@@ -1636,7 +1695,8 @@ func (h *RoomHandler) OnStreamEnd(streamKeyToken string) {
 
 func (h *RoomHandler) getRoomBySlug(slug string) (*models.Room, error) {
 	var room models.Room
-	err := h.db.QueryRow(`
+	ctx, cancel := database.WithTimeout(context.Background())
+	err := h.db.QueryRowContext(ctx, `
 		SELECT id, slug, name, scheduled_at, duration_minutes,
 		       COALESCE(early_open_minutes, 10), opened_at,
 		       password_hash IS NOT NULL, waiting_room_enabled, stream_key_id,
@@ -1656,6 +1716,7 @@ func (h *RoomHandler) getRoomBySlug(slug string) (*models.Room, error) {
 		&room.MaxParticipants, &room.Status,
 		&room.CreatedAt, &room.StartedAt, &room.EndedAt,
 	)
+	cancel()
 	return &room, err
 }
 
@@ -1695,11 +1756,14 @@ func assignColor(id string) string {
 // hash-collision repeats. Falls back to hash assignment once the palette is
 // exhausted.
 func (h *RoomHandler) assignRoomColor(roomID, participantID string) string {
-	rows, err := h.db.Query(`SELECT color FROM participants WHERE room_id = ?`, roomID)
+	ctx, cancel := database.WithTimeout(context.Background())
+	rows, err := h.db.QueryContext(ctx, `SELECT color FROM participants WHERE room_id = ?`, roomID)
 	if err != nil {
+		cancel()
 		return assignColor(participantID)
 	}
 	defer rows.Close()
+	defer cancel()
 
 	used := make(map[string]bool)
 	for rows.Next() {
@@ -1757,12 +1821,14 @@ func (h *RoomHandler) WaitingEvents(w http.ResponseWriter, r *http.Request) {
 	// Verify participant exists and is in waiting state
 	var isAdmitted bool
 	var roomStatus string
-	err = h.db.QueryRow(`
+	verifyCtx, verifyCancel := database.WithTimeout(r.Context())
+	err = h.db.QueryRowContext(verifyCtx, `
 		SELECT p.is_admitted, r.status
 		FROM participants p
 		JOIN rooms r ON r.id = p.room_id
 		WHERE r.slug = ? AND p.id = ?
 	`, slug, participantID).Scan(&isAdmitted, &roomStatus)
+	verifyCancel()
 
 	if err != nil {
 		http.Error(w, "Participant not found", http.StatusNotFound)

@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"fmt"
@@ -8,12 +9,35 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
+
+// QueryTimeout is the deadline applied to handler DB access. SQLite (WAL) is
+// fast for this app's small per-room workload, so a query that hasn't returned
+// in a few seconds is stuck on the write lock (SQLITE_BUSY) or behind a
+// disconnected client that never cancelled. Bounding it prevents one stalled
+// query from holding one of the 4 pooled connections and blocking a latency-
+// sensitive handler (e.g. OnStreamStart, sendChatHistory on join).
+const QueryTimeout = 5 * time.Second
+
+// WithTimeout returns parent (or parent with a QueryTimeout deadline if parent
+// has none) so handlers can pass a single context to the *Context DB methods and
+// get cancellation on client disconnect PLUS a hard query deadline.
+func WithTimeout(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if _, ok := parent.Deadline(); ok {
+		// Caller already imposed a deadline; honour it as-is.
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, QueryTimeout)
+}
 
 // DB wraps a sql.DB connection with application-specific methods
 type DB struct {

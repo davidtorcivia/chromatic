@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -183,7 +184,9 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	var roomID string
 	var roomStatus string
 	var streamKeyID *string
-	err = h.db.QueryRow("SELECT id, status, stream_key_id FROM rooms WHERE slug = ?", slug).Scan(&roomID, &roomStatus, &streamKeyID)
+	roomCtx, roomCancel := database.WithTimeout(r.Context())
+	err = h.db.QueryRowContext(roomCtx, "SELECT id, status, stream_key_id FROM rooms WHERE slug = ?", slug).Scan(&roomID, &roomStatus, &streamKeyID)
+	roomCancel()
 	if err != nil {
 		http.Error(w, "Room not found", http.StatusNotFound)
 		return
@@ -199,11 +202,13 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	var role, color string
 	var isAdmitted bool
 	var canScreenshare bool
-	err = h.db.QueryRow(`
+	partCtx, partCancel := database.WithTimeout(r.Context())
+	err = h.db.QueryRowContext(partCtx, `
 		SELECT role, COALESCE(color, ''), is_admitted, COALESCE(can_screenshare, FALSE)
 		FROM participants
 		WHERE id = ? AND room_id = ?
 	`, participantID, roomID).Scan(&role, &color, &isAdmitted, &canScreenshare)
+	partCancel()
 
 	if err != nil {
 		// Participant not found - this shouldn't happen with valid tokens
@@ -677,7 +682,8 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 	var earlyOpenMinutes int
 	var waitingRoomEnabled bool
 
-	err := h.db.QueryRow(`
+	roomCtx, roomCancel := database.WithTimeout(context.Background())
+	err := h.db.QueryRowContext(roomCtx, `
 		SELECT name, status,
 			COALESCE(watermark_mode, 'none'),
 			watermark_text,
@@ -694,6 +700,7 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 		FROM rooms WHERE slug = ?
 	`, slug).Scan(&roomName, &roomStatus, &watermarkMode, &watermarkText, &watermarkLogoPath, &watermarkLogoPosition, &watermarkOpacity, &watermarkPosX, &watermarkPosY, &watermarkScale,
 		&scheduledAt, &openedAt, &earlyOpenMinutes, &waitingRoomEnabled)
+	roomCancel()
 
 	if err != nil {
 		return
@@ -703,13 +710,13 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 
 	// Persistent screen share approvals (admins are implicitly allowed)
 	canShare := make(map[string]bool)
-	if rows, err := h.db.Query(`
+	shareCtx, shareCancel := database.WithTimeout(context.Background())
+	if rows, err := h.db.QueryContext(shareCtx, `
 		SELECT p.id, COALESCE(p.can_screenshare, FALSE)
 		FROM participants p
 		JOIN rooms r ON r.id = p.room_id
 		WHERE r.slug = ?
 	`, slug); err == nil {
-		defer rows.Close()
 		for rows.Next() {
 			var id string
 			var allowed bool
@@ -717,7 +724,9 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 				canShare[id] = allowed
 			}
 		}
+		rows.Close()
 	}
+	shareCancel()
 
 	// Get participants
 	participants := h.hub.GetRoomClients(slug)
@@ -812,22 +821,26 @@ func (h *WebSocketHandler) sendWaitingState(client *websocket.Client, slug strin
 
 	var roomID string
 	var waitingRoomEnabled bool
-	if err := h.db.QueryRow(`
+	wsCtx, wsCancel := database.WithTimeout(context.Background())
+	if err := h.db.QueryRowContext(wsCtx, `
 		SELECT id, waiting_room_enabled FROM rooms WHERE slug = ?
 	`, slug).Scan(&roomID, &waitingRoomEnabled); err != nil {
+		wsCancel()
 		return
 	}
 
-	rows, err := h.db.Query(`
+	rows, err := h.db.QueryContext(wsCtx, `
 		SELECT id, name, joined_at FROM participants
 		WHERE room_id = ? AND is_admitted = FALSE
 		ORDER BY joined_at
 	`, roomID)
 	if err != nil {
+		wsCancel()
 		logger.Warn("Failed to load waiting roster", "room", slug, "error", err)
 		return
 	}
 	defer rows.Close()
+	defer wsCancel()
 
 	waiting := make([]map[string]interface{}, 0)
 	for rows.Next() {
@@ -861,7 +874,8 @@ func (h *WebSocketHandler) sendWaitingState(client *websocket.Client, slug strin
 // block each new joiner on a full scan.
 func (h *WebSocketHandler) sendChatHistory(client *websocket.Client, slug string) {
 	const chatHistoryLimit = 50
-	rows, err := h.db.Query(`
+	chatCtx, chatCancel := database.WithTimeout(context.Background())
+	rows, err := h.db.QueryContext(chatCtx, `
 		SELECT m.id, m.participant_id, p.name, m.type, m.content, m.created_at
 		FROM messages m
 		JOIN participants p ON p.id = m.participant_id
@@ -870,10 +884,12 @@ func (h *WebSocketHandler) sendChatHistory(client *websocket.Client, slug string
 		LIMIT ?
 	`, slug, chatHistoryLimit)
 	if err != nil {
+		chatCancel()
 		logger.Warn("Failed to load chat history", "room", slug, "error", err)
 		return
 	}
 	defer rows.Close()
+	defer chatCancel()
 
 	messages := make([]map[string]interface{}, 0)
 	for rows.Next() {
@@ -1009,9 +1025,11 @@ func (h *WebSocketHandler) handleChatSend(client *websocket.Client, payload json
 	msgID := generateID()
 
 	// Persist to database
-	h.db.Exec(`INSERT INTO messages (id, room_id, participant_id, type, content, created_at)
+	msgCtx, msgCancel := database.WithTimeout(context.Background())
+	_, _ = h.db.ExecContext(msgCtx, `INSERT INTO messages (id, room_id, participant_id, type, content, created_at)
 		SELECT ?, r.id, ?, 'text', ?, ? FROM rooms r WHERE r.slug = ?`,
 		msgID, client.ID, sanitizedContent, now, client.RoomSlug)
+	msgCancel()
 
 	// Broadcast to all in room
 	h.hub.BroadcastJSON(client.RoomSlug, "chat:message", map[string]interface{}{
@@ -1063,12 +1081,14 @@ func (h *WebSocketHandler) handleChatFile(client *websocket.Client, payload json
 		roomSlug     string
 	)
 
-	err := h.db.QueryRow(`
+	fileCtx, fileCancel := database.WithTimeout(context.Background())
+	err := h.db.QueryRowContext(fileCtx, `
 		SELECT f.id, f.original_name, f.mime_type, r.slug
 		FROM files f
 		JOIN rooms r ON r.id = f.room_id
 		WHERE f.id = ?
 	`, data.FileID).Scan(&fileID, &originalName, &mimeType, &roomSlug)
+	fileCancel()
 	if err != nil {
 		return
 	}
@@ -1093,9 +1113,11 @@ func (h *WebSocketHandler) handleChatFile(client *websocket.Client, payload json
 
 	// Persist to database (store file reference as JSON content)
 	fileJSON, _ := json.Marshal(filePayload)
-	h.db.Exec(`INSERT INTO messages (id, room_id, participant_id, type, content, created_at)
+	insCtx, insCancel := database.WithTimeout(context.Background())
+	_, _ = h.db.ExecContext(insCtx, `INSERT INTO messages (id, room_id, participant_id, type, content, created_at)
 		SELECT ?, r.id, ?, 'file', ?, ? FROM rooms r WHERE r.slug = ?`,
 		msgID, client.ID, string(fileJSON), now, client.RoomSlug)
+	insCancel()
 
 	h.hub.BroadcastJSON(client.RoomSlug, "chat:message", map[string]interface{}{
 		"id":              msgID,
@@ -1528,9 +1550,11 @@ func (h *WebSocketHandler) handleAdminDeleteMessage(client *websocket.Client, pa
 		return
 	}
 
-	res, err := h.db.Exec(`DELETE FROM messages
+	delCtx, delCancel := database.WithTimeout(context.Background())
+	res, err := h.db.ExecContext(delCtx, `DELETE FROM messages
 		WHERE id = ? AND room_id = (SELECT id FROM rooms WHERE slug = ?)`,
 		data.MessageID, client.RoomSlug)
+	delCancel()
 	if err != nil {
 		logger.Error("Failed to delete chat message", "message_id", data.MessageID, "room", client.RoomSlug, "error", err)
 		return
@@ -1614,10 +1638,12 @@ func (h *WebSocketHandler) handleAdminEndSession(client *websocket.Client) {
 	}
 
 	// Mark room as ended in the database
-	_, err := h.db.Exec(`
+	endCtx, endCancel := database.WithTimeout(context.Background())
+	_, err := h.db.ExecContext(endCtx, `
 		UPDATE rooms SET status = 'ended', ended_at = ?
 		WHERE slug = ? AND status != 'ended'
 	`, time.Now(), client.RoomSlug)
+	endCancel()
 	if err != nil {
 		logger.Error("Failed to end session", "room", client.RoomSlug, "error", err)
 	}
@@ -1732,22 +1758,27 @@ func (h *WebSocketHandler) handleScreenShareRequest(client *websocket.Client) {
 // persistent screen share approval.
 func (h *WebSocketHandler) participantCanScreenshare(roomSlug, participantID string) bool {
 	var allowed bool
-	err := h.db.QueryRow(`
+	ctx, cancel := database.WithTimeout(context.Background())
+	err := h.db.QueryRowContext(ctx, `
 		SELECT COALESCE(p.can_screenshare, FALSE)
 		FROM participants p
 		JOIN rooms r ON r.id = p.room_id
 		WHERE p.id = ? AND r.slug = ?
 	`, participantID, roomSlug).Scan(&allowed)
+	cancel()
 	return err == nil && allowed
 }
 
 // setParticipantScreenshare persists the screen share approval flag and
 // broadcasts the updated participant state so admin UIs stay in sync.
 func (h *WebSocketHandler) setParticipantScreenshare(roomSlug, participantID string, allowed bool) {
-	if _, err := h.db.Exec(`
+	ctx, cancel := database.WithTimeout(context.Background())
+	_, err := h.db.ExecContext(ctx, `
 		UPDATE participants SET can_screenshare = ?
 		WHERE id = ? AND room_id = (SELECT id FROM rooms WHERE slug = ?)
-	`, allowed, participantID, roomSlug); err != nil {
+	`, allowed, participantID, roomSlug)
+	cancel()
+	if err != nil {
 		logger.Error("Failed to persist screen share approval", "participant_id", participantID, "room", roomSlug, "error", err)
 		return
 	}
