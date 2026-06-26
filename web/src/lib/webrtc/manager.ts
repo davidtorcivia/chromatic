@@ -279,9 +279,10 @@ export class WebRTCManager {
     private createPeerConnection(): void {
         debugLog('Creating peer connection with ICE servers:', this.options.iceServers);
 
-        this.pc = new RTCPeerConnection({
+        const pc = new RTCPeerConnection({
             iceServers: this.options.iceServers
         });
+        this.pc = pc;
 
         // Handle incoming tracks
         this.pc.ontrack = (event) => {
@@ -336,6 +337,12 @@ export class WebRTCManager {
 
         // Handle ICE candidates
         this.pc.onicecandidate = (event) => {
+            // Guard against the old PC's trailing events after a rebuild: an
+            // ICE candidate from a superseded connection must not be sent for
+            // the current one.
+            if (this.pc !== pc) {
+                return;
+            }
             if (event.candidate) {
                 debugLog('Sending ICE candidate to server');
                 this.sendSubscriberCandidate({
@@ -348,8 +355,18 @@ export class WebRTCManager {
 
         // Handle connection state changes
         this.pc.onconnectionstatechange = () => {
-            const state = this.pc?.connectionState;
+            const state = pc.connectionState;
             debugLog('Connection state:', state);
+
+            // Identity guard: resetPeerConnection (reconnect/fresh-offer/ICE
+            // restart failure) closes this PC and may null this.pc or replace
+            // it with a new one. The old PC can still emit a final
+            // 'closed'/'failed'/'disconnected' event asynchronously; without
+            // this check it would spuriously fire performIceRestart or clear the
+            // new connection's recovery timers (mirrors the publisher's guard).
+            if (this.pc !== pc) {
+                return;
+            }
 
             // Notify callback
             if (state) {
@@ -367,7 +384,7 @@ export class WebRTCManager {
                 }
                 this.connectionLostTimeout = setTimeout(() => {
                     this.connectionLostTimeout = null;
-                    if (this.pc?.connectionState === 'disconnected') {
+                    if (this.pc === pc && this.pc?.connectionState === 'disconnected') {
                         debugLog('Connection still disconnected, attempting ICE restart');
                         this.performIceRestart();
                     }
@@ -458,14 +475,6 @@ export class WebRTCManager {
                 lowLatencyReceiver.playoutDelayHint = WebRTCManager.LOW_LATENCY_PLAYOUT_DELAY_SECONDS;
             } catch (err) {
                 console.warn('Could not set low-latency receiver playout hint:', err);
-            }
-        }
-    }
-
-    private tuneReceiversForLowLatency(): void {
-        for (const receiver of this.pc?.getReceivers() ?? []) {
-            if (receiver.track?.kind === 'video') {
-                this.tuneReceiverForLowLatency(receiver);
             }
         }
     }
@@ -639,7 +648,11 @@ export class WebRTCManager {
             return {};
         }
 
-        this.tuneReceiversForLowLatency();
+        // Read-only: report the receiver latency hints the browser is actually
+        // using. We do NOT re-stomp jitterBufferTarget/playoutDelayHint here:
+        // those are applied once in ontrack, and rewriting them every poll
+        // (this runs each second) fights the browser's adaptive jitter buffer
+        // and adds avoidable per-poll work — both bad for a low-latency stream.
         const receiverLatencyTuning = this.videoReceiverLatencyTuning();
         const stats = await this.pc.getStats();
         // Prefer the nominated (actively used) candidate pair so the latency

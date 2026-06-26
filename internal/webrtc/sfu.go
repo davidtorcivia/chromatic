@@ -135,7 +135,7 @@ type RoomTracks struct {
 	VideoTrack               *webrtc.TrackLocalStaticRTP
 	AudioTrack               *webrtc.TrackLocalStaticRTP
 	Subscribers              map[string]*Subscriber
-	VoiceSessions            map[string]*VoiceSession               // Participant voice connections (also hosts the server-side mute gate)
+	VoiceSessions            map[string]*VoiceSession               // Participant voice connections
 	PendingPublisherICE      map[string][]PublisherICECandidate     // Publisher ICE that arrived before publish:offer.
 	VoiceRemoteTracks        map[string]*webrtc.TrackRemote         // Active voice remote tracks keyed by participant ID
 	VoiceLocalTracks         map[string]*webrtc.TrackLocalStaticRTP // Relay local tracks for voice fan-out
@@ -146,6 +146,16 @@ type RoomTracks struct {
 	voiceRelayDone           map[string]chan struct{}               // Per-participant cancellation for voice relay goroutines
 	screenShareDone          chan struct{}                          // Cancellation for the screen share relay goroutine
 	lastKeyframeRequest      time.Time                              // Coalesces room-level PLI bursts.
+	// voiceMuteFlags is the canonical server-enforced mute gate per participant.
+	// It is intentionally separate from VoiceSessions: a voice track frequently
+	// arrives (and its relay starts) BEFORE the publisher offer, at which point
+	// CreateVoiceRelayTrack builds a placeholder VoiceSession. HandleVoiceOffer
+	// later replaces that placeholder with a real session, so a flag living on
+	// VoiceSession would be orphaned — the running relay would keep reading the
+	// placeholder's flag and admin:mute would silently no-op. Keying the gate
+	// here by participantID keeps the relay's captured *atomic.Bool and
+	// SetVoiceMuted referencing the same object across session replacements.
+	voiceMuteFlags map[string]*atomic.Bool
 }
 
 type PublisherICECandidate struct {
@@ -1938,6 +1948,7 @@ func (s *SFU) removeVoiceSessionIfSame(roomSlug, participantID string, expected 
 	delete(room.PendingPublisherICE, participantID)
 	delete(room.VoiceRemoteTracks, participantID)
 	delete(room.VoiceLocalTracks, participantID)
+	delete(room.voiceMuteFlags, participantID)
 	// Stop the relay goroutine for this participant, if any.
 	if ch, ok := room.voiceRelayDone[participantID]; ok {
 		close(ch)
@@ -1964,8 +1975,15 @@ func (s *SFU) SetVoiceMuted(roomSlug, participantID string, muted bool) {
 		return
 	}
 	room.mu.RLock()
+	flag := room.voiceMuteFlags[participantID]
 	session := room.VoiceSessions[participantID]
 	room.mu.RUnlock()
+	// Prefer the canonical shared flag the live relay reads; also mirror onto
+	// the VoiceSession.Muted atomic so any consumer still reading it (and the
+	// legacy test path) stays consistent.
+	if flag != nil {
+		flag.Store(muted)
+	}
 	if session != nil {
 		session.Muted.Store(muted)
 	}
@@ -2078,22 +2096,19 @@ func (s *SFU) CreateVoiceRelayTrack(roomSlug, participantID string, remoteTrack 
 		localTrack = created
 		room.VoiceLocalTracks[participantID] = localTrack
 	}
-	// Capture the Muted flag pointer now so the forwarder doesn't need a map
-	// lookup per packet. The voice usually arrives over the subscriber PC, so
-	// there may be no VoiceSession yet — create a placeholder to host the
-	// server-side mute gate (SetVoiceMuted looks it up here).
-	if room.VoiceSessions == nil {
-		room.VoiceSessions = make(map[string]*VoiceSession)
+	// Capture the shared server-side mute flag so the forwarder doesn't need a
+	// map lookup per packet and — critically — stays in sync with SetVoiceMuted
+	// even when HandleVoiceOffer later replaces a placeholder VoiceSession with
+	// a real one. The flag lives on RoomTracks (not VoiceSession) so its identity
+	// is stable for the lifetime of the participant's voice relay.
+	if room.voiceMuteFlags == nil {
+		room.voiceMuteFlags = make(map[string]*atomic.Bool)
 	}
-	vs := room.VoiceSessions[participantID]
-	if vs == nil {
-		vs = &VoiceSession{
-			ParticipantID: participantID,
-			done:          make(chan struct{}),
-		}
-		room.VoiceSessions[participantID] = vs
+	mutedFlag := room.voiceMuteFlags[participantID]
+	if mutedFlag == nil {
+		mutedFlag = &atomic.Bool{}
+		room.voiceMuteFlags[participantID] = mutedFlag
 	}
-	mutedFlag := &vs.Muted
 	if room.voiceRelayDone == nil {
 		room.voiceRelayDone = make(map[string]chan struct{})
 	}

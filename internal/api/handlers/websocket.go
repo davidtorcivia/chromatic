@@ -109,6 +109,24 @@ func NewWebSocketHandler(
 	return h
 }
 
+// safeGo runs fn in a new goroutine with panic recovery. Goroutines spawned for
+// connection handling (subscription setup, renegotiation fan-out, voice-track
+// attach) run outside the HTTP Recoverer middleware, so without recovery a
+// single panic while touching the SFU/DB — reachable from one client's
+// signaling — would crash the whole process and drop every room. safeGo
+// isolates the failure to the affected goroutine and logs the cause.
+func safeGo(label string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("Recovered from goroutine panic",
+					"label", label, "panic", fmt.Sprint(r))
+			}
+		}()
+		fn()
+	}()
+}
+
 // HandleConnection handles WebSocket connection upgrades
 func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
@@ -281,7 +299,7 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 	// before the host starts streaming. When the ingest later binds,
 	// BindIngestToRoom attaches the tracks to this same subscriber via
 	// renegotiation (no reconnect, no second offer race).
-	go h.ensureSubscription(client, slug)
+	safeGo("ensureSubscription", func() { h.ensureSubscription(client, slug) })
 
 	// Start read pump with disconnect handler
 	go client.ReadPumpWithDisconnect(
@@ -312,7 +330,7 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 					h.hub.BroadcastJSON(c.RoomSlug, "screenshare:stopped", map[string]interface{}{}, "")
 					// Renegotiate affected subscribers
 					for _, subID := range affected {
-						go h.renegotiateSubscriber(c.RoomSlug, subID)
+						safeGo("renegotiateSubscriber", func() { h.renegotiateSubscriber(c.RoomSlug, subID) })
 					}
 					logger.Info("Screen share stopped (sharer disconnected)", "sharer", c.ID, "room", c.RoomSlug)
 				}
@@ -612,7 +630,7 @@ func (h *WebSocketHandler) handleResubscribe(client *websocket.Client) {
 func (h *WebSocketHandler) InitiateSubscriptionsForRoom(roomSlug string) {
 	clients := h.hub.GetRoomClients(roomSlug)
 	for _, client := range clients {
-		go h.ensureSubscription(client, roomSlug)
+		safeGo("ensureSubscription", func() { h.ensureSubscription(client, roomSlug) })
 	}
 	logger.Info("Ensured subscriptions for room", "room", roomSlug, "client_count", len(clients))
 }
@@ -1252,7 +1270,8 @@ func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID str
 			continue
 		}
 
-		go func(c *websocket.Client) {
+		safeGo("addVoiceTrack", func() {
+			c := client
 			offerSDP, offerID, err := h.sfu.AddVoiceTrackToSubscriber(roomSlug, c.ID, voiceOwnerID, localTrack)
 			if err != nil {
 				logger.Warn("Failed to add voice track to subscriber", "subscriber_id", c.ID, "source_id", voiceOwnerID, "error", err)
@@ -1278,7 +1297,7 @@ func (h *WebSocketHandler) forwardVoiceTrackToClients(roomSlug, voiceOwnerID str
 			}
 
 			logger.Debug("Sent renegotiation offer for voice track", "subscriber_id", c.ID, "source_id", voiceOwnerID)
-		}(client)
+		})
 	}
 }
 
@@ -1540,12 +1559,12 @@ func (h *WebSocketHandler) handleAdminKick(client *websocket.Client, payload jso
 	// "kicked" treated it as a network blip and silently reconnected.
 	roomSlug := client.RoomSlug
 	targetID := data.ParticipantID
-	go func() {
+	safeGo("adminKickDisconnect", func() {
 		time.Sleep(300 * time.Millisecond)
 		if target := h.hub.GetClient(roomSlug, targetID); target != nil {
 			target.Conn.Close()
 		}
-	}()
+	})
 
 	logger.Info("Admin kick", "by", client.ID, "target", data.ParticipantID, "room", client.RoomSlug)
 }
@@ -1761,7 +1780,7 @@ func (h *WebSocketHandler) handleScreenShareRevoke(client *websocket.Client, pay
 			affected := h.sfu.RemoveScreenShareTrack(client.RoomSlug)
 			h.hub.BroadcastJSON(client.RoomSlug, "screenshare:stopped", map[string]interface{}{}, "")
 			for _, subID := range affected {
-				go h.renegotiateSubscriber(client.RoomSlug, subID)
+				safeGo("renegotiateSubscriber", func() { h.renegotiateSubscriber(client.RoomSlug, subID) })
 			}
 		}
 	}
@@ -1814,7 +1833,7 @@ func (h *WebSocketHandler) handleScreenShareStop(client *websocket.Client) {
 
 	// Renegotiate affected subscribers to remove the track
 	for _, subID := range affected {
-		go h.renegotiateSubscriber(client.RoomSlug, subID)
+		safeGo("renegotiateSubscriber", func() { h.renegotiateSubscriber(client.RoomSlug, subID) })
 	}
 
 	logger.Info("Screen share stopped", "stopped_by", client.ID, "sharer", sharerID, "room", client.RoomSlug)

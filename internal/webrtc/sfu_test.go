@@ -755,6 +755,78 @@ func TestSFU_SetVoiceMuted(t *testing.T) {
 	sfu.SetVoiceMuted(roomSlug, "nobody", true)
 }
 
+// TestSFU_VoiceMuteGate_StableAcrossSessionReplacement is a regression test for
+// a silent admin-mute bypass. The voice relay's mute gate is captured by pointer
+// when the relay starts. Voice frequently arrives BEFORE the publisher offer, so
+// CreateVoiceRelayTrack used to host the gate on a *placeholder* VoiceSession;
+// HandleVoiceOffer then replaced that placeholder with a real session, orphaning
+// the pointer the relay still read — making SetVoiceMuted a no-op for that
+// participant. The gate now lives on RoomTracks.voiceMuteFlags, decoupled from
+// VoiceSession identity, so it survives the replacement.
+func TestSFU_VoiceMuteGate_StableAcrossSessionReplacement(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "mute-room"
+	participantID := "speaker-1"
+	room := sfu.GetRoomTracks(roomSlug)
+
+	// Simulate the relay-start path: CreateVoiceRelayTrack allocates the shared
+	// flag and the running relay captures a pointer to it.
+	room.mu.Lock()
+	if room.voiceMuteFlags == nil {
+		room.voiceMuteFlags = make(map[string]*atomic.Bool)
+	}
+	relayFlag := &atomic.Bool{}
+	room.voiceMuteFlags[participantID] = relayFlag
+	// A placeholder VoiceSession exists before the offer arrives.
+	placeholder := &VoiceSession{ParticipantID: participantID, done: make(chan struct{})}
+	room.VoiceSessions = map[string]*VoiceSession{participantID: placeholder}
+	room.mu.Unlock()
+
+	// HandleVoiceOffer replaces the placeholder with a brand-new session object.
+	realSession := &VoiceSession{ParticipantID: participantID, done: make(chan struct{})}
+	room.mu.Lock()
+	room.VoiceSessions[participantID] = realSession
+	room.mu.Unlock()
+
+	// Admin mutes the participant AFTER the replacement.
+	sfu.SetVoiceMuted(roomSlug, participantID, true)
+
+	// The relay reads the flag it captured at start. It must reflect the mute —
+	// this is what was broken: the relay kept reading the orphaned placeholder.
+	if !relayFlag.Load() {
+		t.Fatal("relay's captured mute flag was not flipped by SetVoiceMuted after session replacement (admin mute bypass)")
+	}
+
+	// And the canonical map flag must be the same object the relay holds, so
+	// there is exactly one source of truth.
+	room.mu.RLock()
+	canonical := room.voiceMuteFlags[participantID]
+	room.mu.RUnlock()
+	if canonical != relayFlag {
+		t.Fatal("voiceMuteFlags entry must be the same *atomic.Bool the relay captured")
+	}
+	if realSession.Muted.Load() {
+		// mirrored too, for back-compat consumers
+	} else {
+		t.Fatal("SetVoiceMuted should also mirror onto VoiceSession.Muted")
+	}
+
+	// Cleanup must remove the flag so a rejoiner starts unmuted.
+	sfu.RemoveVoiceSession(roomSlug, participantID)
+	room.mu.RLock()
+	_, stillThere := room.voiceMuteFlags[participantID]
+	room.mu.RUnlock()
+	if stillThere {
+		t.Fatal("voice mute flag should be cleared when the voice session is removed")
+	}
+}
+
 func TestSFU_CreatePeerConnection(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)

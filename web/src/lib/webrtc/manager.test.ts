@@ -574,6 +574,60 @@ describe('WebRTCManager ICE restart recovery', () => {
         ]);
     });
 
+    it('ignores connection-state events from a superseded subscriber peer connection', async () => {
+        // Regression: resetPeerConnection (reconnect / fresh offer / ICE-restart
+        // failure) closes the old PC, which can still emit a trailing
+        // 'disconnected'/'failed' event asynchronously. Without an identity
+        // guard that stale event would spuriously fire an ICE restart — or clear
+        // the NEW connection's recovery timers — on the replacement PC.
+        vi.useFakeTimers();
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: (type, payload) => {
+                sent.push({ type, payload });
+                return true;
+            }
+        });
+
+        const managerInternals = manager as unknown as {
+            createPeerConnection(): void;
+            resetPeerConnection(): void;
+            pc: FakeSubscriberPeerConnection | null;
+        };
+        managerInternals.createPeerConnection();
+        const oldPc = managerInternals.pc!;
+
+        // Simulate a rebuild: the old PC is torn down and a new one takes over.
+        managerInternals.resetPeerConnection();
+        managerInternals.createPeerConnection();
+        const newPc = managerInternals.pc!;
+
+        expect(newPc).not.toBe(oldPc);
+
+        // The stale old PC reports a 'disconnected' state and fires its handler.
+        oldPc.connectionState = 'disconnected';
+        oldPc.onconnectionstatechange?.();
+
+        // Let the disconnect watchdog window elapse fully.
+        await vi.advanceTimersByTimeAsync(3000);
+
+        // No ICE restart must have been requested for the stale event, and the
+        // new connection's state must be untouched.
+        expect(sent.some((m) => m.type === 'signal:ice-restart')).toBe(false);
+        expect(newPc.connectionState).toBe('disconnected');
+
+        // Sanity: the new PC's own event still drives a restart (guard doesn't
+        // suppress legitimate recovery).
+        sent.length = 0;
+        newPc.onconnectionstatechange?.();
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(sent.some((m) => m.type === 'signal:ice-restart')).toBe(true);
+    });
+
     it('escalates immediately when the ICE restart offer cannot be sent', async () => {
         vi.useFakeTimers();
         vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
@@ -936,7 +990,17 @@ describe('WebRTCManager subscriber signaling', () => {
             jitterBufferTarget: null,
             playoutDelayHint: 1
         };
+        // Receivers are tuned once via the ontrack path (the only place the
+        // manager writes latency hints); getStats() must report — not rewrite —
+        // them. Drive the receiver through ontrack so the test mirrors reality,
+        // and register it with the (fake) PC's receiver list so getReceivers()
+        // returns it the way a real browser would after ontrack.
         pc?.receivers.push(receiver as unknown as RTCRtpReceiver);
+        pc?.ontrack?.({
+            track: { kind: 'video', id: 'main-video' },
+            streams: [{ id: 'main-stream' }],
+            receiver
+        } as unknown as RTCTrackEvent);
         pc?.statsReport.set('candidate-pair-1', {
             type: 'candidate-pair',
             state: 'succeeded',

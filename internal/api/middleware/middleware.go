@@ -282,6 +282,14 @@ func RateLimiter(cfg RateLimiterConfig) func(http.Handler) http.Handler {
 // getClientIP extracts the client IP from the request
 // Only trusts X-Forwarded-For and X-Real-IP headers if the direct connection
 // comes from a trusted proxy. This prevents IP spoofing attacks.
+//
+// X-Forwarded-For is a comma-separated chain where each trusted proxy appends
+// the address it received the request from to the RIGHT. The leftmost entry is
+// therefore fully client-controlled and trivially spoofable — trusting it lets
+// an attacker rotate the leftmost value to defeat every IP-based rate limiter
+// (login brute force, room join, file upload). Instead we walk the chain
+// right-to-left and return the first address that is NOT a trusted proxy, i.e.
+// the origin the last trusted proxy actually saw.
 func getClientIP(r *http.Request, trustedProxies trustedProxySet) string {
 	directIP, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -298,16 +306,28 @@ func getClientIP(r *http.Request, trustedProxies trustedProxySet) string {
 		return directIP
 	}
 
-	// Request came from trusted proxy - trust the forwarded headers
-	// Check X-Forwarded-For header first
+	// Request came from trusted proxy - trust the forwarded headers.
+	// Check X-Forwarded-For header first.
 	forwarded := r.Header.Get("X-Forwarded-For")
 	if forwarded != "" {
-		// Take the first IP in the list (original client IP)
+		// Walk right-to-left: the last proxy (the one we trust) appended the
+		// immediate client to the right, so the rightmost untrusted hop is the
+		// real client. Skip any further trusted proxies (multi-hop through our
+		// own infra). Taking the leftmost entry instead would let a client
+		// forge it and bypass every IP rate limit.
 		ips := strings.Split(forwarded, ",")
-		clientIP := strings.TrimSpace(ips[0])
-		if clientIP != "" {
-			return clientIP
+		for i := len(ips) - 1; i >= 0; i-- {
+			clientIP := strings.TrimSpace(ips[i])
+			if clientIP == "" {
+				continue
+			}
+			if !trustedProxies.IsTrusted(clientIP) {
+				return clientIP
+			}
 		}
+		// Every hop was trusted (e.g. health check from internal infra). Fall
+		// through to X-Real-IP / direct IP rather than trusting the spoofable
+		// leftmost entry.
 	}
 
 	// Check X-Real-IP header

@@ -682,3 +682,82 @@ func TestClient_MediaStateConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestClient_ReadPumpRecoversFromHandlerPanic is a regression test for a
+// process-wide crash. The read pump runs in its own goroutine outside the HTTP
+// Recoverer middleware; without its own recover(), a panic while processing a
+// client message (a malformed signaling frame, a Pion/DB edge case) would
+// terminate the entire server and drop every room. This test sends a message
+// whose handler panics and asserts the pump recovers, fires the disconnect
+// handler, and tears the connection down — instead of killing the test binary.
+func TestClient_ReadPumpRecoversFromHandlerPanic(t *testing.T) {
+	var serverConn *gorillawebsocket.Conn
+	accepted := make(chan struct{})
+	upgrader := gorillawebsocket.Upgrader{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade failed: %v", err)
+			close(accepted)
+			return
+		}
+		serverConn = conn
+		close(accepted)
+	}))
+	defer server.Close()
+
+	peer, _, err := gorillawebsocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer peer.Close()
+
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("websocket server did not accept connection")
+	}
+	if serverConn == nil {
+		t.Fatal("websocket server did not produce a connection")
+	}
+
+	hub := NewHub()
+	go hub.Run()
+	defer stopHub(hub)
+
+	client := newTestClient("client-panic", "Alice", "panic-room", hub)
+	client.Conn = serverConn
+
+	disconnected := make(chan struct{})
+	handler := func(_ *Client, _ Message) {
+		panic("simulated handler panic from malformed message")
+	}
+	onDisconnect := func(_ *Client) { close(disconnected) }
+
+	pumpExited := make(chan struct{})
+	go func() {
+		client.ReadPumpWithDisconnect(handler, onDisconnect)
+		close(pumpExited)
+	}()
+
+	// Send a message that triggers the panicking handler.
+	if err := peer.WriteMessage(gorillawebsocket.TextMessage,
+		[]byte(`{"type":"boom","payload":null}`)); err != nil {
+		t.Fatalf("failed to send message: %v", err)
+	}
+
+	// The pump must recover and run its disconnect cleanup rather than crashing
+	// the process. Give it a moment to settle.
+	select {
+	case <-disconnected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("disconnect handler was not invoked after recovered panic")
+	}
+	select {
+	case <-pumpExited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("read pump did not exit cleanly after recovered panic")
+	}
+}
+

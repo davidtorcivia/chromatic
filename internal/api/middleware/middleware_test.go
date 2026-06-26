@@ -567,10 +567,28 @@ func TestGetClientIP(t *testing.T) {
 				expectedIP:    "203.0.113.1",
 			},
 			{
-				name:          "x-forwarded-for multiple from trusted proxy",
+				name:          "x-forwarded-for multiple from trusted proxy returns rightmost untrusted hop",
 				remoteAddr:    "127.0.0.1:12345",
 				xForwardedFor: "203.0.113.1, 198.51.100.1, 10.0.0.1",
-				expectedIP:    "203.0.113.1",
+				expectedIP:    "198.51.100.1",
+			},
+			{
+				name:          "spoofed leftmost xff is ignored in favor of rightmost untrusted hop",
+				remoteAddr:    "127.0.0.1:12345",
+				xForwardedFor: "9.9.9.9, 203.0.113.7",
+				expectedIP:    "203.0.113.7",
+			},
+			{
+				name:          "all-untrusted single hop is returned",
+				remoteAddr:    "127.0.0.1:12345",
+				xForwardedFor: "203.0.113.7",
+				expectedIP:    "203.0.113.7",
+			},
+			{
+				name:          "xff containing only trusted hops falls back to direct ip",
+				remoteAddr:    "127.0.0.1:12345",
+				xForwardedFor: "10.0.0.1",
+				expectedIP:    "127.0.0.1",
 			},
 			{
 				name:       "x-real-ip from trusted proxy",

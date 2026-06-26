@@ -100,6 +100,11 @@
     let resubscribeEvents = $state(0);
     let statsInterval: ReturnType<typeof setInterval> | null = null;
     let statsPollGeneration = 0;
+    // Whether stats polling should be running while the tab is visible. The
+    // visibility handler pauses polling when backgrounded (a backgrounded
+    // viewer's 1s getStats poll does nothing useful and re-tunes nothing now,
+    // but still wakes the CPU) and resumes it only if this was true.
+    let statsPollingWanted = false;
     // Cloudflare TURN credentials default to a 1 h TTL; long color-grading
     // sessions (4–8 h) outlive that. Refresh every 30 min over the existing
     // WebSocket so any ICE restart later always has fresh creds to gather
@@ -250,6 +255,7 @@
 
     onMount(async () => {
         startLoadMonitor();
+        document.addEventListener("visibilitychange", handleVisibilityChange);
         try {
             if (getStorageItem("local", "chromatic_reduce_transparency") === "on") {
                 reduceTransparency = true;
@@ -703,6 +709,7 @@
         closeAudioContext();
         window.removeEventListener("chromatic:tampering", handleTampering);
         navigator.mediaDevices?.removeEventListener?.("devicechange", refreshAudioDevices);
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
         clearMicPromptTimer();
         clearConnectingWatchdog();
         clearSubscriptionRetryTimer();
@@ -1069,6 +1076,12 @@
     }
 
     function startStatsPolling() {
+        statsPollingWanted = true;
+        // If the tab is hidden, defer until it becomes visible again — the
+        // visibility handler will resume polling.
+        if (typeof document !== "undefined" && document.hidden) {
+            return;
+        }
         if (statsInterval) return;
         const generation = ++statsPollGeneration;
         let inFlight = false;
@@ -1114,10 +1127,29 @@
     }
 
     function stopStatsPolling() {
+        statsPollingWanted = false;
         statsPollGeneration++;
         if (statsInterval) {
             clearInterval(statsInterval);
             statsInterval = null;
+        }
+    }
+
+    // Pause stats polling while the tab is hidden (nothing useful happens for a
+    // backgrounded viewer, and skipping the 1s getStats poll saves CPU/power),
+    // resuming automatically when the tab is visible again — but only if
+    // polling was wanted (i.e. a stream is attached).
+    function handleVisibilityChange() {
+        if (destroyed) return;
+        if (document.hidden) {
+            // Drop the interval but remember the intent to poll.
+            statsPollGeneration++;
+            if (statsInterval) {
+                clearInterval(statsInterval);
+                statsInterval = null;
+            }
+        } else if (statsPollingWanted && !statsInterval) {
+            startStatsPolling();
         }
     }
 

@@ -24,6 +24,17 @@ func (c *Client) ReadPump(handler func(*Client, Message)) {
 
 // ReadPumpWithDisconnect pumps messages and calls onDisconnect when client leaves
 func (c *Client) ReadPumpWithDisconnect(handler func(*Client, Message), onDisconnect OnDisconnect) {
+	// The read pump runs in its own goroutine, spawned after the HTTP handler
+	// returns, so it sits OUTSIDE any HTTP middleware panic recovery. A panic
+	// while processing a client message (malformed signaling, a Pion/DB edge
+	// case, a nil deref) would otherwise crash the entire process — taking down
+	// every room and viewer. Recover here so a single bad message tears down
+	// only this connection, then let the deferred cleanup run normally.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("WebSocket read pump panic recovered for client %s: %v", c.ID, r)
+		}
+	}()
 	defer func() {
 		// Call disconnect handler before unregistering
 		if onDisconnect != nil {
@@ -61,6 +72,11 @@ func (c *Client) ReadPumpWithDisconnect(handler func(*Client, Message), onDiscon
 
 // WritePump pumps messages from the hub to the WebSocket connection
 func (c *Client) WritePump() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("WebSocket write pump panic recovered for client %s: %v", c.ID, r)
+		}
+	}()
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
