@@ -146,21 +146,39 @@
         };
     }
 
+    function stopDrawLoop() {
+        if (raf) cancelAnimationFrame(raf);
+        raf = 0;
+    }
+
+    function requestDrawLoop() {
+        if (!open || raf || document.hidden) return;
+        raf = requestAnimationFrame(drawScope);
+    }
+
     function drawScope() {
         raf = 0;
-        if (!open) return;
-        raf = requestAnimationFrame(drawScope);
+        if (!open || document.hidden) return;
         const video = videoElement;
-        if (!video || video.readyState < 2 || !displayCanvas || document.hidden) return;
+        if (!video || video.readyState < 2 || !displayCanvas) {
+            requestDrawLoop();
+            return;
+        }
         const now = performance.now();
         // Lowest rung on the priority ladder: under load the scopes drop
         // to ~10fps before anything else is touched.
-        if (now - lastDrawAt < degradedInterval("scopes", FRAME_MS)) return;
+        if (now - lastDrawAt < degradedInterval("scopes", FRAME_MS)) {
+            requestDrawLoop();
+            return;
+        }
         lastDrawAt = now;
 
         // Identical frame, same mode: the trace would be identical too.
         const bmp = getFrameBitmap(video);
-        if (bmp && bmp === lastAnalyzed && mode === lastAnalyzedMode) return;
+        if (bmp && bmp === lastAnalyzed && mode === lastAnalyzedMode) {
+            requestDrawLoop();
+            return;
+        }
         lastAnalyzed = bmp;
         lastAnalyzedMode = mode;
 
@@ -277,22 +295,35 @@
 
         const dctx = displayCanvas.getContext("2d")!;
         dctx.putImageData(outImage, 0, 0);
+        requestDrawLoop();
     }
 
     $effect(() => {
         const registered = open;
         if (registered) setReviewToolActive("scopes", true);
         if (open) {
-            if (!raf) raf = requestAnimationFrame(drawScope);
+            requestDrawLoop();
         } else {
             clearPointerInteraction();
+            stopDrawLoop();
         }
         return () => {
             if (registered) setReviewToolActive("scopes", false);
             clearPointerInteraction();
-            if (raf) cancelAnimationFrame(raf);
-            raf = 0;
+            stopDrawLoop();
         };
+    });
+
+    $effect(() => {
+        const handleVisibility = () => {
+            if (document.hidden) {
+                stopDrawLoop();
+            } else {
+                requestDrawLoop();
+            }
+        };
+        document.addEventListener("visibilitychange", handleVisibility);
+        return () => document.removeEventListener("visibilitychange", handleVisibility);
     });
 
     // A position persisted on a wide window can land entirely outside a
