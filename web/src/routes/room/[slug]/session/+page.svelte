@@ -201,6 +201,9 @@
     let videoInputs = $state<MediaDeviceInfo[]>([]);
     let remoteCamStreams = $state<Map<string, MediaStream>>(new Map());
     let camsHidden = $state(false);
+    // One-time "turn on your camera?" nudge after the mic is enabled. Dismissed
+    // permanently (for the session) once the user acts on it or turns the cam on.
+    let camNudgeDismissed = $state(false);
     // Live preview for the camera picker. When the cam is already on we preview
     // the published self stream; when off, we open a temporary preview stream
     // while the settings popover is open (stopped as soon as it closes).
@@ -1405,7 +1408,15 @@
     }
 
     // ---- Presence webcam -----------------------------------------------------
+    // The mic→camera nudge: open the device picker (camera section + live
+    // preview) and stop nudging. Default-off; the user opts in here.
+    function openCameraSetup() {
+        camNudgeDismissed = true;
+        showAudioSettings = true;
+    }
+
     async function toggleCamera() {
+        camNudgeDismissed = true; // any camera interaction ends the nudge
         if (!webrtcManager || cameraPending) return;
         const manager = webrtcManager;
         cameraPending = true;
@@ -2367,6 +2378,11 @@
     let cameraPreviewSource = $derived(isCameraOn ? selfCamStream : previewStream);
     // True when an admin has gated this user's own camera off.
     let myCamDisabled = $derived(camDisabledIds.has(sessionData?.participantId ?? ""));
+    // One-time nudge to turn the camera on, shown after the mic is live (cams are
+    // opt-in/default-off). Hidden once dismissed, the cam is on, or it's gated.
+    let showCamNudge = $derived(
+        isMicEnabled && !isCameraOn && !camNudgeDismissed && !myCamDisabled,
+    );
 
     // Join/leave chimes for everyone: watch the roster for deltas rather
     // than a specific message type (joins arrive via roster broadcasts).
@@ -2821,6 +2837,24 @@
 
         <!-- Controls overlay -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <!-- One-time nudge after the mic goes live: cameras are opt-in, so invite
+             the user to turn theirs on. Clicking opens the camera picker/preview. -->
+        {#if showCamNudge && isControlsVisible}
+            <div class="cam-nudge" transition:fade={{ duration: 150 }}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+                <span class="cam-nudge-text">Turn your camera on?</span>
+                <button class="cam-nudge-enable" onclick={openCameraSetup}>Set up camera</button>
+                <button
+                    class="cam-nudge-dismiss"
+                    onclick={() => (camNudgeDismissed = true)}
+                    aria-label="Not now"
+                    title="Not now"
+                >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                </button>
+            </div>
+        {/if}
+
         <!-- Persistent floating cam strip: shown whenever cameras are on and not
              hidden. Unlike the top-bar dots it lives OUTSIDE .controls-overlay,
              so it stays up when the UI auto-hides — sliding flush into the
@@ -2900,7 +2934,7 @@
                          hidden) — then it behaves like before and hides with the
                          UI. When cams are showing, the persistent .cam-float
                          below takes over. -->
-                    {#if participants.length > 1 && !(anyCamActive && !camsHidden)}
+                    {#if (participants.length > 1 || anyCamActive) && !(anyCamActive && !camsHidden)}
                         <div
                             class="presence-row"
                             bind:this={presenceRowEl}
@@ -4374,6 +4408,60 @@
     .cam-float-hide {
         pointer-events: auto;
         align-self: center;
+    }
+
+    /* Mic→camera nudge: a small glass pill centered above the control bar. */
+    .cam-nudge {
+        position: fixed;
+        bottom: 96px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 12;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 8px 8px 14px;
+        border-radius: var(--radius-full);
+        background: rgba(20, 28, 34, 0.92);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        box-shadow: 0 8px 28px rgba(0, 0, 0, 0.4);
+        color: var(--color-text);
+        backdrop-filter: blur(10px);
+    }
+    .cam-nudge-text {
+        font-size: 0.8125rem;
+        white-space: nowrap;
+    }
+    .cam-nudge-enable {
+        background: var(--color-primary);
+        border: none;
+        border-radius: var(--radius-full);
+        color: #041014;
+        font-size: 0.8125rem;
+        font-weight: 600;
+        padding: 6px 12px;
+        cursor: pointer;
+        transition: filter 0.15s ease;
+    }
+    .cam-nudge-enable:hover {
+        filter: brightness(1.08);
+    }
+    .cam-nudge-dismiss {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 1.75rem;
+        height: 1.75rem;
+        border: none;
+        border-radius: 50%;
+        background: transparent;
+        color: var(--color-text-muted);
+        cursor: pointer;
+        transition: background 0.12s ease, color 0.12s ease;
+    }
+    .cam-nudge-dismiss:hover {
+        background: rgba(255, 255, 255, 0.1);
+        color: #fff;
     }
     .cam-preview {
         width: 100%;

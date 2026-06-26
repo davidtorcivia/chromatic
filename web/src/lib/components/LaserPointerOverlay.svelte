@@ -21,6 +21,7 @@
         TRAIL_GLOW_WIDTH_RATIO,
         TRAIL_GLOW_ALPHA,
         MIN_STAMP_DIST_PX,
+        TRAIL_SMOOTHING,
         CURSOR_SEND_INTERVAL_MS,
         type BatchPoint,
         type QuadSlice,
@@ -509,9 +510,14 @@
             cursor.prev1 = { x, y };
             return;
         }
+        // Light exponential smoothing of the trail input toward the raw sample —
+        // tames hand/sensor jitter so the stroke reads as a clean curve. Only the
+        // trail is smoothed; the live cursor dot still tracks the true pointer.
+        const sx = p1.x + TRAIL_SMOOTHING * (x - p1.x);
+        const sy = p1.y + TRAIL_SMOOTHING * (y - p1.y);
         // Skip sub-pixel jitter so round caps don't pile up on one spot.
-        const dx = (x - p1.x) * w;
-        const dy = (y - p1.y) * h;
+        const dx = (sx - p1.x) * w;
+        const dy = (sy - p1.y) * h;
         if (dx * dx + dy * dy < MIN_STAMP_DIST_PX * MIN_STAMP_DIST_PX) return;
 
         const p2 = cursor.prev2 ?? p1; // first slice starts at prev1 itself
@@ -520,11 +526,11 @@
             midpointSlice(
                 { x: p2.x * w, y: p2.y * h },
                 { x: p1.x * w, y: p1.y * h },
-                { x: x * w, y: y * h }
+                { x: sx * w, y: sy * h }
             )
         );
         cursor.prev2 = p1;
-        cursor.prev1 = { x, y };
+        cursor.prev1 = { x: sx, y: sy };
         startRenderLoop();
     }
 

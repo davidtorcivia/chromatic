@@ -71,9 +71,20 @@ export const TRAIL_HOLD_MS = 300;
  * Maximum on-screen chord length (px) of a single stamped slice. A
  * fast flick can put consecutive samples far apart; longer slices are
  * subdivided by sampling the quadratic (flattenSlice) so no stamp
- * degenerates into one long straight rod.
+ * degenerates into one long straight rod. Kept fairly small so fast
+ * strokes read as a smooth curve rather than coarse polyline segments.
  */
-export const SLICE_MAX_CHORD_PX = 40;
+export const SLICE_MAX_CHORD_PX = 18;
+
+/**
+ * Trail input smoothing: each stamped trail point is an exponential blend
+ * this fraction of the way from the previous stamped point toward the raw
+ * sample (1 = no smoothing, snappy; lower = smoother but the trail lags
+ * slightly behind the live dot). Tames hand/sensor jitter so slow strokes
+ * read as a clean curve. Applies to the TRAIL only — the cursor dot still
+ * tracks the true pointer with zero lag.
+ */
+export const TRAIL_SMOOTHING = 0.6;
 
 /**
  * Minimum on-screen distance (px) a new point must move from the last
