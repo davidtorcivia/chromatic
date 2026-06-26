@@ -12,7 +12,7 @@
      * the input handler — never waits for a frame.
      */
     import { fade } from "svelte/transition";
-    import { degradedInterval } from "$lib/perf/loadMonitor";
+    import { degradedInterval, setReviewToolActive } from "$lib/perf/loadMonitor";
     import { IS_GECKO } from "$lib/platform";
     import { linkProgram, bindFullscreenTriangle } from "$lib/glass/gl";
     import { getVideoContentPageRect } from "$lib/video/coordinates";
@@ -85,6 +85,8 @@ void main() {
     let py = -1;
     let raf = 0;
     let lastUploadAt = 0;
+    let cachedSource: { video: HTMLVideoElement; rect: DOMRect } | null = null;
+    let lastSourceCheckAt = 0;
 
     let gl: WebGL2RenderingContext | null = null;
     let glTried = false;
@@ -127,14 +129,30 @@ void main() {
 
     /** Whichever playing video sits under the cursor (share pane wins ties
      *  by document order being checked first). */
-    function sourceUnderPointer(): { video: HTMLVideoElement; rect: DOMRect } | null {
+    function sourceUnderPointer(force = false): { video: HTMLVideoElement; rect: DOMRect } | null {
+        const now = performance.now();
+        if (!force && cachedSource && now - lastSourceCheckAt < 120) {
+            const { rect, video } = cachedSource;
+            if (
+                video.readyState >= 2 &&
+                px >= rect.left &&
+                px <= rect.right &&
+                py >= rect.top &&
+                py <= rect.bottom
+            ) {
+                return cachedSource;
+            }
+        }
+        lastSourceCheckAt = now;
         for (const v of [shareElement, videoElement]) {
             if (!v || v.readyState < 2) continue;
             const r = getVideoContentPageRect(v);
             if (r && px >= r.left && px <= r.right && py >= r.top && py <= r.bottom) {
-                return { video: v, rect: r };
+                cachedSource = { video: v, rect: r };
+                return cachedSource;
             }
         }
+        cachedSource = null;
         return null;
     }
 
@@ -148,6 +166,7 @@ void main() {
             if (chipEl) {
                 chipEl.style.transform = `translate(${px - 24}px, ${py + LENS_SIZE / 2 + 10}px)`;
             }
+            sourceUnderPointer(true);
         }
     }
 
@@ -267,11 +286,14 @@ void main() {
     });
 
     $effect(() => {
+        const registered = enabled;
+        if (registered) setReviewToolActive("loupe", true);
         if (!enabled) {
             if (raf) cancelAnimationFrame(raf);
             raf = 0;
             if (canvasEl) canvasEl.style.opacity = "0";
             if (chipEl) chipEl.style.opacity = "0";
+            cachedSource = null;
             return;
         }
         // One-time usage hint per browsing session
@@ -294,6 +316,8 @@ void main() {
             raf = 0;
             if (hintTimer) clearTimeout(hintTimer);
             showHint = false;
+            cachedSource = null;
+            if (registered) setReviewToolActive("loupe", false);
         };
     });
 </script>

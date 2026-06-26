@@ -13,7 +13,7 @@
     import { scale } from "svelte/transition";
     import { quintOut } from "svelte/easing";
     import { getFrameBitmap } from "$lib/glass/frameSource";
-    import { degradedInterval } from "$lib/perf/loadMonitor";
+    import { degradedInterval, setReviewToolActive } from "$lib/perf/loadMonitor";
 
     interface Props {
         videoElement: HTMLVideoElement | null;
@@ -258,10 +258,13 @@
     }
 
     $effect(() => {
+        const registered = open;
+        if (registered) setReviewToolActive("scopes", true);
         if (open) {
             if (!raf) raf = requestAnimationFrame(drawScope);
         }
         return () => {
+            if (registered) setReviewToolActive("scopes", false);
             if (raf) cancelAnimationFrame(raf);
             raf = 0;
         };

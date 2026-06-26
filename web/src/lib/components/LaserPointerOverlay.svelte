@@ -1,5 +1,6 @@
 <script lang="ts">
     import { IS_GECKO } from "$lib/platform";
+    import { activeReviewToolCount, setReviewToolActive, underPressure } from "$lib/perf/loadMonitor";
     import { onMount } from "svelte";
     import { session } from "$lib/stores/session.svelte";
     import {
@@ -196,21 +197,25 @@
 
     $effect(() => {
         videoElement.style.cursor = enabled ? "crosshair" : "";
+        const registered = enabled;
+        if (registered) setReviewToolActive("laser", true);
 
         if (enabled) {
             showHintForDuration();
-            return;
+        } else {
+            showUsageHint = false;
+            clearHintTimer();
+            if (isPointing) {
+                activePointerId = null;
+                isPointing = false;
+                endLocalStroke();
+                sendCursorEnd();
+            }
+            // No trail cleanup needed: the live buckets fade out on their own.
         }
-
-        showUsageHint = false;
-        clearHintTimer();
-        if (isPointing) {
-            activePointerId = null;
-            isPointing = false;
-            endLocalStroke();
-            sendCursorEnd();
-        }
-        // No trail cleanup needed: the live buckets fade out on their own.
+        return () => {
+            if (registered) setReviewToolActive("laser", false);
+        };
     });
 
     onMount(() => {
@@ -726,19 +731,20 @@
             tc.clearRect(0, 0, w, h);
             tc.lineCap = "round";
             tc.lineJoin = "round";
+            const drawTrailGlow = !underPressure() && activeReviewToolCount() < 3;
             for (const bucket of trailBuckets) {
                 const fade = fadeForAge(frameNow - bucket.openedAt);
                 if (fade <= 0) continue;
                 tc.strokeStyle = bucket.color;
-                // Glow pass: wide, faint, additive. The glow is the pure
-                // participant color at low alpha, so same-color overlap
-                // (crossings, spun circles) saturates toward the vivid
-                // hue — additive compositing cannot white-clip a
-                // single-hue source.
-                tc.globalCompositeOperation = "lighter";
-                tc.globalAlpha = TRAIL_GLOW_ALPHA * fade;
-                tc.lineWidth = TRAIL_BODY_WIDTH * TRAIL_GLOW_WIDTH_RATIO;
-                tc.stroke(bucket.path);
+                if (drawTrailGlow) {
+                    // Glow pass: wide, faint, additive. Dropped only under
+                    // pressure/tool pileups; the actual laser path remains
+                    // full-rate and fully drawn.
+                    tc.globalCompositeOperation = "lighter";
+                    tc.globalAlpha = TRAIL_GLOW_ALPHA * fade;
+                    tc.lineWidth = TRAIL_BODY_WIDTH * TRAIL_GLOW_WIDTH_RATIO;
+                    tc.stroke(bucket.path);
+                }
                 // Body pass: normal width, high alpha, source-over —
                 // crossings (including other participants' trails)
                 // repaint cleanly instead of accumulating.
