@@ -97,6 +97,7 @@
     let reconnectEvents = $state(0);
     let resubscribeEvents = $state(0);
     let statsInterval: ReturnType<typeof setInterval> | null = null;
+    let statsPollGeneration = 0;
     // Cloudflare TURN credentials default to a 1 h TTL; long color-grading
     // sessions (4–8 h) outlive that. Refresh every 30 min over the existing
     // WebSocket so any ICE restart later always has fresh creds to gather
@@ -1067,12 +1068,17 @@
 
     function startStatsPolling() {
         if (statsInterval) return;
+        const generation = ++statsPollGeneration;
         let inFlight = false;
         const poll = async () => {
-            if (!webrtcManager || inFlight) return;
+            const manager = webrtcManager;
+            if (!manager || inFlight || destroyed || generation !== statsPollGeneration) return;
             inFlight = true;
             try {
-                const stats = await webrtcManager.getStats();
+                const stats = await manager.getStats();
+                if (destroyed || webrtcManager !== manager || generation !== statsPollGeneration) {
+                    return;
+                }
                 currentRtt = stats.rtt ?? null;
                 currentVideoBufferDelay = stats.videoJitterBufferDelay ?? null;
                 currentReceiverJitterTarget = stats.receiverJitterBufferTarget ?? null;
@@ -1085,8 +1091,18 @@
                 activeReviewToolCount = load.activeReviewToolCount;
                 longFrameCount = load.longFrameCount;
                 worstLongFrameMs = load.worstLongFrameMs;
+            } catch (err) {
+                if (!destroyed && webrtcManager === manager && generation === statsPollGeneration) {
+                    console.warn("Failed to poll WebRTC stats", err);
+                    currentRtt = null;
+                    currentVideoBufferDelay = null;
+                    currentReceiverJitterTarget = null;
+                    currentReceiverPlayoutHint = null;
+                }
             } finally {
-                inFlight = false;
+                if (!destroyed && generation === statsPollGeneration) {
+                    inFlight = false;
+                }
             }
         };
         void poll();
@@ -1096,6 +1112,7 @@
     }
 
     function stopStatsPolling() {
+        statsPollGeneration++;
         if (statsInterval) {
             clearInterval(statsInterval);
             statsInterval = null;
