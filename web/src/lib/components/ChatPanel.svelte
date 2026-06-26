@@ -136,12 +136,15 @@
     let pinnedToBottom = true;
     let autoScrolling = false;
     let autoScrollTimer: ReturnType<typeof setTimeout> | null = null;
+    let uploadAbortController: AbortController | null = null;
 
     onDestroy(() => {
         if (autoScrollTimer) {
             clearTimeout(autoScrollTimer);
             autoScrollTimer = null;
         }
+        uploadAbortController?.abort();
+        uploadAbortController = null;
     });
 
     function scrollToBottom(smooth = false) {
@@ -238,16 +241,21 @@
     }
 
     async function handleFileUpload(file: File) {
+        uploadAbortController?.abort();
+        const controller = new AbortController();
+        uploadAbortController = controller;
         uploadError = null;
 
         // Validate file type
         if (!ALLOWED_TYPES.includes(file.type)) {
+            uploadAbortController = null;
             uploadError = "File type not allowed. Use images, audio, or PDF.";
             return;
         }
 
         // Validate file size
         if (file.size > MAX_FILE_SIZE) {
+            uploadAbortController = null;
             uploadError = `File too large. Maximum size is ${formatFileSize(MAX_FILE_SIZE)}.`;
             return;
         }
@@ -261,9 +269,13 @@
                 file,
                 joinToken,
                 (progress) => {
+                    if (uploadAbortController !== controller) return;
                     uploadProgress = progress;
-                }
+                },
+                controller.signal
             );
+
+            if (uploadAbortController !== controller) return;
 
             // Send chat:file message via WebSocket
             session.send("chat:file", {
@@ -277,8 +289,13 @@
 
             uploadProgress = null;
         } catch (err) {
+            if (uploadAbortController !== controller) return;
             uploadError = err instanceof Error ? err.message : "Upload failed";
             uploadProgress = null;
+        } finally {
+            if (uploadAbortController === controller) {
+                uploadAbortController = null;
+            }
         }
     }
 

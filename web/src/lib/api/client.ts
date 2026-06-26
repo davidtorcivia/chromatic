@@ -305,12 +305,26 @@ export async function uploadFile(
     roomSlug: string,
     file: File,
     joinToken: string,
-    onProgress?: (percent: number) => void
+    onProgress?: (percent: number) => void,
+    signal?: AbortSignal
 ): Promise<UploadedFile> {
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         const formData = new FormData();
         formData.append('file', file);
+
+        const abortUpload = () => {
+            xhr.abort();
+        };
+        const cleanup = () => {
+            signal?.removeEventListener('abort', abortUpload);
+        };
+
+        if (signal?.aborted) {
+            reject(new Error('Upload cancelled'));
+            return;
+        }
+        signal?.addEventListener('abort', abortUpload, { once: true });
 
         xhr.upload.addEventListener('progress', (e) => {
             if (e.lengthComputable && onProgress) {
@@ -319,6 +333,7 @@ export async function uploadFile(
         });
 
         xhr.addEventListener('load', () => {
+            cleanup();
             if (xhr.status >= 200 && xhr.status < 300) {
                 try {
                     resolve(JSON.parse(xhr.responseText));
@@ -331,10 +346,12 @@ export async function uploadFile(
         });
 
         xhr.addEventListener('error', () => {
+            cleanup();
             reject(new Error('Network error'));
         });
 
         xhr.addEventListener('abort', () => {
+            cleanup();
             reject(new Error('Upload cancelled'));
         });
 

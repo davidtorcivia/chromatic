@@ -119,6 +119,8 @@
     let grabToast = $state<string | null>(null);
     let grabFlashTimer: ReturnType<typeof setTimeout> | null = null;
     let grabToastTimer: ReturnType<typeof setTimeout> | null = null;
+    let grabAbortController: AbortController | null = null;
+    let destroyed = false;
     // Preferences (persisted)
     let uiSounds = $state(getUiSoundsEnabled());
     let reduceTransparency = $state(false);
@@ -684,6 +686,9 @@
     });
 
     onDestroy(() => {
+        destroyed = true;
+        grabAbortController?.abort();
+        grabAbortController = null;
         stopLoadMonitor();
         releaseFrames();
         cleanupWebRTC();
@@ -1732,6 +1737,8 @@
         if (grabBusy || !videoElement || videoElement.readyState < 2 || !videoElement.videoWidth) {
             return;
         }
+        const controller = new AbortController();
+        grabAbortController = controller;
         grabBusy = true;
         grabFlash = true;
         if (grabFlashTimer) clearTimeout(grabFlashTimer);
@@ -1753,7 +1760,14 @@
                 .map((n) => n.toString().padStart(2, "0"))
                 .join("");
             const file = new File([blob], `frame-${slug}-${stamp}.jpg`, { type: "image/jpeg" });
-            const uploaded = await uploadFile(slug, file, sessionData?.token || "");
+            const uploaded = await uploadFile(
+                slug,
+                file,
+                sessionData?.token || "",
+                undefined,
+                controller.signal,
+            );
+            if (destroyed || grabAbortController !== controller) return;
             session.send("chat:file", {
                 fileId: uploaded.id,
                 name: uploaded.originalName,
@@ -1763,9 +1777,16 @@
             });
             showGrabToast("Frame shared to chat");
         } catch {
-            showGrabToast("Could not capture the frame");
+            if (!destroyed && grabAbortController === controller) {
+                showGrabToast("Could not capture the frame");
+            }
         } finally {
-            grabBusy = false;
+            if (grabAbortController === controller) {
+                grabAbortController = null;
+            }
+            if (!destroyed) {
+                grabBusy = false;
+            }
         }
     }
 
