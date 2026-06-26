@@ -2821,6 +2821,59 @@
 
         <!-- Controls overlay -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <!-- Persistent floating cam strip: shown whenever cameras are on and not
+             hidden. Unlike the top-bar dots it lives OUTSIDE .controls-overlay,
+             so it stays up when the UI auto-hides — sliding flush into the
+             top-right corner then, and back to its padded spot when the UI
+             returns (or chat is open). pointer-events:none so it never blocks
+             the laser/loupe on the video beneath; only the hide button is live. -->
+        {#if anyCamActive && !camsHidden}
+            <div class="cam-float" class:flush={!isControlsVisible && !isChatOpen}>
+                {#each participants.slice(0, 12) as p (p.id)}
+                    {@const isSelf = p.id === sessionData?.participantId}
+                    {@const camStream = isSelf
+                        ? (isCameraOn ? selfCamStream : null)
+                        : (remoteCamStreams.get(p.id) ?? null)}
+                    <div class="cam-float-tile">
+                        <div
+                            class="cam-float-circle"
+                            class:speaking={speakingParticipants.has(p.id)}
+                            class:muted={!p.audioEnabled}
+                            class:has-cam={!!camStream}
+                            style="--participant-color: {p.color}"
+                            title="{p.name}{isSelf ? ' (you)' : ''}"
+                        >
+                            {#if camStream}
+                                <!-- svelte-ignore a11y_media_has_caption -->
+                                <video
+                                    class="cam-video"
+                                    class:mirror={isSelf}
+                                    use:bindStream={camStream}
+                                    muted
+                                    autoplay
+                                    playsinline
+                                ></video>
+                            {:else}
+                                {p.name.charAt(0).toUpperCase()}
+                            {/if}
+                        </div>
+                        <span class="cam-float-name">{isSelf ? "You" : p.name}</span>
+                    </div>
+                {/each}
+                {#if participants.length > 12}
+                    <span class="cam-float-overflow">+{participants.length - 12}</span>
+                {/if}
+                <button
+                    class="cam-hide-btn cam-float-hide"
+                    onclick={toggleCamsHidden}
+                    aria-label="Hide cameras"
+                    title="Hide cameras"
+                >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><line x1="2" x2="22" y1="2" y2="22"/></svg>
+                </button>
+            </div>
+        {/if}
+
         <div
             class="controls-overlay"
             class:visible={isControlsVisible}
@@ -2842,12 +2895,14 @@
             >
                 <div class="room-name" bind:this={roomNameEl}>{roomState?.name || "Session"}</div>
                 <div class="top-bar-right">
-                    <!-- Compact presence row: one dot per participant, ring
-                         glows in their color while speaking, slash = muted -->
-                    {#if participants.length > 1 || isCameraOn}
+                    <!-- Compact presence dots in the top bar. Shown only when the
+                         floating cam strip isn't active (i.e. no cams, or cams
+                         hidden) — then it behaves like before and hides with the
+                         UI. When cams are showing, the persistent .cam-float
+                         below takes over. -->
+                    {#if participants.length > 1 && !(anyCamActive && !camsHidden)}
                         <div
-                            class="presence-row cam-strip"
-                            class:has-cams={anyCamActive}
+                            class="presence-row"
                             bind:this={presenceRowEl}
                         >
                             {#each participants.slice(0, 8) as p (p.id)}
@@ -4189,9 +4244,11 @@
     .presence-dot:first-child { margin-left: 0; }
     .presence-dot.speaking {
         z-index: 1;
+        /* Speaking ring is always green (a universal "talking" cue) rather than
+           the participant's color. */
         box-shadow:
-            0 0 0 2px var(--participant-color, var(--color-success)),
-            0 0 8px var(--participant-color, var(--color-success));
+            0 0 0 2px var(--color-success),
+            0 0 8px var(--color-success);
     }
     .presence-dot.muted { opacity: 0.55; }
     .presence-dot.muted::after {
@@ -4212,22 +4269,6 @@
         color: var(--color-text-muted);
     }
 
-    /* Presence cams: when any cam is on, the row expands the stacked dots into
-       a tidy strip of small circles (cam video or colored avatar). */
-    .cam-strip.has-cams {
-        gap: 4px;
-    }
-    .cam-strip.has-cams .presence-dot {
-        width: 2.5rem;
-        height: 2.5rem;
-        margin-left: 0;
-        font-size: 0.875rem;
-        overflow: hidden;
-    }
-    .presence-dot.has-cam {
-        background-color: #000;
-        border-color: rgba(0, 0, 0, 0.55);
-    }
     .cam-video {
         width: 100%;
         height: 100%;
@@ -4255,6 +4296,84 @@
     .cam-hide-btn:hover {
         background: rgba(255, 255, 255, 0.16);
         color: #fff;
+    }
+
+    /* Persistent floating cam strip (top-right). Padded by default; slides flush
+       into the corner when the UI hides (and chat is closed). pointer-events are
+       off so it never blocks the laser/loupe on the video; only the hide button
+       is interactive. */
+    .cam-float {
+        position: fixed;
+        top: 60px;
+        right: 16px;
+        z-index: 8;
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        padding: 8px 10px;
+        border-radius: var(--radius-md);
+        background: rgba(0, 0, 0, 0.28);
+        backdrop-filter: blur(6px);
+        pointer-events: none;
+        transition: top 0.3s var(--ease-out, ease), right 0.3s var(--ease-out, ease),
+            background 0.3s ease;
+    }
+    .cam-float.flush {
+        top: 0;
+        right: 0;
+        background: rgba(0, 0, 0, 0.12);
+    }
+    .cam-float-tile {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 4px;
+    }
+    .cam-float-circle {
+        width: 3.5rem;
+        height: 3.5rem;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.05rem;
+        font-weight: 600;
+        color: #fff;
+        background-color: var(--participant-color, #555);
+        border: 2px solid rgba(0, 0, 0, 0.55);
+        overflow: hidden;
+        transition: box-shadow 0.2s ease, opacity 0.2s ease;
+    }
+    .cam-float-circle.has-cam {
+        background-color: #000;
+    }
+    .cam-float-circle.speaking {
+        box-shadow:
+            0 0 0 2px var(--color-success),
+            0 0 12px var(--color-success);
+    }
+    .cam-float-circle.muted {
+        opacity: 0.7;
+    }
+    .cam-float-name {
+        max-width: 4.25rem;
+        font-size: 0.6875rem;
+        font-weight: 500;
+        color: #fff;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .cam-float-overflow {
+        align-self: center;
+        font-size: 0.75rem;
+        font-weight: 600;
+        color: var(--color-text-muted);
+    }
+    .cam-float-hide {
+        pointer-events: auto;
+        align-self: center;
     }
     .cam-preview {
         width: 100%;
