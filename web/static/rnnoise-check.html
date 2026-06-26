@@ -1,0 +1,113 @@
+<!doctype html>
+<!--
+  RNNoise worklet verification harness (dev only).
+
+  Confirms that the bundled AudioWorklet (static/audio/rnnoise-worklet.js)
+  actually loads + initializes the WASM inside AudioWorkletGlobalScope, and that
+  it denoises live mic input. Run `npm run dev` (predev builds the worklet) and
+  open http://localhost:5173/rnnoise-check.html
+
+  What to look for:
+    - Status reads "worklet ready" (not "error" / "timeout").
+    - With background noise and NOT speaking, the DENOISED meter floor sits
+      clearly below the RAW meter floor (noise removed).
+    - While speaking, both meters track your voice.
+-->
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>RNNoise check</title>
+        <style>
+            body { font-family: system-ui, sans-serif; background: #0b0f12; color: #e6edf0; margin: 0; padding: 2rem; }
+            h1 { font-size: 1.1rem; }
+            button { font-size: 1rem; padding: 0.6rem 1rem; border-radius: 8px; border: 1px solid #2a3a44; background: #14202a; color: #e6edf0; cursor: pointer; }
+            button:hover { background: #1c2c38; }
+            .row { display: flex; align-items: center; gap: 1rem; margin: 1rem 0; }
+            .label { width: 7rem; color: #9fb3bf; }
+            .meter { position: relative; height: 18px; flex: 1; background: #11181d; border-radius: 4px; overflow: hidden; }
+            .fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: linear-gradient(90deg, #2bd576, #f0c040, #e0556a); }
+            .val { width: 6rem; text-align: right; font-variant-numeric: tabular-nums; color: #c7d6df; }
+            #status { padding: 0.5rem 0.75rem; border-radius: 6px; background: #14202a; display: inline-block; }
+            .ok { color: #2bd576; } .err { color: #e0556a; }
+            label.mon { color: #9fb3bf; font-size: 0.9rem; }
+        </style>
+    </head>
+    <body>
+        <h1>RNNoise worklet check</h1>
+        <p>Status: <span id="status">idle</span></p>
+        <button id="start">Start mic test</button>
+        <label class="mon"><input type="checkbox" id="monitor" /> Monitor denoised output (use headphones)</label>
+
+        <div class="row"><span class="label">Raw mic</span><div class="meter"><div class="fill" id="rawFill"></div></div><span class="val" id="rawVal">–</span></div>
+        <div class="row"><span class="label">Denoised</span><div class="meter"><div class="fill" id="denFill"></div></div><span class="val" id="denVal">–</span></div>
+
+        <script type="module">
+            const statusEl = document.getElementById('status');
+            const setStatus = (t, cls) => { statusEl.textContent = t; statusEl.className = cls || ''; };
+
+            function meterFromAnalyser(analyser, fillEl, valEl) {
+                const buf = new Float32Array(analyser.fftSize);
+                function tick() {
+                    analyser.getFloatTimeDomainData(buf);
+                    let sum = 0;
+                    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+                    const rms = Math.sqrt(sum / buf.length);
+                    const db = 20 * Math.log10(rms || 1e-7);
+                    const pct = Math.max(0, Math.min(100, ((db + 70) / 70) * 100));
+                    fillEl.style.width = pct + '%';
+                    valEl.textContent = db.toFixed(1) + ' dBFS';
+                    requestAnimationFrame(tick);
+                }
+                tick();
+            }
+
+            document.getElementById('start').onclick = async () => {
+                try {
+                    setStatus('starting…');
+                    const ctx = new AudioContext();
+                    await ctx.resume();
+
+                    await ctx.audioWorklet.addModule('/audio/rnnoise-worklet.js');
+
+                    const raw = await navigator.mediaDevices.getUserMedia({
+                        audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false },
+                        video: false
+                    });
+
+                    const src = ctx.createMediaStreamSource(raw);
+                    const hp = ctx.createBiquadFilter();
+                    hp.type = 'highpass'; hp.frequency.value = 90; hp.Q.value = 0.7;
+
+                    const node = new AudioWorkletNode(ctx, 'chromatic-rnnoise', {
+                        numberOfInputs: 1, numberOfOutputs: 1,
+                        channelCount: 1, channelCountMode: 'explicit',
+                        channelInterpretation: 'speakers', outputChannelCount: [1]
+                    });
+                    node.port.onmessage = (e) => {
+                        if (e.data?.type === 'ready') setStatus('worklet ready', 'ok');
+                        else if (e.data?.type === 'error') setStatus('error: ' + e.data.message, 'err');
+                    };
+                    setTimeout(() => { if (statusEl.textContent === 'starting…') setStatus('timeout — no ready message', 'err'); }, 2000);
+
+                    const rawAnalyser = ctx.createAnalyser(); rawAnalyser.fftSize = 1024;
+                    const denAnalyser = ctx.createAnalyser(); denAnalyser.fftSize = 1024;
+
+                    src.connect(rawAnalyser);
+                    src.connect(hp); hp.connect(node); node.connect(denAnalyser);
+
+                    document.getElementById('monitor').onchange = (ev) => {
+                        if (ev.target.checked) node.connect(ctx.destination);
+                        else try { node.disconnect(ctx.destination); } catch {}
+                    };
+
+                    meterFromAnalyser(rawAnalyser, document.getElementById('rawFill'), document.getElementById('rawVal'));
+                    meterFromAnalyser(denAnalyser, document.getElementById('denFill'), document.getElementById('denVal'));
+                } catch (err) {
+                    setStatus('failed: ' + (err?.message || err), 'err');
+                    console.error(err);
+                }
+            };
+        </script>
+    </body>
+</html>

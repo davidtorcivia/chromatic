@@ -5,8 +5,10 @@
 	"type": "module",
 	"scripts": {
 		"dev": "vite dev",
+		"predev": "node scripts/build-worklets.mjs",
+		"build:worklets": "node scripts/build-worklets.mjs",
 		"clean:kit": "node -e \"require('node:fs').rmSync('.svelte-kit',{recursive:true,force:true})\"",
-		"build": "npm run clean:kit && svelte-kit sync && vite build",
+		"build": "npm run build:worklets && npm run clean:kit && svelte-kit sync && vite build",
 		"preview": "vite preview",
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
@@ -30,6 +32,7 @@
 	},
 	"dependencies": {
 		"@fontsource/space-grotesk": "^5.2.10",
-		"@fontsource/work-sans": "^5.2.8"
+		"@fontsource/work-sans": "^5.2.8",
+		"@jitsi/rnnoise-wasm": "^0.2.1"
 	}
 }

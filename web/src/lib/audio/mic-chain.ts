@@ -10,6 +10,8 @@
 // the raw capture track exactly as before.
 
 import { getAudioContext } from './context';
+import type { AudioMode, DenoiserEngine } from './audio-mode';
+import { createDenoiser, type Denoiser } from './denoiser';
 
 const GATE_PROCESSOR_NAME = 'chromatic-soft-gate';
 
@@ -68,14 +70,33 @@ registerProcessor('${GATE_PROCESSOR_NAME}', SoftGateProcessor);
 // addModule is per-context and must run exactly once for it.
 const moduleLoaded = new WeakSet<AudioContext>();
 
+export interface MicChainOptions {
+    /** Talkback applies the cleanup chain; studio sends the capture untouched. */
+    mode: AudioMode;
+    /** Which noise-reduction engine to splice in (talkback only). */
+    denoiser: DenoiserEngine;
+}
+
 export interface MicChain {
     /** Stream whose audio track should be sent in place of the raw capture. */
     stream: MediaStream;
+    /** True when an in-app denoiser is actually running in this chain. When
+     *  false in talkback, the caller keeps the browser's native noise
+     *  suppression so speech is never left un-denoised. */
+    denoiserActive: boolean;
     /** Tears down the graph nodes (does NOT stop the raw capture track). */
     dispose(): void;
 }
 
-export async function createMicChain(raw: MediaStream): Promise<MicChain | null> {
+export async function createMicChain(
+    raw: MediaStream,
+    opts: MicChainOptions
+): Promise<MicChain | null> {
+    // Studio / critical-listening: send the capture untouched (no HPF, gate, or
+    // denoiser) so reference music / instruments stay pristine.
+    if (opts.mode === 'studio') {
+        return null;
+    }
     try {
         const ctx = await getAudioContext();
         // A suspended context (no user gesture yet, e.g. right after F5)
@@ -102,6 +123,15 @@ export async function createMicChain(raw: MediaStream): Promise<MicChain | null>
         highpass.type = 'highpass';
         highpass.frequency.value = 90;
         highpass.Q.value = 0.7;
+
+        // Optional neural denoiser between the high-pass and the gate. If the
+        // engine is unimplemented or fails to load, createDenoiser returns null
+        // and we run HPF -> gate alone; the caller then keeps native NS.
+        let denoiser: Denoiser | null = null;
+        if (opts.denoiser !== 'off') {
+            denoiser = await createDenoiser(ctx, opts.denoiser);
+        }
+
         const gate = new AudioWorkletNode(ctx, GATE_PROCESSOR_NAME, {
             numberOfInputs: 1,
             numberOfOutputs: 1
@@ -109,15 +139,22 @@ export async function createMicChain(raw: MediaStream): Promise<MicChain | null>
         const destination = ctx.createMediaStreamDestination();
 
         source.connect(highpass);
-        highpass.connect(gate);
+        let tail: AudioNode = highpass;
+        if (denoiser) {
+            tail.connect(denoiser.node);
+            tail = denoiser.node;
+        }
+        tail.connect(gate);
         gate.connect(destination);
 
         return {
             stream: destination.stream,
+            denoiserActive: denoiser !== null,
             dispose() {
                 try {
                     source.disconnect();
                     highpass.disconnect();
+                    denoiser?.dispose();
                     gate.disconnect();
                     // Disconnect the destination too: it holds the processed
                     // MediaStream the sender referenced, and without this the

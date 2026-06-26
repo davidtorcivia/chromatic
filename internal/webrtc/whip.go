@@ -132,12 +132,15 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 		return
 	}
 
+	// Keep this fmtp in lockstep with the Opus codec registered in NewSFU
+	// (stereo=1;sprop-stereo=1) so the relay capability matches the negotiated
+	// codec and the program audio is carried/decoded as full stereo, not mono.
 	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{
 			MimeType:    webrtc.MimeTypeOpus,
 			ClockRate:   48000,
 			Channels:    2,
-			SDPFmtpLine: "minptime=10;useinbandfec=1",
+			SDPFmtpLine: "minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1",
 		},
 		"audio",
 		"chromatic-stream",

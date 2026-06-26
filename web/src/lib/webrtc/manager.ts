@@ -1,6 +1,15 @@
 // WebRTC Manager - handles peer connection for receiving stream and sending voice
 
 import { createMicChain, type MicChain } from '$lib/audio/mic-chain';
+import {
+    type AudioMode,
+    type DenoiserEngine,
+    loadAudioModeState,
+    saveAudioModeState,
+    opusPreferencesFor
+} from '$lib/audio/audio-mode';
+import { isDenoiserImplemented } from '$lib/audio/denoiser';
+import { applyOpusPreferences } from './sdp';
 
 const DEBUG = import.meta.env.DEV;
 const debugLog = (...args: unknown[]) => {
@@ -31,17 +40,46 @@ export function storeMicDeviceId(deviceId: string | null): void {
     }
 }
 
-function micConstraints(deviceId?: string | null, exact = false): MediaTrackConstraints {
-    const constraints: MediaTrackConstraints = {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
+export interface MicConstraintOptions {
+    deviceId?: string | null;
+    exact?: boolean;
+    mode: AudioMode;
+    studioHeadphones: boolean;
+    // True when an in-app denoiser will actually run; we then disable the
+    // browser's native noiseSuppression so the two don't stack (double NS
+    // compounds the "musical noise" artifacts).
+    inAppDenoise: boolean;
+}
+
+// Per-mode capture constraints. Talkback keeps native echo cancellation
+// (system-preferred — OS AEC beats Chrome's software AEC3, notably on macOS)
+// and lets our own denoiser handle noise. Studio sends a pristine signal: no
+// noise suppression or AGC, and echo cancellation off only when the user has
+// confirmed headphones (otherwise EC stays on as a laptop-speaker safety net).
+// Non-standard keys (echoCancellationType) are ignored by browsers that don't
+// support them, so this degrades gracefully.
+export function micConstraints(opts: MicConstraintOptions): MediaTrackConstraints {
+    const studio = opts.mode === 'studio';
+    const echoCancellation = studio ? !opts.studioHeadphones : true;
+
+    const constraints: MediaTrackConstraints & Record<string, unknown> = {
+        echoCancellation,
+        // Studio: never suppress/AGC. Talkback: suppress natively only when our
+        // own denoiser isn't carrying that load; AGC stays native for level
+        // consistency (we add no gain stage in talkback, so it can't pump).
+        noiseSuppression: studio ? false : !opts.inAppDenoise,
+        autoGainControl: studio ? false : true
     };
-    if (deviceId) {
+    if (echoCancellation) {
+        // Prefer the OS echo canceller where available; falls back to the
+        // browser one otherwise.
+        constraints.echoCancellationType = { ideal: 'system' };
+    }
+    if (opts.deviceId) {
         // `ideal` lets getUserMedia fall back to the default mic when the
         // remembered device was unplugged; `exact` is used for explicit
         // user selection where silently picking another mic would be wrong.
-        constraints.deviceId = exact ? { exact: deviceId } : { ideal: deviceId };
+        constraints.deviceId = opts.exact ? { exact: opts.deviceId } : { ideal: opts.deviceId };
     }
     return constraints;
 }
@@ -88,6 +126,11 @@ export class WebRTCManager {
     private rawMicStream: MediaStream | null = null;
     private micChain: MicChain | null = null;
     private audioSender: RTCRtpSender | null = null;
+    // Talkback vs studio/critical-listening, plus the chosen denoiser engine and
+    // the studio "I'm on headphones" flag. Persisted across sessions.
+    private audioMode: AudioMode = 'talkback';
+    private denoiserEngine: DenoiserEngine = 'rnnoise';
+    private studioHeadphones: boolean = false;
     private screenShareStream: MediaStream | null = null;
     private screenShareSender: RTCRtpSender | null = null;
     private isMicMuted: boolean = true;
@@ -135,6 +178,28 @@ export class WebRTCManager {
 
     constructor(options: WebRTCManagerOptions) {
         this.options = options;
+        const saved = loadAudioModeState();
+        this.audioMode = saved.mode;
+        this.denoiserEngine = saved.denoiser;
+        this.studioHeadphones = saved.studioHeadphones;
+    }
+
+    // True when the talkback path intends to run an in-app denoiser (talkback
+    // mode + a chosen, implemented engine). Drives whether native NS is left on.
+    private wantsInAppDenoise(): boolean {
+        return (
+            this.audioMode === 'talkback' &&
+            this.denoiserEngine !== 'off' &&
+            isDenoiserImplemented(this.denoiserEngine)
+        );
+    }
+
+    private persistAudioModeState(): void {
+        saveAudioModeState({
+            mode: this.audioMode,
+            denoiser: this.denoiserEngine,
+            studioHeadphones: this.studioHeadphones
+        });
     }
 
     private isClosed(): boolean {
@@ -756,15 +821,49 @@ export class WebRTCManager {
     // device preference (chromatic_mic_device) unless an explicit deviceId is
     // passed.
     async requestMicrophone(deviceId?: string | null): Promise<boolean> {
-        try {
-            if (this.isClosed()) return false;
-            const preferred = deviceId ?? getStoredMicDeviceId();
-            const raw = await navigator.mediaDevices.getUserMedia({
-                audio: micConstraints(preferred),
-                video: false
-            });
+        const preferred = deviceId ?? getStoredMicDeviceId();
+        const ok = await this.acquireMic(preferred, false);
+        if (ok) debugLog('Microphone access granted');
+        return ok;
+    }
+
+    // Unified mic acquisition used by the initial request, device switching, and
+    // audio mode/engine/headphone changes. Acquires with the current mode's
+    // constraints, builds the mode-aware cleanup chain, swaps the new track into
+    // any live sender via replaceTrack (same kind/m-line — no renegotiation for
+    // a pure device swap), and releases the previous capture only on success.
+    //
+    // If talkback intends an in-app denoiser but it doesn't actually engage
+    // (engine unimplemented or failed to load), it re-acquires ONCE with native
+    // noise suppression so speech is never shipped un-denoised.
+    private async acquireMic(deviceId: string | null, exact: boolean): Promise<boolean> {
+        if (this.isClosed()) return false;
+        const previousRaw = this.rawMicStream;
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const inAppDenoise = this.wantsInAppDenoise() && attempt === 0;
+            let raw: MediaStream;
+            try {
+                raw = await navigator.mediaDevices.getUserMedia({
+                    audio: micConstraints({
+                        deviceId,
+                        exact,
+                        mode: this.audioMode,
+                        studioHeadphones: this.studioHeadphones,
+                        inAppDenoise
+                    }),
+                    video: false
+                });
+            } catch (err) {
+                console.error('Failed to get microphone access:', err);
+                return false;
+            }
 
             if (this.isClosed()) {
+                this.stopStream(raw);
+                return false;
+            }
+            if (raw.getAudioTracks().length === 0) {
                 this.stopStream(raw);
                 return false;
             }
@@ -774,21 +873,45 @@ export class WebRTCManager {
                 return false;
             }
 
-            debugLog('Microphone access granted');
+            // Talkback wanted an in-app denoiser but it didn't engage — retry
+            // once with native noise suppression rather than shipping raw noisy
+            // speech. (rawMicStream now points at this attempt's capture.)
+            if (inAppDenoise && !(this.micChain?.denoiserActive ?? false)) {
+                console.warn('In-app denoiser inactive; re-acquiring mic with native noise suppression');
+                this.disposeMicChain();
+                this.stopStream(raw);
+                this.rawMicStream = null;
+                this.localStream = null;
+                continue;
+            }
+
+            const newTrack = this.localStream?.getAudioTracks()[0] ?? null;
+            if (this.audioSender && newTrack) {
+                await this.audioSender.replaceTrack(newTrack);
+                if (this.isClosed()) return false;
+            }
+
+            // Release the previous capture only after the swap succeeded so a
+            // failed switch leaves the working mic untouched.
+            if (previousRaw && previousRaw !== raw) {
+                this.stopStream(previousRaw);
+            }
             return true;
-        } catch (err) {
-            console.error('Failed to get microphone access:', err);
-            return false;
         }
+        return false;
     }
 
-    // Routes a fresh mic capture through the light cleanup chain (high-pass +
-    // soft gate) when available, falls back to the raw capture otherwise, and
-    // applies the current mute state to whichever stream will be sent.
+    // Routes a fresh mic capture through the mode-aware cleanup chain (high-pass
+    // + optional denoiser + soft gate in talkback; bypassed entirely in studio),
+    // falls back to the raw capture on any failure, and applies the current mute
+    // state to whichever stream will be sent.
     private async installMicStream(raw: MediaStream): Promise<void> {
         this.disposeMicChain();
         this.rawMicStream = raw;
-        this.micChain = await createMicChain(raw);
+        this.micChain = await createMicChain(raw, {
+            mode: this.audioMode,
+            denoiser: this.denoiserEngine
+        });
         if (this.isClosed()) {
             this.disposeMicChain();
             this.stopStream(raw);
@@ -812,49 +935,87 @@ export class WebRTCManager {
         }
     }
 
-    // Switch the microphone input device: re-acquire the mic with the given
-    // deviceId and swap the new track into the existing RTCRtpSender via
-    // replaceTrack — same kind, same m-line, so NO renegotiation is needed.
+    // Switch the microphone input device: re-acquire with the given deviceId and
+    // swap the new track into the existing sender. No renegotiation needed.
     async setMicDevice(deviceId: string): Promise<boolean> {
+        const ok = await this.acquireMic(deviceId, true);
+        if (ok) debugLog('Switched microphone device:', deviceId);
+        return ok;
+    }
+
+    // ---- Audio mode (talkback vs studio / critical-listening) ---------------
+    getAudioMode(): AudioMode {
+        return this.audioMode;
+    }
+    getDenoiserEngine(): DenoiserEngine {
+        return this.denoiserEngine;
+    }
+    isStudioHeadphones(): boolean {
+        return this.studioHeadphones;
+    }
+
+    // Switch talkback <-> studio. Re-acquires the mic with the new constraints,
+    // rebuilds the chain, retunes the send bitrate, and renegotiates the
+    // publisher so the new per-mode Opus preferences take effect.
+    async setAudioMode(mode: AudioMode): Promise<void> {
+        if (this.audioMode === mode) return;
+        this.audioMode = mode;
+        this.persistAudioModeState();
+        await this.reapplyAudioSettings();
+    }
+
+    // Change the talkback denoiser engine. Rebuilds the mic chain (different
+    // worklet); no renegotiation (codec unchanged). No effect in studio mode.
+    async setDenoiserEngine(engine: DenoiserEngine): Promise<void> {
+        if (this.denoiserEngine === engine) return;
+        this.denoiserEngine = engine;
+        this.persistAudioModeState();
+        if (this.audioMode === 'talkback') {
+            await this.reapplyAudioSettings();
+        }
+    }
+
+    // Studio only: toggle whether echo cancellation is removed (headphones).
+    // Changes a capture constraint, so it re-acquires the mic.
+    async setStudioHeadphones(on: boolean): Promise<void> {
+        if (this.studioHeadphones === on) return;
+        this.studioHeadphones = on;
+        this.persistAudioModeState();
+        if (this.audioMode === 'studio') {
+            await this.reapplyAudioSettings();
+        }
+    }
+
+    // Re-acquire the current mic with up-to-date constraints, retune the sender
+    // bitrate, and renegotiate the publisher so Opus fmtp reflects the mode.
+    // No-op when there is no active capture yet — the next mic-enable picks up
+    // the new settings.
+    private async reapplyAudioSettings(): Promise<void> {
+        if (this.isClosed() || !this.rawMicStream) return;
+        const deviceId = this.getCurrentMicDeviceId();
+        await this.acquireMic(deviceId, false);
+        if (this.isClosed()) return;
+        await this.tuneAudioSender();
+        if (this.audioSender && this.publisherPc) {
+            await this.negotiatePublisher();
+        }
+    }
+
+    // Apply the current mode's send bitrate cap to the audio sender. Mirrors
+    // tuneShareSender. Opus fmtp (stereo/dtx/fec) is set separately on the
+    // publisher offer via applyOpusPreferences.
+    private async tuneAudioSender(): Promise<void> {
+        const sender = this.audioSender;
+        if (!sender) return;
         try {
-            if (this.isClosed()) return false;
-            const newRaw = await navigator.mediaDevices.getUserMedia({
-                audio: micConstraints(deviceId, true),
-                video: false
-            });
-
-            if (this.isClosed()) {
-                this.stopStream(newRaw);
-                return false;
+            const params = sender.getParameters();
+            if (!params.encodings || params.encodings.length === 0) {
+                params.encodings = [{}];
             }
-
-            if (newRaw.getAudioTracks().length === 0) {
-                newRaw.getTracks().forEach(t => t.stop());
-                return false;
-            }
-
-            const oldRaw = this.rawMicStream;
-            await this.installMicStream(newRaw);
-            if (this.isClosed()) {
-                return false;
-            }
-
-            const newTrack = this.localStream?.getAudioTracks()[0] ?? null;
-            if (this.audioSender && newTrack) {
-                await this.audioSender.replaceTrack(newTrack);
-            }
-
-            // Release the previous capture only after the swap succeeded so a
-            // failed switch leaves the working mic untouched.
-            if (oldRaw && oldRaw !== newRaw) {
-                oldRaw.getTracks().forEach(t => t.stop());
-            }
-
-            debugLog('Switched microphone device:', deviceId);
-            return true;
+            params.encodings[0].maxBitrate = opusPreferencesFor(this.audioMode).maxBitrate;
+            await sender.setParameters(params);
         } catch (err) {
-            console.error('Failed to switch microphone device:', err);
-            return false;
+            console.warn('Could not tune audio sender parameters:', err);
         }
     }
 
@@ -924,6 +1085,7 @@ export class WebRTCManager {
             // leak an orphaned publisher or send publish:offer on a dead socket.
             const pub = this.ensurePublisher();
             this.audioSender = pub.addTrack(audioTrack, this.localStream);
+            void this.tuneAudioSender();
             if (!(await this.negotiatePublisher())) {
                 throw new Error('publisher offer was not sent');
             }
@@ -1036,8 +1198,16 @@ export class WebRTCManager {
                 this.publisherOfferId = offerId;
                 this.publisherCandidateOfferId = offerId;
                 const offer = await pc.createOffer();
-                await pc.setLocalDescription(offer);
-                if (!this.sendSignal('publish:offer', { sdp: offer.sdp, offerId })) {
+                // Steer the browser's Opus encoder per mode (mono voice with DTX
+                // vs stereo hi-fi) by editing only Opus fmtp params — never
+                // m-lines/payloads, which would wedge renegotiation. The same
+                // munged SDP is set locally and signaled so both sides agree.
+                const tunedSdp = applyOpusPreferences(
+                    offer.sdp ?? '',
+                    opusPreferencesFor(this.audioMode)
+                );
+                await pc.setLocalDescription({ type: offer.type, sdp: tunedSdp });
+                if (!this.sendSignal('publish:offer', { sdp: tunedSdp, offerId })) {
                     throw new Error('publisher offer send failed');
                 }
                 this.publisherOfferSent = true;
@@ -1139,6 +1309,7 @@ export class WebRTCManager {
         const pc = this.ensurePublisher();
         if (audioTrack && this.localStream) {
             this.audioSender = pc.addTrack(audioTrack, this.localStream);
+            void this.tuneAudioSender();
         }
         if (shareTrack && shareTrack.readyState === 'live' && this.screenShareStream) {
             this.screenShareSender = pc.addTrack(shareTrack, this.screenShareStream);

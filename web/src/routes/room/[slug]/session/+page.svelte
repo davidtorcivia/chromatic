@@ -9,6 +9,7 @@
     import { chatStore, type ChatMessage } from "$lib/stores/chat.svelte";
     import { unlockAudio, getAudioContext, closeAudioContext } from "$lib/audio/context";
     import { WebRTCManager, getStoredMicDeviceId, storeMicDeviceId } from "$lib/webrtc/manager";
+    import { loadAudioModeState, type AudioMode, type DenoiserEngine } from "$lib/audio/audio-mode";
     import { deriveStreamOverlayState } from "$lib/video/stream-overlay";
     import { AudioDuckingManager } from "$lib/audio/ducking";
     import { playShareRequestChime, playWaitingRoomChime, playJoinChime, playLeaveChime, playChatReceiveChime, getUiSoundsEnabled, setUiSoundsEnabled } from "$lib/audio/chimes";
@@ -178,6 +179,13 @@
     let activeMicId = $state<string | null>(null);
     let selectedSpeakerId = $state<string | null>(null);
     let micSwitchPending = $state(false);
+    // Talkback vs studio/critical-listening (persisted). Initialized from the
+    // saved preference so the UI is correct even before the manager exists.
+    const _savedAudioMode = loadAudioModeState();
+    let audioMode = $state<AudioMode>(_savedAudioMode.mode);
+    let denoiserEngine = $state<DenoiserEngine>(_savedAudioMode.denoiser);
+    let studioHeadphones = $state(_savedAudioMode.studioHeadphones);
+    let audioModePending = $state(false);
     const SPEAKER_DEVICE_STORAGE_KEY = "chromatic_speaker_device";
     const supportsSinkSelection =
         typeof HTMLMediaElement !== "undefined" &&
@@ -1674,6 +1682,53 @@
         }
     }
 
+    // Switch talkback <-> studio. The manager re-acquires the mic with the new
+    // constraints and renegotiates Opus (mono voice vs stereo hi-fi).
+    async function selectAudioMode(mode: AudioMode) {
+        if (!webrtcManager || audioModePending || mode === audioMode) return;
+        const manager = webrtcManager;
+        audioMode = mode; // optimistic; reconciled below
+        audioModePending = true;
+        try {
+            await manager.setAudioMode(mode);
+            if (destroyed || webrtcManager !== manager) return;
+            audioMode = manager.getAudioMode();
+        } finally {
+            if (!destroyed) audioModePending = false;
+        }
+    }
+
+    // Talkback noise-reduction engine. Rebuilds the mic chain; no renegotiation.
+    async function selectDenoiser(engine: DenoiserEngine) {
+        if (!webrtcManager || audioModePending || engine === denoiserEngine) return;
+        const manager = webrtcManager;
+        denoiserEngine = engine; // optimistic
+        audioModePending = true;
+        try {
+            await manager.setDenoiserEngine(engine);
+            if (destroyed || webrtcManager !== manager) return;
+            denoiserEngine = manager.getDenoiserEngine();
+        } finally {
+            if (!destroyed) audioModePending = false;
+        }
+    }
+
+    // Studio only: removing echo cancellation for headphone users (max fidelity).
+    async function toggleStudioHeadphones() {
+        if (!webrtcManager || audioModePending) return;
+        const manager = webrtcManager;
+        const next = !studioHeadphones;
+        studioHeadphones = next; // optimistic
+        audioModePending = true;
+        try {
+            await manager.setStudioHeadphones(next);
+            if (destroyed || webrtcManager !== manager) return;
+            studioHeadphones = manager.isStudioHeadphones();
+        } finally {
+            if (!destroyed) audioModePending = false;
+        }
+    }
+
     async function selectSpeakerDevice(deviceId: string) {
         selectedSpeakerId = deviceId;
         setStorageItem("local", SPEAKER_DEVICE_STORAGE_KEY, deviceId);
@@ -2668,6 +2723,67 @@
                                     <span class="audio-device-label">{device.label || "Microphone"}</span>
                                 </button>
                             {/each}
+                        </div>
+                        <div class="audio-settings-section">
+                            <span class="audio-settings-title">Audio mode</span>
+                            <div class="audio-mode-toggle" role="group" aria-label="Audio mode">
+                                <button
+                                    class="audio-mode-option"
+                                    class:selected={audioMode === "talkback"}
+                                    disabled={audioModePending}
+                                    onclick={() => selectAudioMode("talkback")}
+                                    aria-pressed={audioMode === "talkback"}
+                                >
+                                    <span class="audio-mode-name">Talkback</span>
+                                    <span class="audio-mode-desc">Clean voice, ultra-low latency</span>
+                                </button>
+                                <button
+                                    class="audio-mode-option"
+                                    class:selected={audioMode === "studio"}
+                                    disabled={audioModePending}
+                                    onclick={() => selectAudioMode("studio")}
+                                    aria-pressed={audioMode === "studio"}
+                                >
+                                    <span class="audio-mode-name">Studio</span>
+                                    <span class="audio-mode-desc">Pristine stereo for music &amp; instruments</span>
+                                </button>
+                            </div>
+                            {#if audioMode === "talkback"}
+                                <label class="pref-row">
+                                    <span>Noise reduction</span>
+                                    <span class="seg" role="group" aria-label="Noise reduction">
+                                        <button
+                                            class="seg-btn"
+                                            class:selected={denoiserEngine !== "off"}
+                                            disabled={audioModePending}
+                                            onclick={() => selectDenoiser("rnnoise")}
+                                            aria-pressed={denoiserEngine !== "off"}
+                                        >On</button>
+                                        <button
+                                            class="seg-btn"
+                                            class:selected={denoiserEngine === "off"}
+                                            disabled={audioModePending}
+                                            onclick={() => selectDenoiser("off")}
+                                            aria-pressed={denoiserEngine === "off"}
+                                        >Off</button>
+                                    </span>
+                                </label>
+                            {/if}
+                            {#if audioMode === "studio"}
+                                <label class="pref-row">
+                                    <span>On headphones (disable echo cancellation)</span>
+                                    <input
+                                        type="checkbox"
+                                        class="switch"
+                                        checked={studioHeadphones}
+                                        disabled={audioModePending}
+                                        onchange={toggleStudioHeadphones}
+                                    />
+                                </label>
+                                <p class="audio-settings-hint">
+                                    Studio sends full-bandwidth stereo with no noise processing. Use headphones to avoid echo.
+                                </p>
+                            {/if}
                         </div>
                         {#if supportsSinkSelection && audioOutputs.length > 0}
                             <div class="audio-settings-section">
@@ -3913,6 +4029,64 @@
         opacity: 0.5;
         cursor: wait;
     }
+    .audio-mode-toggle {
+        display: flex;
+        gap: var(--space-xs);
+    }
+    .audio-mode-option {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        text-align: left;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid transparent;
+        border-radius: var(--radius-sm);
+        color: var(--color-text);
+        padding: 8px 10px;
+        cursor: pointer;
+        transition: background 0.12s ease, border-color 0.12s ease;
+    }
+    .audio-mode-option:hover { background: rgba(255, 255, 255, 0.1); }
+    .audio-mode-option.selected {
+        border-color: var(--color-primary);
+        background: rgba(255, 255, 255, 0.12);
+        color: #fff;
+    }
+    .audio-mode-option:disabled {
+        opacity: 0.5;
+        cursor: wait;
+    }
+    .audio-mode-name {
+        font-size: 0.8125rem;
+        font-weight: 600;
+    }
+    .audio-mode-desc {
+        font-size: 0.6875rem;
+        color: var(--color-text-subtle);
+        line-height: 1.25;
+    }
+    .seg {
+        display: inline-flex;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: var(--radius-sm);
+        overflow: hidden;
+    }
+    .seg-btn {
+        background: transparent;
+        border: none;
+        color: var(--color-text-muted);
+        font-size: 0.75rem;
+        padding: 3px 10px;
+        cursor: pointer;
+        transition: background 0.12s ease, color 0.12s ease;
+    }
+    .seg-btn.selected {
+        background: var(--color-primary);
+        color: #041014;
+        font-weight: 600;
+    }
+    .seg-btn:disabled { cursor: wait; opacity: 0.6; }
     .audio-device-check {
         width: 14px;
         display: inline-flex;
