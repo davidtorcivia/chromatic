@@ -62,7 +62,14 @@
             return;
         }
 
-        sessionData = JSON.parse(stored);
+        try {
+            sessionData = JSON.parse(stored);
+        } catch (e) {
+            console.error("Failed to parse waiting room session", e);
+            sessionStorage.removeItem(`chromatic_session_${slug}`);
+            void goto(`/room/${slug}`);
+            return;
+        }
 
         // Countdown lobby: anchor to the server clock captured at join time,
         // then refine with the fresher timestamp from /info below.
@@ -96,7 +103,9 @@
             });
 
         longWaitTimer = setTimeout(() => {
-            waitedLong = true;
+            if (!destroyed) {
+                waitedLong = true;
+            }
         }, LONG_WAIT_MS);
 
         // Connect to SSE endpoint for push notifications

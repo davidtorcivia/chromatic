@@ -27,6 +27,8 @@
     // ?host=1 auto-join: 'joining' shows the branded hold state instead of
     // flashing the form; 'failed' falls back to the form with the token field.
     let hostJoinState = $state<"none" | "joining" | "failed">("none");
+    let destroyed = false;
+    let loadRequestId = 0;
 
     const slug = $page.params.slug!;
 
@@ -49,6 +51,7 @@
     }
 
     onMount(async () => {
+        const requestId = ++loadRequestId;
         // Pre-fill the name from a previous session
         const storedName = localStorage.getItem("chromatic_name");
         if (storedName) {
@@ -62,13 +65,18 @@
         }
 
         try {
-            roomInfo = await rooms.info(slug);
-            serverOffset = serverClockOffset(roomInfo.serverTime, Date.now());
+            const nextRoomInfo = await rooms.info(slug);
+            if (destroyed || requestId !== loadRequestId) return;
+
+            roomInfo = nextRoomInfo;
+            serverOffset = serverClockOffset(nextRoomInfo.serverTime, Date.now());
         } catch (e) {
+            if (destroyed || requestId !== loadRequestId) return;
             error = "Room not found";
             hostJoinState = "none";
         }
 
+        if (destroyed || requestId !== loadRequestId) return;
         if (isHostLink && roomInfo && roomInfo.status !== "ended") {
             await attemptHostJoin();
         } else if (hostJoinState === "joining") {
@@ -80,6 +88,7 @@
     });
 
     onDestroy(() => {
+        destroyed = true;
         if (timer) {
             clearInterval(timer);
         }
@@ -93,30 +102,39 @@
         const hostName = localStorage.getItem("chromatic_name")?.trim() || "Host";
         try {
             const result = await rooms.join(slug, hostName);
-            if (result.role === "admin") {
+            if (!destroyed && result.role === "admin") {
                 finishJoin(result, hostName);
                 return;
             }
         } catch {
             // 401 / network — fall through to the manual form
         }
+        if (destroyed) return;
         hostJoinState = "failed";
         showHostSection = true;
     }
 
     function finishJoin(result: JoinResult, joinedName: string) {
-        // Store sanitized participant name for future sessions
-        localStorage.setItem("chromatic_name", result.name || joinedName);
+        if (destroyed) return;
 
-        // Store session info (includes the server-assigned role and any
-        // countdown-lobby payload for the waiting page)
-        sessionStorage.setItem(`chromatic_session_${slug}`, JSON.stringify(result));
+        try {
+            // Store sanitized participant name for future sessions
+            localStorage.setItem("chromatic_name", result.name || joinedName);
+
+            // Store session info (includes the server-assigned role and any
+            // countdown-lobby payload for the waiting page)
+            sessionStorage.setItem(`chromatic_session_${slug}`, JSON.stringify(result));
+        } catch (e) {
+            console.error("Failed to store session", e);
+            error = "Browser storage is unavailable. Enable storage for this site and try again.";
+            return;
+        }
 
         // Navigate based on waiting room / lobby status
         if (result.waitingRoom) {
-            goto(`/room/${slug}/waiting`);
+            void goto(`/room/${slug}/waiting`);
         } else {
-            goto(`/room/${slug}/session`);
+            void goto(`/room/${slug}/session`);
         }
     }
 
@@ -169,10 +187,16 @@
             );
 
             finishJoin(result, name.trim());
-        } catch (e: any) {
-            error = e.message || "We couldn't join the session. Please try again.";
+        } catch (e) {
+            if (destroyed) return;
+            error =
+                e instanceof Error
+                    ? e.message
+                    : "We couldn't join the session. Please try again.";
         } finally {
-            isLoading = false;
+            if (!destroyed) {
+                isLoading = false;
+            }
         }
     }
 </script>
