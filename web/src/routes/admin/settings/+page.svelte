@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount } from "svelte";
+    import { onDestroy, onMount } from "svelte";
     import { fade } from "svelte/transition";
     import { appConfig, type AppConfig, type TURNTestResponse } from "$lib/api/client";
     import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
@@ -21,22 +21,64 @@
     let turnUsername = $state("");
     let turnCredential = $state("");
     let clearTurnCredential = $state(false);
+    let destroyed = false;
+    let successTimer: ReturnType<typeof setTimeout> | null = null;
+    let loadRequestId = 0;
+
+    onDestroy(() => {
+        destroyed = true;
+        clearSuccessTimer();
+    });
 
     onMount(async () => {
         await loadConfig();
     });
 
+    function clearSuccessTimer() {
+        if (successTimer) {
+            clearTimeout(successTimer);
+            successTimer = null;
+        }
+    }
+
+    function clearSuccessMessage() {
+        clearSuccessTimer();
+        successMessage = "";
+    }
+
+    function showSuccessMessage(message: string, durationMs = 3000) {
+        clearSuccessTimer();
+        successMessage = message;
+        successTimer = setTimeout(() => {
+            successTimer = null;
+            if (!destroyed) {
+                successMessage = "";
+            }
+        }, durationMs);
+    }
+
+    function getErrorMessage(e: unknown, fallback: string) {
+        return e instanceof Error ? e.message : fallback;
+    }
+
     async function loadConfig() {
+        const requestId = ++loadRequestId;
         try {
-            config = await appConfig.get();
+            const nextConfig = await appConfig.get();
+            if (destroyed || requestId !== loadRequestId) return;
+
+            config = nextConfig;
             watermarkText = config.defaultWatermarkText || "";
             turnUrl = config.turnExternalUrl || "";
             turnUsername = config.turnExternalUsername || "";
         } catch (e) {
+            if (destroyed || requestId !== loadRequestId) return;
             console.error("Failed to load config", e);
             error = "Failed to load settings";
         } finally {
-            isLoading = false;
+            if (!destroyed && requestId === loadRequestId) {
+                isLoading = false;
+            }
         }
     }
 
@@ -44,18 +86,23 @@
         e.preventDefault();
         isSaving = true;
         error = "";
-        successMessage = "";
+        clearSuccessMessage();
 
         try {
-            config = await appConfig.update({
+            const nextConfig = await appConfig.update({
                 defaultWatermarkText: watermarkText || undefined,
             });
-            successMessage = "Watermark settings saved";
-            setTimeout(() => (successMessage = ""), 3000);
-        } catch (e: any) {
-            error = e.message || "Failed to save settings";
+            if (destroyed) return;
+
+            config = nextConfig;
+            showSuccessMessage("Watermark settings saved");
+        } catch (e) {
+            if (destroyed) return;
+            error = getErrorMessage(e, "Failed to save settings");
         } finally {
-            isSaving = false;
+            if (!destroyed) {
+                isSaving = false;
+            }
         }
     }
 
@@ -63,7 +110,7 @@
         e.preventDefault();
         isSaving = true;
         error = "";
-        successMessage = "";
+        clearSuccessMessage();
 
         try {
             const normalizedTurnURL = turnUrl
@@ -75,21 +122,26 @@
                 ? ""
                 : turnCredential || undefined;
 
-            config = await appConfig.update({
+            const nextConfig = await appConfig.update({
                 turnExternalUrl: normalizedTurnURL,
                 turnExternalUsername: turnUsername.trim(),
                 turnExternalCredential: turnCredentialPayload,
             });
+            if (destroyed) return;
+
+            config = nextConfig;
             turnUrl = config.turnExternalUrl || "";
             turnUsername = config.turnExternalUsername || "";
             turnCredential = ""; // Clear credential field after save
             clearTurnCredential = false;
-            successMessage = "TURN settings saved";
-            setTimeout(() => (successMessage = ""), 3000);
-        } catch (e: any) {
-            error = e.message || "Failed to save settings";
+            showSuccessMessage("TURN settings saved");
+        } catch (e) {
+            if (destroyed) return;
+            error = getErrorMessage(e, "Failed to save settings");
         } finally {
-            isSaving = false;
+            if (!destroyed) {
+                isSaving = false;
+            }
         }
     }
 
@@ -113,34 +165,44 @@
 
         isUploadingLogo = true;
         error = "";
-        successMessage = "";
+        clearSuccessMessage();
 
         try {
             await appConfig.uploadLogo(file);
+            if (destroyed) return;
             // Reload config to get new logo URL
-            config = await appConfig.get();
-            successMessage = "Logo uploaded successfully";
-            setTimeout(() => (successMessage = ""), 3000);
-        } catch (e: any) {
-            error = e.message || "Failed to upload logo";
+            const nextConfig = await appConfig.get();
+            if (destroyed) return;
+
+            config = nextConfig;
+            showSuccessMessage("Logo uploaded successfully");
+        } catch (e) {
+            if (destroyed) return;
+            error = getErrorMessage(e, "Failed to upload logo");
         } finally {
-            isUploadingLogo = false;
-            input.value = "";
+            if (!destroyed) {
+                isUploadingLogo = false;
+                input.value = "";
+            }
         }
     }
 
     async function handleDeleteLogo() {
         confirmDeleteLogoOpen = false;
         error = "";
-        successMessage = "";
+        clearSuccessMessage();
 
         try {
             await appConfig.deleteLogo();
-            config = await appConfig.get();
-            successMessage = "Logo deleted";
-            setTimeout(() => (successMessage = ""), 3000);
-        } catch (e: any) {
-            error = e.message || "Failed to delete logo";
+            if (destroyed) return;
+            const nextConfig = await appConfig.get();
+            if (destroyed) return;
+
+            config = nextConfig;
+            showSuccessMessage("Logo deleted");
+        } catch (e) {
+            if (destroyed) return;
+            error = getErrorMessage(e, "Failed to delete logo");
         }
     }
 
@@ -148,17 +210,23 @@
         isTesting = true;
         turnTestResults = null;
         error = "";
+        clearSuccessMessage();
 
         try {
-            turnTestResults = await appConfig.testTurn();
-            if (turnTestResults.success) {
-                successMessage = "TURN connectivity test passed!";
-                setTimeout(() => (successMessage = ""), 5000);
+            const nextResults = await appConfig.testTurn();
+            if (destroyed) return;
+
+            turnTestResults = nextResults;
+            if (nextResults.success) {
+                showSuccessMessage("TURN connectivity test passed!", 5000);
             }
-        } catch (e: any) {
-            error = e.message || "Failed to test TURN connectivity";
+        } catch (e) {
+            if (destroyed) return;
+            error = getErrorMessage(e, "Failed to test TURN connectivity");
         } finally {
-            isTesting = false;
+            if (!destroyed) {
+                isTesting = false;
+            }
         }
     }
 

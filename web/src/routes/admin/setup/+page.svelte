@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount } from "svelte";
+    import { onDestroy, onMount } from "svelte";
     import { goto } from "$app/navigation";
     import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
     import {
@@ -107,12 +107,109 @@
     let createdRoom = $state<Room | null>(null);
     let createdRoomSource = $state<"new" | "existing" | null>(null);
     let copiedRoom = $state(false);
+    let destroyed = false;
+    let loadDataRequestId = 0;
+    let refreshConfigRequestId = 0;
+    let healthRequestId = 0;
+    let healthAbortController: AbortController | null = null;
+    let turnSuccessTimer: ReturnType<typeof setTimeout> | null = null;
+    let brandingSuccessTimer: ReturnType<typeof setTimeout> | null = null;
+    let copiedKeyTimer: ReturnType<typeof setTimeout> | null = null;
+    let copiedRoomTimer: ReturnType<typeof setTimeout> | null = null;
+
+    onDestroy(() => {
+        destroyed = true;
+        healthAbortController?.abort();
+        clearTurnSuccess();
+        clearBrandingSuccess();
+        clearCopiedKey();
+        clearCopiedRoom();
+    });
 
     onMount(async () => {
         await loadData();
     });
 
+    function getErrorMessage(e: unknown, fallback: string) {
+        return e instanceof Error ? e.message : fallback;
+    }
+
+    function clearTimer(timer: ReturnType<typeof setTimeout> | null) {
+        if (timer) {
+            clearTimeout(timer);
+        }
+    }
+
+    function clearTurnSuccess() {
+        clearTimer(turnSuccessTimer);
+        turnSuccessTimer = null;
+        turnSuccess = "";
+    }
+
+    function showTurnSuccess(message: string, durationMs = 3000) {
+        clearTurnSuccess();
+        turnSuccess = message;
+        turnSuccessTimer = setTimeout(() => {
+            turnSuccessTimer = null;
+            if (!destroyed) {
+                turnSuccess = "";
+            }
+        }, durationMs);
+    }
+
+    function clearBrandingSuccess() {
+        clearTimer(brandingSuccessTimer);
+        brandingSuccessTimer = null;
+        brandingSuccess = "";
+    }
+
+    function showBrandingSuccess(message: string, durationMs = 3000) {
+        clearBrandingSuccess();
+        brandingSuccess = message;
+        brandingSuccessTimer = setTimeout(() => {
+            brandingSuccessTimer = null;
+            if (!destroyed) {
+                brandingSuccess = "";
+            }
+        }, durationMs);
+    }
+
+    function clearCopiedKey() {
+        clearTimer(copiedKeyTimer);
+        copiedKeyTimer = null;
+        copiedKeyId = null;
+    }
+
+    function showCopiedKey(keyId: string) {
+        clearCopiedKey();
+        copiedKeyId = keyId;
+        copiedKeyTimer = setTimeout(() => {
+            copiedKeyTimer = null;
+            if (!destroyed) {
+                copiedKeyId = null;
+            }
+        }, 2000);
+    }
+
+    function clearCopiedRoom() {
+        clearTimer(copiedRoomTimer);
+        copiedRoomTimer = null;
+        copiedRoom = false;
+    }
+
+    function showCopiedRoom() {
+        clearCopiedRoom();
+        copiedRoom = true;
+        copiedRoomTimer = setTimeout(() => {
+            copiedRoomTimer = null;
+            if (!destroyed) {
+                copiedRoom = false;
+            }
+        }, 2000);
+    }
+
     async function loadData() {
+        const requestId = ++loadDataRequestId;
         isLoading = true;
         loadError = "";
 
@@ -122,6 +219,7 @@
                 streamKeys.list(),
                 rooms.list(),
             ]);
+            if (destroyed || requestId !== loadDataRequestId) return;
 
             config = configData;
             baseUrl =
@@ -152,16 +250,23 @@
             turnUsername = configData.turnExternalUsername || "";
 
             await checkHealth();
-        } catch (e: any) {
-            loadError = e.message || "Failed to load setup data";
+        } catch (e) {
+            if (destroyed || requestId !== loadDataRequestId) return;
+            loadError = getErrorMessage(e, "Failed to load setup data");
         } finally {
-            isLoading = false;
+            if (!destroyed && requestId === loadDataRequestId) {
+                isLoading = false;
+            }
         }
     }
 
     async function refreshConfig() {
+        const requestId = ++refreshConfigRequestId;
         try {
-            config = await appConfig.get();
+            const nextConfig = await appConfig.get();
+            if (destroyed || requestId !== refreshConfigRequestId) return;
+
+            config = nextConfig;
             baseUrl =
                 config?.publicUrl ||
                 (typeof window !== "undefined" ? window.location.origin : "");
@@ -172,26 +277,44 @@
     }
 
     async function checkHealth() {
+        const requestId = ++healthRequestId;
+        healthAbortController?.abort();
+        const controller = new AbortController();
+        healthAbortController = controller;
         healthStatus = "checking";
         healthMessage = "";
 
         try {
-            const res = await fetch("/health", { cache: "no-store" });
+            const res = await fetch("/health", {
+                cache: "no-store",
+                signal: controller.signal,
+            });
+            if (destroyed || requestId !== healthRequestId) return;
+
             if (!res.ok) {
                 healthStatus = "error";
                 healthMessage = `HTTP ${res.status}`;
                 return;
             }
             const data = await res.json();
+            if (destroyed || requestId !== healthRequestId) return;
+
             if (data?.status === "ok") {
                 healthStatus = "ok";
             } else {
                 healthStatus = "error";
                 healthMessage = "Unexpected response";
             }
-        } catch (e: any) {
+        } catch (e) {
+            if (destroyed || requestId !== healthRequestId) return;
+            if (e instanceof DOMException && e.name === "AbortError") return;
+
             healthStatus = "error";
-            healthMessage = e.message || "Health check failed";
+            healthMessage = getErrorMessage(e, "Health check failed");
+        } finally {
+            if (healthAbortController === controller) {
+                healthAbortController = null;
+            }
         }
     }
 
@@ -311,7 +434,7 @@
         e.preventDefault();
         isSavingTurn = true;
         turnError = "";
-        turnSuccess = "";
+        clearTurnSuccess();
 
         try {
             const normalizedTurnURL = turnUrl
@@ -323,11 +446,14 @@
                 ? ""
                 : turnCredential || undefined;
 
-            config = await appConfig.update({
+            const nextConfig = await appConfig.update({
                 turnExternalUrl: normalizedTurnURL,
                 turnExternalUsername: turnUsername.trim(),
                 turnExternalCredential: turnCredentialPayload,
             });
+            if (destroyed) return;
+
+            config = nextConfig;
             baseUrl =
                 config?.publicUrl ||
                 (typeof window !== "undefined" ? window.location.origin : "");
@@ -336,13 +462,15 @@
             turnUsername = config?.turnExternalUsername || "";
             turnCredential = "";
             clearTurnCredential = false;
-            turnSuccess = "TURN settings saved";
             turnConfirmed = true;
-            setTimeout(() => (turnSuccess = ""), 3000);
-        } catch (e: any) {
-            turnError = e.message || "Failed to save TURN settings";
+            showTurnSuccess("TURN settings saved");
+        } catch (e) {
+            if (destroyed) return;
+            turnError = getErrorMessage(e, "Failed to save TURN settings");
         } finally {
-            isSavingTurn = false;
+            if (!destroyed) {
+                isSavingTurn = false;
+            }
         }
     }
 
@@ -350,20 +478,25 @@
         isTestingTurn = true;
         turnTestResults = null;
         turnError = "";
-        turnSuccess = "";
+        clearTurnSuccess();
 
         try {
-            turnTestResults = await appConfig.testTurn();
-            if (turnTestResults.success) {
-                turnSuccess = "TURN connectivity test passed";
-                setTimeout(() => (turnSuccess = ""), 4000);
+            const nextResults = await appConfig.testTurn();
+            if (destroyed) return;
+
+            turnTestResults = nextResults;
+            if (nextResults.success) {
+                showTurnSuccess("TURN connectivity test passed", 4000);
             } else {
-                turnError = turnTestResults.message || "TURN test failed";
+                turnError = nextResults.message || "TURN test failed";
             }
-        } catch (e: any) {
-            turnError = e.message || "Failed to test TURN connectivity";
+        } catch (e) {
+            if (destroyed) return;
+            turnError = getErrorMessage(e, "Failed to test TURN connectivity");
         } finally {
-            isTestingTurn = false;
+            if (!destroyed) {
+                isTestingTurn = false;
+            }
         }
     }
 
@@ -371,19 +504,24 @@
         e.preventDefault();
         isSavingBranding = true;
         brandingError = "";
-        brandingSuccess = "";
+        clearBrandingSuccess();
 
         try {
-            config = await appConfig.update({
+            const nextConfig = await appConfig.update({
                 defaultWatermarkText: watermarkText || undefined,
             });
-            brandingSuccess = "Watermark saved";
+            if (destroyed) return;
+
+            config = nextConfig;
             brandingConfirmed = true;
-            setTimeout(() => (brandingSuccess = ""), 3000);
-        } catch (e: any) {
-            brandingError = e.message || "Failed to save watermark";
+            showBrandingSuccess("Watermark saved");
+        } catch (e) {
+            if (destroyed) return;
+            brandingError = getErrorMessage(e, "Failed to save watermark");
         } finally {
-            isSavingBranding = false;
+            if (!destroyed) {
+                isSavingBranding = false;
+            }
         }
     }
 
@@ -405,34 +543,42 @@
 
         isUploadingLogo = true;
         brandingError = "";
-        brandingSuccess = "";
+        clearBrandingSuccess();
 
         try {
             await appConfig.uploadLogo(file);
+            if (destroyed) return;
             await refreshConfig();
-            brandingSuccess = "Logo uploaded";
+            if (destroyed) return;
+
             brandingConfirmed = true;
-            setTimeout(() => (brandingSuccess = ""), 3000);
-        } catch (e: any) {
-            brandingError = e.message || "Failed to upload logo";
+            showBrandingSuccess("Logo uploaded");
+        } catch (e) {
+            if (destroyed) return;
+            brandingError = getErrorMessage(e, "Failed to upload logo");
         } finally {
-            isUploadingLogo = false;
-            input.value = "";
+            if (!destroyed) {
+                isUploadingLogo = false;
+                input.value = "";
+            }
         }
     }
 
     async function handleDeleteLogo() {
         confirmDeleteLogoOpen = false;
         brandingError = "";
-        brandingSuccess = "";
+        clearBrandingSuccess();
 
         try {
             await appConfig.deleteLogo();
+            if (destroyed) return;
             await refreshConfig();
-            brandingSuccess = "Logo removed";
-            setTimeout(() => (brandingSuccess = ""), 3000);
-        } catch (e: any) {
-            brandingError = e.message || "Failed to delete logo";
+            if (destroyed) return;
+
+            showBrandingSuccess("Logo removed");
+        } catch (e) {
+            if (destroyed) return;
+            brandingError = getErrorMessage(e, "Failed to delete logo");
         }
     }
 
@@ -445,23 +591,37 @@
 
         try {
             const key = await streamKeys.create(newKeyName.trim());
+            if (destroyed) return;
+
             keys = [...keys, key];
             selectedKeyId = key.id;
             newKeyName = "";
-        } catch (e: any) {
-            streamError = e.message || "Failed to create stream key";
+        } catch (e) {
+            if (destroyed) return;
+            streamError = getErrorMessage(e, "Failed to create stream key");
         } finally {
-            isCreatingKey = false;
+            if (!destroyed) {
+                isCreatingKey = false;
+            }
         }
     }
 
-    function copyWhipUrl() {
+    async function copyWhipUrl() {
         const key = keys.find((k) => k.id === selectedKeyId);
         if (!key) return;
         const url = `${baseUrl}/whip/${key.keyToken}`;
-        navigator.clipboard.writeText(url);
-        copiedKeyId = key.id;
-        setTimeout(() => (copiedKeyId = null), 2000);
+        streamError = "";
+
+        try {
+            await navigator.clipboard.writeText(url);
+            if (!destroyed) {
+                showCopiedKey(key.id);
+            }
+        } catch (e) {
+            if (!destroyed) {
+                streamError = getErrorMessage(e, "Failed to copy WHIP URL");
+            }
+        }
     }
 
     function handleRoomNameChange(e: Event) {
@@ -516,13 +676,18 @@
             }
 
             const room = await rooms.create(payload);
+            if (destroyed) return;
+
             createdRoom = room;
             createdRoomSource = "new";
             roomsList = [room, ...roomsList];
-        } catch (e: any) {
-            roomError = e.message || "Failed to create room";
+        } catch (e) {
+            if (destroyed) return;
+            roomError = getErrorMessage(e, "Failed to create room");
         } finally {
-            isCreatingRoom = false;
+            if (!destroyed) {
+                isCreatingRoom = false;
+            }
         }
     }
 
@@ -536,12 +701,21 @@
         return `/admin/rooms/${createdRoom.slug}`;
     }
 
-    function copyRoomUrl() {
+    async function copyRoomUrl() {
         const url = roomUrl();
         if (!url) return;
-        navigator.clipboard.writeText(url);
-        copiedRoom = true;
-        setTimeout(() => (copiedRoom = false), 2000);
+        roomError = "";
+
+        try {
+            await navigator.clipboard.writeText(url);
+            if (!destroyed) {
+                showCopiedRoom();
+            }
+        } catch (e) {
+            if (!destroyed) {
+                roomError = getErrorMessage(e, "Failed to copy room URL");
+            }
+        }
     }
 
     function turnModeLabel(mode?: string) {
