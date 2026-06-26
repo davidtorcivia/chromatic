@@ -584,6 +584,22 @@ func (s *SFU) RemoveIngest(streamKeyToken string) {
 	s.removeIngestIf(streamKeyToken, nil)
 }
 
+// TakeIngest atomically looks up and removes the ingest for a token, returning
+// the removed session. It exists so WHIP DELETE can tear down the session it
+// actually saw without a TOCTOU window: with a separate GetIngest + teardown, a
+// concurrent OBS reconnect (SetIngest) can replace the session between the two,
+// and the DELETE would then close a stale PC and return a misleading 204 for a
+// session that no longer matches. By taking under one lock, the caller is
+// guaranteed either the exact session it removes (then nil) or nothing. The
+// caller is responsible for closing the PC and running teardown.
+func (s *SFU) TakeIngest(streamKeyToken string) *IngestSession {
+	s.mu.Lock()
+	session := s.ingests[streamKeyToken]
+	delete(s.ingests, streamKeyToken)
+	s.mu.Unlock()
+	return session
+}
+
 // removeIngestIfSame removes the ingest only when the current map entry
 // matches the given expected session. Prevents a stale Failed/Closed callback
 // from a replaced ingest from killing the new one.

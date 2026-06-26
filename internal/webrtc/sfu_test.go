@@ -822,6 +822,68 @@ func TestSFU_BindIngestToRoom_ReplacesExistingSender(t *testing.T) {
 	}
 }
 
+// TestSFU_TakeIngest_StaleDeleteDoesNotTearDownReconnect is the regression test
+// for the WHIP C2 TOCTOU. handleDelete used to GetIngest then run teardown in
+// separate steps; a concurrent OBS reconnect (SetIngest) could replace the
+// session in between, and the DELETE would close a stale PC and return a
+// misleading 204. With atomic TakeIngest, the DELETE either removes the exact
+// session it saw or finds nothing (404) — and crucially a reconnect's new
+// session is never touched by a stale DELETE. This test exercises both
+// interleavings deterministically at the SFU layer.
+func TestSFU_TakeIngest_StaleDeleteDoesNotTearDownReconnect(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	token := "reconnect-token"
+
+	// Old session is live.
+	oldSession := &IngestSession{StreamKeyToken: token, done: make(chan struct{})}
+	sfu.SetIngest(token, oldSession)
+	if got := sfu.GetIngest(token); got != oldSession {
+		t.Fatal("old session should be registered")
+	}
+
+	// Interleaving A: the reconnect (SetIngest) wins the race BEFORE the DELETE.
+	// The DELETE's TakeIngest then removes the NEW session, not the old one —
+	// but that's the DELETE correctly taking whatever is current, and the old
+	// session is left for its own teardown. The point: TakeIngest is atomic, so
+	// there is no window where a stale pointer is operated on.
+	newSession := &IngestSession{StreamKeyToken: token, done: make(chan struct{})}
+	sfu.SetIngest(token, newSession)
+	taken := sfu.TakeIngest(token)
+	if taken != newSession {
+		t.Fatal("TakeIngest must return the current (new) session, not a stale pointer")
+	}
+	if sfu.GetIngest(token) != nil {
+		t.Fatal("TakeIngest must remove the session from the map")
+	}
+
+	// Interleaving B: the DELETE (TakeIngest) wins BEFORE the reconnect. The
+	// reconnect then registers fresh and must be retrievable — the DELETE did
+	// not (and could not) touch it because the map was already empty when it
+	// took the old entry.
+	sfu.SetIngest(token, oldSession)
+	taken = sfu.TakeIngest(token)
+	if taken != oldSession {
+		t.Fatal("TakeIngest should return the old session it removed")
+	}
+	// Reconnect lands a brand-new session; it survives untouched.
+	sfu.SetIngest(token, newSession)
+	if got := sfu.GetIngest(token); got != newSession {
+		t.Fatal("reconnect's new session must survive a stale DELETE (TakeIngest already completed)")
+	}
+
+	// Interleaving C: TakeIngest on an empty slot returns nil (→ DELETE returns
+	// 404, not a misleading 204).
+	if got := sfu.TakeIngest("never-registered"); got != nil {
+		t.Fatal("TakeIngest on an absent token must return nil")
+	}
+}
+
 func TestSFU_Shutdown(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)

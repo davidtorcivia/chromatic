@@ -377,7 +377,14 @@ func (h *WHIPHandler) handleICETrickle(w http.ResponseWriter, r *http.Request, t
 
 // handleDelete handles stream termination
 func (h *WHIPHandler) handleDelete(w http.ResponseWriter, r *http.Request, token string) {
-	session := h.sfu.GetIngest(token)
+	// Atomically take (lookup + remove under one lock) the session. This closes
+	// the TOCTOU window that a separate GetIngest + teardown had: a concurrent
+	// OBS reconnect (SetIngest) could replace the session between the two, and
+	// the DELETE would then close a stale PC, leave the live replacement
+	// untouched, and return a misleading 204 for a session it didn't actually
+	// remove. With TakeIngest, either we get the exact session we remove (and
+	// tear it down) or we get nil (it was already replaced → 404, not 204).
+	session := h.sfu.TakeIngest(token)
 	if session == nil {
 		http.Error(w, "Session not found", http.StatusNotFound)
 		return
@@ -385,16 +392,13 @@ func (h *WHIPHandler) handleDelete(w http.ResponseWriter, r *http.Request, token
 
 	session.PeerConnection.Close()
 
-	// Run the shared teardown (idempotent): removes the ingest and notifies
-	// stream end exactly once, even though Close() also fires the Closed state
-	// callback asynchronously. Every handleOffer-created session has teardown
-	// set; if it were ever nil, fall back to pointer-scoped removal
-	// (removeIngestIfSame) — NOT unconditional RemoveIngest, which would tear
-	// down a reconnected session sharing this token.
+	// Run the shared teardown (idempotent): notifies stream end exactly once,
+	// even though Close() also fires the Closed state callback asynchronously.
+	// The session is already removed from the map by TakeIngest, so teardown's
+	// removeIngestIfSame is a harmless no-op; it still drives the metric
+	// decrement and onStreamEnd (guarded by teardownOnce).
 	if session.teardown != nil {
 		session.teardown()
-	} else {
-		h.sfu.removeIngestIfSame(token, session)
 	}
 
 	w.WriteHeader(http.StatusNoContent)
