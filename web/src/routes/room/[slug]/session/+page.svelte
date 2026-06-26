@@ -77,6 +77,8 @@
     let participantListEl = $state<HTMLDivElement | null>(null);
     let currentRtt = $state<number | null>(null);
     let currentVideoBufferDelay = $state<number | null>(null);
+    let currentReceiverJitterTarget = $state<number | null>(null);
+    let currentReceiverPlayoutHint = $state<number | null>(null);
     let statsInterval: ReturnType<typeof setInterval> | null = null;
     // Cloudflare TURN credentials default to a 1 h TTL; long color-grading
     // sessions (4–8 h) outlive that. Refresh every 30 min over the existing
@@ -1024,6 +1026,11 @@
                 const stats = await webrtcManager.getStats();
                 currentRtt = stats.rtt ?? null;
                 currentVideoBufferDelay = stats.videoJitterBufferDelay ?? null;
+                currentReceiverJitterTarget = stats.receiverJitterBufferTarget ?? null;
+                currentReceiverPlayoutHint =
+                    stats.receiverPlayoutDelayHint === undefined
+                        ? null
+                        : stats.receiverPlayoutDelayHint * 1000;
             } finally {
                 inFlight = false;
             }
@@ -2739,6 +2746,10 @@
                             <div class="stats-row">
                                 <span>Post-receive</span>
                                 <span>{frameReceiveToDisplayDelay !== null ? `~${Math.round(frameReceiveToDisplayDelay)} ms` : "n/a"}</span>
+                            </div>
+                            <div class="stats-row">
+                                <span>Buffer target</span>
+                                <span>{currentReceiverJitterTarget !== null ? `${Math.round(currentReceiverJitterTarget)} ms` : currentReceiverPlayoutHint !== null ? `${Math.round(currentReceiverPlayoutHint)} ms` : "n/a"}</span>
                             </div>
                             <div class="stats-row">
                                 <span>Decode</span>

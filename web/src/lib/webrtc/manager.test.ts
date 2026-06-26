@@ -82,6 +82,7 @@ class FakeSubscriberPeerConnection {
     addedCandidates: RTCIceCandidateInit[] = [];
     configurationHistory: RTCConfiguration[] = [];
     statsReport = new Map<string, unknown>();
+    receivers: RTCRtpReceiver[] = [];
     rejectRemoteOffers = false;
 
     async createOffer(options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
@@ -136,6 +137,10 @@ class FakeSubscriberPeerConnection {
 
     async getStats(): Promise<Map<string, unknown>> {
         return this.statsReport;
+    }
+
+    getReceivers(): RTCRtpReceiver[] {
+        return this.receivers;
     }
 
     setConfiguration(configuration: RTCConfiguration): void {
@@ -817,8 +822,8 @@ describe('WebRTCManager subscriber signaling', () => {
             receiver
         } as unknown as RTCTrackEvent);
 
-        expect(receiver.jitterBufferTarget).toBe(50);
-        expect(receiver.playoutDelayHint).toBe(0.05);
+        expect(receiver.jitterBufferTarget).toBe(20);
+        expect(receiver.playoutDelayHint).toBe(0.02);
     });
 
     it('refreshes ICE servers on both subscriber and publisher peer connections', async () => {
@@ -857,6 +862,12 @@ describe('WebRTCManager subscriber signaling', () => {
 
         await manager.handleOffer('subscriber-offer', 'offer-123');
         const pc = (manager as unknown as { pc: FakeSubscriberPeerConnection | null }).pc;
+        const receiver = {
+            track: { kind: 'video' },
+            jitterBufferTarget: null,
+            playoutDelayHint: 1
+        };
+        pc?.receivers.push(receiver as unknown as RTCRtpReceiver);
         pc?.statsReport.set('candidate-pair-1', {
             type: 'candidate-pair',
             state: 'succeeded',
@@ -874,8 +885,12 @@ describe('WebRTCManager subscriber signaling', () => {
         await expect(manager.getStats()).resolves.toEqual({
             rtt: 32,
             videoJitterBufferDelay: 30,
-            videoFramesDropped: 2
+            videoFramesDropped: 2,
+            receiverJitterBufferTarget: 20,
+            receiverPlayoutDelayHint: 0.02
         });
+        expect(receiver.jitterBufferTarget).toBe(20);
+        expect(receiver.playoutDelayHint).toBe(0.02);
 
         pc?.statsReport.set('inbound-video-1', {
             type: 'inbound-rtp',
@@ -889,6 +904,8 @@ describe('WebRTCManager subscriber signaling', () => {
         expect(refreshedStats.rtt).toBe(32);
         expect(refreshedStats.videoJitterBufferDelay).toBeCloseTo(20);
         expect(refreshedStats.videoFramesDropped).toBe(3);
+        expect(refreshedStats.receiverJitterBufferTarget).toBe(20);
+        expect(refreshedStats.receiverPlayoutDelayHint).toBe(0.02);
     });
 });
 

@@ -61,6 +61,8 @@ export interface WebRTCStats {
     rtt?: number;
     videoJitterBufferDelay?: number;
     videoFramesDropped?: number;
+    receiverJitterBufferTarget?: number | null;
+    receiverPlayoutDelayHint?: number;
 }
 
 interface JitterBufferSample {
@@ -115,7 +117,7 @@ export class WebRTCManager {
     // Keep browser playout buffers tight for color-review A/B work. Modern
     // browsers expose jitterBufferTarget in ms; Chromium also has the older
     // seconds-based playoutDelayHint. Unsupported browsers ignore either hint.
-    private static readonly LOW_LATENCY_JITTER_BUFFER_TARGET_MS = 50;
+    private static readonly LOW_LATENCY_JITTER_BUFFER_TARGET_MS = 20;
     private static readonly LOW_LATENCY_PLAYOUT_DELAY_SECONDS =
         WebRTCManager.LOW_LATENCY_JITTER_BUFFER_TARGET_MS / 1000;
     private lastResyncAt = 0;
@@ -446,6 +448,32 @@ export class WebRTCManager {
         }
     }
 
+    private tuneReceiversForLowLatency(): void {
+        for (const receiver of this.pc?.getReceivers() ?? []) {
+            if (receiver.track?.kind === 'video') {
+                this.tuneReceiverForLowLatency(receiver);
+            }
+        }
+    }
+
+    private videoReceiverLatencyTuning(): Pick<WebRTCStats, 'receiverJitterBufferTarget' | 'receiverPlayoutDelayHint'> {
+        type LowLatencyReceiver = RTCRtpReceiver & { playoutDelayHint?: number };
+        for (const receiver of this.pc?.getReceivers() ?? []) {
+            if (receiver.track?.kind !== 'video') continue;
+
+            const lowLatencyReceiver = receiver as LowLatencyReceiver;
+            return {
+                receiverJitterBufferTarget: 'jitterBufferTarget' in receiver
+                    ? receiver.jitterBufferTarget
+                    : undefined,
+                receiverPlayoutDelayHint: 'playoutDelayHint' in lowLatencyReceiver
+                    ? lowLatencyReceiver.playoutDelayHint
+                    : undefined
+            };
+        }
+        return {};
+    }
+
     // Perform ICE restart to recover from connection issues.
     //
     // If the answer never arrives (dropped WS, server restart mid-flight) the
@@ -597,6 +625,8 @@ export class WebRTCManager {
             return {};
         }
 
+        this.tuneReceiversForLowLatency();
+        const receiverLatencyTuning = this.videoReceiverLatencyTuning();
         const stats = await this.pc.getStats();
         // Prefer the nominated (actively used) candidate pair so the latency
         // display is stable; fall back to any succeeded pair if none is
@@ -654,7 +684,8 @@ export class WebRTCManager {
         return {
             rtt: nominatedRtt ?? fallbackRtt,
             videoJitterBufferDelay,
-            videoFramesDropped
+            videoFramesDropped,
+            ...receiverLatencyTuning
         };
     }
 
