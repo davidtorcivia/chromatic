@@ -2,6 +2,7 @@
     import { onMount, onDestroy } from "svelte";
     import { fade, fly } from "svelte/transition";
     import { quintOut } from "svelte/easing";
+    import { goto } from "$app/navigation";
     import { page } from "$app/stores";
     import { rooms, type LobbyInfo } from "$lib/api/client";
     import { countdownParts, formatScheduleLabel, serverClockOffset } from "$lib/lobby";
@@ -18,18 +19,20 @@
     let error = $state("");
     let roomName = $state("");
     let eventSource: EventSource | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout>;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let reconnectAttempts = $state(0);
+    let destroyed = false;
+    let sseGeneration = 0;
 
     // After a minute of waiting, acknowledge the wait with a second line.
     const LONG_WAIT_MS = 60000;
     let waitedLong = $state(false);
-    let longWaitTimer: ReturnType<typeof setTimeout>;
+    let longWaitTimer: ReturnType<typeof setTimeout> | null = null;
 
     // Smooth exit: fade the page out before navigating into the session.
     const EXIT_FADE_MS = 400;
     let isLeaving = $state(false);
-    let exitTimer: ReturnType<typeof setTimeout>;
+    let exitTimer: ReturnType<typeof setTimeout> | null = null;
 
     // Countdown lobby (scheduled room joined before it opened)
     let lobby = $state<LobbyInfo | null>(null);
@@ -55,7 +58,7 @@
         // Get session data
         const stored = sessionStorage.getItem(`chromatic_session_${slug}`);
         if (!stored) {
-            window.location.href = `/room/${slug}`;
+            void goto(`/room/${slug}`);
             return;
         }
 
@@ -82,6 +85,7 @@
         rooms
             .info(slug)
             .then((info) => {
+                if (destroyed) return;
                 roomName = info.name;
                 if (info.serverTime) {
                     serverOffset = serverClockOffset(info.serverTime, Date.now());
@@ -100,20 +104,20 @@
     });
 
     onDestroy(() => {
-        if (eventSource) {
-            eventSource.close();
-        }
-        if (reconnectTimer) {
-            clearTimeout(reconnectTimer);
-        }
+        destroyed = true;
+        closeSSE();
+        clearReconnectTimer();
         if (longWaitTimer) {
             clearTimeout(longWaitTimer);
+            longWaitTimer = null;
         }
         if (exitTimer) {
             clearTimeout(exitTimer);
+            exitTimer = null;
         }
         if (countdownTimer) {
             clearInterval(countdownTimer);
+            countdownTimer = undefined;
         }
     });
 
@@ -141,19 +145,41 @@
     // beat, fade the page out, then navigate — the session page fades in on
     // top of the same dark background, so the handoff reads as one motion.
     function enterSession() {
-        if (isLeaving) return;
+        if (destroyed || isLeaving) return;
         status = "admitted";
-        eventSource?.close();
+        closeSSE();
+        clearReconnectTimer();
         if (prefersReducedMotion) {
-            window.location.href = `/room/${slug}/session`;
+            void goto(`/room/${slug}/session`);
             return;
         }
         exitTimer = setTimeout(() => {
+            if (destroyed) return;
             isLeaving = true;
             exitTimer = setTimeout(() => {
-                window.location.href = `/room/${slug}/session`;
+                if (!destroyed) void goto(`/room/${slug}/session`);
             }, EXIT_FADE_MS);
         }, 600);
+    }
+
+    function clearReconnectTimer() {
+        if (!reconnectTimer) return;
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
+    function closeSSE() {
+        sseGeneration++;
+        if (!eventSource) return;
+        eventSource.onopen = null;
+        eventSource.onmessage = null;
+        eventSource.onerror = null;
+        eventSource.close();
+        eventSource = null;
+    }
+
+    function isTerminalStatus() {
+        return status === "admitted" || status === "ended" || status === "error";
     }
 
     // Calculate delay with exponential backoff and jitter
@@ -168,7 +194,8 @@
     }
 
     function connectSSE() {
-        if (!sessionData) return;
+        if (destroyed || !sessionData || isLeaving || isTerminalStatus()) return;
+        clearReconnectTimer();
 
         // Check if we've exceeded max retry attempts
         if (reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
@@ -178,19 +205,24 @@
         }
 
         // Close existing connection if any
-        if (eventSource) {
-            eventSource.close();
-        }
+        closeSSE();
 
         const url = `/api/rooms/${slug}/waiting/events/${sessionData.participantId}?token=${encodeURIComponent(sessionData.token)}`;
-        eventSource = new EventSource(url);
+        const generation = ++sseGeneration;
+        const source = new EventSource(url);
+        eventSource = source;
 
-        eventSource.onopen = () => {
+        const isCurrentConnection = () =>
+            !destroyed && generation === sseGeneration && eventSource === source;
+
+        source.onopen = () => {
+            if (!isCurrentConnection()) return;
             // Reset retry count on successful connection
             reconnectAttempts = 0;
         };
 
-        eventSource.onmessage = (event) => {
+        source.onmessage = (event) => {
+            if (!isCurrentConnection()) return;
             try {
                 const data = JSON.parse(event.data);
 
@@ -199,11 +231,11 @@
                     enterSession();
                 } else if (data.event === "ended") {
                     status = "ended";
-                    eventSource?.close();
+                    closeSSE();
                 } else if (data.event === "denied") {
                     status = "error";
                     error = "The host declined your request to join this session.";
-                    eventSource?.close();
+                    closeSSE();
                 } else if (data.event === "open") {
                     // The room opened (waiting-room enabled): countdown
                     // crossfades into the approval-waiting state. The server
@@ -211,7 +243,6 @@
                     if (status === "lobby") {
                         status = "waiting";
                     }
-                    eventSource?.close();
                     connectSSE();
                 }
             } catch (e) {
@@ -219,9 +250,11 @@
             }
         };
 
-        eventSource.onerror = (e) => {
+        source.onerror = (e) => {
+            if (!isCurrentConnection()) return;
             console.error("SSE error", e);
-            eventSource?.close();
+            source.close();
+            if (eventSource === source) eventSource = null;
 
             reconnectAttempts++;
 
@@ -236,7 +269,10 @@
             const delay = getReconnectDelay();
             console.log(`SSE reconnecting in ${delay}ms (attempt ${reconnectAttempts}/${RECONNECT_MAX_ATTEMPTS})`);
 
+            const reconnectGeneration = generation;
             reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                if (destroyed || reconnectGeneration !== sseGeneration || isTerminalStatus()) return;
                 // Before reconnecting, check status via API
                 checkStatusAndReconnect();
             }, delay);
@@ -244,10 +280,12 @@
     }
 
     async function checkStatusAndReconnect() {
-        if (!sessionData) return;
+        if (destroyed || !sessionData || isLeaving || isTerminalStatus()) return;
+        const generation = sseGeneration;
 
         try {
             const result = await rooms.checkStatus(slug, sessionData.participantId, sessionData.token);
+            if (destroyed || generation !== sseGeneration || isTerminalStatus()) return;
 
             if (result.roomStatus === "ended") {
                 status = "ended";
@@ -262,9 +300,11 @@
 
             // Still waiting, reconnect SSE
             connectSSE();
-        } catch (e: any) {
+        } catch (e: unknown) {
+            if (destroyed || generation !== sseGeneration || isTerminalStatus()) return;
             // If participant not found, may have been removed
-            if (e.message.includes("not found")) {
+            const message = e instanceof Error ? e.message : String(e);
+            if (message.includes("not found")) {
                 error = "You have been removed from the waiting room.";
                 status = "error";
             } else {
@@ -278,7 +318,10 @@
                 }
 
                 const delay = getReconnectDelay();
+                const reconnectGeneration = generation;
                 reconnectTimer = setTimeout(() => {
+                    reconnectTimer = null;
+                    if (destroyed || reconnectGeneration !== sseGeneration || isTerminalStatus()) return;
                     connectSSE();
                 }, delay);
             }
@@ -287,6 +330,8 @@
 
     function handleRetry() {
         // Reset retry state and attempt to connect again
+        closeSSE();
+        clearReconnectTimer();
         reconnectAttempts = 0;
         status = "waiting";
         error = "";
@@ -294,8 +339,10 @@
     }
 
     function handleLeave() {
+        closeSSE();
+        clearReconnectTimer();
         sessionStorage.removeItem(`chromatic_session_${slug}`);
-        window.location.href = `/room/${slug}`;
+        void goto(`/room/${slug}`);
     }
 </script>
 
