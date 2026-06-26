@@ -306,6 +306,17 @@ func (h *ConfigHandler) DeleteLogo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Containment check (mirrors GetLogo / DeleteFile): the path comes from the
+	// DB and must resolve inside the configured logo root before we unlink it.
+	// Without this, a logo_path that ever pointed outside the root (a buggy
+	// write, a future code path, or a tampered DB) would let DeleteLogo remove
+	// an arbitrary file.
+	if !isPathWithin(h.cfg.LogoPath, *logoPath) {
+		logger.Warn("Blocked logo delete outside logo root", "path", *logoPath)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
 	// Delete the file
 	if err := os.Remove(*logoPath); err != nil && !os.IsNotExist(err) {
 		logger.Warn("Failed to delete logo file", "path", *logoPath, "error", err)
