@@ -241,10 +241,10 @@
         // Laser pointer only activates when explicitly enabled from the session controls.
         const handleVideoPointerDown = (e: PointerEvent) => {
             if (!enabled || e.pointerType === "touch" || e.button !== 0 || isPointing) return;
+            if (!beginLocalStroke(e)) return;
             showUsageHint = false;
             activePointerId = e.pointerId;
             isPointing = true;
-            beginLocalStroke(e);
             sendCursor(e);
         };
 
@@ -581,6 +581,7 @@
     }
 
     function appendLocalBatch(cursor: Cursor, batch: BatchPoint[]) {
+        if (batch.length === 0) return false;
         // Stamp every coalesced sample synchronously on capture (zero
         // latency, full input geometry).
         if (!reducedMotion) {
@@ -596,22 +597,28 @@
         cursor.x = head.x;
         cursor.y = head.y;
         cursor.lastUpdate = Date.now();
+        return true;
     }
 
-    function beginLocalStroke(e: PointerEvent) {
+    function beginLocalStroke(e: PointerEvent): boolean {
+        const batch = coalescedCoords(e);
+        if (batch.length === 0) return false;
         const cursor = localCursor();
-        if (!cursor) return;
+        if (!cursor) return false;
         cursor.prev1 = null;
         cursor.prev2 = null;
         cursor.active = true;
-        appendLocalBatch(cursor, coalescedCoords(e));
+        appendLocalBatch(cursor, batch);
         startRenderLoop();
+        return true;
     }
 
     function extendLocalStroke(e: PointerEvent) {
+        const batch = coalescedCoords(e);
+        if (batch.length === 0) return;
         const cursor = localCursor();
         if (!cursor) return;
-        appendLocalBatch(cursor, coalescedCoords(e));
+        appendLocalBatch(cursor, batch);
         startRenderLoop();
     }
 
@@ -668,7 +675,8 @@
         // Flush any samples still pending plus the final position, and ask
         // every client to play the expanding ripple there (`release`).
         if (pendingPoints.length === 0) {
-            pendingPoints.push(lastQueuedPos ?? { x: 0, y: 0 });
+            if (!lastQueuedPos) return;
+            pendingPoints.push(lastQueuedPos);
         }
         const points = subsampleBatch(pendingPoints);
         pendingPoints = [];
