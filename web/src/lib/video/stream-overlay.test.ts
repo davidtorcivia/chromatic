@@ -122,4 +122,27 @@ describe('deriveStreamOverlayState', () => {
             )
         ).toBe('reconnecting');
     });
+
+    // Regression: a failed RTCPeerConnection with a HEALTHY WebSocket. The WS-
+    // driven connectionLost/reconnecting flags never flip in that case, so the
+    // page's onConnectionStateChange wiring forces isVideoPlaying=false on a
+    // degraded PC. This must drop a previously-playing stream out of 'playing'
+    // into 'connecting' (the recovery indicator) — not leave the viewer on a
+    // frozen frame that reads as live.
+    it('drops to connecting when a previously-playing stream degrades (isVideoPlaying cleared)', () => {
+        // Was playing fine…
+        expect(
+            deriveStreamOverlayState(
+                inputs({ roomLive: true, hasStream: true, isVideoPlaying: true })
+            )
+        ).toBe('playing');
+        // …PC failed/disconnected: wiring clears isVideoPlaying. The frozen
+        // frame must surface as 'connecting' while ICE restart / resubscribe
+        // runs, with no WS error to drive connectionLost.
+        expect(
+            deriveStreamOverlayState(
+                inputs({ roomLive: true, hasStream: true, isVideoPlaying: false })
+            )
+        ).toBe('connecting');
+    });
 });

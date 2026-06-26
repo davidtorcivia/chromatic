@@ -139,6 +139,14 @@
     // that frames are rendering. play()'s promise can stay pending forever on
     // a stream waiting for a keyframe (BUG 1), so we never gate UI on it.
     let isVideoPlaying = $state(false);
+    // True while the subscriber RTCPeerConnection is in a degraded/terminal
+    // state (failed/disconnected) that the manager is recovering from. Driven
+    // by onConnectionStateChange so a failed PC with a HEALTHY WebSocket —
+    // where the WS-driven connectionLost flag never flips — still drops the
+    // frozen last frame out of the 'playing' overlay and into 'connecting' while
+    // ICE restart / resubscribe runs. Without this the viewer sits on a frozen
+    // frame with no recovery indicator.
+    let peerConnectionDegraded = $state(false);
     // Keyframe nudge: if tracks are bound but the video hasn't started
     // playing shortly after, request a resync (PLI). The server's single PLI
     // at subscriber-creation can be lost (sent before ICE finished), leaving
@@ -766,6 +774,19 @@
             onVoiceTrack: handleVoiceTrack,
             onScreenShareTrack: handleScreenShareTrack,
             sendSignal: (type, payload) => session.send(type, payload),
+            onConnectionStateChange: (state) => {
+                // The WebSocket can stay healthy while the media path dies (e.g.
+                // a TURN allocation expires mid-session). Surface the PC's own
+                // state so a frozen frame drops into the 'connecting' overlay
+                // while the manager's ICE-restart / resubscribe recovery runs,
+                // instead of masquerading as 'playing'. We do NOT trigger a
+                // competing resubscribe here — the manager's failed→ICE-restart
+                // →onIceRestartFailed chain (already wired below) owns that.
+                peerConnectionDegraded = state === 'failed' || state === 'disconnected';
+                if (peerConnectionDegraded) {
+                    isVideoPlaying = false;
+                }
+            },
             onIceRestartFailed: () => {
                 // ICE restart couldn't repair the path — rebuild the whole
                 // subscription before declaring the stream unreachable.
@@ -1459,6 +1480,7 @@
         }
         hasStream = false;
         isVideoPlaying = false;
+        peerConnectionDegraded = false;
         needsPlayClick = false;
         clearMediaStallTimer();
         clearKeyframeNudge();
