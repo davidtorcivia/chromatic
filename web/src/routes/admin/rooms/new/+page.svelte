@@ -122,6 +122,10 @@
         destroyed = true;
     });
 
+    function getErrorMessage(e: unknown, fallback: string) {
+        return e instanceof Error ? e.message : fallback;
+    }
+
     function generateSlug(text: string): string {
         return text
             .toLowerCase()
@@ -198,9 +202,9 @@
             const created = await rooms.create(roomData);
             if (destroyed) return;
             void goto(`/admin/rooms/${created.slug || slug}`);
-        } catch (e: any) {
+        } catch (e) {
             if (destroyed) return;
-            error = e.message || "Failed to create room";
+            error = getErrorMessage(e, "Failed to create room");
         } finally {
             if (!destroyed) isSaving = false;
         }

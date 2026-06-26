@@ -57,6 +57,7 @@
     let dragOffsetY = 0;
     let destroyed = false;
     let successTimer: ReturnType<typeof setTimeout> | null = null;
+    let waitingRoomRequestId = 0;
 
     function previewPoint(e: PointerEvent) {
         const rect = previewEl!.getBoundingClientRect();
@@ -167,6 +168,10 @@
         clearSuccessTimer();
     });
 
+    function getErrorMessage(e: unknown, fallback: string) {
+        return e instanceof Error ? e.message : fallback;
+    }
+
     function clearSuccessTimer() {
         if (!successTimer) return;
         clearTimeout(successTimer);
@@ -177,12 +182,15 @@
         clearSuccessTimer();
         successMessage = message;
         successTimer = setTimeout(() => {
-            successMessage = "";
             successTimer = null;
+            if (!destroyed) {
+                successMessage = "";
+            }
         }, 4000);
     }
 
     function stopWaitingRoomPolling() {
+        waitingRoomRequestId++;
         if (!pollInterval) return;
         clearInterval(pollInterval);
         pollInterval = null;
@@ -206,12 +214,13 @@
     }
 
     async function loadWaitingRoom() {
+        const requestId = ++waitingRoomRequestId;
         try {
             const participants = (await rooms.listWaiting(slug)) ?? [];
-            if (destroyed) return;
+            if (destroyed || requestId !== waitingRoomRequestId) return;
             waitingParticipants = participants;
         } catch (e) {
-            if (destroyed) return;
+            if (destroyed || requestId !== waitingRoomRequestId) return;
             console.error("Failed to load waiting room", e);
         }
     }
@@ -233,9 +242,11 @@
         fileToDelete = null;
         try {
             await roomFiles.delete(target.id);
+            if (destroyed) return;
             files = files.filter((f) => f.id !== target.id);
-        } catch (e: any) {
-            error = e.message || "Failed to delete file";
+        } catch (e) {
+            if (destroyed) return;
+            error = getErrorMessage(e, "Failed to delete file");
         }
     }
 
@@ -273,9 +284,9 @@
             }
             waitingParticipants = [];
             showSuccess("Room opened. Waiting guests have been let in.");
-        } catch (e: any) {
+        } catch (e) {
             if (destroyed) return;
-            error = e.message || "Failed to open the room";
+            error = getErrorMessage(e, "Failed to open the room");
         } finally {
             if (!destroyed) isOpeningRoom = false;
         }
@@ -347,9 +358,9 @@
             reconcileWaitingRoomPolling();
             showSuccess("Room updated successfully");
             password = ""; // Clear password field after save
-        } catch (e: any) {
+        } catch (e) {
             if (destroyed) return;
-            error = e.message || "Failed to update room";
+            error = getErrorMessage(e, "Failed to update room");
         } finally {
             if (!destroyed) isSaving = false;
         }
@@ -397,9 +408,9 @@
         try {
             await rooms.delete(slug, deleteRoomFiles);
             if (!destroyed) void goto("/admin/rooms");
-        } catch (e: any) {
+        } catch (e) {
             if (destroyed) return;
-            error = e.message || "Failed to delete room";
+            error = getErrorMessage(e, "Failed to delete room");
         }
     }
 
