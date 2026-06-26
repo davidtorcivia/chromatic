@@ -302,6 +302,95 @@ func TestRoomTracks_AddRemoveSubscriber(t *testing.T) {
 	room.RemoveSubscriber("nonexistent")
 }
 
+// TestRemoveSubscriber_SharerRemovalTearsDownOtherViewers is a regression test
+// for frozen screen-share frames. When the active sharer's subscriber is
+// removed abruptly (e.g. its peer connection Failed while the WebSocket lived),
+// removeSubscriberLocked previously cleared the room's screen-share state but
+// left every OTHER viewer's sender bound to the now-dead relay local track — a
+// frozen last frame. It must instead remove that sender from each other
+// subscriber and report them so callers can renegotiate.
+func TestRemoveSubscriber_SharerRemovalTearsDownOtherViewers(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "screen-room"
+	room := sfu.GetRoomTracks(roomSlug)
+
+	// Build a screen-share relay local track and bind it to two viewer PCs.
+	videoCodec := webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}
+	localTrack, err := webrtc.NewTrackLocalStaticRTP(videoCodec, "screenshare-sharer", "screenshare-stream-sharer")
+	if err != nil {
+		t.Fatalf("failed to create local track: %v", err)
+	}
+
+	sharerPC, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create sharer pc: %v", err)
+	}
+	defer sharerPC.Close()
+	sharer := &Subscriber{ID: "sharer", PeerConnection: sharerPC, done: make(chan struct{})}
+
+	viewerPC, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create viewer pc: %v", err)
+	}
+	defer viewerPC.Close()
+	viewerSender, err := viewerPC.AddTrack(localTrack)
+	if err != nil {
+		t.Fatalf("failed to add screen share track to viewer: %v", err)
+	}
+	_ = viewerSender
+	viewer := &Subscriber{ID: "viewer", PeerConnection: viewerPC, done: make(chan struct{})}
+
+	room.mu.Lock()
+	room.Subscribers["sharer"] = sharer
+	room.Subscribers["viewer"] = viewer
+	room.ScreenShareParticipantID = "sharer"
+	room.ScreenShareLocalTrack = localTrack
+	room.mu.Unlock()
+
+	// Sanity: the viewer has the screen-share sender bound.
+	if !senderBound(viewerPC, localTrack) {
+		t.Fatal("viewer should have the screen-share sender bound before sharer removal")
+	}
+
+	// Remove the sharer abruptly via the IfSame path (mimics a Failed PC).
+	affected := sfu.RemoveSubscriberIfSame(roomSlug, "sharer", sharer)
+	if len(affected) != 1 || affected[0] != "viewer" {
+		t.Fatalf("expected affected=[viewer], got %v", affected)
+	}
+
+	// The viewer's screen-share sender must be gone (no frozen frame)…
+	if senderBound(viewerPC, localTrack) {
+		t.Fatal("viewer screen-share sender should have been removed when the sharer left")
+	}
+	// …and the viewer flagged for renegotiation so the m-line is torn down.
+	if !viewer.needsRenegotiation {
+		t.Fatal("viewer should be flagged needsRenegotiation after its screen-share sender was removed")
+	}
+
+	// Room screen-share state cleared.
+	room.mu.RLock()
+	cleared := room.ScreenShareParticipantID == "" && room.ScreenShareLocalTrack == nil
+	room.mu.RUnlock()
+	if !cleared {
+		t.Fatal("room screen-share state should be cleared after sharer removal")
+	}
+}
+
+func senderBound(pc *webrtc.PeerConnection, track *webrtc.TrackLocalStaticRTP) bool {
+	for _, s := range pc.GetSenders() {
+		if s.Track() == track {
+			return true
+		}
+	}
+	return false
+}
+
 // TestRoomTracks_AddSubscriber_ReplacesOldOnRejoin is the regression test for
 // the "hang forever on reconnect" bug: when a participant rejoins with the
 // same ID, the old subscriber must be displaced (done channel closed, PC
@@ -659,6 +748,77 @@ func TestSFU_BindIngestToRoom_Success(t *testing.T) {
 	room := sfu.GetRoomTracksForSlug(roomSlug)
 	if room == nil {
 		t.Error("room should exist after binding")
+	}
+}
+
+// TestSFU_BindIngestToRoom_ReplacesExistingSender verifies that rebinding an
+// ingest to a room whose subscriber already carries a video sender (a stream
+// restart in OBS) correctly re-establishes the media path instead of leaving
+// the viewer on a dead sender. ReplaceTrack on a healthy sender is the common
+// path; this also covers the recovery fallback (RemoveTrack + AddTrack) that
+// runs when ReplaceTrack itself fails, ensuring renegotiation is requested so
+// the m-line is refreshed rather than silently swallowed.
+func TestSFU_BindIngestToRoom_ReplacesExistingSender(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	token := "restart-token"
+	roomSlug := "restart-room"
+	room := sfu.GetRoomTracks(roomSlug)
+
+	// Subscriber with a real PC and an initial video sender bound to a stale
+	// local track (simulating a prior OBS stream).
+	staleTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "stale", "stale-stream")
+	if err != nil {
+		t.Fatalf("create stale track: %v", err)
+	}
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("create pc: %v", err)
+	}
+	defer pc.Close()
+	staleSender, err := pc.AddTrack(staleTrack)
+	if err != nil {
+		t.Fatalf("add stale track: %v", err)
+	}
+	sub := &Subscriber{
+		ID:             "sub-1",
+		PeerConnection: pc,
+		VideoSender:    staleSender,
+		done:           make(chan struct{}),
+	}
+	room.AddSubscriber(sub)
+
+	// New ingest with a fresh video track.
+	freshTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "fresh", "fresh-stream")
+	if err != nil {
+		t.Fatalf("create fresh track: %v", err)
+	}
+	session := &IngestSession{
+		StreamKeyToken: token,
+		VideoTrack:     freshTrack,
+		done:           make(chan struct{}),
+	}
+	sfu.SetIngest(token, session)
+
+	// Rebind. The subscriber already has a sender, so ReplaceTrack runs. On the
+	// success path no renegotiation is needed (in-place replacement); on the
+	// fallback path renegotiation IS requested. Either way this must not error
+	// and must not leave the sender pointing at the stale track.
+	_, err = sfu.BindIngestToRoom(token, roomSlug)
+	if err != nil {
+		t.Fatalf("rebind failed: %v", err)
+	}
+
+	// The sender must now carry the fresh track, not the stale one.
+	if sub.VideoSender == nil || sub.VideoSender.Track() != freshTrack {
+		t.Fatal("subscriber video sender should reference the fresh ingest track after rebind")
 	}
 }
 

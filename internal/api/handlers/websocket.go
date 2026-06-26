@@ -357,7 +357,13 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 				st.subscriber = nil
 				st.created = false
 				st.mu.Unlock()
-				h.sfu.RemoveSubscriberIfSame(c.RoomSlug, c.ID, sub)
+				// If this viewer was the screen sharer, RemoveSubscriberIfSame
+				// tore their sender out of every other subscriber and returns
+				// those IDs so we can renegotiate the m-line removal.
+				affected := h.sfu.RemoveSubscriberIfSame(c.RoomSlug, c.ID, sub)
+				for _, subID := range affected {
+					safeGo("renegotiateSubscriber", func() { h.renegotiateSubscriber(c.RoomSlug, subID) })
+				}
 			}
 			// Broadcast participant:left when client disconnects
 			h.hub.BroadcastJSON(c.RoomSlug, "participant:left", map[string]interface{}{

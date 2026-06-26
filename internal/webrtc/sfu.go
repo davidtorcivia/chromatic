@@ -707,27 +707,29 @@ func (rt *RoomTracks) AddSubscriber(sub *Subscriber) {
 //
 // The pointer check and removal happen under a single write lock to prevent
 // a TOCTOU race where AddSubscriber replaces the subscriber between the check
-// and the removal.
-func (rt *RoomTracks) removeSubscriberIfSame(id string, expected *Subscriber) {
+// and the removal. Returns the IDs of other subscribers affected by a
+// screen-share sender teardown (when the removed subscriber was the sharer).
+func (rt *RoomTracks) removeSubscriberIfSame(id string, expected *Subscriber) []string {
 	rt.mu.Lock()
 	current, ok := rt.Subscribers[id]
 	if !ok || current != expected {
 		rt.mu.Unlock()
-		return
+		return nil
 	}
-	pcs := rt.removeSubscriberLocked(id)
+	pcs, affected := rt.removeSubscriberLocked(id)
 	rt.mu.Unlock()
 
 	// Close outside the lock — pion state callbacks re-enter rt.mu.
 	for _, pc := range pcs {
 		pc.Close()
 	}
+	return affected
 }
 
 // RemoveSubscriber removes a subscriber from a room unconditionally.
 func (rt *RoomTracks) RemoveSubscriber(id string) {
 	rt.mu.Lock()
-	pcs := rt.removeSubscriberLocked(id)
+	pcs, _ := rt.removeSubscriberLocked(id)
 	rt.mu.Unlock()
 
 	// Close outside the lock — pion state callbacks re-enter rt.mu.
@@ -740,8 +742,16 @@ func (rt *RoomTracks) RemoveSubscriber(id string) {
 // write lock and is responsible for closing the returned PeerConnections AFTER
 // releasing the lock (pion fires OnConnectionStateChange callbacks during
 // Close that call back into rt.mu, e.g. via removeSubscriberIfSame).
-func (rt *RoomTracks) removeSubscriberLocked(id string) []*webrtc.PeerConnection {
-	var pcs []*webrtc.PeerConnection
+//
+// When the removed subscriber was the screen sharer, it also tears down the
+// screen-share sender from every OTHER subscriber and returns those IDs in
+// affectedSharerRemoval so callers can renegotiate them. This matters because
+// the abrupt path (subscriber PC Failed while the WS survives, or any removal
+// that clears ScreenShareLocalTrack before RemoveScreenShareTrack runs) would
+// otherwise leave every viewer with a frozen last frame bound to a dead local
+// track — and RemoveScreenShareTrack alone can't fix it after the local track
+// is already nil (it early-returns).
+func (rt *RoomTracks) removeSubscriberLocked(id string) (pcs []*webrtc.PeerConnection, affectedSharerRemoval []string) {
 	if sub, ok := rt.Subscribers[id]; ok {
 		// Use sync.Once to prevent double-close panic
 		sub.closeOnce.Do(func() {
@@ -774,14 +784,20 @@ func (rt *RoomTracks) removeSubscriberLocked(id string) []*webrtc.PeerConnection
 		}
 		delete(rt.VoiceSessions, id)
 	}
+	delete(rt.voiceMuteFlags, id)
 	delete(rt.VoiceRemoteTracks, id)
 	delete(rt.VoiceLocalTracks, id)
 	if ch, ok := rt.voiceRelayDone[id]; ok {
 		close(ch)
 		delete(rt.voiceRelayDone, id)
 	}
-	// Clean up screen share state if this participant was sharing
+	// Clean up screen share state if this participant was sharing. Remove the
+	// sender from every other subscriber BEFORE nulling the local track, so
+	// viewers don't keep a frozen frame bound to the now-dead relay track. This
+	// covers the abrupt path that RemoveScreenShareTrack can't reach once the
+	// local track is gone.
 	if rt.ScreenShareParticipantID == id {
+		sharerLocalTrack := rt.ScreenShareLocalTrack
 		rt.ScreenShareParticipantID = ""
 		rt.ScreenShareRemoteTrack = nil
 		rt.ScreenShareLocalTrack = nil
@@ -789,8 +805,26 @@ func (rt *RoomTracks) removeSubscriberLocked(id string) []*webrtc.PeerConnection
 			close(rt.screenShareDone)
 			rt.screenShareDone = nil
 		}
+		if sharerLocalTrack != nil {
+			for otherID, other := range rt.Subscribers {
+				if otherID == id {
+					continue
+				}
+				for _, sender := range other.PeerConnection.GetSenders() {
+					if sender.Track() == sharerLocalTrack {
+						if err := other.PeerConnection.RemoveTrack(sender); err != nil {
+							log.Printf("Failed to remove screen share sender from %s during sharer removal: %v", otherID, err)
+						} else {
+							other.needsRenegotiation = true
+							affectedSharerRemoval = append(affectedSharerRemoval, otherID)
+						}
+						break
+					}
+				}
+			}
+		}
 	}
-	return pcs
+	return pcs, affectedSharerRemoval
 }
 
 // BindIngestToRoom binds an ingest session's tracks to a room for distribution.
@@ -842,7 +876,22 @@ func (s *SFU) BindIngestToRoom(streamKeyToken, roomSlug string) ([]string, error
 		// Video track
 		if sub.VideoSender != nil && ingest.VideoTrack != nil {
 			if err := sub.VideoSender.ReplaceTrack(ingest.VideoTrack); err != nil {
-				log.Printf("Failed to replace video track for subscriber %s: %v", sub.ID, err)
+				// A swallowed ReplaceTrack failure leaves the subscriber's
+				// sender bound to the prior (possibly dead) track and no
+				// renegotiation ever re-establishes media — the viewer stays
+				// frozen. Recover by dropping the stale sender and re-adding
+				// the new track, which forces a renegotiation offer.
+				log.Printf("ReplaceTrack failed for video (%s); falling back to re-add: %v", sub.ID, err)
+				if rmErr := sub.PeerConnection.RemoveTrack(sub.VideoSender); rmErr != nil {
+					log.Printf("Failed to remove stale video sender for %s: %v", sub.ID, rmErr)
+				}
+				sender, addErr := sub.PeerConnection.AddTrack(ingest.VideoTrack)
+				if addErr != nil {
+					log.Printf("Failed to re-add video track to subscriber %s: %v", sub.ID, addErr)
+				} else {
+					sub.VideoSender = sender
+					subNeedsReneg = true
+				}
 			}
 		} else if sub.VideoSender == nil && ingest.VideoTrack != nil {
 			sender, err := sub.PeerConnection.AddTrack(ingest.VideoTrack)
@@ -857,7 +906,17 @@ func (s *SFU) BindIngestToRoom(streamKeyToken, roomSlug string) ([]string, error
 		// Audio track
 		if sub.AudioSender != nil && ingest.AudioTrack != nil {
 			if err := sub.AudioSender.ReplaceTrack(ingest.AudioTrack); err != nil {
-				log.Printf("Failed to replace audio track for subscriber %s: %v", sub.ID, err)
+				log.Printf("ReplaceTrack failed for audio (%s); falling back to re-add: %v", sub.ID, err)
+				if rmErr := sub.PeerConnection.RemoveTrack(sub.AudioSender); rmErr != nil {
+					log.Printf("Failed to remove stale audio sender for %s: %v", sub.ID, rmErr)
+				}
+				sender, addErr := sub.PeerConnection.AddTrack(ingest.AudioTrack)
+				if addErr != nil {
+					log.Printf("Failed to re-add audio track to subscriber %s: %v", sub.ID, addErr)
+				} else {
+					sub.AudioSender = sender
+					subNeedsReneg = true
+				}
 			}
 		} else if sub.AudioSender == nil && ingest.AudioTrack != nil {
 			sender, err := sub.PeerConnection.AddTrack(ingest.AudioTrack)
@@ -1006,12 +1065,15 @@ func (s *SFU) HasSubscriber(roomSlug, subscriberID string) bool {
 // still points at the expected subscriber instance. Disconnect cleanup uses
 // this to release a confirmed-leaving viewer without tearing down a fast
 // reconnect that already replaced the subscriber with the same participant ID.
-func (s *SFU) RemoveSubscriberIfSame(roomSlug, subscriberID string, expected *Subscriber) {
+//
+// Returns the IDs of other subscribers whose screen-share sender was torn down
+// because the removed viewer was the active sharer; callers renegotiate those.
+func (s *SFU) RemoveSubscriberIfSame(roomSlug, subscriberID string, expected *Subscriber) []string {
 	room := s.GetRoomTracksForSlug(roomSlug)
 	if room == nil || expected == nil {
-		return
+		return nil
 	}
-	room.removeSubscriberIfSame(subscriberID, expected)
+	return room.removeSubscriberIfSame(subscriberID, expected)
 }
 
 // CreateSubscriberConnection creates a new subscriber peer connection for a room.
