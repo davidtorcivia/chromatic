@@ -532,6 +532,21 @@ func FileUploadRateLimiter(trustedProxies []string) func(http.Handler) http.Hand
 	})
 }
 
+// WHIPRateLimiter rate-limits the WHIP ingest endpoint per IP. The WHIP route
+// authenticates with a raw stream key in the URL and each POST creates a
+// PeerConnection + hits the DB (validateKey), so it is both a stream-key
+// brute-force vector and a cheap CPU/DB amplification attack. A legitimate OBS
+// instance makes very few requests per session (one POST, a handful of trickle
+// PATCHes, one DELETE); 20/minute per IP is generous for real publishers and
+// throttles guessing.
+func WHIPRateLimiter(trustedProxies []string) func(http.Handler) http.Handler {
+	return EndpointRateLimiter(EndpointRateLimiterConfig{
+		RequestsPerWindow: 20,
+		WindowDuration:    time.Minute,
+		TrustedProxies:    trustedProxies,
+	})
+}
+
 // SecurityHeaders adds security-related HTTP headers.
 // In production mode, connect-src is restricted to same-origin only.
 func SecurityHeaders(productionMode bool) func(http.Handler) http.Handler {

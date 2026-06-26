@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"chromatic/internal/metrics"
 
@@ -53,6 +54,18 @@ func (h *WHIPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// keyPrefix returns a short, log-safe prefix of a stream-key token. The token
+// comes from the URL path and is untrusted in length; slicing token[:8]
+// directly panics on tokens shorter than 8 bytes (a panic in an HTTP handler
+// goroutine crashes the whole process, so any POST /whip/<short> would be a
+// trivial DoS). Mirrors the min(8, len) guard used in sfu.go.
+func keyPrefix(token string) string {
+	if len(token) > 8 {
+		return token[:8]
+	}
+	return token
 }
 
 // handleOffer handles the initial SDP offer from OBS
@@ -229,7 +242,7 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 
 	// Handle connection state changes
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		log.Printf("WHIP connection state: %s (key: %s...)", state, token[:8])
+		log.Printf("WHIP connection state: %s (key: %s...)", state, keyPrefix(token))
 
 		switch state {
 		case webrtc.PeerConnectionStateConnected:
@@ -313,7 +326,7 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 		log.Printf("Failed to write WHIP answer: %v", err)
 	}
 
-	log.Printf("WHIP session established for key: %s...", token[:8])
+	log.Printf("WHIP session established for key: %s...", keyPrefix(token))
 }
 
 // handleICETrickle handles ICE candidate trickling
@@ -324,8 +337,15 @@ func (h *WHIPHandler) handleICETrickle(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
-	// Check ICE candidate limit to prevent flooding attacks
+	// Sliding-window limit to prevent ICE candidate flooding without permanently
+	// blocking a long-lived session that legitimately regathers candidates
+	// (network transitions, TURN rotation). The window resets every minute.
+	now := time.Now()
 	session.iceMu.Lock()
+	if now.Sub(session.iceWindowStart) >= whipCandidateWindow {
+		session.iceWindowStart = now
+		session.iceCandidateCount = 0
+	}
 	if session.iceCandidateCount >= MaxICECandidates {
 		session.iceMu.Unlock()
 		http.Error(w, "Too many ICE candidates", http.StatusTooManyRequests)
@@ -366,16 +386,19 @@ func (h *WHIPHandler) handleDelete(w http.ResponseWriter, r *http.Request, token
 	session.PeerConnection.Close()
 
 	// Run the shared teardown (idempotent): removes the ingest and notifies
-	// stream end exactly once, even though Close() also fires the Closed
-	// state callback asynchronously.
+	// stream end exactly once, even though Close() also fires the Closed state
+	// callback asynchronously. Every handleOffer-created session has teardown
+	// set; if it were ever nil, fall back to pointer-scoped removal
+	// (removeIngestIfSame) — NOT unconditional RemoveIngest, which would tear
+	// down a reconnected session sharing this token.
 	if session.teardown != nil {
 		session.teardown()
 	} else {
-		h.sfu.RemoveIngest(token)
+		h.sfu.removeIngestIfSame(token, session)
 	}
 
 	w.WriteHeader(http.StatusNoContent)
-	log.Printf("WHIP session terminated for key: %s...", token[:8])
+	log.Printf("WHIP session terminated for key: %s...", keyPrefix(token))
 }
 
 // validateSDP validates the incoming SDP offer

@@ -336,6 +336,42 @@ func TestRateLimiterXForwardedFor(t *testing.T) {
 	}
 }
 
+// TestWHIPRateLimiter verifies the WHIP ingest endpoint limiter throttles
+// stream-key brute-force / PeerConnection-amplification attempts while letting
+// a legitimate publisher through.
+func TestWHIPRateLimiter(t *testing.T) {
+	limiter := WHIPRateLimiter([]string{})
+	handler := limiter(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+
+	// A legit OBS publisher makes a handful of WHIP requests per session and
+	// must always get through (20/min window).
+	for i := 0; i < 10; i++ {
+		req := httptest.NewRequest("POST", "/whip/some-stream-key", nil)
+		req.RemoteAddr = "192.168.1.10:5000"
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("legit request %d throttled: status %d", i, rr.Code)
+		}
+	}
+
+	// Hammer from the same IP to exhaust the per-minute window — excess
+	// attempts must be rejected (429) so brute-forcing stream keys is bounded.
+	for i := 0; i < 30; i++ {
+		req := httptest.NewRequest("POST", "/whip/guess-"+string(rune('a'+i)), nil)
+		req.RemoteAddr = "192.168.1.10:5000"
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		// At least some of these must be throttled; the window is 20/min.
+		if rr.Code == http.StatusTooManyRequests {
+			return // throttling engaged as expected
+		}
+	}
+	t.Fatal("expected at least one 429 after exhausting the WHIP rate window")
+}
+
 // TestRateLimiterTokenRefill tests that tokens refill over time
 func TestRateLimiterTokenRefill(t *testing.T) {
 	cfg := RateLimiterConfig{

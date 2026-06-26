@@ -62,6 +62,12 @@ type SFU struct {
 // reject all candidates and make ICE restarts fail permanently.
 const MaxICECandidates = 50
 
+// whipCandidateWindow is the rolling window over which at most MaxICECandidates
+// trickle-ICE candidates are accepted on a WHIP ingest. A lifetime cap would
+// silently break connectivity on long sessions that regather candidates; this
+// bounds the flooding attack rate without permanently rejecting candidates.
+const whipCandidateWindow = time.Minute
+
 const keyframeRequestMinInterval = 250 * time.Millisecond
 
 var ErrStaleSubscriberAnswer = errors.New("stale subscriber answer")
@@ -110,8 +116,15 @@ type IngestSession struct {
 	AudioTrack        *webrtc.TrackLocalStaticRTP
 	done              chan struct{}
 	closeOnce         sync.Once  // Ensures done channel is closed only once
-	iceCandidateCount int        // Counter for ICE candidates received
-	iceMu             sync.Mutex // Protects iceCandidateCount
+	// iceCandidateCount/iceWindowStart form a sliding-window budget that bounds
+	// trickle-ICE flooding per time window (whipCandidateWindow) instead of over
+	// the whole session. A monotonically-growing lifetime counter would, on a
+	// long color-grading session with several network transitions / ICE
+	// regatherings, eventually exhaust MaxICECandidates and reject every later
+	// candidate — silently breaking connectivity for the rest of the session.
+	iceCandidateCount int
+	iceWindowStart    time.Time
+	iceMu             sync.Mutex // Protects iceCandidateCount/iceWindowStart
 	// everConnected records whether the PeerConnection ever reached Connected.
 	// Used to avoid spurious stream-end notifications and negative metrics
 	// for sessions that never connected.

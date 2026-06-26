@@ -112,8 +112,10 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	mux.Handle("POST /api/auth/login", middleware.LoginRateLimiter(cfg.TrustedProxies)(http.HandlerFunc(authHandler.Login)))
 	mux.HandleFunc("POST /api/auth/logout", authHandler.Logout)
 
-	// WHIP endpoints (no auth - stream key is in URL)
-	mux.Handle("/whip/", whipHandler)
+	// WHIP endpoints (no auth - stream key is in URL). Rate-limited per IP to
+	// throttle stream-key brute force and PeerConnection/DB amplification; a
+	// legit OBS publisher makes only a few requests per session.
+	mux.Handle("/whip/", middleware.WHIPRateLimiter(cfg.TrustedProxies)(whipHandler))
 
 	// Admin API (requires auth)
 	adminMux := http.NewServeMux()
