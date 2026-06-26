@@ -1182,10 +1182,15 @@ func (h *WebSocketHandler) handleSignalOffer(client *websocket.Client, payload j
 		return
 	}
 
-	// Send answer back to client
-	client.SendJSON("signal:voice-answer", map[string]interface{}{
+	// Send answer back to client. If queuing fails, SendJSON has already
+	// closed the websocket for reconnect; do not flush follow-up signaling to
+	// a dead client.
+	if err := client.SendJSON("signal:voice-answer", map[string]interface{}{
 		"sdp": answer,
-	})
+	}); err != nil {
+		logger.Warn("Failed to send voice answer", "participant_id", client.ID, "room", client.RoomSlug, "error", err)
+		return
+	}
 
 	logger.Debug("Sent voice answer", "participant_id", client.ID, "rolled_back", rolledBack)
 
@@ -1356,7 +1361,10 @@ func (h *WebSocketHandler) handleIceRestart(client *websocket.Client, payload js
 	if data.OfferID != "" {
 		response["offerId"] = data.OfferID
 	}
-	client.SendJSON("signal:answer", response)
+	if err := client.SendJSON("signal:answer", response); err != nil {
+		logger.Warn("Failed to send ICE restart answer", "participant_id", client.ID, "room", client.RoomSlug, "offer_id", data.OfferID, "error", err)
+		return
+	}
 
 	logger.Debug("Sent ICE restart answer", "participant_id", client.ID)
 
