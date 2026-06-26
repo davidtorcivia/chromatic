@@ -117,6 +117,7 @@
     let grabBusy = $state(false);
     let grabFlash = $state(false);
     let grabToast = $state<string | null>(null);
+    let grabFlashTimer: ReturnType<typeof setTimeout> | null = null;
     let grabToastTimer: ReturnType<typeof setTimeout> | null = null;
     // Preferences (persisted)
     let uiSounds = $state(getUiSoundsEnabled());
@@ -713,7 +714,19 @@
             clearInterval(typingPruneInterval);
             typingPruneInterval = null;
         }
+        clearGrabTimers();
     });
+
+    function clearGrabTimers() {
+        if (grabFlashTimer) {
+            clearTimeout(grabFlashTimer);
+            grabFlashTimer = null;
+        }
+        if (grabToastTimer) {
+            clearTimeout(grabToastTimer);
+            grabToastTimer = null;
+        }
+    }
 
     function clearConnectingWatchdog() {
         if (connectingWatchdog) {
@@ -1721,7 +1734,11 @@
         }
         grabBusy = true;
         grabFlash = true;
-        setTimeout(() => (grabFlash = false), 60);
+        if (grabFlashTimer) clearTimeout(grabFlashTimer);
+        grabFlashTimer = setTimeout(() => {
+            grabFlash = false;
+            grabFlashTimer = null;
+        }, 60);
         try {
             const canvas = document.createElement("canvas");
             canvas.width = videoElement.videoWidth;

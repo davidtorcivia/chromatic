@@ -1,4 +1,6 @@
 <script lang="ts">
+    import { onDestroy } from "svelte";
+
     interface Props {
         /** The value copied to the clipboard. */
         value: string;
@@ -20,6 +22,10 @@
 
     let copied = $state(false);
     let timer: ReturnType<typeof setTimeout> | undefined;
+
+    onDestroy(() => {
+        clearTimeout(timer);
+    });
 
     async function copy() {
         try {

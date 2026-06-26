@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { onDestroy } from "svelte";
     import { fade, fly, scale } from "svelte/transition";
     import { quintOut } from "svelte/easing";
     import { session } from "$lib/stores/session.svelte";
@@ -135,6 +136,13 @@
     let pinnedToBottom = true;
     let autoScrolling = false;
     let autoScrollTimer: ReturnType<typeof setTimeout> | null = null;
+
+    onDestroy(() => {
+        if (autoScrollTimer) {
+            clearTimeout(autoScrollTimer);
+            autoScrollTimer = null;
+        }
+    });
 
     function scrollToBottom(smooth = false) {
         if (!messagesContainer) return;
