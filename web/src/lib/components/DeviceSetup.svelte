@@ -363,6 +363,21 @@
         padding: 7px 9px;
         cursor: pointer;
     }
+    /* Touch only: 44px targets + 16px text (no iOS focus-zoom). Desktop keeps
+       the compact pre-join controls. */
+    @media (pointer: coarse) {
+        .device-toggle {
+            min-width: 64px;
+            min-height: 44px;
+            font-size: 0.8125rem;
+            padding: 7px 14px;
+        }
+        .device-select {
+            min-height: 44px;
+            font-size: 16px;
+            padding: 9px 10px;
+        }
+    }
     .cam-preview-box {
         width: 100%;
         aspect-ratio: 4 / 3;

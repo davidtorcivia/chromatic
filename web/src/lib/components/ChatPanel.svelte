@@ -34,6 +34,24 @@
         typing = [],
     }: Props = $props();
 
+    // iOS: the on-screen keyboard overlays a fixed bottom sheet, hiding the
+    // input. Track visualViewport so the mobile sheet rides above the keyboard.
+    let keyboardInset = $state(0);
+    $effect(() => {
+        const vv = typeof window !== "undefined" ? window.visualViewport : null;
+        if (!vv) return;
+        const update = () => {
+            keyboardInset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+        };
+        update();
+        vv.addEventListener("resize", update);
+        vv.addEventListener("scroll", update);
+        return () => {
+            vv.removeEventListener("resize", update);
+            vv.removeEventListener("scroll", update);
+        };
+    });
+
     // 1: "A is typing" · 2: "A and B are typing" · 3: all three names ·
     // 4+: a count. The row itself is one fixed-height line that
     // ellipsizes, so any number of typers never shifts the transcript.
@@ -203,7 +221,11 @@
      *  smoothly instead of jumping by 320px; content stays right-anchored
      *  at full width inside. On mobile the sheet slides up instead. */
     function drawer(node: HTMLElement) {
-        const mobile = window.matchMedia("(max-width: 768px)").matches;
+        const mobile =
+            window.matchMedia("(max-width: 768px)").matches ||
+            window.matchMedia(
+                "(orientation: landscape) and (max-height: 480px) and (pointer: coarse)",
+            ).matches;
         return {
             duration: 320,
             easing: quintOut,
@@ -423,6 +445,7 @@
     <div
         class="chat-panel"
         class:drag-over={isDragOver}
+        style="--keyboard-inset: {keyboardInset}px"
         ondragover={handleDragOver}
         ondragleave={handleDragLeave}
         ondrop={handleDrop}
@@ -1156,6 +1179,12 @@
         font-family: inherit;
         padding: 0 4px;
     }
+    /* Touch only: >=16px so iOS Safari doesn't zoom the page on focus. */
+    @media (pointer: coarse) {
+        .chat-text-input {
+            font-size: 16px;
+        }
+    }
     .chat-text-input::placeholder {
         color: var(--color-text-subtle);
     }
@@ -1203,14 +1232,14 @@
     }
     .chat-lightbox img {
         max-width: min(92vw, 1600px);
-        max-height: 80vh;
+        max-height: 80dvh;
         border-radius: 12px;
         box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
         cursor: default;
     }
     .chat-lightbox-pdf {
         width: min(92vw, 1100px);
-        height: 80vh;
+        height: 80dvh;
         border: none;
         border-radius: 12px;
         background: #fff;
@@ -1300,18 +1329,27 @@
         background: rgba(255, 255, 255, 0.16);
     }
 
-    @media (max-width: 768px) {
+    @media (max-width: 768px), (orientation: landscape) and (max-height: 480px) and (pointer: coarse) {
         .chat-panel {
             position: fixed;
-            bottom: 0;
+            /* Ride above the iOS keyboard (keyboard-inset comes from
+               visualViewport); when closed this is 0. */
+            bottom: var(--keyboard-inset, 0px);
             left: 0;
             right: 0;
             width: 100%;
-            height: 50%;
+            /* Taller sheet (a 50% sheet is a slit in landscape); dvh so Safari's
+               toolbar collapse doesn't change it. */
+            height: min(70dvh, 560px);
             border-left: none;
             border-top: 1px solid var(--color-border);
             border-radius: var(--radius-lg) var(--radius-lg) 0 0;
             z-index: 100;
+            transition: bottom 0.2s ease;
+        }
+        /* Keep the input clear of the home indicator when the keyboard is down. */
+        .chat-input-container {
+            padding-bottom: calc(var(--space-sm) + env(safe-area-inset-bottom, 0px));
         }
         .chat-inner {
             width: 100%;

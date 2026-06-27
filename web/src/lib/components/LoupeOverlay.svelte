@@ -82,6 +82,11 @@ void main() {
     let zoom = $state(3);
     let showHint = $state(false);
     let hintTimer: ReturnType<typeof setTimeout> | null = null;
+    // Touch: a finger drag moves the lens, a two-finger pinch zooms it (wheel is
+    // mouse-only). Track active touch pointers + the pinch baseline.
+    const touchPts = new Map<number, { x: number; y: number }>();
+    let pinchBaseDist = 0;
+    let pinchBaseZoom = 3;
     let px = -1;
     let py = -1;
     let raf = 0;
@@ -159,18 +164,39 @@ void main() {
         return null;
     }
 
+    function positionLens() {
+        if (!enabled || !canvasEl) return;
+        canvasEl.style.transform = `translate(${px - LENS_SIZE / 2}px, ${py - LENS_SIZE / 2}px)`;
+        if (chipEl) {
+            chipEl.style.transform = `translate(${px - 24}px, ${py + LENS_SIZE / 2 + 10}px)`;
+        }
+        sourceUnderPointer(true);
+    }
+
     function handleMove(e: PointerEvent) {
+        // Touch: keep the lens under the finger; a 2nd finger pinch-zooms.
+        if (e.pointerType === "touch" && touchPts.has(e.pointerId)) {
+            touchPts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+            const pts = [...touchPts.values()];
+            if (pts.length >= 2) {
+                const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+                if (pinchBaseDist > 0) {
+                    zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, pinchBaseZoom * (dist / pinchBaseDist)));
+                }
+                px = (pts[0].x + pts[1].x) / 2;
+                py = (pts[0].y + pts[1].y) / 2;
+            } else {
+                px = e.clientX;
+                py = e.clientY;
+            }
+            positionLens();
+            return;
+        }
         px = e.clientX;
         py = e.clientY;
         // Position applies on the input event itself — the lens never
         // waits for a frame to follow the cursor.
-        if (enabled && canvasEl) {
-            canvasEl.style.transform = `translate(${px - LENS_SIZE / 2}px, ${py - LENS_SIZE / 2}px)`;
-            if (chipEl) {
-                chipEl.style.transform = `translate(${px - 24}px, ${py + LENS_SIZE / 2 + 10}px)`;
-            }
-            sourceUnderPointer(true);
-        }
+        positionLens();
     }
 
     function handleWheel(e: WheelEvent) {
@@ -185,11 +211,35 @@ void main() {
         zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom - Math.sign(e.deltaY) * 0.5));
     }
 
-    // Click the picture to put the loupe away.
     function handlePointerDown(e: PointerEvent) {
-        if (!enabled || e.button !== 0) return;
+        if (!enabled) return;
         const target = e.target as HTMLElement | null;
-        if (target?.closest(".video-container")) onExit();
+        const onVideo = !!target?.closest(".video-container");
+        if (e.pointerType === "touch") {
+            // Only capture touches on the picture — taps on the control bar /
+            // chrome must still work (e.g. to turn the loupe off).
+            if (!onVideo) return;
+            e.preventDefault();
+            px = e.clientX;
+            py = e.clientY;
+            touchPts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+            if (touchPts.size === 2) {
+                const pts = [...touchPts.values()];
+                pinchBaseDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+                pinchBaseZoom = zoom;
+            }
+            positionLens();
+            return;
+        }
+        // Mouse: click the picture to put the loupe away.
+        if (e.button !== 0) return;
+        if (onVideo) onExit();
+    }
+
+    function handleTouchEnd(e: PointerEvent) {
+        if (!touchPts.has(e.pointerId)) return;
+        touchPts.delete(e.pointerId);
+        pinchBaseDist = 0; // a new 2-finger gesture re-baselines on next move
     }
 
     function draw() {
@@ -310,11 +360,23 @@ void main() {
             // Storage unavailable; skip the hint.
         }
         window.addEventListener("pointerdown", handlePointerDown, true);
+        window.addEventListener("pointerup", handleTouchEnd, true);
+        window.addEventListener("pointercancel", handleTouchEnd, true);
         window.addEventListener("wheel", handleWheel, { passive: false });
+        // Suppress the browser's touch pan/zoom on the picture so a finger drag
+        // moves the lens and a pinch zooms it (instead of scrolling the page).
+        if (videoElement) videoElement.style.touchAction = "none";
+        if (shareElement) shareElement.style.touchAction = "none";
         if (!raf) raf = requestAnimationFrame(draw);
         return () => {
             window.removeEventListener("pointerdown", handlePointerDown, true);
+            window.removeEventListener("pointerup", handleTouchEnd, true);
+            window.removeEventListener("pointercancel", handleTouchEnd, true);
             window.removeEventListener("wheel", handleWheel);
+            if (videoElement) videoElement.style.touchAction = "";
+            if (shareElement) shareElement.style.touchAction = "";
+            touchPts.clear();
+            pinchBaseDist = 0;
             if (raf) cancelAnimationFrame(raf);
             raf = 0;
             if (hintTimer) clearTimeout(hintTimer);

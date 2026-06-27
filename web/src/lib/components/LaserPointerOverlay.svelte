@@ -198,6 +198,9 @@
 
     $effect(() => {
         videoElement.style.cursor = enabled ? "crosshair" : "";
+        // While the laser is on, suppress the browser's touch pan/zoom on the
+        // video so a finger drag draws instead of scrolling the page.
+        videoElement.style.touchAction = enabled ? "none" : "";
         const registered = enabled;
         if (registered) setReviewToolActive("laser", true);
 
@@ -239,10 +242,14 @@
         const resizeObserver = new ResizeObserver(updateVideoRect);
         resizeObserver.observe(videoElement);
 
-        // Laser pointer only activates when explicitly enabled from the session controls.
+        // Laser pointer only activates when explicitly enabled from the session
+        // controls. Touch IS supported (a finger drag is a pointing stroke) — the
+        // flagship review tool must work for a client on a phone; touch-action is
+        // set to none above so the drag doesn't scroll the page.
         const handleVideoPointerDown = (e: PointerEvent) => {
-            if (!enabled || e.pointerType === "touch" || e.button !== 0 || isPointing) return;
+            if (!enabled || e.button !== 0 || isPointing) return;
             if (!beginLocalStroke(e)) return;
+            if (e.pointerType === "touch") e.preventDefault();
             showUsageHint = false;
             activePointerId = e.pointerId;
             isPointing = true;

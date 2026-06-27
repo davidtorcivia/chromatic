@@ -65,6 +65,18 @@
     let kickTarget = $state<{ id: string; name: string } | null>(null);
     let endState = $state<{ title: string; body: string } | null>(null);
     let isFullscreen = $state(false);
+    // iPhone has no element Fullscreen API (only native <video>, which drops our
+    // overlays + watermark) — hide the button there. iPad/desktop keep it.
+    let supportsFullscreen = $state(true);
+    // Mobile: phones collapse secondary tools behind a "More" sheet.
+    let showMoreSheet = $state(false);
+    // Touch device (coarse pointer) — gates the More sheet, touch tools, the
+    // rotate hint, and hides controls that can't work on iPhone (Fullscreen).
+    let isCoarsePointer = $state(false);
+    // Orientation + the program stream's intrinsic aspect, for the rotate nudge.
+    let isPortrait = $state(false);
+    let videoAspect = $state(0); // videoWidth / videoHeight, 0 until known
+    let rotateHintDismissed = $state(false);
     // Glass surfaces rendered by the shared WebGL bar renderers
     let controlBarEl = $state<HTMLDivElement | null>(null);
     let roomNameEl = $state<HTMLDivElement | null>(null);
@@ -1076,6 +1088,15 @@
         clearSubscriptionRetryTimer();
         // Media is flowing again — future failures get a fresh retry budget.
         resubscribeAttempts = 0;
+        captureVideoAspect();
+    }
+
+    // The intrinsic aspect of the program stream drives the rotate hint (so we
+    // only nudge when the phone orientation actually fights the content).
+    function captureVideoAspect() {
+        const w = videoElement?.videoWidth ?? 0;
+        const h = videoElement?.videoHeight ?? 0;
+        if (w > 0 && h > 0) videoAspect = w / h;
     }
 
     function handleVideoStalled() {
@@ -1451,6 +1472,7 @@
     function openCameraModal() {
         if (myCamDisabled) return; // admin gate: no preview, no enable
         camNudgeDismissed = true;
+        showMoreSheet = false; // collapse the phone sheet cleanly into the modal
         showCameraModal = true;
         void refreshAudioDevices();
         void startCameraPreview(activeCameraId);
@@ -2155,10 +2177,14 @@
     }
 
     function toggleFullscreen() {
+        // The button is hidden on iPhone (no element Fullscreen API there, and
+        // native <video> fullscreen would strip our overlays + watermark), but
+        // feature-detect anyway so the call can never throw.
+        if (typeof document.documentElement.requestFullscreen !== "function") return;
         if (document.fullscreenElement) {
-            document.exitFullscreen();
+            void document.exitFullscreen().catch(() => {});
         } else {
-            document.documentElement.requestFullscreen();
+            void document.documentElement.requestFullscreen().catch(() => {});
         }
     }
 
@@ -2434,6 +2460,8 @@
             case "escape":
                 if (showShortcuts) {
                     showShortcuts = false;
+                } else if (showMoreSheet) {
+                    showMoreSheet = false;
                 } else if (showStats) {
                     showStats = false;
                 } else if (showAudioSettings) {
@@ -2477,7 +2505,9 @@
 
     // Touch: a tap on the bare video toggles the controls (when laser is off).
     function handleVideoPointerDown(e: PointerEvent) {
-        if (e.pointerType !== "touch" || isLaserEnabled) return;
+        // A review tool owns the touch (laser draws, loupe moves/pinches), so a
+        // tap on the picture must NOT also toggle the chrome then.
+        if (e.pointerType !== "touch" || isLaserEnabled || isLoupeEnabled) return;
         e.stopPropagation();
         if (isControlsVisible) {
             if (controlsTimer) {
@@ -2626,7 +2656,8 @@
             controlsHaveFocus ||
             showStats ||
             showParticipantList ||
-            showAudioSettings
+            showAudioSettings ||
+            showMoreSheet
     );
 
     // While pinned, cancel the hide countdown; when unpinned, restart it.
@@ -2640,6 +2671,58 @@
         } else {
             startControlsTimer();
         }
+    });
+
+    // Track touch-ness and orientation for the mobile chrome + rotate hint.
+    $effect(() => {
+        if (typeof window === "undefined") return;
+        const coarse = window.matchMedia("(pointer: coarse)");
+        const portrait = window.matchMedia("(orientation: portrait)");
+        supportsFullscreen = typeof document.documentElement.requestFullscreen === "function";
+        const sync = () => {
+            isCoarsePointer = coarse.matches;
+            isPortrait = portrait.matches;
+            // Re-read the aspect on rotate: the element box changed, and a hint
+            // dismissed for the previous orientation shouldn't stick forever.
+            captureVideoAspect();
+        };
+        sync();
+        coarse.addEventListener("change", sync);
+        portrait.addEventListener("change", sync);
+        return () => {
+            coarse.removeEventListener("change", sync);
+            portrait.removeEventListener("change", sync);
+        };
+    });
+
+    // Show the "rotate your phone" nudge only on a touch device when the stream's
+    // aspect genuinely fights the current orientation: landscape content (≳5:4)
+    // on a portrait phone, or tall content (≲4:5) on a landscape phone. Near-
+    // square content is left alone (rotating wouldn't help). Dismissed per
+    // orientation so it can re-appear if the mismatch flips on rotate.
+    let rotateHintMismatch = $derived(
+        videoAspect > 0 &&
+            ((isPortrait && videoAspect >= 1.25) || (!isPortrait && videoAspect <= 0.8)),
+    );
+    let showRotateHint = $derived(
+        isCoarsePointer &&
+            hasStream &&
+            isVideoPlaying &&
+            rotateHintMismatch &&
+            !rotateHintDismissed,
+    );
+    // Reset the dismissal whenever the mismatch direction changes (the user
+    // rotated, or the content aspect changed), so a fresh mismatch nudges again.
+    $effect(() => {
+        void isPortrait;
+        void rotateHintMismatch;
+        rotateHintDismissed = false;
+    });
+    // Auto-dismiss the rotate hint after a few seconds so it never nags.
+    $effect(() => {
+        if (!showRotateHint) return;
+        const t = setTimeout(() => (rotateHintDismissed = true), 6000);
+        return () => clearTimeout(t);
     });
 
     // Device labels are empty until the browser has granted a capture —
@@ -2697,6 +2780,241 @@
     onmousemove={handleMouseMove}
     onpointerdown={handlePagePointerDown}
 >
+    <!-- Settings panel content, declared at top level so it can render in BOTH
+         the desktop popover (anchored above the control bar) and the phone
+         "More" bottom sheet (a top-level overlay). -->
+    {#snippet settingsContent()}
+        <div class="audio-settings-section">
+            <span class="audio-settings-title">Microphone</span>
+            {#if audioInputs.length > 0 && micLabelsAvailable}
+                <!-- Collapsed to the selected device + caret; the native dropdown
+                     scrolls cleanly even with many devices (vs. a long inline list). -->
+                <select
+                    class="device-select"
+                    value={micSelectValue}
+                    disabled={micSwitchPending}
+                    aria-label="Microphone device"
+                    onchange={(e) => selectMicDevice((e.currentTarget as HTMLSelectElement).value)}
+                >
+                    {#each audioInputs as device (device.deviceId)}
+                        <option value={device.deviceId}>{device.label || "Microphone"}</option>
+                    {/each}
+                </select>
+            {:else if hasMicPermission}
+                <p class="audio-settings-hint">No microphones found.</p>
+            {:else}
+                <p class="audio-settings-hint">
+                    Allow microphone access to see and choose your input devices.
+                </p>
+                <button class="audio-settings-grant" onclick={requestMicForLabels}>
+                    Enable microphone
+                </button>
+            {/if}
+        </div>
+        <div class="audio-settings-section">
+            <span class="audio-settings-title">Camera</span>
+            <button class="audio-settings-grant" onclick={openCameraModal}>
+                {isCameraOn ? "Camera settings" : "Set up camera"}
+            </button>
+        </div>
+        {#if supportsSinkSelection && audioOutputs.length > 0}
+            <div class="audio-settings-section">
+                <span class="audio-settings-title">Speaker</span>
+                <select
+                    class="device-select"
+                    value={selectedSpeakerId ?? "default"}
+                    aria-label="Speaker device"
+                    onchange={(e) => selectSpeakerDevice((e.currentTarget as HTMLSelectElement).value)}
+                >
+                    {#each audioOutputs as device (device.deviceId)}
+                        <option value={device.deviceId}>{device.label || "Speaker"}</option>
+                    {/each}
+                </select>
+            </div>
+        {/if}
+        <div class="audio-settings-section">
+            <span class="audio-settings-title">Volume</span>
+            <div class="volume-row">
+                <label for="program-volume">Program</label>
+                <input
+                    id="program-volume"
+                    class="range-input"
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={streamVolume}
+                    oninput={handleStreamVolumeChange}
+                />
+            </div>
+            <div class="volume-row">
+                <label for="voice-volume">Voice chat</label>
+                <input
+                    id="voice-volume"
+                    class="range-input"
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={voiceVolume}
+                    oninput={handleVoiceVolumeChange}
+                />
+            </div>
+            <button class="volume-mute-btn" onclick={toggleMute} aria-pressed={isMuted}>
+                {isMuted ? "Unmute program audio" : "Mute program audio"}
+            </button>
+        </div>
+        <div class="audio-settings-section">
+            <span class="audio-settings-title">Audio mode</span>
+            <div class="audio-mode-toggle" role="group" aria-label="Audio mode">
+                <button
+                    class="audio-mode-option"
+                    class:selected={audioMode === "talkback"}
+                    disabled={audioModePending}
+                    onclick={() => selectAudioMode("talkback")}
+                    aria-pressed={audioMode === "talkback"}
+                >
+                    <span class="audio-mode-name">Talkback</span>
+                    <span class="audio-mode-desc">Clean voice, ultra-low latency</span>
+                </button>
+                <button
+                    class="audio-mode-option"
+                    class:selected={audioMode === "studio"}
+                    disabled={audioModePending}
+                    onclick={() => selectAudioMode("studio")}
+                    aria-pressed={audioMode === "studio"}
+                >
+                    <span class="audio-mode-name">Studio</span>
+                    <span class="audio-mode-desc">Pristine stereo for music &amp; instruments</span>
+                </button>
+            </div>
+            {#if audioMode === "talkback"}
+                <label class="pref-row">
+                    <span>Noise reduction</span>
+                    <span class="seg" role="group" aria-label="Noise reduction">
+                        <button
+                            class="seg-btn"
+                            class:selected={denoiserEngine !== "off"}
+                            disabled={audioModePending}
+                            onclick={() => selectDenoiser("rnnoise")}
+                            aria-pressed={denoiserEngine !== "off"}
+                        >On</button>
+                        <button
+                            class="seg-btn"
+                            class:selected={denoiserEngine === "off"}
+                            disabled={audioModePending}
+                            onclick={() => selectDenoiser("off")}
+                            aria-pressed={denoiserEngine === "off"}
+                        >Off</button>
+                    </span>
+                </label>
+            {/if}
+            {#if audioMode === "studio"}
+                <label class="pref-row">
+                    <span>On headphones (disable echo cancellation)</span>
+                    <input
+                        type="checkbox"
+                        class="switch"
+                        checked={studioHeadphones}
+                        disabled={audioModePending}
+                        onchange={toggleStudioHeadphones}
+                    />
+                </label>
+                <p class="audio-settings-hint">
+                    Studio sends full-bandwidth stereo with no noise processing. Use headphones to avoid echo.
+                </p>
+            {/if}
+        </div>
+        <div class="audio-settings-section">
+            <span class="audio-settings-title">Preferences</span>
+            <label class="pref-row">
+                <span>UI sounds</span>
+                <input
+                    type="checkbox"
+                    class="switch"
+                    checked={uiSounds}
+                    onchange={toggleUiSounds}
+                />
+            </label>
+            <label class="pref-row">
+                <span>Reduce transparency</span>
+                <input
+                    type="checkbox"
+                    class="switch"
+                    checked={reduceTransparency}
+                    onchange={toggleReduceTransparency}
+                />
+            </label>
+        </div>
+    {/snippet}
+
+    <!-- Phone "More" bottom sheet: secondary tools + the full settings panel,
+         collapsed off the cramped control bar. Top-level overlay (z-index honored
+         against the other overlays); only reachable on phones (More button hidden
+         elsewhere). -->
+    {#if showMoreSheet}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div
+            class="more-sheet-backdrop"
+            transition:fade={{ duration: 150 }}
+            role="presentation"
+            onclick={() => (showMoreSheet = false)}
+            onkeydown={(e) => {
+                if (e.key === "Escape") showMoreSheet = false;
+            }}
+        >
+            <div
+                class="more-sheet"
+                role="dialog"
+                aria-label="More controls"
+                tabindex="-1"
+                transition:fly={{ y: 28, duration: 240, easing: quintOut }}
+                onclick={(e) => e.stopPropagation()}
+                onkeydown={(e) => e.stopPropagation()}
+            >
+                <span class="more-sheet-handle" aria-hidden="true"></span>
+                <div class="more-tools" role="group" aria-label="Tools">
+                    <button
+                        class="more-tool"
+                        disabled={grabBusy || !hasStream}
+                        onclick={() => { void grabFrame(); showMoreSheet = false; }}
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
+                        <span>Grab</span>
+                    </button>
+                    <button
+                        class="more-tool"
+                        class:active={isLoupeEnabled}
+                        onclick={() => { toggleLoupe(); showMoreSheet = false; }}
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22"><circle cx="11" cy="11" r="8"/><line x1="21" x2="16.65" y1="21" y2="16.65"/><line x1="11" x2="11" y1="8" y2="14"/><line x1="8" x2="14" y1="11" y2="11"/></svg>
+                        <span>Loupe</span>
+                    </button>
+                    <button
+                        class="more-tool"
+                        class:active={showScopes}
+                        onclick={() => { showScopes = !showScopes; showMoreSheet = false; }}
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22"><path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/></svg>
+                        <span>Scopes</span>
+                    </button>
+                    <button
+                        class="more-tool"
+                        class:active={screenShareActive}
+                        disabled={isScreenShareDisabled}
+                        onclick={() => { toggleScreenShare(); showMoreSheet = false; }}
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22"><path d="m9 10 3-3 3 3"/><path d="M12 13V7"/><rect width="20" height="14" x="2" y="3" rx="2"/><path d="M12 17v4"/><path d="M8 21h8"/></svg>
+                        <span>{screenShareActive ? "Stop" : "Share"}</span>
+                    </button>
+                </div>
+                <div class="more-sheet-settings">
+                    {@render settingsContent()}
+                </div>
+            </div>
+        </div>
+    {/if}
+
     <div class="video-wrapper" class:split-active={screenShareStream || selfShareStream}>
         {#if screenShareStream || selfShareStream}
             <!-- The sharer sees their own capture in the same split position
@@ -3032,6 +3350,22 @@
             </div>
         {/if}
 
+        <!-- Rotate hint: only on a phone whose orientation fights the stream's
+             aspect (e.g. 16:9 on a portrait phone). iOS can't lock orientation,
+             so we nudge rather than force; tap to dismiss, auto-hides, and it
+             re-evaluates on rotate. -->
+        {#if showRotateHint}
+            <button
+                class="rotate-hint"
+                transition:fade={{ duration: 200 }}
+                onclick={() => (rotateHintDismissed = true)}
+                aria-label="Dismiss rotate hint"
+            >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M2 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M22 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/></svg>
+                <span>{isPortrait ? "Rotate for a bigger view" : "Rotate upright for a bigger view"}</span>
+            </button>
+        {/if}
+
         <!-- One-time prompt after the mic goes live: cameras are opt-in, so
              invite the user to turn theirs on. Centered on screen (a deliberate
              first-run prompt, distinct from the on-click camera setup) and it
@@ -3230,171 +3564,10 @@
                         role="dialog"
                         aria-label="Settings"
                     >
-                        <div class="audio-settings-section">
-                            <span class="audio-settings-title">Microphone</span>
-                            {#if audioInputs.length > 0 && micLabelsAvailable}
-                                <!-- Collapsed to the selected device + caret; the
-                                     native dropdown scrolls cleanly even with many
-                                     devices (vs. a long inline list). -->
-                                <select
-                                    class="device-select"
-                                    value={micSelectValue}
-                                    disabled={micSwitchPending}
-                                    aria-label="Microphone device"
-                                    onchange={(e) => selectMicDevice((e.currentTarget as HTMLSelectElement).value)}
-                                >
-                                    {#each audioInputs as device (device.deviceId)}
-                                        <option value={device.deviceId}>{device.label || "Microphone"}</option>
-                                    {/each}
-                                </select>
-                            {:else if hasMicPermission}
-                                <p class="audio-settings-hint">No microphones found.</p>
-                            {:else}
-                                <p class="audio-settings-hint">
-                                    Allow microphone access to see and choose your input devices.
-                                </p>
-                                <button class="audio-settings-grant" onclick={requestMicForLabels}>
-                                    Enable microphone
-                                </button>
-                            {/if}
-                        </div>
-                        <div class="audio-settings-section">
-                            <span class="audio-settings-title">Camera</span>
-                            <button class="audio-settings-grant" onclick={openCameraModal}>
-                                {isCameraOn ? "Camera settings" : "Set up camera"}
-                            </button>
-                        </div>
-                        {#if supportsSinkSelection && audioOutputs.length > 0}
-                            <div class="audio-settings-section">
-                                <span class="audio-settings-title">Speaker</span>
-                                <select
-                                    class="device-select"
-                                    value={selectedSpeakerId ?? "default"}
-                                    aria-label="Speaker device"
-                                    onchange={(e) => selectSpeakerDevice((e.currentTarget as HTMLSelectElement).value)}
-                                >
-                                    {#each audioOutputs as device (device.deviceId)}
-                                        <option value={device.deviceId}>{device.label || "Speaker"}</option>
-                                    {/each}
-                                </select>
-                            </div>
-                        {/if}
-                        <div class="audio-settings-section">
-                            <span class="audio-settings-title">Volume</span>
-                            <div class="volume-row">
-                                <label for="program-volume">Program</label>
-                                <input
-                                    id="program-volume"
-                                    class="range-input"
-                                    type="range"
-                                    min="0"
-                                    max="1"
-                                    step="0.05"
-                                    value={streamVolume}
-                                    oninput={handleStreamVolumeChange}
-                                />
-                            </div>
-                            <div class="volume-row">
-                                <label for="voice-volume">Voice chat</label>
-                                <input
-                                    id="voice-volume"
-                                    class="range-input"
-                                    type="range"
-                                    min="0"
-                                    max="1"
-                                    step="0.05"
-                                    value={voiceVolume}
-                                    oninput={handleVoiceVolumeChange}
-                                />
-                            </div>
-                            <button class="volume-mute-btn" onclick={toggleMute} aria-pressed={isMuted}>
-                                {isMuted ? "Unmute program audio" : "Mute program audio"}
-                            </button>
-                        </div>
-                        <div class="audio-settings-section">
-                            <span class="audio-settings-title">Audio mode</span>
-                            <div class="audio-mode-toggle" role="group" aria-label="Audio mode">
-                                <button
-                                    class="audio-mode-option"
-                                    class:selected={audioMode === "talkback"}
-                                    disabled={audioModePending}
-                                    onclick={() => selectAudioMode("talkback")}
-                                    aria-pressed={audioMode === "talkback"}
-                                >
-                                    <span class="audio-mode-name">Talkback</span>
-                                    <span class="audio-mode-desc">Clean voice, ultra-low latency</span>
-                                </button>
-                                <button
-                                    class="audio-mode-option"
-                                    class:selected={audioMode === "studio"}
-                                    disabled={audioModePending}
-                                    onclick={() => selectAudioMode("studio")}
-                                    aria-pressed={audioMode === "studio"}
-                                >
-                                    <span class="audio-mode-name">Studio</span>
-                                    <span class="audio-mode-desc">Pristine stereo for music &amp; instruments</span>
-                                </button>
-                            </div>
-                            {#if audioMode === "talkback"}
-                                <label class="pref-row">
-                                    <span>Noise reduction</span>
-                                    <span class="seg" role="group" aria-label="Noise reduction">
-                                        <button
-                                            class="seg-btn"
-                                            class:selected={denoiserEngine !== "off"}
-                                            disabled={audioModePending}
-                                            onclick={() => selectDenoiser("rnnoise")}
-                                            aria-pressed={denoiserEngine !== "off"}
-                                        >On</button>
-                                        <button
-                                            class="seg-btn"
-                                            class:selected={denoiserEngine === "off"}
-                                            disabled={audioModePending}
-                                            onclick={() => selectDenoiser("off")}
-                                            aria-pressed={denoiserEngine === "off"}
-                                        >Off</button>
-                                    </span>
-                                </label>
-                            {/if}
-                            {#if audioMode === "studio"}
-                                <label class="pref-row">
-                                    <span>On headphones (disable echo cancellation)</span>
-                                    <input
-                                        type="checkbox"
-                                        class="switch"
-                                        checked={studioHeadphones}
-                                        disabled={audioModePending}
-                                        onchange={toggleStudioHeadphones}
-                                    />
-                                </label>
-                                <p class="audio-settings-hint">
-                                    Studio sends full-bandwidth stereo with no noise processing. Use headphones to avoid echo.
-                                </p>
-                            {/if}
-                        </div>
-                        <div class="audio-settings-section">
-                            <span class="audio-settings-title">Preferences</span>
-                            <label class="pref-row">
-                                <span>UI sounds</span>
-                                <input
-                                    type="checkbox"
-                                    class="switch"
-                                    checked={uiSounds}
-                                    onchange={toggleUiSounds}
-                                />
-                            </label>
-                            <label class="pref-row">
-                                <span>Reduce transparency</span>
-                                <input
-                                    type="checkbox"
-                                    class="switch"
-                                    checked={reduceTransparency}
-                                    onchange={toggleReduceTransparency}
-                                />
-                            </label>
-                        </div>
+                        {@render settingsContent()}
                     </div>
                 {/if}
+
                 <div class="control-bar" bind:this={controlBarEl}>
                     <button
                         class="control-btn"
@@ -3464,7 +3637,7 @@
                     </button>
 
                     <button
-                        class="control-btn"
+                        class="control-btn secondary-tool"
                         style="--stagger: 18ms"
                         class:active={showAudioSettings}
                         onclick={toggleAudioSettings}
@@ -3504,7 +3677,7 @@
                     <span class="bar-divider" aria-hidden="true"></span>
 
                     <button
-                        class="control-btn"
+                        class="control-btn secondary-tool"
                         style="--stagger: 54ms"
                         disabled={grabBusy || !hasStream}
                         onclick={() => void grabFrame()}
@@ -3533,7 +3706,7 @@
                     </button>
 
                     <button
-                        class="control-btn"
+                        class="control-btn secondary-tool"
                         style="--stagger: 90ms"
                         class:active={isLoupeEnabled}
                         onclick={toggleLoupe}
@@ -3548,7 +3721,7 @@
                     </button>
 
                     <button
-                        class="control-btn"
+                        class="control-btn secondary-tool"
                         style="--stagger: 108ms"
                         class:active={showScopes}
                         onclick={() => (showScopes = !showScopes)}
@@ -3565,7 +3738,7 @@
                     <span class="bar-divider" aria-hidden="true"></span>
 
                     <button
-                        class="control-btn"
+                        class="control-btn secondary-tool"
                         style="--stagger: 126ms"
                         class:active={screenShareActive}
                         class:requesting={screenShareRequested}
@@ -3579,22 +3752,41 @@
                         <span class="control-label">{screenShareActive ? "Stop Share" : screenShareRequested ? "Pending..." : "Share"}</span>
                     </button>
 
+                    {#if supportsFullscreen}
+                        <button
+                            class="control-btn desktop-only"
+                            style="--stagger: 144ms"
+                            onclick={toggleFullscreen}
+                            aria-pressed={isFullscreen}
+                            aria-label={isFullscreen ? "Exit fullscreen (F)" : "Fullscreen (F)"}
+                            use:tooltip={"Fullscreen (F)"}
+                        >
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
+                                {#if isFullscreen}
+                                    <path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/>
+                                {:else}
+                                    <path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>
+                                {/if}
+                            </svg>
+                            <span class="control-label">{isFullscreen ? "Exit Full" : "Fullscreen"}</span>
+                        </button>
+                    {/if}
+
+                    <!-- Phone-only: collapse the secondary tools + all settings
+                         into a labeled bottom sheet so the bar fits a 390px bar. -->
                     <button
-                        class="control-btn"
+                        class="control-btn more-btn"
                         style="--stagger: 144ms"
-                        onclick={toggleFullscreen}
-                        aria-pressed={isFullscreen}
-                        aria-label={isFullscreen ? "Exit fullscreen (F)" : "Fullscreen (F)"}
-                        use:tooltip={"Fullscreen (F)"}
+                        class:active={showMoreSheet}
+                        onclick={() => { showMoreSheet = !showMoreSheet; if (showMoreSheet) showAudioSettings = false; }}
+                        aria-label="More controls"
+                        aria-expanded={showMoreSheet}
+                        aria-haspopup="dialog"
                     >
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
-                            {#if isFullscreen}
-                                <path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/>
-                            {:else}
-                                <path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>
-                            {/if}
+                            <circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/>
                         </svg>
-                        <span class="control-label">{isFullscreen ? "Exit Full" : "Fullscreen"}</span>
+                        <span class="control-label">More</span>
                     </button>
 
                     <button
@@ -4213,8 +4405,14 @@
         display: flex;
         flex-direction: column;
         justify-content: space-between;
-        padding: var(--space-md) var(--space-lg);
-        padding-bottom: calc(var(--space-md) + env(safe-area-inset-bottom, 0px));
+        /* Include left/right safe-area so the room name and the latency/signal
+           pills clear the notch / Dynamic Island and the rounded corners when a
+           phone is held in landscape. */
+        padding:
+            calc(var(--space-md) + env(safe-area-inset-top, 0px))
+            calc(var(--space-lg) + env(safe-area-inset-right, 0px))
+            calc(var(--space-md) + env(safe-area-inset-bottom, 0px))
+            calc(var(--space-lg) + env(safe-area-inset-left, 0px));
         pointer-events: none;
         opacity: 0;
         visibility: hidden;
@@ -4348,6 +4546,20 @@
     .participant-list-item:focus-within .participant-actions {
         opacity: 1;
         pointer-events: auto;
+    }
+    /* Touch has no hover, so the per-row moderation actions would be unreachable.
+       Show them in-flow (static) so a host on a phone can still moderate. */
+    @media (hover: none) {
+        .participant-actions {
+            position: static;
+            transform: none;
+            opacity: 1;
+            pointer-events: auto;
+            margin-left: auto;
+            background: transparent;
+            border: none;
+            box-shadow: none;
+        }
     }
     .participant-action {
         background: transparent;
@@ -4519,6 +4731,11 @@
         right: 16px;
         z-index: 8;
         display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        /* Never run off the left edge with a crowded room — wrap into rows and
+           cap to the viewport (minus its right offset + a margin). */
+        max-width: calc(100vw - 32px);
         align-items: flex-start;
         gap: 10px;
         padding: 7px 9px;
@@ -4615,6 +4832,34 @@
     /* Mic→camera prompt: a one-time glass card centered on screen (not pinned to
        the bar) so it reads as a deliberate first-run invite and survives the
        control-bar auto-hide. Sits below the .cam-modal (z 60) it opens. */
+
+    /* Rotate hint: a small glass pill at the top-center, tap to dismiss. */
+    .rotate-hint {
+        position: fixed;
+        top: calc(12px + env(safe-area-inset-top, 0px));
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 30;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 14px;
+        max-width: calc(100vw - 24px);
+        border-radius: var(--radius-full);
+        background: var(--glass-bg-deep);
+        border: 1px solid var(--glass-edge);
+        box-shadow: var(--glass-specular), 0 8px 28px rgba(0, 0, 0, 0.4);
+        color: var(--color-text);
+        font-size: 0.8125rem;
+        font-weight: 500;
+        white-space: nowrap;
+        cursor: pointer;
+    }
+    .rotate-hint svg {
+        flex-shrink: 0;
+        color: var(--color-text-muted);
+    }
+
     .cam-nudge {
         position: fixed;
         top: 50%;
@@ -4714,6 +4959,11 @@
     .cam-modal {
         width: 100%;
         max-width: 380px;
+        /* Never exceed the screen (landscape phone is only ~390px tall) — scroll
+           the modal body and keep the Dismiss/Enable buttons reachable. */
+        max-height: calc(100dvh - 2 * var(--space-lg));
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
         display: flex;
         flex-direction: column;
         gap: var(--space-md);
@@ -4775,6 +5025,14 @@
         padding: 8px 32px 8px 10px;
         cursor: pointer;
         transition: background-color 0.12s ease, border-color 0.12s ease;
+    }
+    /* Touch only: bump to 16px (+roomier hit area) so iOS Safari doesn't zoom
+       the page on focus. Desktop keeps the compact size. */
+    @media (pointer: coarse) {
+        .device-select {
+            font-size: 16px;
+            padding: 10px 32px 10px 10px;
+        }
     }
     .device-select:hover {
         background-color: rgba(255, 255, 255, 0.09);
@@ -5669,17 +5927,20 @@
     }
 
     /* Volume sliders: quiet glass track, white thumb */
-    .audio-settings-popover .range-input {
+    .audio-settings-popover .range-input,
+    .more-sheet .range-input {
         height: 4px;
         background: rgba(255, 255, 255, 0.16);
     }
-    .audio-settings-popover .range-input::-webkit-slider-thumb {
+    .audio-settings-popover .range-input::-webkit-slider-thumb,
+    .more-sheet .range-input::-webkit-slider-thumb {
         width: 14px;
         height: 14px;
         background: #fff;
         box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
     }
-    .audio-settings-popover .range-input::-moz-range-thumb {
+    .audio-settings-popover .range-input::-moz-range-thumb,
+    .more-sheet .range-input::-moz-range-thumb {
         width: 14px;
         height: 14px;
         background: #fff;
@@ -5693,6 +5954,81 @@
         margin: 8px 3px;
         background: rgba(255, 255, 255, 0.09);
         flex-shrink: 0;
+    }
+
+    /* Phone "More" sheet (trigger hidden on desktop; shown via the phone media
+       query below). The sheet holds the secondary tools + the full settings
+       panel so the control bar can stay a short primary row on a phone. */
+    .more-btn { display: none; }
+    .more-sheet-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 55;
+        display: flex;
+        align-items: flex-end;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.45);
+        /* It lives inside .controls-overlay (pointer-events:none); take taps. */
+        pointer-events: auto;
+    }
+    .more-sheet {
+        width: 100%;
+        max-width: 540px;
+        max-height: 85dvh;
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-md);
+        padding: 10px var(--space-lg) calc(var(--space-lg) + env(safe-area-inset-bottom, 0px));
+        border-radius: 20px 20px 0 0;
+        background:
+            linear-gradient(to bottom, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0) 72px),
+            var(--glass-bg-deep);
+        border: 1px solid var(--glass-edge);
+        border-bottom: none;
+        box-shadow: var(--glass-specular), 0 -12px 48px rgba(0, 0, 0, 0.5);
+        color: var(--color-text);
+    }
+    .more-sheet-handle {
+        align-self: center;
+        width: 40px;
+        height: 4px;
+        border-radius: 2px;
+        background: rgba(255, 255, 255, 0.25);
+        flex-shrink: 0;
+    }
+    .more-tools {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: var(--space-sm);
+    }
+    .more-tool {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 6px;
+        padding: 12px 6px;
+        min-height: 64px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 14px;
+        color: var(--color-text);
+        font-size: 0.75rem;
+        font-weight: 500;
+        cursor: pointer;
+        transition: background 0.12s ease, border-color 0.12s ease;
+    }
+    .more-tool.active {
+        border-color: rgba(255, 255, 255, 0.4);
+        background: rgba(255, 255, 255, 0.14);
+        color: #fff;
+    }
+    .more-tool:disabled { opacity: 0.45; cursor: default; }
+    .more-sheet-settings {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-md);
     }
 
     /* Preference switches in the settings popover */
@@ -5750,6 +6086,11 @@
         border: 1px solid var(--glass-edge);
         transform-origin: 100% 100%;
         z-index: 30;
+        /* ~14 rows can exceed a landscape phone's height — scroll instead of
+           clipping the top rows off-screen. */
+        max-height: 70dvh;
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
     }
     .stats-row {
         display: flex;
@@ -5968,10 +6309,17 @@
         cursor: nwse-resize;
     }
 
-    @media (max-width: 768px) {
+    /* Phones, BOTH orientations. The width leg catches portrait (and small
+       windows); the height+landscape+coarse leg catches landscape iPhones,
+       which are ~844px wide and would otherwise fall through to desktop chrome
+       in a 390px-tall window. */
+    @media (max-width: 768px), (orientation: landscape) and (max-height: 480px) and (pointer: coarse) {
         .session-page { flex-direction: column; }
         .video-wrapper { flex: 1; min-height: 0; }
-        .control-bar { gap: 4px; padding: var(--space-xs) var(--space-sm); }
+        /* Wrap as a safety net: on a very narrow phone (<=360px) the 7 primary
+           buttons fall to a second centered row rather than clipping Mic/Leave
+           off the edges. */
+        .control-bar { gap: 4px; padding: var(--space-xs) var(--space-sm); flex-wrap: wrap; justify-content: center; }
         .control-btn { padding: 8px 10px; min-width: 52px; }
         .control-btn svg { width: 20px; height: 20px; }
         .control-label { font-size: 0.5625rem; }
@@ -5979,6 +6327,13 @@
            this one button doesn't widen the bar on tablets. The white live-dot,
            red muted state and tooltip still convey it. */
         .program-audio-btn .control-label { display: none; }
+        /* Collapse the control bar to a primary row + a labeled "More" sheet:
+           secondary tools, the bar dividers, and the (desktop-only) Fullscreen
+           come out; the More trigger comes in. */
+        .control-btn.secondary-tool,
+        .control-btn.desktop-only,
+        .bar-divider { display: none; }
+        .more-btn { display: flex; }
         .active-speaker-indicator {
             top: calc(52px + env(safe-area-inset-top, 0px));
             right: var(--space-sm);
@@ -5993,20 +6348,20 @@
         .split-screenshare { flex: 1; }
     }
 
-    /* Icon-only controls on small phones so all buttons fit a 375px screen */
+    /* Smallest phones: the primary bar is only ~7 buttons now, so they keep
+       their short labels (Mic/Cam/Laser/Chat/More/Leave) — far more usable for a
+       non-technical client than blank icons. Just tighten spacing to fit ~360px. */
     @media (max-width: 480px) {
         .controls-overlay { padding-left: var(--space-sm); padding-right: var(--space-sm); }
         .stream-card { padding: var(--space-lg); }
         .connect-stage { padding: var(--space-lg); }
         .connect-copy > p { white-space: normal; }
         .end-state-card { padding: var(--space-lg); }
-        .control-label { display: none; }
         .control-bar { gap: 2px; }
         .control-btn {
-            min-width: 44px;
-            min-height: 44px;
-            padding: 10px;
-            justify-content: center;
+            min-width: 46px;
+            min-height: 46px;
+            padding: 7px 6px;
         }
         .bottom-bar {
             display: flex;
