@@ -214,10 +214,6 @@
     // One-time "turn on your camera?" nudge after the mic is enabled. Dismissed
     // permanently (for the session) once the user acts on it or turns the cam on.
     let camNudgeDismissed = $state(false);
-    // Live preview for the camera picker. When the cam is already on we preview
-    // the published self stream; when off, we open a temporary preview stream
-    // while the settings popover is open (stopped as soon as it closes).
-    let previewStream = $state<MediaStream | null>(null);
     const SPEAKER_DEVICE_STORAGE_KEY = "chromatic_speaker_device";
     const supportsSinkSelection =
         typeof HTMLMediaElement !== "undefined" &&
@@ -503,9 +499,17 @@
                 // The relay teardown already drops the tile elsewhere; ensure
                 // ours goes too.
                 removeRemoteCam(data.participantId);
-                if (data.participantId === sessionData?.participantId && isCameraOn) {
-                    webrtcManager?.stopWebcam();
-                    isCameraOn = false;
+                if (data.participantId === sessionData?.participantId) {
+                    // Stop a live broadcast AND release a preview-only capture
+                    // (modal open but not yet enabled) so the admin gate also
+                    // turns off the camera light. Close the modal too.
+                    if (isCameraOn) {
+                        webrtcManager?.stopWebcam();
+                        isCameraOn = false;
+                    } else {
+                        webrtcManager?.cancelCameraPreview();
+                    }
+                    showCameraModal = false;
                     selfCamStream = null;
                 }
             }
@@ -1431,17 +1435,37 @@
     }
 
     // ---- Presence webcam -----------------------------------------------------
+    // The camera is captured ONCE, in the manager, and the SAME MediaStream
+    // serves both the modal preview and the live broadcast. openCameraModal
+    // opens the preview (device light on); Enable only ADDS the already-live
+    // track to the publisher. selfCamStream points at that one manager-owned
+    // stream the whole way through, so going live never re-acquires the device
+    // or detaches/re-attaches the <video> — the light can't drop and the tile
+    // can't black on Enable (the old preview→handoff path did both).
+
+    // Set true if the user dismisses the modal while an Enable is still in
+    // flight, so the resolving enable tears down instead of silently going live.
+    let camEnableAborted = false;
+
     // Open the centered camera modal: pick a device, preview, then Enable.
     function openCameraModal() {
+        if (myCamDisabled) return; // admin gate: no preview, no enable
         camNudgeDismissed = true;
         showCameraModal = true;
-        void startCameraPreview(activeCameraId);
         void refreshAudioDevices();
+        void startCameraPreview(activeCameraId);
     }
 
     function closeCameraModal() {
+        // If an Enable is mid-flight, mark it aborted so it doesn't turn the cam
+        // on after the user dismissed.
+        if (cameraPending) camEnableAborted = true;
         showCameraModal = false;
-        stopCameraPreview();
+        // Dismissed without going live — release the preview capture.
+        if (!isCameraOn) {
+            webrtcManager?.cancelCameraPreview();
+            selfCamStream = null;
+        }
     }
 
     // Camera control-bar button: when off, open the picker; when on, turn off.
@@ -1454,32 +1478,40 @@
         }
     }
 
-    // Modal "Enable camera": go live with the device we're already previewing.
-    // Hand the live preview capture straight to the manager instead of stopping
-    // and re-acquiring it (that round-trip races the device handle and fails on
-    // Firefox — the cam would never actually come on).
+    // Modal "Enable camera": go live on the device we're already previewing.
+    // The manager keeps the same capture (no stop / re-acquire), so the camera
+    // light stays on and the self-view never blacks.
     async function enableCameraFromModal() {
-        if (!webrtcManager || cameraPending) return;
+        if (!webrtcManager || cameraPending || myCamDisabled) return;
         const manager = webrtcManager;
-        const handoff = previewStream;
-        previewStream = null; // ownership moves to the manager; effect won't stop it
-        showCameraModal = false;
         camNudgeDismissed = true;
         if (isCameraOn) {
-            if (handoff) handoff.getTracks().forEach((t) => t.stop());
+            showCameraModal = false; // button reads "Done"
             return;
         }
         cameraPending = true;
+        camEnableAborted = false;
         try {
-            const ok = await manager.startWebcam(activeCameraId, handoff);
+            const ok = await manager.enableCamera(activeCameraId);
             if (destroyed || webrtcManager !== manager) {
                 manager.stopWebcam();
+                return;
+            }
+            if (ok && camEnableAborted) {
+                // User dismissed the modal while we were going live — honor it.
+                manager.stopWebcam();
+                selfCamStream = null;
                 return;
             }
             if (ok) {
                 isCameraOn = true;
                 selfCamStream = manager.getCameraStream();
                 activeCameraId = manager.getCurrentCameraDeviceId();
+                showCameraModal = false;
+            } else {
+                // Capture failed/denied — keep the modal up to show the reason.
+                camCaptureDenied = true;
+                selfCamStream = manager.getCameraStream();
             }
         } finally {
             if (!destroyed) cameraPending = false;
@@ -1498,7 +1530,10 @@
                 selfCamStream = null;
                 return;
             }
-            const ok = await manager.startWebcam();
+            if (myCamDisabled) return; // admin gate: can't go live
+            // No preview open (join-with-camera / direct toggle): enableCamera
+            // acquires the capture itself.
+            const ok = await manager.enableCamera(activeCameraId);
             if (destroyed || webrtcManager !== manager) {
                 manager.stopWebcam();
                 return;
@@ -1522,18 +1557,14 @@
         try {
             storeCameraDeviceId(deviceId);
             activeCameraId = deviceId;
-            if (isCameraOn) {
-                // Live switch the broadcast track.
-                const ok = await manager.setCameraDevice(deviceId);
-                if (destroyed || webrtcManager !== manager) return;
-                if (ok) {
-                    selfCamStream = manager.getCameraStream();
-                    activeCameraId = manager.getCurrentCameraDeviceId() ?? deviceId;
-                }
-            } else {
-                // Not broadcasting: just update the local preview + remembered
-                // device. The next "Cam On" uses the stored choice.
-                await startCameraPreview(deviceId);
+            // setCameraDevice handles BOTH states: replaceTrack while live,
+            // in-place track swap while only previewing — one stream identity
+            // either way, so the bound <video> never re-attaches.
+            const ok = await manager.setCameraDevice(deviceId);
+            if (destroyed || webrtcManager !== manager) return;
+            if (ok) {
+                selfCamStream = manager.getCameraStream();
+                activeCameraId = manager.getCurrentCameraDeviceId() ?? deviceId;
             }
             await refreshAudioDevices();
         } finally {
@@ -1541,52 +1572,30 @@
         }
     }
 
-    // Open a temporary local preview stream for the camera modal (used only
-    // while the cam is OFF and the modal is open).
+    // Open the manager-owned preview capture and bind it to the self-view. The
+    // manager reuses an already-live capture, so this never double-acquires the
+    // device (which fails on Firefox).
     async function startCameraPreview(deviceId?: string | null) {
-        stopCameraPreview();
+        if (!webrtcManager) return;
+        const manager = webrtcManager;
         camCaptureDenied = false;
-        try {
-            const stream = await navigator.mediaDevices.getUserMedia({
-                video: {
-                    width: { ideal: 320 },
-                    height: { ideal: 240 },
-                    deviceId: deviceId ? { ideal: deviceId } : undefined,
-                },
-                audio: false,
-            });
-            // The modal may have closed (or the cam turned on) during the
-            // await — don't leave an orphaned capture running.
-            if (destroyed || !showCameraModal || isCameraOn) {
-                stream.getTracks().forEach((t) => t.stop());
-                return;
-            }
-            previewStream = stream;
-            activeCameraId =
-                stream.getVideoTracks()[0]?.getSettings().deviceId ?? activeCameraId;
-            await refreshAudioDevices();
-        } catch (err) {
-            console.warn("Camera preview unavailable:", err);
-            if (!destroyed) camCaptureDenied = true;
+        const stream = await manager.openCameraPreview(deviceId ?? activeCameraId);
+        if (destroyed || webrtcManager !== manager) return;
+        if (!stream) {
+            camCaptureDenied = true;
+            return;
         }
+        // The modal may have been dismissed during the await — if we're not
+        // going to use the capture, release it.
+        if (!showCameraModal && !isCameraOn) {
+            manager.cancelCameraPreview();
+            selfCamStream = null;
+            return;
+        }
+        selfCamStream = stream;
+        activeCameraId = manager.getCurrentCameraDeviceId() ?? activeCameraId;
+        await refreshAudioDevices();
     }
-
-    function stopCameraPreview() {
-        if (previewStream) {
-            previewStream.getTracks().forEach((t) => t.stop());
-            previewStream = null;
-        }
-    }
-
-    // Release the preview capture whenever the camera modal closes or the cam
-    // goes live, and on unmount. Preview is started explicitly by openCameraModal
-    // / device selection — never auto-started.
-    $effect(() => {
-        if (!showCameraModal || isCameraOn) {
-            stopCameraPreview();
-        }
-        return stopCameraPreview;
-    });
 
     function toggleCamsHidden() {
         camsHidden = !camsHidden;
@@ -1595,14 +1604,14 @@
     // Svelte action: attach a MediaStream to a <video> and keep it in sync.
     function bindStream(node: HTMLVideoElement, stream: MediaStream | null) {
         // Firefox can leave a freshly-attached getUserMedia stream painting a
-        // black frame: the camera was just handed over from the modal preview
-        // (detached from one <video>, re-attached to this one), and a lone
-        // synchronous play() that rejects is never retried — so the tile sits
-        // black over its #000 background even though the track is live. Retry
-        // playback on the element's readiness events, and re-kick whenever a
-        // track flips mute→unmute (Firefox briefly mutes the source when the
-        // encoder re-opens the device at the relay's low resolution).
+        // black frame: a lone synchronous play() that rejects is never retried —
+        // so the tile sits black over its #000 background even though the track
+        // is live. Retry playback on the element's readiness events, on a track
+        // flipping mute→unmute, AND when the device switch swaps a new track INTO
+        // the same MediaStream (identity unchanged, so `update` never fires — we
+        // catch it via the stream's 'addtrack' and re-kick + rebind).
         let current: MediaStream | null = null;
+        let watched: MediaStream | null = null;
         const tryPlay = () => void node.play().catch(() => {});
         const onLoaded = () => tryPlay();
         const onUnmute = () => tryPlay();
@@ -1611,16 +1620,31 @@
             for (const t of trackListeners) t.removeEventListener("unmute", onUnmute);
             trackListeners.length = 0;
         };
+        const attachTracks = (s: MediaStream) => {
+            for (const t of s.getVideoTracks()) {
+                t.addEventListener("unmute", onUnmute);
+                trackListeners.push(t);
+            }
+        };
+        const onAddTrack = () => {
+            if (!watched) return;
+            detachTracks();
+            attachTracks(watched);
+            tryPlay();
+        };
         const apply = (s: MediaStream | null) => {
             if (current === s) return;
             current = s;
             detachTracks();
+            if (watched) {
+                watched.removeEventListener("addtrack", onAddTrack);
+                watched = null;
+            }
             node.srcObject = s;
             if (s) {
-                for (const t of s.getVideoTracks()) {
-                    t.addEventListener("unmute", onUnmute);
-                    trackListeners.push(t);
-                }
+                watched = s;
+                s.addEventListener("addtrack", onAddTrack);
+                attachTracks(s);
                 tryPlay();
             }
         };
@@ -1631,6 +1655,8 @@
             destroy() {
                 node.removeEventListener("loadeddata", onLoaded);
                 detachTracks();
+                if (watched) watched.removeEventListener("addtrack", onAddTrack);
+                watched = null;
                 node.srcObject = null;
                 current = null;
             },
@@ -1811,9 +1837,10 @@
         activeVoicePids.clear();
         pendingVoiceTracks.clear();
         speakingParticipants = new Set();
-        // Camera teardown: close() stops the local capture; drop the UI state and
-        // any remote cam tiles so nothing is left frozen/desynced.
-        stopCameraPreview();
+        // Camera teardown: release a preview-only capture now (close() stops it
+        // anyway when broadcasting); drop the UI state and any remote cam tiles
+        // so nothing is left frozen/desynced.
+        webrtcManager?.cancelCameraPreview();
         isCameraOn = false;
         selfCamStream = null;
         remoteCamStreams = new Map();
@@ -2468,9 +2495,6 @@
     // True when anyone (self or remote) has a cam on — gates the cam-strip
     // sizing and the hide toggle.
     let anyCamActive = $derived(isCameraOn || remoteCamStreams.size > 0);
-    // What the camera-picker preview shows: the live published stream if the cam
-    // is on, otherwise the temporary preview opened while the popover is open.
-    let cameraPreviewSource = $derived(isCameraOn ? selfCamStream : previewStream);
     // True when an admin has gated this user's own camera off.
     let myCamDisabled = $derived(camDisabledIds.has(sessionData?.participantId ?? ""));
     // One-time nudge to turn the camera on, shown after the mic is live (cams are
@@ -2958,11 +2982,11 @@
                 >
                     <h2 class="cam-modal-title">Camera</h2>
                     <div class="cam-modal-preview">
-                        {#if cameraPreviewSource}
+                        {#if selfCamStream}
                             <!-- svelte-ignore a11y_media_has_caption -->
                             <video
                                 class="cam-modal-video"
-                                use:bindStream={cameraPreviewSource}
+                                use:bindStream={selfCamStream}
                                 muted
                                 autoplay
                                 playsinline
@@ -2986,7 +3010,7 @@
                     {/if}
                     <div class="cam-modal-actions">
                         <button class="btn btn-secondary" onclick={closeCameraModal}>Dismiss</button>
-                        <button class="btn btn-primary" onclick={enableCameraFromModal} disabled={cameraPending}>
+                        <button class="btn btn-primary" onclick={enableCameraFromModal} disabled={cameraPending || myCamDisabled}>
                             {isCameraOn ? "Done" : "Enable camera"}
                         </button>
                     </div>
@@ -2994,21 +3018,27 @@
             </div>
         {/if}
 
-        <!-- One-time nudge after the mic goes live: cameras are opt-in, so invite
-             the user to turn theirs on. Clicking opens the camera picker/preview. -->
-        {#if showCamNudge && isControlsVisible}
+        <!-- One-time prompt after the mic goes live: cameras are opt-in, so
+             invite the user to turn theirs on. Centered on screen (a deliberate
+             first-run prompt, distinct from the on-click camera setup) and it
+             stays put when the controls auto-hide. "Set up camera" opens the
+             centered picker/preview modal. -->
+        {#if showCamNudge}
             <div class="cam-nudge" transition:fade={{ duration: 150 }}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
-                <span class="cam-nudge-text">Turn your camera on?</span>
-                <button class="cam-nudge-enable" onclick={openCameraModal}>Set up camera</button>
                 <button
                     class="cam-nudge-dismiss"
                     onclick={() => (camNudgeDismissed = true)}
                     aria-label="Not now"
                     title="Not now"
                 >
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
                 </button>
+                <span class="cam-nudge-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+                </span>
+                <span class="cam-nudge-text">Turn your camera on?</span>
+                <span class="cam-nudge-sub">Let everyone see you during the review.</span>
+                <button class="cam-nudge-enable" onclick={openCameraModal}>Set up camera</button>
             </div>
         {/if}
 
@@ -3402,16 +3432,17 @@
                         <span class="control-label">{isCameraOn ? "Cam On" : "Cam Off"}</span>
                     </button>
 
-                    <!-- Program (stream) audio mute — a dedicated control, no
-                         longer conflated with the settings gear. -->
+                    <!-- Program (stream) audio mute — a dedicated, visually
+                         distinct control so clients can't mistake it for their
+                         own mic or the settings gear. -->
                     <button
-                        class="control-btn"
+                        class="control-btn program-audio-btn"
                         style="--stagger: 14ms"
                         class:off={isMuted}
                         onclick={toggleMute}
                         aria-pressed={!isMuted}
-                        aria-label="Program audio (mute/unmute)"
-                        use:tooltip={isMuted ? "Unmute program audio" : "Mute program audio"}
+                        aria-label="Stream audio (mute/unmute)"
+                        use:tooltip={isMuted ? "Unmute stream audio" : "Mute stream audio"}
                     >
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
                             {#if isMuted}
@@ -3420,7 +3451,7 @@
                                 <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
                             {/if}
                         </svg>
-                        <span class="control-label">{isMuted ? "Muted" : "Audio"}</span>
+                        <span class="control-label">{isMuted ? "Stream Muted" : "Stream Audio"}</span>
                     </button>
 
                     <button
@@ -4557,37 +4588,68 @@
         align-self: center;
     }
 
-    /* Mic→camera nudge: a small glass pill centered above the control bar. */
+    /* Mic→camera prompt: a one-time glass card centered on screen (not pinned to
+       the bar) so it reads as a deliberate first-run invite and survives the
+       control-bar auto-hide. Sits below the .cam-modal (z 60) it opens. */
     .cam-nudge {
         position: fixed;
-        bottom: 96px;
+        top: 50%;
         left: 50%;
-        transform: translateX(-50%);
-        z-index: 12;
+        transform: translate(-50%, -50%);
+        z-index: 40;
         display: flex;
+        flex-direction: column;
         align-items: center;
-        gap: 10px;
-        padding: 8px 8px 8px 14px;
-        border-radius: var(--radius-full);
-        background: var(--glass-bg-deep);
-        backdrop-filter: var(--glass-backdrop-deep);
-        -webkit-backdrop-filter: var(--glass-backdrop-deep);
+        text-align: center;
+        gap: 8px;
+        padding: 22px 24px 20px;
+        max-width: 300px;
+        border-radius: var(--radius-lg, 16px);
+        background:
+            linear-gradient(to bottom, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0) 56px),
+            var(--glass-bg-deep);
         border: 1px solid var(--glass-edge);
-        box-shadow: var(--glass-specular), 0 8px 28px rgba(0, 0, 0, 0.4);
+        box-shadow: var(--glass-specular), 0 16px 48px rgba(0, 0, 0, 0.5);
         color: var(--color-text);
+        /* Centered over the picture but NON-blocking: only the buttons take
+           clicks, so the loupe/laser/grab on the picture center still work
+           through the card. */
+        pointer-events: none;
+    }
+    .cam-nudge-enable,
+    .cam-nudge-dismiss {
+        pointer-events: auto;
+    }
+    .cam-nudge-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 46px;
+        height: 46px;
+        margin-bottom: 2px;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid var(--glass-edge);
+        color: #fff;
     }
     .cam-nudge-text {
+        font-size: 1rem;
+        font-weight: 600;
+    }
+    .cam-nudge-sub {
         font-size: 0.8125rem;
-        white-space: nowrap;
+        color: var(--color-text-muted);
+        line-height: 1.35;
     }
     .cam-nudge-enable {
+        margin-top: 6px;
         background: var(--color-primary);
         border: none;
         border-radius: var(--radius-full);
         color: #041014;
-        font-size: 0.8125rem;
+        font-size: 0.875rem;
         font-weight: 600;
-        padding: 6px 12px;
+        padding: 9px 20px;
         cursor: pointer;
         transition: filter 0.15s ease;
     }
@@ -4595,6 +4657,9 @@
         filter: brightness(1.08);
     }
     .cam-nudge-dismiss {
+        position: absolute;
+        top: 8px;
+        right: 8px;
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -5029,6 +5094,41 @@
         background: rgba(239, 68, 68, 0.15);
         border-color: rgba(239, 68, 68, 0.4);
         color: var(--color-error);
+    }
+
+    /* Program/stream audio: the one control that governs what EVERYONE hears,
+       so it must never read as just-another-button. When live it sits brighter
+       than the neutral chrome with a small "audio is playing" dot; when muted
+       the .off rule above paints it solid red ("Stream Muted"). */
+    .control-btn.program-audio-btn {
+        position: relative;
+    }
+    .control-btn.program-audio-btn:not(.off) {
+        background: rgba(255, 255, 255, 0.16);
+        border-color: rgba(255, 255, 255, 0.34);
+        color: #fff;
+    }
+    .control-btn.program-audio-btn:not(.off):hover {
+        background: radial-gradient(
+            120% 100% at 50% 0%,
+            rgba(255, 255, 255, 0.26),
+            rgba(255, 255, 255, 0.12) 70%
+        );
+        border-color: rgba(255, 255, 255, 0.42);
+    }
+    /* "Audio is playing" dot. Neutral white, NOT a saturated color — a green/teal
+       accent next to the picture would contaminate color judgment (the one
+       sanctioned colored accent is the laser button). */
+    .control-btn.program-audio-btn:not(.off)::after {
+        content: "";
+        position: absolute;
+        top: 6px;
+        right: 6px;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: 0 0 5px rgba(255, 255, 255, 0.5);
     }
 
     /* Laser is the one deliberate exception to the neutral active state:
@@ -5866,6 +5966,10 @@
         .control-btn { padding: 8px 10px; min-width: 52px; }
         .control-btn svg { width: 20px; height: 20px; }
         .control-label { font-size: 0.5625rem; }
+        /* "Stream Audio"/"Stream Muted" is ~2x the other labels; drop it here so
+           this one button doesn't widen the bar on tablets. The white live-dot,
+           red muted state and tooltip still convey it. */
+        .program-audio-btn .control-label { display: none; }
         .active-speaker-indicator {
             top: calc(52px + env(safe-area-inset-top, 0px));
             right: var(--space-sm);

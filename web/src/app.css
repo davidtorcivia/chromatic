@@ -72,14 +72,15 @@
   --glass-bg: rgba(22, 22, 26, 0.5);
   --glass-bg-deep: rgba(15, 15, 18, 0.74);
   --glass-edge: rgba(255, 255, 255, 0.08);
-  /* NO CSS backdrop-filter. On Firefox, backdrop-filter (even plain blur) bleeds
-     across the WHOLE frame, greying/tinting the picture where no UI even is — a
-     non-starter for color review. On Chromium the prominent bars still get the
-     premium frosted look from the GPU "liquid glass" renderer, which is scoped
-     to the bar surfaces and never touches the rest of the frame. On Firefox even
-     that GPU path washes whole-frame, so it's off there (see glassDisabled) and
-     ALL chrome is translucent glass — tinting only its own footprint, never the
-     open image. */
+  /* NO CSS backdrop-filter, on ANY engine. On Firefox, backdrop-filter (even
+     plain blur) under a transformed ancestor bleeds across the WHOLE frame,
+     greying/tinting the picture where no UI even is — a non-starter for color
+     review (the bars animate with transform, so this always triggers). The
+     premium frosted look comes instead from the GPU "liquid glass" renderer
+     (videoGlass.ts), which is per-pixel scoped to each bar/pill footprint and
+     composites transparently everywhere else — on Chromium AND Firefox alike.
+     Smaller chrome with no GPU canvas falls back to translucent glass (the
+     --glass-bg fill), tinting only its own footprint, never the open image. */
   --glass-backdrop: none;
   --glass-backdrop-deep: none;
   /* Specular: a whisper of top light, nothing more. Bright edges read as

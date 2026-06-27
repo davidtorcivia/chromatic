@@ -178,9 +178,15 @@ export class WebRTCManager {
     private studioHeadphones: boolean = false;
     private screenShareStream: MediaStream | null = null;
     private screenShareSender: RTCRtpSender | null = null;
-    // Presence webcam (small cam tile). Opt-in, off until startWebcam.
+    // Presence webcam (small cam tile). Opt-in: openCameraPreview captures it,
+    // enableCamera broadcasts it. One capture serves preview + broadcast.
     private cameraStream: MediaStream | null = null;
     private cameraSender: RTCRtpSender | null = null;
+    // Single-flight guard: one in-flight camera getUserMedia at a time, so a
+    // preview-open racing an Enable (or a device-switch) can't fire a SECOND
+    // concurrent capture — that double-acquire is exactly the Firefox "device in
+    // use" failure (and leaks a stream whose track is never stopped).
+    private cameraOpenPromise: Promise<MediaStream | null> | null = null;
     private isMicMuted: boolean = true;
     private iceRestartPending: boolean = false;
     private iceRestartOfferCounter = 0;
@@ -1673,64 +1679,102 @@ export class WebRTCManager {
         }
     }
 
-    // `existingStream` lets a caller hand over an already-open capture (e.g. the
-    // camera-modal preview) so we DON'T release and re-acquire the same device —
-    // that round-trip races the OS device handle and fails on Firefox
-    // ("device in use"), which is why the cam never came on after the preview.
-    async startWebcam(deviceId?: string | null, existingStream?: MediaStream | null): Promise<boolean> {
+    // The camera is captured ONCE: the self-view preview and the broadcast share
+    // a single getUserMedia stream and a single MediaStream identity. The modal
+    // calls openCameraPreview() (device light on, self-view binds the stream);
+    // Enable calls enableCamera(), which only ADDS the already-live track to the
+    // publisher and negotiates. Nothing here ever stops a live capture except
+    // stopWebcam()/cancelCameraPreview() — so clicking Enable can never turn the
+    // camera light off (the old handoff path stopped the stream in a guard
+    // branch and returned a stale one, which is what blacked the tile).
+
+    private hasLiveVideo(stream: MediaStream | null): boolean {
+        const t = stream?.getVideoTracks()[0];
+        return !!t && t.readyState === 'live';
+    }
+
+    // Adopt a freshly-acquired capture as the current camera stream: motion
+    // content hint + an onended that tears the cam down if the device vanishes.
+    private adoptCameraStream(stream: MediaStream): void {
+        this.cameraStream = stream;
+        const track = stream.getVideoTracks()[0];
+        if (!track) return;
         try {
-            if (this.isClosed()) {
-                if (existingStream) this.stopStream(existingStream);
-                return false;
-            }
-            if (this.cameraSender) {
-                // Already on — the handed-over preview is redundant; release it.
-                if (existingStream) this.stopStream(existingStream);
-                return true;
-            }
-            if (existingStream && existingStream.getVideoTracks().length > 0) {
-                this.cameraStream = existingStream;
-            } else {
-                if (existingStream) this.stopStream(existingStream);
+            track.contentHint = 'motion';
+        } catch {
+            // older browsers — fine without the hint
+        }
+        track.onended = () => {
+            debugLog('Camera ended (device removed)');
+            this.stopWebcam();
+            this.options.onWebcamEnded?.();
+        };
+    }
+
+    // Open (or reuse) the local capture for the self-view preview WITHOUT
+    // broadcasting. Returns the stream to bind to the preview <video>, or null
+    // if capture failed/was denied. Reuses an already-live capture so the device
+    // is never double-acquired (which fails on Firefox: "device in use").
+    async openCameraPreview(deviceId?: string | null): Promise<MediaStream | null> {
+        if (this.isClosed()) return null;
+        if (this.hasLiveVideo(this.cameraStream)) return this.cameraStream;
+        // Coalesce concurrent opens (preview + Enable, or a racing switch) onto
+        // ONE getUserMedia so the device is never acquired twice at once.
+        if (this.cameraOpenPromise) return this.cameraOpenPromise;
+        this.cameraOpenPromise = (async () => {
+            try {
                 const preferred = deviceId ?? getStoredCameraDeviceId();
-                this.cameraStream = await navigator.mediaDevices.getUserMedia({
+                const stream = await navigator.mediaDevices.getUserMedia({
                     video: camConstraints(preferred),
                     audio: false
                 });
+                if (this.isClosed()) {
+                    this.stopStream(stream);
+                    return null;
+                }
+                this.adoptCameraStream(stream);
+                return this.cameraStream;
+            } catch (err) {
+                console.error('Failed to open camera preview:', err);
+                return null;
+            } finally {
+                this.cameraOpenPromise = null;
             }
-            if (this.isClosed()) {
-                this.stopStream(this.cameraStream);
-                this.cameraStream = null;
-                return false;
+        })();
+        return this.cameraOpenPromise;
+    }
+
+    // Release the preview capture — ONLY when not broadcasting (stopWebcam owns
+    // teardown once live). Safe to call on modal dismiss / cleanup.
+    cancelCameraPreview(): void {
+        if (this.cameraSender) return;
+        if (this.cameraStream) {
+            this.stopStream(this.cameraStream);
+            this.cameraStream = null;
+        }
+    }
+
+    // Go live: add the already-captured cam track to the publisher and
+    // negotiate. Acquires a capture first if none is open (the control-bar /
+    // join-with-camera path, which has no preview). Idempotent while
+    // broadcasting. NEVER stops a live capture, so it can't kill the self-view.
+    async enableCamera(deviceId?: string | null): Promise<boolean> {
+        try {
+            if (this.isClosed()) return false;
+            if (this.cameraSender) return true; // already broadcasting
+            if (!this.hasLiveVideo(this.cameraStream)) {
+                const opened = await this.openCameraPreview(deviceId);
+                if (!opened || this.isClosed() || !this.hasLiveVideo(this.cameraStream)) {
+                    return false;
+                }
             }
-
-            const videoTrack = this.cameraStream.getVideoTracks()[0];
-            if (!videoTrack) {
-                this.stopStream(this.cameraStream);
-                this.cameraStream = null;
-                return false;
-            }
-
-            // Presence cam is motion content; let the encoder drop resolution
-            // before framerate so faces stay fluid.
-            try {
-                videoTrack.contentHint = 'motion';
-            } catch {
-                // older browsers — fine without the hint
-            }
-
-            videoTrack.onended = () => {
-                debugLog('Camera ended (device removed)');
-                this.stopWebcam();
-                this.options.onWebcamEnded?.();
-            };
-
+            const videoTrack = this.cameraStream!.getVideoTracks()[0];
             // Announce the cam track id BEFORE negotiating so the server maps
             // the incoming video track to the webcam path (not screen share).
             this.sendSignal('webcam:start', { trackId: videoTrack.id });
 
             const pub = this.ensurePublisher();
-            this.cameraSender = pub.addTrack(videoTrack, this.cameraStream);
+            this.cameraSender = pub.addTrack(videoTrack, this.cameraStream!);
             void this.tuneWebcamSender(this.cameraSender);
 
             const negotiated = await this.negotiatePublisher();
@@ -1740,12 +1784,22 @@ export class WebRTCManager {
             debugLog('Webcam started');
             return true;
         } catch (err) {
-            console.error('Failed to start webcam:', err);
+            console.error('Failed to enable camera:', err);
+            // Leave nothing half-live: drop the sender AND the capture so the
+            // returned false matches a clean "off" state in both the manager and
+            // the UI (no broadcasting-with-Cam-Off desync, no device left lit).
+            if (this.cameraSender && this.publisherPc) {
+                try {
+                    this.publisherPc.removeTrack(this.cameraSender);
+                } catch {
+                    // already gone
+                }
+            }
+            this.cameraSender = null;
             if (this.cameraStream) {
                 this.stopStream(this.cameraStream);
                 this.cameraStream = null;
             }
-            this.cameraSender = null;
             return false;
         }
     }
@@ -1776,12 +1830,20 @@ export class WebRTCManager {
         debugLog('Webcam stopped');
     }
 
-    // Switch camera device: re-capture and swap the track via replaceTrack. No
-    // renegotiation — the SDP msid (and thus the server's track-id mapping) is
-    // preserved, so the relay keeps flowing uninterrupted.
+    // Switch the camera device. While broadcasting, replaceTrack swaps the
+    // sender's track with NO renegotiation — the SDP msid (and the server's
+    // track-id mapping) is preserved, so the relay keeps flowing. While only
+    // previewing, there's no sender yet. EITHER way the new track is moved into
+    // the SAME this.cameraStream object so the bound self-view <video> keeps its
+    // srcObject and shows the new device with no black re-attach flash. When no
+    // capture is open yet, this just opens a preview on the chosen device.
     async setCameraDevice(deviceId: string): Promise<boolean> {
         try {
-            if (this.isClosed() || !this.cameraSender) return false;
+            if (this.isClosed()) return false;
+            // Not capturing yet: open a preview on the chosen device.
+            if (!this.hasLiveVideo(this.cameraStream)) {
+                return (await this.openCameraPreview(deviceId)) != null;
+            }
             const newStream = await navigator.mediaDevices.getUserMedia({
                 video: camConstraints(deviceId, true),
                 audio: false
@@ -1806,23 +1868,32 @@ export class WebRTCManager {
                 this.options.onWebcamEnded?.();
             };
 
-            const oldStream = this.cameraStream;
-            try {
-                await this.cameraSender.replaceTrack(newTrack);
-            } catch (err) {
-                // Don't leak the freshly-opened device (camera light) if the
-                // swap fails; keep the previous capture running.
-                console.error('Failed to replace camera track:', err);
-                this.stopStream(newStream);
-                return false;
+            const stream = this.cameraStream!;
+            const oldTrack = stream.getVideoTracks()[0];
+
+            if (this.cameraSender) {
+                // Broadcasting: swap on the sender (no renegotiation).
+                try {
+                    await this.cameraSender.replaceTrack(newTrack);
+                } catch (err) {
+                    // Don't leak the freshly-opened device if the swap fails;
+                    // keep the previous capture running.
+                    console.error('Failed to replace camera track:', err);
+                    this.stopStream(newStream);
+                    return false;
+                }
+                if (this.isClosed()) {
+                    this.stopStream(newStream);
+                    return false;
+                }
             }
-            if (this.isClosed()) {
-                this.stopStream(newStream);
-                return false;
-            }
-            this.cameraStream = newStream;
-            if (oldStream && oldStream !== newStream) {
-                this.stopStream(oldStream);
+            // Keep this.cameraStream identity stable: move the new track into it
+            // and retire the old one, so the self-view <video> bound to this
+            // stream shows the new device without a re-attach.
+            stream.addTrack(newTrack);
+            if (oldTrack) {
+                stream.removeTrack(oldTrack);
+                oldTrack.stop();
             }
             debugLog('Switched camera device:', deviceId);
             return true;

@@ -200,8 +200,12 @@ export function videoGlassGroup(node: HTMLElement, options: GroupOptions) {
 	const opts = { zoom: 0.08, rim: 18, bezel: 26, ...options };
 
 	const canvas = document.createElement("canvas");
+	// `contain: layout paint` (not `strict`): strict adds `size` containment,
+	// which declares the canvas has zero intrinsic size — atypical for a
+	// replaced element and an unnecessary Gecko risk. layout+paint keeps the
+	// isolation/clip without the size-containment quirk.
 	canvas.style.cssText =
-		"position:absolute;inset:0;width:100%;height:100%;pointer-events:none;display:none;contain:strict";
+		"position:absolute;inset:0;width:100%;height:100%;pointer-events:none;display:none;contain:layout paint";
 	canvas.setAttribute("aria-hidden", "true");
 
 	let gl: WebGL2RenderingContext | null = null;
