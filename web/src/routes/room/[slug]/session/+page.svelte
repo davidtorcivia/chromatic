@@ -1594,17 +1594,45 @@
 
     // Svelte action: attach a MediaStream to a <video> and keep it in sync.
     function bindStream(node: HTMLVideoElement, stream: MediaStream | null) {
+        // Firefox can leave a freshly-attached getUserMedia stream painting a
+        // black frame: the camera was just handed over from the modal preview
+        // (detached from one <video>, re-attached to this one), and a lone
+        // synchronous play() that rejects is never retried — so the tile sits
+        // black over its #000 background even though the track is live. Retry
+        // playback on the element's readiness events, and re-kick whenever a
+        // track flips mute→unmute (Firefox briefly mutes the source when the
+        // encoder re-opens the device at the relay's low resolution).
+        let current: MediaStream | null = null;
+        const tryPlay = () => void node.play().catch(() => {});
+        const onLoaded = () => tryPlay();
+        const onUnmute = () => tryPlay();
+        const trackListeners: MediaStreamTrack[] = [];
+        const detachTracks = () => {
+            for (const t of trackListeners) t.removeEventListener("unmute", onUnmute);
+            trackListeners.length = 0;
+        };
         const apply = (s: MediaStream | null) => {
-            if (node.srcObject !== s) {
-                node.srcObject = s;
-                if (s) void node.play().catch(() => {});
+            if (current === s) return;
+            current = s;
+            detachTracks();
+            node.srcObject = s;
+            if (s) {
+                for (const t of s.getVideoTracks()) {
+                    t.addEventListener("unmute", onUnmute);
+                    trackListeners.push(t);
+                }
+                tryPlay();
             }
         };
+        node.addEventListener("loadeddata", onLoaded);
         apply(stream);
         return {
             update: apply,
             destroy() {
+                node.removeEventListener("loadeddata", onLoaded);
+                detachTracks();
                 node.srcObject = null;
+                current = null;
             },
         };
     }
@@ -3157,38 +3185,6 @@
                         aria-label="Settings"
                     >
                         <div class="audio-settings-section">
-                            <span class="audio-settings-title">Volume</span>
-                            <div class="volume-row">
-                                <label for="program-volume">Program</label>
-                                <input
-                                    id="program-volume"
-                                    class="range-input"
-                                    type="range"
-                                    min="0"
-                                    max="1"
-                                    step="0.05"
-                                    value={streamVolume}
-                                    oninput={handleStreamVolumeChange}
-                                />
-                            </div>
-                            <div class="volume-row">
-                                <label for="voice-volume">Voice chat</label>
-                                <input
-                                    id="voice-volume"
-                                    class="range-input"
-                                    type="range"
-                                    min="0"
-                                    max="1"
-                                    step="0.05"
-                                    value={voiceVolume}
-                                    oninput={handleVoiceVolumeChange}
-                                />
-                            </div>
-                            <button class="volume-mute-btn" onclick={toggleMute} aria-pressed={isMuted}>
-                                {isMuted ? "Unmute program audio" : "Mute program audio"}
-                            </button>
-                        </div>
-                        <div class="audio-settings-section">
                             <span class="audio-settings-title">Microphone</span>
                             {#if !micLabelsAvailable}
                                 <p class="audio-settings-hint">
@@ -3222,6 +3218,58 @@
                             <span class="audio-settings-title">Camera</span>
                             <button class="audio-settings-grant" onclick={openCameraModal}>
                                 {isCameraOn ? "Camera settings" : "Set up camera"}
+                            </button>
+                        </div>
+                        {#if supportsSinkSelection && audioOutputs.length > 0}
+                            <div class="audio-settings-section">
+                                <span class="audio-settings-title">Speaker</span>
+                                {#each audioOutputs as device (device.deviceId)}
+                                    <button
+                                        class="audio-device-option"
+                                        class:selected={device.deviceId === (selectedSpeakerId ?? "default")}
+                                        onclick={() => selectSpeakerDevice(device.deviceId)}
+                                        aria-pressed={device.deviceId === (selectedSpeakerId ?? "default")}
+                                    >
+                                        <span class="audio-device-check" aria-hidden="true">
+                                            {#if device.deviceId === (selectedSpeakerId ?? "default")}
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12"><path d="M20 6 9 17l-5-5"/></svg>
+                                            {/if}
+                                        </span>
+                                        <span class="audio-device-label">{device.label || "Speaker"}</span>
+                                    </button>
+                                {/each}
+                            </div>
+                        {/if}
+                        <div class="audio-settings-section">
+                            <span class="audio-settings-title">Volume</span>
+                            <div class="volume-row">
+                                <label for="program-volume">Program</label>
+                                <input
+                                    id="program-volume"
+                                    class="range-input"
+                                    type="range"
+                                    min="0"
+                                    max="1"
+                                    step="0.05"
+                                    value={streamVolume}
+                                    oninput={handleStreamVolumeChange}
+                                />
+                            </div>
+                            <div class="volume-row">
+                                <label for="voice-volume">Voice chat</label>
+                                <input
+                                    id="voice-volume"
+                                    class="range-input"
+                                    type="range"
+                                    min="0"
+                                    max="1"
+                                    step="0.05"
+                                    value={voiceVolume}
+                                    oninput={handleVoiceVolumeChange}
+                                />
+                            </div>
+                            <button class="volume-mute-btn" onclick={toggleMute} aria-pressed={isMuted}>
+                                {isMuted ? "Unmute program audio" : "Mute program audio"}
                             </button>
                         </div>
                         <div class="audio-settings-section">
@@ -3285,26 +3333,6 @@
                                 </p>
                             {/if}
                         </div>
-                        {#if supportsSinkSelection && audioOutputs.length > 0}
-                            <div class="audio-settings-section">
-                                <span class="audio-settings-title">Speaker</span>
-                                {#each audioOutputs as device (device.deviceId)}
-                                    <button
-                                        class="audio-device-option"
-                                        class:selected={device.deviceId === (selectedSpeakerId ?? "default")}
-                                        onclick={() => selectSpeakerDevice(device.deviceId)}
-                                        aria-pressed={device.deviceId === (selectedSpeakerId ?? "default")}
-                                    >
-                                        <span class="audio-device-check" aria-hidden="true">
-                                            {#if device.deviceId === (selectedSpeakerId ?? "default")}
-                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12"><path d="M20 6 9 17l-5-5"/></svg>
-                                            {/if}
-                                        </span>
-                                        <span class="audio-device-label">{device.label || "Speaker"}</span>
-                                    </button>
-                                {/each}
-                            </div>
-                        {/if}
                         <div class="audio-settings-section">
                             <span class="audio-settings-title">Preferences</span>
                             <label class="pref-row">
@@ -4453,14 +4481,15 @@
         display: flex;
         align-items: flex-start;
         gap: 10px;
-        padding: 8px 10px;
+        padding: 7px 9px;
         border-radius: var(--radius-md);
-        /* Glass like the other chrome (blur frosts only what's behind THIS
-           strip — the image elsewhere is untouched). */
-        background: var(--glass-bg);
+        /* Subtle glass: a whisper-light translucent strip so the cams read as
+           floating over the picture, not a heavy box. Tints only its own
+           footprint — the image elsewhere is untouched. */
+        background: rgba(18, 18, 22, 0.34);
         backdrop-filter: var(--glass-backdrop);
         -webkit-backdrop-filter: var(--glass-backdrop);
-        border: 1px solid var(--glass-edge);
+        border: 1px solid rgba(255, 255, 255, 0.06);
         pointer-events: none;
         transition: top 0.3s var(--ease-out, ease), right 0.3s var(--ease-out, ease),
             background 0.3s ease;
@@ -4485,13 +4514,19 @@
         font-size: 1.05rem;
         font-weight: 600;
         color: #fff;
-        background-color: var(--participant-color, #555);
-        border: 2px solid rgba(0, 0, 0, 0.55);
+        /* Glass-framed avatar: the participant color sits under a soft glass
+           rim + inner highlight rather than a hard black ring, so it reads as
+           part of the chrome. The video (when on) covers the fill. */
+        background-color: color-mix(in srgb, var(--participant-color, #555) 80%, transparent);
+        border: 1px solid var(--glass-edge);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
         overflow: hidden;
         transition: box-shadow 0.2s ease, opacity 0.2s ease;
     }
     .cam-float-circle.has-cam {
-        background-color: #000;
+        /* Dim glass base behind the video so a momentary no-frame gap reads as
+           soft glass, not a hard black disc. */
+        background-color: rgba(8, 8, 11, 0.85);
     }
     .cam-float-circle.speaking {
         box-shadow:

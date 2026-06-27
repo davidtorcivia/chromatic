@@ -2058,6 +2058,11 @@ func (h *WebSocketHandler) forwardWebcamTrack(roomSlug, participantID string, tr
 	h.hub.BroadcastJSON(roomSlug, "webcam:started", map[string]interface{}{
 		"participantId": participantID,
 	}, "")
+
+	// Force a keyframe now so subscribers can decode the cam immediately rather
+	// than waiting for the publisher's next natural keyframe (which can leave the
+	// tile black for seconds).
+	h.sfu.RequestWebcamKeyframe(roomSlug, participantID)
 }
 
 // forwardScreenShareTrack forwards a participant's screen share track to all other participants.

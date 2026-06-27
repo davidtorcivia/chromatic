@@ -383,9 +383,8 @@ void main() {
         font-weight: 600;
         font-variant-numeric: tabular-nums;
         color: rgba(255, 255, 255, 0.85);
-        background: rgba(15, 15, 18, 0.7);
-        backdrop-filter: blur(8px);
-        -webkit-backdrop-filter: blur(8px);
+        /* No backdrop-filter: it washed the whole frame on Firefox. */
+        background: rgba(15, 15, 18, 0.85);
         border: 1px solid rgba(255, 255, 255, 0.1);
         border-radius: var(--radius-full);
         padding: 2px 10px;

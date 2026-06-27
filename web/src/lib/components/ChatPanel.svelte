@@ -1000,9 +1000,7 @@
     .drop-overlay {
         position: absolute;
         inset: 0;
-        background: rgba(12, 12, 15, 0.82);
-        backdrop-filter: blur(6px);
-        -webkit-backdrop-filter: blur(6px);
+        background: rgba(12, 12, 15, 0.9);
         display: flex;
         align-items: center;
         justify-content: center;
@@ -1194,9 +1192,7 @@
         justify-content: center;
         gap: var(--space-md);
         padding: var(--space-xl);
-        background: rgba(8, 8, 10, 0.7);
-        backdrop-filter: blur(7px);
-        -webkit-backdrop-filter: blur(7px);
+        background: rgba(8, 8, 10, 0.9);
         cursor: zoom-out;
     }
     .chat-lightbox img {
@@ -1236,9 +1232,7 @@
         justify-content: center;
         width: 44px;
         height: 44px;
-        background: rgba(20, 20, 24, 0.75);
-        backdrop-filter: blur(8px);
-        -webkit-backdrop-filter: blur(8px);
+        background: rgba(20, 20, 24, 0.9);
         border: 1px solid rgba(255, 255, 255, 0.1);
         border-radius: var(--radius-full);
         color: var(--color-text);

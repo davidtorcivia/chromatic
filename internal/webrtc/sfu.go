@@ -1153,6 +1153,49 @@ func (room *RoomTracks) screenShareKeyframePeerConnectionLocked(sharerID string)
 	return nil
 }
 
+// RequestWebcamKeyframe sends a PLI to a participant's publisher PC for their
+// webcam track, forcing an immediate keyframe so a freshly-subscribed (or
+// renegotiated) viewer can decode the cam right away instead of sitting on a
+// black tile until the next natural keyframe. A cam shares the publisher PC
+// with the (optional) screen share, so we PLI only the receiver whose track id
+// the client announced as a webcam (webcam:start) — never the screen share's.
+func (s *SFU) RequestWebcamKeyframe(roomSlug, participantID string) {
+	if participantID == "" {
+		return
+	}
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return
+	}
+
+	room.mu.RLock()
+	// The webcam publishes on the same PC as screen share / voice.
+	pc := room.screenShareKeyframePeerConnectionLocked(participantID)
+	camIDs := room.webcamTrackIDs[participantID]
+	room.mu.RUnlock()
+
+	if pc == nil || len(camIDs) == 0 {
+		return
+	}
+
+	for _, receiver := range pc.GetReceivers() {
+		track := receiver.Track()
+		if track == nil || track.Kind() != webrtc.RTPCodecTypeVideo {
+			continue
+		}
+		if !camIDs[track.ID()] {
+			continue // a screen-share video receiver on the same PC — skip
+		}
+		if err := pc.WriteRTCP([]rtcp.Packet{
+			&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())},
+		}); err != nil {
+			log.Printf("Failed to send PLI for webcam %s in room %s: %v", participantID, roomSlug, err)
+		} else {
+			log.Printf("Sent PLI for webcam keyframe (%s) in room %s", participantID, roomSlug)
+		}
+	}
+}
+
 // GetRoomTracksForSlug returns the room tracks if they exist
 func (s *SFU) GetRoomTracksForSlug(roomSlug string) *RoomTracks {
 	s.mu.RLock()
@@ -1300,6 +1343,7 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 
 	// Add existing webcam relay tracks so late joiners see active cams in the
 	// initial offer (avoids a separate renegotiation racing the first exchange).
+	var activeWebcamPIDs []string
 	for pid, webcamTrack := range room.WebcamLocalTracks {
 		if pid == subscriberID {
 			continue
@@ -1307,6 +1351,7 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 		if _, addErr := pc.AddTrack(webcamTrack); addErr != nil {
 			log.Printf("Failed to add webcam relay track for %s to subscriber %s: %v", pid, subscriberID, addErr)
 		} else {
+			activeWebcamPIDs = append(activeWebcamPIDs, pid)
 			log.Printf("Added existing webcam relay track to subscriber %s", subscriberID)
 		}
 	}
@@ -1369,6 +1414,12 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 	// interceptor provides the ongoing cadence).
 	if screenShareActive {
 		go s.RequestScreenShareKeyframe(roomSlug)
+	}
+	// Same for any cams already on: nudge each owner so the joiner's cam tiles
+	// fill in immediately instead of sitting black until the next keyframe.
+	for _, pid := range activeWebcamPIDs {
+		pid := pid
+		go s.RequestWebcamKeyframe(roomSlug, pid)
 	}
 
 	// Handle connection state — only remove on terminal states.
