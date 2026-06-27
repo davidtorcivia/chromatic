@@ -69,11 +69,11 @@
   --glass-bg: rgba(22, 22, 26, 0.4);
   --glass-bg-deep: rgba(15, 15, 18, 0.62);
   --glass-edge: rgba(255, 255, 255, 0.08);
-  /* Color-critical: NO saturate/brightness here. backdrop-filter applies these
-     to the live video behind the bars, which visibly lightened/over-saturated
-     the reviewed image when the controls appeared (worst on Firefox). Frost
-     (blur) only — the dark --glass-bg tint provides legibility without shifting
-     the picture's color. */
+  /* Frost (blur) only — NO saturate/brightness. Those were applied by
+     backdrop-filter to the live video behind the bars and, on Firefox, bled a
+     lightened/over-saturated cast across the WHOLE frame (the wash where no UI
+     even is). Blur stays: it frosts only what's directly behind each glass
+     surface, so the picture is untouched wherever the chrome isn't. */
   --glass-backdrop: blur(12px);
   --glass-backdrop-deep: blur(16px);
   /* Specular: a whisper of top light, nothing more. Bright edges read as

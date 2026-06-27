@@ -1673,15 +1673,31 @@ export class WebRTCManager {
         }
     }
 
-    async startWebcam(deviceId?: string | null): Promise<boolean> {
+    // `existingStream` lets a caller hand over an already-open capture (e.g. the
+    // camera-modal preview) so we DON'T release and re-acquire the same device —
+    // that round-trip races the OS device handle and fails on Firefox
+    // ("device in use"), which is why the cam never came on after the preview.
+    async startWebcam(deviceId?: string | null, existingStream?: MediaStream | null): Promise<boolean> {
         try {
-            if (this.isClosed()) return false;
-            if (this.cameraSender) return true; // already on
-            const preferred = deviceId ?? getStoredCameraDeviceId();
-            this.cameraStream = await navigator.mediaDevices.getUserMedia({
-                video: camConstraints(preferred),
-                audio: false
-            });
+            if (this.isClosed()) {
+                if (existingStream) this.stopStream(existingStream);
+                return false;
+            }
+            if (this.cameraSender) {
+                // Already on — the handed-over preview is redundant; release it.
+                if (existingStream) this.stopStream(existingStream);
+                return true;
+            }
+            if (existingStream && existingStream.getVideoTracks().length > 0) {
+                this.cameraStream = existingStream;
+            } else {
+                if (existingStream) this.stopStream(existingStream);
+                const preferred = deviceId ?? getStoredCameraDeviceId();
+                this.cameraStream = await navigator.mediaDevices.getUserMedia({
+                    video: camConstraints(preferred),
+                    audio: false
+                });
+            }
             if (this.isClosed()) {
                 this.stopStream(this.cameraStream);
                 this.cameraStream = null;

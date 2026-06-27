@@ -84,7 +84,17 @@
     const bottomGlassItems = () =>
         glassItems([controlBarEl, livePillEl, signalEl, latencyEl]);
     const glassEnabled = () =>
-        hasStream && isVideoPlaying && !screenShareStream && !selfShareStream;
+        hasStream &&
+        isVideoPlaying &&
+        !screenShareStream &&
+        !selfShareStream &&
+        // The WebGL glass samples the video every frame on the main thread; while
+        // a review tool is in hand that competes with the laser's pointer input
+        // and makes strokes coarse. Sleep it during laser/loupe — the bars fall
+        // back to the (GPU-composited) CSS glass, so they stay glassy and the
+        // laser stays smooth.
+        !isLaserEnabled &&
+        !isLoupeEnabled;
     // Specular sweep requests: stream connect and new arrivals. The glass
     // renderer only honors fresh requests, so a join while the controls
     // are hidden passes without a stale sweep on the next reveal.
@@ -1444,12 +1454,36 @@
         }
     }
 
-    // Modal "Enable camera": go live with the selected device, then close.
+    // Modal "Enable camera": go live with the device we're already previewing.
+    // Hand the live preview capture straight to the manager instead of stopping
+    // and re-acquiring it (that round-trip races the device handle and fails on
+    // Firefox — the cam would never actually come on).
     async function enableCameraFromModal() {
-        if (cameraPending) return;
-        stopCameraPreview();
+        if (!webrtcManager || cameraPending) return;
+        const manager = webrtcManager;
+        const handoff = previewStream;
+        previewStream = null; // ownership moves to the manager; effect won't stop it
         showCameraModal = false;
-        if (!isCameraOn) await toggleCamera();
+        camNudgeDismissed = true;
+        if (isCameraOn) {
+            if (handoff) handoff.getTracks().forEach((t) => t.stop());
+            return;
+        }
+        cameraPending = true;
+        try {
+            const ok = await manager.startWebcam(activeCameraId, handoff);
+            if (destroyed || webrtcManager !== manager) {
+                manager.stopWebcam();
+                return;
+            }
+            if (ok) {
+                isCameraOn = true;
+                selfCamStream = manager.getCameraStream();
+                activeCameraId = manager.getCurrentCameraDeviceId();
+            }
+        } finally {
+            if (!destroyed) cameraPending = false;
+        }
     }
 
     async function toggleCamera() {
@@ -3340,11 +3374,31 @@
                         <span class="control-label">{isCameraOn ? "Cam On" : "Cam Off"}</span>
                     </button>
 
+                    <!-- Program (stream) audio mute — a dedicated control, no
+                         longer conflated with the settings gear. -->
+                    <button
+                        class="control-btn"
+                        style="--stagger: 14ms"
+                        class:off={isMuted}
+                        onclick={toggleMute}
+                        aria-pressed={!isMuted}
+                        aria-label="Program audio (mute/unmute)"
+                        use:tooltip={isMuted ? "Unmute program audio" : "Mute program audio"}
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
+                            {#if isMuted}
+                                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" x2="17" y1="9" y2="15"/><line x1="17" x2="23" y1="9" y2="15"/>
+                            {:else}
+                                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+                            {/if}
+                        </svg>
+                        <span class="control-label">{isMuted ? "Muted" : "Audio"}</span>
+                    </button>
+
                     <button
                         class="control-btn"
                         style="--stagger: 18ms"
                         class:active={showAudioSettings}
-                        class:off={isMuted}
                         onclick={toggleAudioSettings}
                         bind:this={audioSettingsBtnEl}
                         aria-label="Settings"
@@ -3355,7 +3409,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22">
                             <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>
                         </svg>
-                        <span class="control-label">{isMuted ? "Muted" : "Settings"}</span>
+                        <span class="control-label">Settings</span>
                     </button>
 
                     <button
@@ -4401,9 +4455,12 @@
         gap: 10px;
         padding: 8px 10px;
         border-radius: var(--radius-md);
-        /* No backdrop-filter: over the color-critical video it would re-sample
-           and shift the image (badly in Firefox). Solid scrim instead. */
-        background: rgba(0, 0, 0, 0.42);
+        /* Glass like the other chrome (blur frosts only what's behind THIS
+           strip — the image elsewhere is untouched). */
+        background: var(--glass-bg);
+        backdrop-filter: var(--glass-backdrop);
+        -webkit-backdrop-filter: var(--glass-backdrop);
+        border: 1px solid var(--glass-edge);
         pointer-events: none;
         transition: top 0.3s var(--ease-out, ease), right 0.3s var(--ease-out, ease),
             background 0.3s ease;
@@ -4411,7 +4468,6 @@
     .cam-float.flush {
         top: 0;
         right: 0;
-        background: rgba(0, 0, 0, 0.12);
     }
     .cam-float-tile {
         display: flex;
@@ -4478,9 +4534,11 @@
         gap: 10px;
         padding: 8px 8px 8px 14px;
         border-radius: var(--radius-full);
-        background: rgba(20, 28, 34, 0.97);
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        box-shadow: 0 8px 28px rgba(0, 0, 0, 0.4);
+        background: var(--glass-bg-deep);
+        backdrop-filter: var(--glass-backdrop-deep);
+        -webkit-backdrop-filter: var(--glass-backdrop-deep);
+        border: 1px solid var(--glass-edge);
+        box-shadow: var(--glass-specular), 0 8px 28px rgba(0, 0, 0, 0.4);
         color: var(--color-text);
     }
     .cam-nudge-text {
@@ -4537,9 +4595,14 @@
         gap: var(--space-md);
         padding: var(--space-lg);
         border-radius: var(--radius-lg, 16px);
-        background: rgba(20, 24, 28, 0.98);
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+        /* Match the app's panels (popovers/cards) — glass, not solid. */
+        background:
+            linear-gradient(to bottom, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0) 48px),
+            var(--glass-bg-deep);
+        backdrop-filter: var(--glass-backdrop-deep);
+        -webkit-backdrop-filter: var(--glass-backdrop-deep);
+        border: 1px solid var(--glass-edge);
+        box-shadow: var(--glass-specular), var(--glass-shadow, 0 16px 48px rgba(0, 0, 0, 0.5));
     }
     .cam-modal-title {
         margin: 0;
