@@ -66,16 +66,20 @@
      neutral white only — tinted edges next to the picture would
      contaminate color judgment. Blur stays ≤16px: backdrop-filter over a
      playing <video> re-filters every frame and cost scales with radius. */
-  --glass-bg: rgba(22, 22, 26, 0.4);
-  --glass-bg-deep: rgba(15, 15, 18, 0.62);
+  /* Slightly more opaque than the old frosted values: with no backdrop blur
+     (below) these translucent fills carry legibility on their own, while still
+     reading as glass (the picture shows through). */
+  --glass-bg: rgba(22, 22, 26, 0.5);
+  --glass-bg-deep: rgba(15, 15, 18, 0.74);
   --glass-edge: rgba(255, 255, 255, 0.08);
-  /* Frost (blur) only — NO saturate/brightness. Those were applied by
-     backdrop-filter to the live video behind the bars and, on Firefox, bled a
-     lightened/over-saturated cast across the WHOLE frame (the wash where no UI
-     even is). Blur stays: it frosts only what's directly behind each glass
-     surface, so the picture is untouched wherever the chrome isn't. */
-  --glass-backdrop: blur(12px);
-  --glass-backdrop-deep: blur(16px);
+  /* NO CSS backdrop-filter. On Firefox, backdrop-filter (even plain blur) bleeds
+     across the WHOLE frame, greying/tinting the picture where no UI even is — a
+     non-starter for color review. The prominent bars still get the premium
+     frosted look from the GPU "liquid glass" renderer, which is scoped to the
+     bar surfaces and never touches the rest of the frame; smaller chrome is
+     translucent glass (tinting only its own footprint, never the open image). */
+  --glass-backdrop: none;
+  --glass-backdrop-deep: none;
   /* Specular: a whisper of top light, nothing more. Bright edges read as
      cheap strokes, not depth, when there's no refraction behind them. */
   --glass-specular:
