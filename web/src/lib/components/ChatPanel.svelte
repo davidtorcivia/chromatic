@@ -699,18 +699,24 @@
 
 <style>
     .chat-panel {
-        width: 320px;
+        width: var(--chat-panel-width, 320px);
         height: 100%;
         display: flex;
         background: var(--color-surface);
         border-left: 1px solid var(--color-border);
         overflow: hidden;
+        /* Own stacking context ABOVE the viewport-fixed cam strip (z-index 8),
+           so the cam circles can never paint over chat content — not even during
+           the open/close width animation, when the strip's offset transition
+           and the drawer width briefly disagree. */
+        position: relative;
+        z-index: 9;
     }
 
     /* Fixed-width inner column, right-anchored: during the drawer reveal
        the panel's width animates while the content never reflows. */
     .chat-inner {
-        width: 320px;
+        width: var(--chat-panel-width, 320px);
         flex-shrink: 0;
         margin-left: auto;
         height: 100%;

@@ -1889,8 +1889,10 @@
     // Controls auto-hide (ITEM 3): idle for CONTROLS_HIDE_DELAY_MS with the
     // cursor away from the bars fades them out fully; any pointer movement or
     // touch brings them back. They never hide while the cursor is over a bar,
-    // a control has keyboard focus, a popover (volume / participants / audio
-    // settings) is open, or chat is open.
+    // a control has keyboard focus, or a popover (volume / participants / audio
+    // settings) is open. Chat being open does NOT pin them — the chrome hides on
+    // idle while the chat panel stays up (closed via its own X or the chat
+    // button when the controls return).
     const CONTROLS_HIDE_DELAY_MS = 3000;
 
     function startControlsTimer() {
@@ -2616,14 +2618,15 @@
         }
     });
 
-    // Controls stay visible while any of these hold (ITEM 3).
+    // Controls stay visible while any of these hold (ITEM 3). Chat being open is
+    // deliberately NOT here: the chrome should auto-hide on idle even with chat
+    // up (the chat panel persists on its own), so the picture isn't crowded.
     let controlsPinned = $derived(
         isPointerOverControls ||
             controlsHaveFocus ||
             showStats ||
             showParticipantList ||
-            showAudioSettings ||
-            isChatOpen
+            showAudioSettings
     );
 
     // While pinned, cancel the hide countdown; when unpinned, restart it.
@@ -2642,6 +2645,16 @@
     // Device labels are empty until the browser has granted a capture —
     // used to show the permission hint in the audio settings popover.
     let micLabelsAvailable = $derived(audioInputs.some((d) => d.label !== ""));
+
+    // The <select> value MUST be a deviceId that exists in the option list, or
+    // the native control silently shows the first option (misrepresenting the
+    // active mic, and a click on that shown item fires no change event). Fall
+    // back to the first enumerated device when activeMicId doesn't match.
+    let micSelectValue = $derived(
+        audioInputs.some((d) => d.deviceId === activeMicId)
+            ? activeMicId
+            : (audioInputs[0]?.deviceId ?? ""),
+    );
 
     // Move focus into the participant list when it opens (Esc closes it via
     // the global keyboard handler).
@@ -2999,8 +3012,9 @@
                     </div>
                     {#if videoInputs.length > 1}
                         <select
-                            class="cam-modal-select"
+                            class="device-select"
                             value={activeCameraId}
+                            aria-label="Camera device"
                             onchange={(e) => selectCameraDevice((e.currentTarget as HTMLSelectElement).value)}
                         >
                             {#each videoInputs as d (d.deviceId)}
@@ -3045,11 +3059,13 @@
         <!-- Persistent floating cam strip: shown whenever cameras are on and not
              hidden. Unlike the top-bar dots it lives OUTSIDE .controls-overlay,
              so it stays up when the UI auto-hides — sliding flush into the
-             top-right corner then, and back to its padded spot when the UI
-             returns (or chat is open). pointer-events:none so it never blocks
-             the laser/loupe on the video beneath; only the hide button is live. -->
+             corner then, and back to its padded spot when the UI returns. When
+             chat is open it shifts left by the chat-panel width so it sits over
+             the video beside chat (chat also stacks above it). pointer-events:
+             none so it never blocks the laser/loupe on the video beneath; only
+             the hide button is live. -->
         {#if anyCamActive && !camsHidden}
-            <div class="cam-float" class:flush={!isControlsVisible && !isChatOpen}>
+            <div class="cam-float" class:flush={!isControlsVisible} class:chat-open={isChatOpen}>
                 {#each participants.slice(0, 12) as p (p.id)}
                     {@const isSelf = p.id === sessionData?.participantId}
                     {@const camStream = isSelf
@@ -3216,7 +3232,24 @@
                     >
                         <div class="audio-settings-section">
                             <span class="audio-settings-title">Microphone</span>
-                            {#if !micLabelsAvailable}
+                            {#if audioInputs.length > 0 && micLabelsAvailable}
+                                <!-- Collapsed to the selected device + caret; the
+                                     native dropdown scrolls cleanly even with many
+                                     devices (vs. a long inline list). -->
+                                <select
+                                    class="device-select"
+                                    value={micSelectValue}
+                                    disabled={micSwitchPending}
+                                    aria-label="Microphone device"
+                                    onchange={(e) => selectMicDevice((e.currentTarget as HTMLSelectElement).value)}
+                                >
+                                    {#each audioInputs as device (device.deviceId)}
+                                        <option value={device.deviceId}>{device.label || "Microphone"}</option>
+                                    {/each}
+                                </select>
+                            {:else if hasMicPermission}
+                                <p class="audio-settings-hint">No microphones found.</p>
+                            {:else}
                                 <p class="audio-settings-hint">
                                     Allow microphone access to see and choose your input devices.
                                 </p>
@@ -3224,25 +3257,6 @@
                                     Enable microphone
                                 </button>
                             {/if}
-                            {#if audioInputs.length === 0 && micLabelsAvailable}
-                                <p class="audio-settings-hint">No microphones found.</p>
-                            {/if}
-                            {#each audioInputs as device (device.deviceId)}
-                                <button
-                                    class="audio-device-option"
-                                    class:selected={device.deviceId === activeMicId}
-                                    disabled={micSwitchPending}
-                                    onclick={() => selectMicDevice(device.deviceId)}
-                                    aria-pressed={device.deviceId === activeMicId}
-                                >
-                                    <span class="audio-device-check" aria-hidden="true">
-                                        {#if device.deviceId === activeMicId}
-                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12"><path d="M20 6 9 17l-5-5"/></svg>
-                                        {/if}
-                                    </span>
-                                    <span class="audio-device-label">{device.label || "Microphone"}</span>
-                                </button>
-                            {/each}
                         </div>
                         <div class="audio-settings-section">
                             <span class="audio-settings-title">Camera</span>
@@ -3253,21 +3267,16 @@
                         {#if supportsSinkSelection && audioOutputs.length > 0}
                             <div class="audio-settings-section">
                                 <span class="audio-settings-title">Speaker</span>
-                                {#each audioOutputs as device (device.deviceId)}
-                                    <button
-                                        class="audio-device-option"
-                                        class:selected={device.deviceId === (selectedSpeakerId ?? "default")}
-                                        onclick={() => selectSpeakerDevice(device.deviceId)}
-                                        aria-pressed={device.deviceId === (selectedSpeakerId ?? "default")}
-                                    >
-                                        <span class="audio-device-check" aria-hidden="true">
-                                            {#if device.deviceId === (selectedSpeakerId ?? "default")}
-                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12"><path d="M20 6 9 17l-5-5"/></svg>
-                                            {/if}
-                                        </span>
-                                        <span class="audio-device-label">{device.label || "Speaker"}</span>
-                                    </button>
-                                {/each}
+                                <select
+                                    class="device-select"
+                                    value={selectedSpeakerId ?? "default"}
+                                    aria-label="Speaker device"
+                                    onchange={(e) => selectSpeakerDevice((e.currentTarget as HTMLSelectElement).value)}
+                                >
+                                    {#each audioOutputs as device (device.deviceId)}
+                                        <option value={device.deviceId}>{device.label || "Speaker"}</option>
+                                    {/each}
+                                </select>
                             </div>
                         {/if}
                         <div class="audio-settings-section">
@@ -4522,12 +4531,27 @@
         -webkit-backdrop-filter: var(--glass-backdrop);
         border: 1px solid rgba(255, 255, 255, 0.06);
         pointer-events: none;
-        transition: top 0.3s var(--ease-out, ease), right 0.3s var(--ease-out, ease),
+        /* Match the chat drawer's open/close motion (duration + glide easing) so
+           the strip's leftward shift stays geometry-locked to the panel and the
+           cams never sweep across chat content mid-animation. */
+        transition: top 0.32s var(--ease-glide), right 0.32s var(--ease-glide),
             background 0.3s ease;
     }
     .cam-float.flush {
         top: 0;
         right: 0;
+    }
+    /* Chat is an in-flow panel on the right that shrinks the video; the cam strip
+       is viewport-fixed, so shift it left of the chat (by the panel width) to
+       keep it over the picture, not on top of chat. The chat panel also stacks
+       above the strip (z-index), so any transient animation overlap hides the
+       strip behind chat rather than painting cams over it. */
+    .cam-float.chat-open {
+        right: calc(var(--chat-panel-width, 320px) + 16px);
+    }
+    .cam-float.flush.chat-open {
+        top: 0;
+        right: var(--chat-panel-width, 320px);
     }
     .cam-float-tile {
         display: flex;
@@ -4536,8 +4560,8 @@
         gap: 4px;
     }
     .cam-float-circle {
-        width: 3.5rem;
-        height: 3.5rem;
+        width: 3.9rem;
+        height: 3.9rem;
         border-radius: 50%;
         display: flex;
         align-items: center;
@@ -4733,15 +4757,42 @@
         font-size: 0.8125rem;
         color: var(--color-text-subtle);
     }
-    .cam-modal-select {
+    /* Shared device dropdown (mic / speaker / camera): collapses to the selected
+       device with a caret; the native list opens on click and scrolls for many
+       devices. appearance:none + an inline caret keeps it on-theme. */
+    .device-select {
         width: 100%;
-        background: rgba(255, 255, 255, 0.05);
+        appearance: none;
+        -webkit-appearance: none;
+        background-color: rgba(255, 255, 255, 0.05);
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: right 10px center;
         border: 1px solid rgba(255, 255, 255, 0.12);
         border-radius: var(--radius-sm);
         color: var(--color-text);
         font-size: 0.8125rem;
-        padding: 8px 10px;
+        padding: 8px 32px 8px 10px;
         cursor: pointer;
+        transition: background-color 0.12s ease, border-color 0.12s ease;
+    }
+    .device-select:hover {
+        background-color: rgba(255, 255, 255, 0.09);
+        border-color: rgba(255, 255, 255, 0.2);
+    }
+    .device-select:focus-visible {
+        outline: none;
+        border-color: rgba(255, 255, 255, 0.45);
+        box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.35);
+    }
+    .device-select:disabled {
+        opacity: 0.6;
+        cursor: default;
+    }
+    /* Native option list is OS-rendered; force legible dark text on the
+       light default menu background (Chromium/Firefox respect these). */
+    .device-select option {
+        color: #000;
     }
     .cam-modal-actions {
         display: flex;
@@ -4834,12 +4885,14 @@
         color: var(--color-text-muted);
     }
     .volume-mute-btn {
+        /* Breathing room from the Voice-chat slider directly above it. */
+        margin-top: 6px;
         background: rgba(255, 255, 255, 0.08);
         border: 1px solid rgba(255, 255, 255, 0.15);
         border-radius: var(--radius-sm);
         color: var(--color-text);
         font-size: var(--text-meta);
-        padding: 6px 10px;
+        padding: 8px 10px;
         cursor: pointer;
         transition: background 0.12s ease;
     }
@@ -4893,31 +4946,6 @@
         transition: filter 0.15s ease;
     }
     .audio-settings-grant:hover { filter: brightness(1.08); }
-    .audio-device-option {
-        display: flex;
-        align-items: center;
-        gap: var(--space-xs);
-        width: 100%;
-        text-align: left;
-        background: rgba(255, 255, 255, 0.04);
-        border: 1px solid transparent;
-        border-radius: var(--radius-sm);
-        color: var(--color-text);
-        font-size: 0.8125rem;
-        padding: 6px 8px;
-        cursor: pointer;
-        transition: background 0.12s ease, border-color 0.12s ease;
-    }
-    .audio-device-option:hover { background: rgba(255, 255, 255, 0.1); }
-    .audio-device-option.selected {
-        border-color: rgba(255, 255, 255, 0.35);
-        background: rgba(255, 255, 255, 0.12);
-        color: #fff;
-    }
-    .audio-device-option:disabled {
-        opacity: 0.5;
-        cursor: wait;
-    }
     .audio-mode-toggle {
         display: flex;
         gap: var(--space-xs);
@@ -4976,21 +5004,6 @@
         font-weight: 600;
     }
     .seg-btn:disabled { cursor: wait; opacity: 0.6; }
-    .audio-device-check {
-        width: 14px;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        flex-shrink: 0;
-        color: var(--color-primary);
-    }
-    .audio-device-label {
-        flex: 1;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }
-
     /* Full-screen end-state panel */
     .end-state-overlay {
         position: absolute;
@@ -5622,10 +5635,6 @@
     .split-screenshare-stop {
         border-radius: var(--radius-full);
     }
-    .audio-device-option {
-        border-radius: 10px;
-    }
-
     /* Bars host a shared glass canvas as their first child; real content
        must be positioned so it paints above the canvas. */
     .top-bar,
@@ -5975,6 +5984,10 @@
             right: var(--space-sm);
         }
         .presence-row { display: none; }
+        /* Chat is a bottom sheet here (not a right panel), so the cam strip
+           needs no horizontal offset — undo the desktop chat shift. */
+        .cam-float.chat-open { right: 16px; }
+        .cam-float.flush.chat-open { right: 0; }
         .video-wrapper.split-active { flex-direction: column; }
         .video-wrapper.split-active .video-container { flex: 1; }
         .split-screenshare { flex: 1; }

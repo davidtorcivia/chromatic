@@ -83,6 +83,9 @@
      --glass-bg fill), tinting only its own footprint, never the open image. */
   --glass-backdrop: none;
   --glass-backdrop-deep: none;
+  /* Chat drawer width. Shared so the viewport-fixed cam strip can offset itself
+     by exactly the panel width (the two live in different files). */
+  --chat-panel-width: 320px;
   /* Specular: a whisper of top light, nothing more. Bright edges read as
      cheap strokes, not depth, when there's no refraction behind them. */
   --glass-specular:
