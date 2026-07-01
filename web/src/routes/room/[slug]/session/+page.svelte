@@ -4713,11 +4713,13 @@
     }
 
     .cam-video {
+        position: absolute;
+        inset: 0;
         width: 100%;
         height: 100%;
         object-fit: cover;
-        border-radius: inherit;
-        clip-path: circle(50% at 50% 50%);
+        border-radius: 50%;
+        clip-path: inset(0 round 999px);
         display: block;
     }
     .cam-video.mirror {
@@ -4798,8 +4800,11 @@
         gap: 4px;
     }
     .cam-float-circle {
+        position: relative;
         width: 3.9rem;
         height: 3.9rem;
+        flex: 0 0 3.9rem;
+        aspect-ratio: 1;
         border-radius: 50%;
         display: flex;
         align-items: center;
@@ -4807,24 +4812,46 @@
         font-size: 1.05rem;
         font-weight: 600;
         color: #fff;
+        background: transparent;
+        border: none;
+        overflow: visible;
+        transition: box-shadow 0.2s ease, opacity 0.2s ease;
+    }
+    .cam-float-circle::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border-radius: 50%;
         /* Glass-framed avatar: the participant color sits under a soft glass
            rim + inner highlight rather than a hard black ring, so it reads as
            part of the chrome. The video (when on) covers the fill. */
         background-color: color-mix(in srgb, var(--participant-color, #555) 80%, transparent);
         border: 1px solid var(--glass-edge);
         box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
-        overflow: hidden;
-        transition: box-shadow 0.2s ease, opacity 0.2s ease;
+        pointer-events: none;
+    }
+    .cam-float-circle::after {
+        content: "";
+        position: absolute;
+        inset: -2px;
+        border-radius: 50%;
+        opacity: 0;
+        box-shadow:
+            0 0 0 2px var(--color-success),
+            0 0 12px var(--color-success);
+        pointer-events: none;
+        transition: opacity 0.2s ease;
     }
     .cam-float-circle.has-cam {
         /* Dim glass base behind the video so a momentary no-frame gap reads as
            soft glass, not a hard black disc. */
+        color: transparent;
+    }
+    .cam-float-circle.has-cam::before {
         background-color: rgba(8, 8, 11, 0.85);
     }
-    .cam-float-circle.speaking {
-        box-shadow:
-            0 0 0 2px var(--color-success),
-            0 0 12px var(--color-success);
+    .cam-float-circle.speaking::after {
+        opacity: 1;
     }
     .cam-float-circle.muted {
         opacity: 0.7;

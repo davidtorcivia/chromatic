@@ -82,6 +82,11 @@ function camConstraints(deviceId?: string | null, exact = false): MediaTrackCons
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+function isCameraPermissionError(err: unknown): boolean {
+    const name = (err as { name?: string })?.name ?? '';
+    return name === 'NotAllowedError' || name === 'SecurityError';
+}
+
 export interface MicConstraintOptions {
     deviceId?: string | null;
     exact?: boolean;
@@ -1731,6 +1736,61 @@ export class WebRTCManager {
         return !!t && t.readyState === 'live';
     }
 
+    private async getCameraCapture(preferred: string | null, exactPreferred = false): Promise<MediaStream> {
+        const attempts: MediaStreamConstraints[] = [];
+        const pushAttempt = (constraints: MediaStreamConstraints) => {
+            const key = JSON.stringify(constraints);
+            if (!attempts.some((existing) => JSON.stringify(existing) === key)) {
+                attempts.push(constraints);
+            }
+        };
+
+        if (preferred) {
+            pushAttempt({ video: camConstraints(preferred, exactPreferred), audio: false });
+        }
+        pushAttempt({ video: camConstraints(null), audio: false });
+        // Firefox on Windows can reject a specific resolution/facingMode combo
+        // with "Failed to allocate videosource" even when the camera is usable.
+        pushAttempt({
+            video: {
+                width: { ideal: 320 },
+                height: { ideal: 240 },
+                frameRate: { ideal: 15, max: 24 }
+            },
+            audio: false
+        });
+
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            for (const device of devices) {
+                if (device.kind === 'videoinput' && device.deviceId && device.deviceId !== preferred) {
+                    pushAttempt({ video: { deviceId: { exact: device.deviceId } }, audio: false });
+                }
+            }
+        } catch {
+            // enumerateDevices can fail before permission in some browsers; the
+            // generic attempts below are enough to continue.
+        }
+
+        pushAttempt({ video: true, audio: false });
+
+        let lastError: unknown = null;
+        for (let i = 0; i < attempts.length; i += 1) {
+            try {
+                return await navigator.mediaDevices.getUserMedia(attempts[i]);
+            } catch (err) {
+                lastError = err;
+                if (preferred) storeCameraDeviceId(null);
+                if (isCameraPermissionError(err)) throw err;
+                // Camera drivers on Windows/Firefox often need a short beat
+                // after a failed allocation before the next constraint set.
+                await sleep(i === 0 ? 300 : 150);
+            }
+        }
+
+        throw lastError ?? new Error('Camera capture failed');
+    }
+
     // Adopt a freshly-acquired capture as the current camera stream: motion
     // content hint + an onended that tears the cam down if the device vanishes.
     private adoptCameraStream(stream: MediaStream): void {
@@ -1756,34 +1816,17 @@ export class WebRTCManager {
     async openCameraPreview(deviceId?: string | null): Promise<MediaStream | null> {
         if (this.isClosed()) return null;
         if (this.hasLiveVideo(this.cameraStream)) return this.cameraStream;
+        if (this.cameraStream) {
+            this.stopStream(this.cameraStream);
+            this.cameraStream = null;
+        }
         // Coalesce concurrent opens (preview + Enable, or a racing switch) onto
         // ONE getUserMedia so the device is never acquired twice at once.
         if (this.cameraOpenPromise) return this.cameraOpenPromise;
         this.cameraOpenPromise = (async () => {
             try {
                 const preferred = deviceId ?? getStoredCameraDeviceId();
-                let stream: MediaStream;
-                try {
-                    stream = await navigator.mediaDevices.getUserMedia({
-                        video: camConstraints(preferred),
-                        audio: false
-                    });
-                } catch (err) {
-                    const name = (err as { name?: string })?.name ?? '';
-                    const shouldRetryDefault = !!preferred && (
-                        name === 'NotReadableError' ||
-                        name === 'AbortError' ||
-                        name === 'OverconstrainedError' ||
-                        name === 'NotFoundError'
-                    );
-                    if (!shouldRetryDefault) throw err;
-                    storeCameraDeviceId(null);
-                    await sleep(250);
-                    stream = await navigator.mediaDevices.getUserMedia({
-                        video: camConstraints(null),
-                        audio: false
-                    });
-                }
+                const stream = await this.getCameraCapture(preferred);
                 if (this.isClosed()) {
                     this.stopStream(stream);
                     return null;
@@ -1901,10 +1944,7 @@ export class WebRTCManager {
             if (!this.hasLiveVideo(this.cameraStream)) {
                 return (await this.openCameraPreview(deviceId)) != null;
             }
-            const newStream = await navigator.mediaDevices.getUserMedia({
-                video: camConstraints(deviceId, true),
-                audio: false
-            });
+            const newStream = await this.getCameraCapture(deviceId, true);
             if (this.isClosed()) {
                 this.stopStream(newStream);
                 return false;
