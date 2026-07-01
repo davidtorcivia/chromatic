@@ -193,6 +193,9 @@ type RoomTracks struct {
 	// persists across a page refresh (admin intent) and is cleared on a
 	// confirmed leave or when the admin re-enables.
 	webcamDisabled map[string]bool
+	// webcamHidden is the owner's fast hide/show state. The media relay remains
+	// attached, but clients hide the tile until the owner shows it again.
+	webcamHidden map[string]bool
 }
 
 type PublisherICECandidate struct {
@@ -817,6 +820,7 @@ func (s *SFU) CloseRoom(roomSlug string) {
 	room.WebcamLocalTracks = nil
 	room.webcamTrackIDs = nil
 	room.webcamDisabled = nil
+	room.webcamHidden = nil
 	room.mu.Unlock()
 	s.mu.Unlock()
 
@@ -964,6 +968,7 @@ func (rt *RoomTracks) removeSubscriberLocked(id string) (pcs []*webrtc.PeerConne
 	// even when no relay was ever created (a webcam:start whose cam never
 	// arrived would otherwise leave a permanent entry).
 	delete(rt.webcamTrackIDs, id)
+	delete(rt.webcamHidden, id)
 	// Confirmed leave clears the admin camera gate (it intentionally persists
 	// across a page refresh, but not across a real departure/rejoin).
 	delete(rt.webcamDisabled, id)
@@ -3319,6 +3324,7 @@ func (s *SFU) RemoveWebcamTrack(roomSlug, participantID string) []string {
 	localTrack := room.WebcamLocalTracks[participantID]
 	delete(room.WebcamLocalTracks, participantID)
 	delete(room.webcamTrackIDs, participantID)
+	delete(room.webcamHidden, participantID)
 	if ch, ok := room.webcamRelayDone[participantID]; ok {
 		close(ch)
 		delete(room.webcamRelayDone, participantID)
@@ -3398,6 +3404,41 @@ func (s *SFU) IsWebcamDisabled(roomSlug, participantID string) bool {
 	room.mu.RLock()
 	defer room.mu.RUnlock()
 	return room.webcamDisabled[participantID]
+}
+
+// SetWebcamVisible records the owner's fast hide/show state for late joiners.
+func (s *SFU) SetWebcamVisible(roomSlug, participantID string, visible bool) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return
+	}
+	room.mu.Lock()
+	defer room.mu.Unlock()
+	if visible {
+		delete(room.webcamHidden, participantID)
+		return
+	}
+	if room.webcamHidden == nil {
+		room.webcamHidden = make(map[string]bool)
+	}
+	room.webcamHidden[participantID] = true
+}
+
+// HiddenWebcamParticipantIDs returns active webcam owners whose tiles are hidden.
+func (s *SFU) HiddenWebcamParticipantIDs(roomSlug string) []string {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return nil
+	}
+	room.mu.RLock()
+	defer room.mu.RUnlock()
+	ids := make([]string, 0, len(room.webcamHidden))
+	for id := range room.webcamHidden {
+		if _, active := room.WebcamLocalTracks[id]; active {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // HasWebcam reports whether a participant currently has an active webcam relay.

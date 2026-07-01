@@ -832,6 +832,7 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 
 	// Include active screen share state for late joiners
 	var screenShareData interface{}
+	var hiddenWebcams []string
 	roomTracks := h.sfu.GetRoomTracksForSlug(slug)
 	if roomTracks != nil {
 		roomTracks.RLockVoiceTracks() // reuse RLock helper
@@ -852,14 +853,16 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 			}
 		}
 		roomTracks.RUnlockVoiceTracks()
+		hiddenWebcams = h.sfu.HiddenWebcamParticipantIDs(slug)
 	}
 
 	client.SendJSON("room:state", map[string]interface{}{
-		"room":         roomData,
-		"participants": participantData,
-		"isLive":       isLive,
-		"iceServers":   h.sfu.GetICEServers(),
-		"screenShare":  screenShareData,
+		"room":          roomData,
+		"participants":  participantData,
+		"isLive":        isLive,
+		"iceServers":    h.sfu.GetICEServers(),
+		"screenShare":   screenShareData,
+		"hiddenWebcams": hiddenWebcams,
 	})
 }
 
@@ -1054,6 +1057,8 @@ func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket
 		h.handleWebcamStart(client, msg.Payload)
 	case "webcam:stop":
 		h.handleWebcamStop(client)
+	case "webcam:visibility":
+		h.handleWebcamVisibility(client, msg.Payload)
 	case "admin:disable-cam":
 		h.handleAdminDisableCam(client, msg.Payload)
 	default:
@@ -2064,6 +2069,22 @@ func (h *WebSocketHandler) handleWebcamStop(client *websocket.Client) {
 		safeGo("renegotiateSubscriber", func() { h.renegotiateSubscriber(client.RoomSlug, subID) })
 	}
 	logger.Info("Webcam stopped", "participant_id", client.ID, "room", client.RoomSlug)
+}
+
+// handleWebcamVisibility lets a participant quickly hide/show their active
+// webcam tile without renegotiating the publisher/subscriber peer connections.
+func (h *WebSocketHandler) handleWebcamVisibility(client *websocket.Client, payload json.RawMessage) {
+	var data struct {
+		Visible bool `json:"visible"`
+	}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		return
+	}
+	h.sfu.SetWebcamVisible(client.RoomSlug, client.ID, data.Visible)
+	h.hub.BroadcastJSON(client.RoomSlug, "webcam:visibility", map[string]interface{}{
+		"participantId": client.ID,
+		"visible":       data.Visible,
+	}, "")
 }
 
 // forwardWebcamTrack forwards a participant's webcam presence track to all other

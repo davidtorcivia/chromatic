@@ -286,6 +286,53 @@ func TestSFU_WebcamDisableGate(t *testing.T) {
 	}
 }
 
+func TestSFU_WebcamVisibilityState(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "cam-hidden-room"
+	room := sfu.GetRoomTracks(roomSlug)
+	pid := "p1"
+
+	sfu.SetWebcamVisible(roomSlug, pid, false)
+	if got := sfu.HiddenWebcamParticipantIDs(roomSlug); len(got) != 0 {
+		t.Fatalf("hidden list should ignore participants without an active relay, got %v", got)
+	}
+
+	localTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
+		"webcam-p1",
+		"webcam-stream-p1",
+	)
+	if err != nil {
+		t.Fatalf("failed to create webcam track: %v", err)
+	}
+	room.mu.Lock()
+	room.WebcamLocalTracks = map[string]*webrtc.TrackLocalStaticRTP{pid: localTrack}
+	room.mu.Unlock()
+
+	sfu.SetWebcamVisible(roomSlug, pid, false)
+	got := sfu.HiddenWebcamParticipantIDs(roomSlug)
+	if len(got) != 1 || got[0] != pid {
+		t.Fatalf("expected active hidden webcam %q, got %v", pid, got)
+	}
+
+	sfu.SetWebcamVisible(roomSlug, pid, true)
+	if got := sfu.HiddenWebcamParticipantIDs(roomSlug); len(got) != 0 {
+		t.Fatalf("visible webcam should not be reported hidden, got %v", got)
+	}
+
+	sfu.SetWebcamVisible(roomSlug, pid, false)
+	sfu.RemoveWebcamTrack(roomSlug, pid)
+	if got := sfu.HiddenWebcamParticipantIDs(roomSlug); len(got) != 0 {
+		t.Fatalf("stopped webcam should clear hidden state, got %v", got)
+	}
+}
+
 func TestSFU_GetRoomTracksForSlug(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)

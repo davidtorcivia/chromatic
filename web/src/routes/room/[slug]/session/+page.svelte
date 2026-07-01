@@ -217,11 +217,13 @@
     // the device preference persists. Remote cam streams keyed by participant id
     // (reassigned for reactivity, mirroring speakingParticipants).
     let isCameraOn = $state(false);
+    let isSelfCamHidden = $state(false);
     let cameraPending = $state(false);
     let selfCamStream = $state<MediaStream | null>(null);
     let activeCameraId = $state<string | null>(null);
     let videoInputs = $state<MediaDeviceInfo[]>([]);
     let remoteCamStreams = $state<Map<string, MediaStream>>(new Map());
+    let hiddenCamIds = $state<Set<string>>(new Set());
     // One-time "turn on your camera?" nudge after the mic is enabled. Dismissed
     // permanently (for the session) once the user acts on it or turns the cam on.
     let camNudgeDismissed = $state(false);
@@ -517,6 +519,7 @@
                     if (isCameraOn) {
                         webrtcManager?.stopWebcam();
                         isCameraOn = false;
+                        isSelfCamHidden = false;
                     } else {
                         webrtcManager?.cancelCameraPreview();
                     }
@@ -670,6 +673,15 @@
             if (data?.participantId) removeRemoteCam(data.participantId);
         });
 
+        session.onMessage("webcam:visibility", (payload: unknown) => {
+            const data = payload as { participantId?: string; visible?: boolean };
+            if (!data?.participantId) return;
+            const next = new Set(hiddenCamIds);
+            if (data.visible === false) next.add(data.participantId);
+            else next.delete(data.participantId);
+            hiddenCamIds = next;
+        });
+
         // Chat handlers live here (always active) rather than in ChatPanel,
         // which is conditionally rendered — otherwise history/messages
         // arriving before the panel is first opened would be missed.
@@ -750,8 +762,10 @@
             // re-arrive in the fresh subscriber offer; the user re-enables their
             // own cam if they want it back (parity with screen share resetting).
             isCameraOn = false;
+            isSelfCamHidden = false;
             selfCamStream = null;
             remoteCamStreams = new Map();
+            hiddenCamIds = new Set();
             streamPaused = false;
             streamError = null;
         });
@@ -876,6 +890,7 @@
                 // Local cam capture died (device unplugged / OS revoked) — reset
                 // the UI so it doesn't show "Cam On" over a frozen self-view.
                 isCameraOn = false;
+                isSelfCamHidden = false;
                 selfCamStream = null;
             },
             sendSignal: (type, payload) => session.send(type, payload),
@@ -1417,12 +1432,30 @@
 
     function removeRemoteCam(participantId: string, only?: MediaStream) {
         const current = remoteCamStreams.get(participantId);
-        if (!current) return;
+        const hadHiddenState = hiddenCamIds.has(participantId);
+        if (!current && !hadHiddenState) return;
         // Guard against a stale end-event for a track that was already replaced.
         if (only && current !== only) return;
         const next = new Map(remoteCamStreams);
         next.delete(participantId);
         remoteCamStreams = next;
+        if (hadHiddenState) {
+            const hidden = new Set(hiddenCamIds);
+            hidden.delete(participantId);
+            hiddenCamIds = hidden;
+        }
+    }
+
+    function toggleSelfCamVisibility() {
+        camNudgeDismissed = true;
+        if (!webrtcManager || cameraPending || myCamDisabled) return;
+        if (!isCameraOn) {
+            void toggleCamera();
+            return;
+        }
+        const nextHidden = !isSelfCamHidden;
+        isSelfCamHidden = nextHidden;
+        webrtcManager.setWebcamVisible(!nextHidden);
     }
 
     function cleanupParticipantVoice(participantId: string) {
@@ -1525,6 +1558,7 @@
             }
             if (ok) {
                 isCameraOn = true;
+                isSelfCamHidden = false;
                 selfCamStream = manager.getCameraStream();
                 activeCameraId = manager.getCurrentCameraDeviceId();
                 showCameraModal = false;
@@ -1547,6 +1581,7 @@
             if (isCameraOn) {
                 manager.stopWebcam();
                 isCameraOn = false;
+                isSelfCamHidden = false;
                 selfCamStream = null;
                 return;
             }
@@ -1560,6 +1595,7 @@
             }
             if (ok) {
                 isCameraOn = true;
+                isSelfCamHidden = false;
                 selfCamStream = manager.getCameraStream();
                 activeCameraId = manager.getCurrentCameraDeviceId();
                 // Labels become available after the first successful capture.
@@ -1858,8 +1894,10 @@
         // so nothing is left frozen/desynced.
         webrtcManager?.cancelCameraPreview();
         isCameraOn = false;
+        isSelfCamHidden = false;
         selfCamStream = null;
         remoteCamStreams = new Map();
+        hiddenCamIds = new Set();
         if (webrtcManager) {
             webrtcManager.close();
             webrtcManager = null;
@@ -2524,7 +2562,8 @@
     let participants = $derived(roomState?.participants || []);
     // True when anyone (self or remote) has a cam on — gates the cam-strip
     // sizing and the hide toggle.
-    let anyCamActive = $derived(isCameraOn || remoteCamStreams.size > 0);
+    let anyCamActive = $derived(isCameraOn || !!selfCamStream || remoteCamStreams.size > 0);
+    let showCamStrip = $derived(anyCamActive);
     // True when an admin has gated this user's own camera off.
     let myCamDisabled = $derived(camDisabledIds.has(sessionData?.participantId ?? ""));
     // One-time nudge to turn the camera on, shown after the mic is live (cams are
@@ -2947,10 +2986,9 @@
         </div>
     {/snippet}
 
-    <!-- Phone "More" bottom sheet: secondary tools + the full settings panel,
-         collapsed off the cramped control bar. Top-level overlay (z-index honored
-         against the other overlays); only reachable on phones (More button hidden
-         elsewhere). -->
+    <!-- More controls: secondary tools + the full settings panel, collapsed off
+         cramped control bars. Top-level overlay (z-index honored against the
+         other overlays). -->
     {#if showMoreSheet}
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
@@ -2998,7 +3036,7 @@
                         <span>Scopes</span>
                     </button>
                     <button
-                        class="more-tool"
+                        class="more-tool phone-hidden"
                         class:active={screenShareActive}
                         disabled={isScreenShareDisabled}
                         onclick={() => { toggleScreenShare(); showMoreSheet = false; }}
@@ -3397,13 +3435,13 @@
              the video beside chat (chat also stacks above it). pointer-events:
              none so it never blocks the laser/loupe on the video beneath; only
              the hide button is live. -->
-        {#if anyCamActive}
+        {#if showCamStrip}
             <div class="cam-float" class:flush={!isControlsVisible} class:chat-open={isChatOpen}>
                 {#each participants.slice(0, 12) as p (p.id)}
                     {@const isSelf = p.id === sessionData?.participantId}
                     {@const camStream = isSelf
-                        ? (isCameraOn ? selfCamStream : null)
-                        : (remoteCamStreams.get(p.id) ?? null)}
+                        ? (isCameraOn && !isSelfCamHidden ? selfCamStream : null)
+                        : (hiddenCamIds.has(p.id) ? null : (remoteCamStreams.get(p.id) ?? null))}
                     <div class="cam-float-tile">
                         <div
                             class="cam-float-circle"
@@ -3438,12 +3476,12 @@
                      the control-bar Camera button's job). -->
                 <button
                     class="cam-hide-btn cam-float-hide"
-                    onclick={() => toggleCamera()}
+                    onclick={toggleSelfCamVisibility}
                     disabled={cameraPending || myCamDisabled}
-                    aria-label={isCameraOn ? "Turn my camera off" : "Turn my camera on"}
-                    title={myCamDisabled ? "Camera disabled by host" : isCameraOn ? "Turn my camera off" : "Turn my camera on"}
+                    aria-label={isCameraOn && !isSelfCamHidden ? "Hide my camera" : "Show my camera"}
+                    title={myCamDisabled ? "Camera disabled by host" : isCameraOn && !isSelfCamHidden ? "Hide my camera" : "Show my camera"}
                 >
-                    {#if isCameraOn}
+                    {#if isCameraOn && !isSelfCamHidden}
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
                     {:else}
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><line x1="2" x2="22" y1="2" y2="22"/><path d="M10.66 5H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"/><path d="M16 16a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/></svg>
@@ -3610,7 +3648,7 @@
                                 <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
                             {/if}
                         </svg>
-                        <span class="control-label">{isMuted ? "Stream Muted" : "Stream Audio"}</span>
+                        <span class="control-label">Stream</span>
                     </button>
 
                     <button
@@ -3683,7 +3721,7 @@
                     </button>
 
                     <button
-                        class="control-btn secondary-tool"
+                        class="control-btn secondary-tool compact-keep"
                         style="--stagger: 90ms"
                         class:active={isLoupeEnabled}
                         onclick={toggleLoupe}
@@ -3715,7 +3753,7 @@
                     <span class="bar-divider" aria-hidden="true"></span>
 
                     <button
-                        class="control-btn secondary-tool"
+                        class="control-btn secondary-tool compact-keep"
                         style="--stagger: 126ms"
                         class:active={screenShareActive}
                         class:requesting={screenShareRequested}
@@ -3920,7 +3958,7 @@
         {/if}
 
         <!-- Active speaker indicator (always visible when someone is speaking) -->
-        {#if activeSpeakers.length > 0 && !showParticipantList}
+        {#if activeSpeakers.length > 0 && !showParticipantList && !showCamStrip}
             <div class="active-speaker-indicator">
                 {#each activeSpeakers as speaker (speaker.id)}
                     <div class="active-speaker-chip">
@@ -4678,7 +4716,8 @@
         width: 100%;
         height: 100%;
         object-fit: cover;
-        border-radius: 50%;
+        border-radius: inherit;
+        clip-path: circle(50% at 50% 50%);
         display: block;
     }
     .cam-video.mirror {
@@ -5952,51 +5991,45 @@
         flex-shrink: 0;
     }
 
-    /* Phone "More" sheet (trigger hidden on desktop; shown via the phone media
-       query below). The sheet holds the secondary tools + the full settings
-       panel so the control bar can stay a short primary row on a phone. */
+    /* "More" sheet. It holds secondary tools + the full settings panel so
+       compact control bars can stay one short row. */
     .more-btn { display: none; }
     .more-sheet-backdrop {
         position: fixed;
         inset: 0;
         z-index: 55;
         display: flex;
-        align-items: flex-end;
+        align-items: center;
         justify-content: center;
+        padding: var(--space-lg);
         background: rgba(0, 0, 0, 0.45);
         /* It lives inside .controls-overlay (pointer-events:none); take taps. */
         pointer-events: auto;
     }
     .more-sheet {
-        width: 100%;
+        width: min(540px, calc(100vw - 2 * var(--space-lg)));
         max-width: 540px;
-        max-height: 85dvh;
+        max-height: calc(100dvh - 2 * var(--space-lg));
         overflow-y: auto;
         -webkit-overflow-scrolling: touch;
         display: flex;
         flex-direction: column;
         gap: var(--space-md);
-        padding: 10px var(--space-lg) calc(var(--space-lg) + env(safe-area-inset-bottom, 0px));
-        border-radius: 20px 20px 0 0;
+        padding: var(--space-lg);
+        border-radius: 20px;
         background:
             linear-gradient(to bottom, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0) 72px),
             var(--glass-bg-deep);
         border: 1px solid var(--glass-edge);
-        border-bottom: none;
-        box-shadow: var(--glass-specular), 0 -12px 48px rgba(0, 0, 0, 0.5);
+        box-shadow: var(--glass-specular), 0 18px 56px rgba(0, 0, 0, 0.5);
         color: var(--color-text);
     }
     .more-sheet-handle {
-        align-self: center;
-        width: 40px;
-        height: 4px;
-        border-radius: 2px;
-        background: rgba(255, 255, 255, 0.25);
-        flex-shrink: 0;
+        display: none;
     }
     .more-tools {
         display: grid;
-        grid-template-columns: repeat(4, 1fr);
+        grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
         gap: var(--space-sm);
     }
     .more-tool {
@@ -6332,6 +6365,7 @@
             right: var(--space-sm);
         }
         .presence-row { display: none; }
+        .more-tool.phone-hidden { display: none; }
         /* Chat is a bottom sheet here (not a right panel), so the cam strip
            needs no horizontal offset — undo the desktop chat shift. */
         .cam-float.chat-open { right: 16px; }
@@ -6372,7 +6406,7 @@
        remaining primary buttons, so the bar stays one short row in the video
        column with the chat entry field always clear. */
     @container (max-width: 1100px) {
-        .session-page.chat-open .control-btn.secondary-tool,
+        .session-page.chat-open .control-btn.secondary-tool:not(.compact-keep),
         .session-page.chat-open .control-btn.desktop-only,
         .session-page.chat-open .bar-divider { display: none; }
         .session-page.chat-open .more-btn { display: flex; }
@@ -6385,7 +6419,7 @@
         .session-page.chat-open .control-btn { min-width: 44px; padding: 6px 8px; }
     }
     @media (min-width: 769px) and (max-width: 1150px) {
-        .session-page.chat-open .control-btn.secondary-tool,
+        .session-page.chat-open .control-btn.secondary-tool:not(.compact-keep),
         .session-page.chat-open .control-btn.desktop-only,
         .session-page.chat-open .bar-divider { display: none; }
         .session-page.chat-open .more-btn { display: flex; }

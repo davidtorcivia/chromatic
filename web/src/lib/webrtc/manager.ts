@@ -80,6 +80,8 @@ function camConstraints(deviceId?: string | null, exact = false): MediaTrackCons
     return constraints;
 }
 
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 export interface MicConstraintOptions {
     deviceId?: string | null;
     exact?: boolean;
@@ -1699,6 +1701,13 @@ export class WebRTCManager {
         return this.cameraStream;
     }
 
+    setWebcamVisible(visible: boolean): void {
+        const track = this.cameraStream?.getVideoTracks()[0];
+        if (!track || track.readyState !== 'live') return;
+        track.enabled = visible;
+        this.sendSignal('webcam:visibility', { visible });
+    }
+
     getCurrentCameraDeviceId(): string | null {
         const track = this.cameraStream?.getVideoTracks()[0];
         try {
@@ -1753,10 +1762,28 @@ export class WebRTCManager {
         this.cameraOpenPromise = (async () => {
             try {
                 const preferred = deviceId ?? getStoredCameraDeviceId();
-                const stream = await navigator.mediaDevices.getUserMedia({
-                    video: camConstraints(preferred),
-                    audio: false
-                });
+                let stream: MediaStream;
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        video: camConstraints(preferred),
+                        audio: false
+                    });
+                } catch (err) {
+                    const name = (err as { name?: string })?.name ?? '';
+                    const shouldRetryDefault = !!preferred && (
+                        name === 'NotReadableError' ||
+                        name === 'AbortError' ||
+                        name === 'OverconstrainedError' ||
+                        name === 'NotFoundError'
+                    );
+                    if (!shouldRetryDefault) throw err;
+                    storeCameraDeviceId(null);
+                    await sleep(250);
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        video: camConstraints(null),
+                        audio: false
+                    });
+                }
                 if (this.isClosed()) {
                     this.stopStream(stream);
                     return null;
@@ -1798,6 +1825,7 @@ export class WebRTCManager {
                 }
             }
             const videoTrack = this.cameraStream!.getVideoTracks()[0];
+            videoTrack.enabled = true;
             // Announce the cam track id BEFORE negotiating so the server maps
             // the incoming video track to the webcam path (not screen share).
             this.sendSignal('webcam:start', { trackId: videoTrack.id });

@@ -286,6 +286,7 @@ export function createSessionStore() {
                     isLive: boolean;
                     iceServers: RTCIceServer[];
                     screenShare?: { participantId: string; name: string } | null;
+                    hiddenWebcams?: string[] | null;
                 };
                 state.room = {
                     slug: roomState.room.slug,
@@ -311,6 +312,11 @@ export function createSessionStore() {
                 // Emit screen share state for late joiners
                 if (roomState.screenShare) {
                     messageHandlers.get('screenshare:started')?.forEach(h => h(roomState.screenShare));
+                }
+                // Emit hidden webcam state for late joiners/reconnects. Live
+                // changes use the same websocket message directly.
+                for (const participantId of roomState.hiddenWebcams ?? []) {
+                    messageHandlers.get('webcam:visibility')?.forEach(h => h({ participantId, visible: false }));
                 }
                 break;
 
