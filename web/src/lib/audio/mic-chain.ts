@@ -71,8 +71,8 @@ export async function createMicChain(
         highpass.Q.value = 0.7;
 
         // Optional neural denoiser between the high-pass and the gate. If the
-        // engine is unimplemented or fails to load, createDenoiser returns null
-        // and we run HPF -> gate alone; the caller then keeps native NS.
+        // engine fails to load, createDenoiser returns null so the caller can
+        // discard this chain and reacquire with native browser suppression.
         let denoiser: Denoiser | null = null;
         if (opts.denoiser !== 'off') {
             denoiser = await createDenoiser(ctx, opts.denoiser);

@@ -18,8 +18,8 @@
 export type AudioMode = 'talkback' | 'studio';
 
 // Which noise-reduction engine the talkback path uses. 'rnnoise' is the
-// ultra-low-latency neural denoiser; 'off' disables in-app noise reduction
-// (the browser's native noise suppression is used instead).
+// ultra-low-latency neural denoiser; 'off' bypasses in-app mic processing so
+// the captured talkback mic is not denoised or gated.
 export type DenoiserEngine = 'rnnoise' | 'off';
 
 export interface AudioModeState {

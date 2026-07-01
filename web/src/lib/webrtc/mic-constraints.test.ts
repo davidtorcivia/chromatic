@@ -10,7 +10,7 @@ describe('micConstraints', () => {
     it('talkback keeps native EC (system-preferred) and AGC, and passes NS through', () => {
         const off = micConstraints({ mode: 'talkback', studioHeadphones: false, noiseSuppression: false });
         expect(off.echoCancellation).toBe(true);
-        expect(off.noiseSuppression).toBe(false); // RNNoise handling, or user chose off
+        expect(off.noiseSuppression).toBe(false); // RNNoise handling, or true off
         expect(off.autoGainControl).toBe(true);
         expect(asRec(off).echoCancellationType).toEqual({ ideal: 'system' });
 

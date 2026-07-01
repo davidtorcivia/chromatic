@@ -1008,18 +1008,18 @@ export class WebRTCManager {
         return false;
     }
 
-    // Routes a fresh mic capture through the mode-aware cleanup chain (high-pass
-    // + optional denoiser + soft gate in talkback; bypassed entirely in studio),
-    // falls back to the raw capture on any failure, and applies the current mute
-    // state to whichever stream will be sent. `useDenoiser` is false on the
-    // native-NS fallback attempt so RNNoise and native NS never stack.
+    // Routes a fresh mic capture through the RNNoise cleanup chain only when
+    // that engine is active. "Noise reduction off" and the native-NS fallback
+    // send the capture directly, avoiding the in-app gate on quiet Mac mics.
     private async installMicStream(raw: MediaStream, useDenoiser: boolean): Promise<void> {
         this.disposeMicChain();
         this.rawMicStream = raw;
-        this.micChain = await createMicChain(raw, {
-            mode: this.audioMode,
-            denoiser: useDenoiser ? this.denoiserEngine : 'off'
-        });
+        this.micChain = useDenoiser
+            ? await createMicChain(raw, {
+                    mode: this.audioMode,
+                    denoiser: this.denoiserEngine
+                })
+            : null;
         if (this.isClosed()) {
             this.disposeMicChain();
             this.stopStream(raw);
