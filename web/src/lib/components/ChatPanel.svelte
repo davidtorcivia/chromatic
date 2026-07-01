@@ -1330,7 +1330,9 @@
             bottom: var(--keyboard-inset, 0px);
             left: 0;
             right: 0;
-            width: 100%;
+            width: 100dvw;
+            max-width: 100dvw;
+            box-sizing: border-box;
             /* Taller sheet (a 50% sheet is a slit in landscape); dvh so Safari's
                toolbar collapse doesn't change it. */
             height: min(70dvh, 560px);
@@ -1346,6 +1348,55 @@
         }
         .chat-inner {
             width: 100%;
+            min-width: 0;
+            flex: 1 1 auto;
+            margin-left: 0;
+        }
+        .chat-header,
+        .chat-messages,
+        .chat-input-container,
+        .typing-row,
+        .upload-chip {
+            width: 100%;
+            box-sizing: border-box;
+        }
+        .chat-messages {
+            padding-left: var(--space-sm);
+            padding-right: var(--space-sm);
+        }
+        .chat-message,
+        .chat-message-body,
+        .chat-message-content,
+        .chat-message-file,
+        .chat-message-file a,
+        .chat-message-file .file-link {
+            width: 100%;
+            max-width: 100%;
+            box-sizing: border-box;
+        }
+        .chat-message:not(.own) .chat-message-body {
+            padding-left: 0;
+        }
+        .chat-message.own .chat-message-body {
+            margin-left: 0;
+            margin-right: 0;
+            width: 100%;
+            max-width: 100%;
+        }
+        .chat-message-file img {
+            width: 100%;
+            max-width: 100%;
+            height: auto;
+            max-height: 42dvh;
+            object-fit: contain;
+        }
+        .chat-message-file :global(.audio-msg) {
+            width: 100%;
+            box-sizing: border-box;
+        }
+        .chat-input-pill {
+            width: 100%;
+            box-sizing: border-box;
         }
     }
 </style>

@@ -3452,17 +3452,19 @@
                             title="{p.name}{isSelf ? ' (you)' : ''}"
                         >
                             {#if camStream}
-                                <!-- svelte-ignore a11y_media_has_caption -->
-                                <video
-                                    class="cam-video"
-                                    class:mirror={isSelf}
-                                    use:bindStream={camStream}
-                                    muted
-                                    autoplay
-                                    playsinline
-                                ></video>
+                                <span class="cam-video-clip" aria-hidden="true">
+                                    <!-- svelte-ignore a11y_media_has_caption -->
+                                    <video
+                                        class="cam-video"
+                                        class:mirror={isSelf}
+                                        use:bindStream={camStream}
+                                        muted
+                                        autoplay
+                                        playsinline
+                                    ></video>
+                                </span>
                             {:else}
-                                {p.name.charAt(0).toUpperCase()}
+                                <span class="cam-initial">{p.name.charAt(0).toUpperCase()}</span>
                             {/if}
                         </div>
                         <span class="cam-float-name">{isSelf ? "You" : p.name}</span>
@@ -4712,14 +4714,25 @@
         color: var(--color-text-muted);
     }
 
+    .cam-video-clip {
+        position: absolute;
+        inset: 0;
+        z-index: 1;
+        display: block;
+        border-radius: 50%;
+        overflow: hidden;
+        clip-path: circle(50% at 50% 50%);
+        contain: paint;
+        background: rgba(8, 8, 11, 0.85);
+    }
     .cam-video {
         position: absolute;
         inset: 0;
         width: 100%;
         height: 100%;
         object-fit: cover;
-        border-radius: 50%;
-        clip-path: inset(0 round 999px);
+        border-radius: 0;
+        clip-path: none;
         display: block;
     }
     .cam-video.mirror {
@@ -4801,6 +4814,7 @@
     }
     .cam-float-circle {
         position: relative;
+        isolation: isolate;
         width: 3.9rem;
         height: 3.9rem;
         flex: 0 0 3.9rem;
@@ -4821,6 +4835,7 @@
         content: "";
         position: absolute;
         inset: 0;
+        z-index: 0;
         border-radius: 50%;
         /* Glass-framed avatar: the participant color sits under a soft glass
            rim + inner highlight rather than a hard black ring, so it reads as
@@ -4834,6 +4849,7 @@
         content: "";
         position: absolute;
         inset: -2px;
+        z-index: 2;
         border-radius: 50%;
         opacity: 0;
         box-shadow:
@@ -4855,6 +4871,10 @@
     }
     .cam-float-circle.muted {
         opacity: 0.7;
+    }
+    .cam-initial {
+        position: relative;
+        z-index: 1;
     }
     .cam-float-name {
         max-width: 4.25rem;
