@@ -4114,6 +4114,11 @@
 
     .video-wrapper {
         flex: 1;
+        /* Without min-width:0 a flex item won't shrink below its content size, so
+           opening the in-flow chat panel didn't actually narrow the video column
+           — the control bar / status stayed full-width and spilled under the chat.
+           This lets the column (and the controls-overlay inset into it) shrink. */
+        min-width: 0;
         position: relative;
         display: flex;
         align-items: center;
@@ -6361,24 +6366,26 @@
     }
 
     /* Chat open steals ~320px from the video column. On a constrained (but still
-       desktop-layout, >768px) window that can push the control bar toward the
-       chat. Rather than wrap to an ugly second row, SHRINK the bar so it stays a
-       single row inside the video area and the chat entry field stays clear.
-       Two tiers: compact buttons first, then icon-only when very tight. */
-    @media (min-width: 769px) and (max-width: 1100px) {
-        .session-page.chat-open .control-bar { gap: 5px; padding: 6px; }
-        .session-page.chat-open .control-btn { min-width: 50px; padding: 7px 10px; }
-        .session-page.chat-open .control-btn svg { width: 19px; height: 19px; }
-        .session-page.chat-open .control-label { font-size: 0.5625rem; }
-        /* "Stream Audio/Muted" is the widest label; drop it first (state still
-           reads via the dot/colour + tooltip). */
-        .session-page.chat-open .program-audio-btn .control-label { display: none; }
+       desktop-layout, >768px) window the full 12-button bar can't fit the
+       narrowed column and spills under the chat. Collapse the secondary tools
+       into the "More" sheet (exactly as the phone layout does) and tighten the
+       remaining primary buttons, so the bar stays one short row in the video
+       column with the chat entry field always clear. */
+    @media (min-width: 769px) and (max-width: 1150px) {
+        .session-page.chat-open .control-btn.secondary-tool,
+        .session-page.chat-open .control-btn.desktop-only,
         .session-page.chat-open .bar-divider { display: none; }
+        .session-page.chat-open .more-btn { display: flex; }
+        .session-page.chat-open .control-bar { gap: 5px; padding: 6px; }
+        .session-page.chat-open .control-btn { min-width: 50px; padding: 7px 9px; }
+        .session-page.chat-open .control-btn svg { width: 20px; height: 20px; }
+        /* "Stream Audio/Muted" is the widest label; drop it (state still reads
+           via the dot/colour + tooltip). */
+        .session-page.chat-open .program-audio-btn .control-label { display: none; }
     }
-    @media (min-width: 769px) and (max-width: 920px) {
-        /* Very tight: icon-only so ~9 buttons still fit one row beside chat. */
+    @media (min-width: 769px) and (max-width: 900px) {
+        /* Very tight: icon-only on the remaining primaries. */
         .session-page.chat-open .control-label { display: none; }
         .session-page.chat-open .control-btn { min-width: 44px; padding: 6px 8px; }
-        .session-page.chat-open .control-btn svg { width: 18px; height: 18px; }
     }
 </style>
