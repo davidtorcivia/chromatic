@@ -6371,7 +6371,7 @@
        into the "More" sheet (exactly as the phone layout does) and tighten the
        remaining primary buttons, so the bar stays one short row in the video
        column with the chat entry field always clear. */
-    @container (max-width: 980px) {
+    @container (max-width: 1100px) {
         .session-page.chat-open .control-btn.secondary-tool,
         .session-page.chat-open .control-btn.desktop-only,
         .session-page.chat-open .bar-divider { display: none; }
@@ -6379,11 +6379,8 @@
         .session-page.chat-open .control-bar { gap: 5px; padding: 6px; }
         .session-page.chat-open .control-btn { min-width: 50px; padding: 7px 9px; }
         .session-page.chat-open .control-btn svg { width: 20px; height: 20px; }
-        /* "Stream Audio/Muted" is the widest label; drop it (state still reads
-           via the dot/colour + tooltip). */
-        .session-page.chat-open .program-audio-btn .control-label { display: none; }
     }
-    @container (max-width: 680px) {
+    @container (max-width: 760px) {
         .session-page.chat-open .control-label { display: none; }
         .session-page.chat-open .control-btn { min-width: 44px; padding: 6px 8px; }
     }
@@ -6395,9 +6392,6 @@
         .session-page.chat-open .control-bar { gap: 5px; padding: 6px; }
         .session-page.chat-open .control-btn { min-width: 50px; padding: 7px 9px; }
         .session-page.chat-open .control-btn svg { width: 20px; height: 20px; }
-        /* "Stream Audio/Muted" is the widest label; drop it (state still reads
-           via the dot/colour + tooltip). */
-        .session-page.chat-open .program-audio-btn .control-label { display: none; }
     }
     @media (min-width: 769px) and (max-width: 900px) {
         /* Very tight: icon-only on the remaining primaries. */
