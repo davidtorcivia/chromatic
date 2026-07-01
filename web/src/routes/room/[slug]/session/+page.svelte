@@ -1715,6 +1715,172 @@
         };
     }
 
+    type CanvasStreamOptions = {
+        stream: MediaStream | null;
+        mirror?: boolean;
+    };
+
+    // Floating webcam pills render through canvas instead of a visible <video>.
+    // That avoids Windows/browser video-overlay paths that can ignore CSS clips.
+    function bindCanvasStream(node: HTMLCanvasElement, options: CanvasStreamOptions) {
+        const video = document.createElement("video");
+        video.muted = true;
+        video.autoplay = true;
+        video.playsInline = true;
+
+        let current: MediaStream | null = null;
+        let watched: MediaStream | null = null;
+        let raf: number | null = null;
+        let mirror = options.mirror ?? false;
+        let destroyedCanvas = false;
+        const ctx = node.getContext("2d", { alpha: true });
+        const trackListeners: MediaStreamTrack[] = [];
+
+        const clearCanvas = () => {
+            if (!ctx) return;
+            ctx.clearRect(0, 0, node.width, node.height);
+        };
+
+        const tryPlay = () => void video.play().catch(() => {});
+        const onLoaded = () => {
+            tryPlay();
+            scheduleDraw();
+        };
+        const onUnmute = () => {
+            tryPlay();
+            scheduleDraw();
+        };
+
+        const detachTracks = () => {
+            for (const t of trackListeners) t.removeEventListener("unmute", onUnmute);
+            trackListeners.length = 0;
+        };
+
+        const attachTracks = (s: MediaStream) => {
+            for (const t of s.getVideoTracks()) {
+                t.addEventListener("unmute", onUnmute);
+                trackListeners.push(t);
+            }
+        };
+
+        const onAddTrack = () => {
+            if (!watched) return;
+            detachTracks();
+            attachTracks(watched);
+            tryPlay();
+            scheduleDraw();
+        };
+
+        const ensureCanvasSize = () => {
+            const rect = node.getBoundingClientRect();
+            const dpr = Math.min(window.devicePixelRatio || 1, 2);
+            const width = Math.max(1, Math.round((rect.width || 64) * dpr));
+            const height = Math.max(1, Math.round((rect.height || 64) * dpr));
+            if (node.width !== width) node.width = width;
+            if (node.height !== height) node.height = height;
+        };
+
+        const drawFrame = () => {
+            raf = null;
+            if (destroyedCanvas || !current || !ctx) return;
+            scheduleDraw();
+            if (
+                video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+                !video.videoWidth ||
+                !video.videoHeight
+            ) {
+                return;
+            }
+
+            ensureCanvasSize();
+            const w = node.width;
+            const h = node.height;
+            if (!w || !h) return;
+
+            const canvasAspect = w / h;
+            const videoAspect = video.videoWidth / video.videoHeight;
+            let sx = 0;
+            let sy = 0;
+            let sw = video.videoWidth;
+            let sh = video.videoHeight;
+            if (videoAspect > canvasAspect) {
+                sw = video.videoHeight * canvasAspect;
+                sx = (video.videoWidth - sw) / 2;
+            } else {
+                sh = video.videoWidth / canvasAspect;
+                sy = (video.videoHeight - sh) / 2;
+            }
+
+            ctx.clearRect(0, 0, w, h);
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(w / 2, h / 2, Math.min(w, h) / 2, 0, Math.PI * 2);
+            ctx.clip();
+            if (mirror) {
+                ctx.translate(w, 0);
+                ctx.scale(-1, 1);
+            }
+            ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
+            ctx.restore();
+        };
+
+        function scheduleDraw() {
+            if (destroyedCanvas || raf !== null || !current) return;
+            raf = requestAnimationFrame(drawFrame);
+        }
+
+        const apply = (next: CanvasStreamOptions) => {
+            mirror = next.mirror ?? false;
+            const nextStream = next.stream;
+            if (current === nextStream) {
+                scheduleDraw();
+                return;
+            }
+
+            if (raf !== null) {
+                cancelAnimationFrame(raf);
+                raf = null;
+            }
+            detachTracks();
+            if (watched) {
+                watched.removeEventListener("addtrack", onAddTrack);
+                watched = null;
+            }
+
+            current = nextStream;
+            video.srcObject = nextStream;
+            if (!nextStream) {
+                clearCanvas();
+                return;
+            }
+
+            watched = nextStream;
+            nextStream.addEventListener("addtrack", onAddTrack);
+            attachTracks(nextStream);
+            tryPlay();
+            scheduleDraw();
+        };
+
+        video.addEventListener("loadeddata", onLoaded);
+        apply(options);
+
+        return {
+            update: apply,
+            destroy() {
+                destroyedCanvas = true;
+                if (raf !== null) cancelAnimationFrame(raf);
+                video.removeEventListener("loadeddata", onLoaded);
+                detachTracks();
+                if (watched) watched.removeEventListener("addtrack", onAddTrack);
+                video.pause();
+                video.srcObject = null;
+                current = null;
+                watched = null;
+                clearCanvas();
+            },
+        };
+    }
+
     function toggleScreenShare() {
         if (screenShareActive) {
             // Stop sharing
@@ -3452,15 +3618,10 @@
                         >
                             {#if camStream}
                                 <span class="cam-video-clip" aria-hidden="true">
-                                    <!-- svelte-ignore a11y_media_has_caption -->
-                                    <video
-                                        class="cam-video"
-                                        class:mirror={isSelf}
-                                        use:bindStream={camStream}
-                                        muted
-                                        autoplay
-                                        playsinline
-                                    ></video>
+                                    <canvas
+                                        class="cam-video-canvas"
+                                        use:bindCanvasStream={{ stream: camStream, mirror: isSelf }}
+                                    ></canvas>
                                 </span>
                             {:else}
                                 <span class="cam-initial">{p.name.charAt(0).toUpperCase()}</span>
@@ -4729,18 +4890,13 @@
         contain: paint;
         background: rgba(8, 8, 11, 0.85);
     }
-    .cam-video {
+    .cam-video-canvas {
         position: absolute;
         inset: 0;
         width: 100%;
         height: 100%;
-        object-fit: cover;
-        border-radius: 0;
-        clip-path: none;
+        border-radius: 50%;
         display: block;
-    }
-    .cam-video.mirror {
-        transform: scaleX(-1);
     }
     .cam-hide-btn {
         display: inline-flex;
