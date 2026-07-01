@@ -4119,6 +4119,7 @@
            — the control bar / status stayed full-width and spilled under the chat.
            This lets the column (and the controls-overlay inset into it) shrink. */
         min-width: 0;
+        container-type: inline-size;
         position: relative;
         display: flex;
         align-items: center;
@@ -5068,10 +5069,10 @@
         justify-content: flex-end;
         gap: var(--space-sm);
         justify-self: end;
-        /* Shrink/wrap the LIVE + signal + latency cluster rather than pushing it
-           out of the video column and over the chat. */
+        /* Shrink instead of pushing out of the video column and over the chat. */
         min-width: 0;
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
+        overflow: hidden;
     }
 
     .live-pill {
@@ -5304,6 +5305,8 @@
     .control-bar {
         display: flex;
         gap: 8px;
+        flex-wrap: nowrap;
+        max-width: 100%;
         border: 1px solid var(--glass-edge);
         padding: 8px;
         border-radius: 20px;
@@ -6309,10 +6312,7 @@
     @media (max-width: 768px), (orientation: landscape) and (max-height: 480px) and (pointer: coarse) {
         .session-page { flex-direction: column; }
         .video-wrapper { flex: 1; min-height: 0; }
-        /* Wrap as a safety net: on a very narrow phone (<=360px) the 7 primary
-           buttons fall to a second centered row rather than clipping Mic/Leave
-           off the edges. */
-        .control-bar { gap: 4px; padding: var(--space-xs) var(--space-sm); flex-wrap: wrap; justify-content: center; }
+        .control-bar { gap: 4px; padding: var(--space-xs) var(--space-sm); justify-content: center; }
         .control-btn { padding: 8px 10px; min-width: 52px; }
         .control-btn svg { width: 20px; height: 20px; }
         .control-label { font-size: 0.5625rem; }
@@ -6371,6 +6371,22 @@
        into the "More" sheet (exactly as the phone layout does) and tighten the
        remaining primary buttons, so the bar stays one short row in the video
        column with the chat entry field always clear. */
+    @container (max-width: 980px) {
+        .session-page.chat-open .control-btn.secondary-tool,
+        .session-page.chat-open .control-btn.desktop-only,
+        .session-page.chat-open .bar-divider { display: none; }
+        .session-page.chat-open .more-btn { display: flex; }
+        .session-page.chat-open .control-bar { gap: 5px; padding: 6px; }
+        .session-page.chat-open .control-btn { min-width: 50px; padding: 7px 9px; }
+        .session-page.chat-open .control-btn svg { width: 20px; height: 20px; }
+        /* "Stream Audio/Muted" is the widest label; drop it (state still reads
+           via the dot/colour + tooltip). */
+        .session-page.chat-open .program-audio-btn .control-label { display: none; }
+    }
+    @container (max-width: 680px) {
+        .session-page.chat-open .control-label { display: none; }
+        .session-page.chat-open .control-btn { min-width: 44px; padding: 6px 8px; }
+    }
     @media (min-width: 769px) and (max-width: 1150px) {
         .session-page.chat-open .control-btn.secondary-tool,
         .session-page.chat-open .control-btn.desktop-only,
