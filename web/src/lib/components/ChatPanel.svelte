@@ -908,11 +908,13 @@
     }
 
     .chat-message-file img {
-        max-width: 100%;
-        max-height: 220px;
+        width: auto;
+        max-width: min(100%, 260px);
+        max-height: 180px;
         border-radius: 10px;
         cursor: pointer;
         display: block;
+        object-fit: contain;
         transition: filter 0.15s ease;
     }
     .chat-message-file img:hover {
@@ -1384,10 +1386,10 @@
             max-width: 100%;
         }
         .chat-message-file img {
-            width: 100%;
-            max-width: 100%;
+            width: auto;
+            max-width: min(72vw, 280px);
             height: auto;
-            max-height: 42dvh;
+            max-height: min(30dvh, 190px);
             object-fit: contain;
         }
         .chat-message-file :global(.audio-msg) {

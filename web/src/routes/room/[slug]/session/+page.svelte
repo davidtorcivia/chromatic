@@ -4869,7 +4869,8 @@
     .cam-float-circle.speaking::after {
         opacity: 1;
     }
-    .cam-float-circle.muted {
+    .cam-float-circle.muted:not(.has-cam)::before,
+    .cam-float-circle.muted .cam-initial {
         opacity: 0.7;
     }
     .cam-initial {
