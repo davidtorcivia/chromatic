@@ -3445,8 +3445,7 @@
                     <div class="cam-float-tile">
                         <div
                             class="cam-float-circle"
-                            class:speaking={speakingParticipants.has(p.id)}
-                            class:muted={!p.audioEnabled}
+                            class:muted={!p.audioEnabled && !camStream}
                             class:has-cam={!!camStream}
                             style="--participant-color: {p.color}"
                             title="{p.name}{isSelf ? ' (you)' : ''}"
@@ -3466,6 +3465,11 @@
                             {:else}
                                 <span class="cam-initial">{p.name.charAt(0).toUpperCase()}</span>
                             {/if}
+                            <span
+                                class="cam-speaking-ring"
+                                class:active={speakingParticipants.has(p.id)}
+                                aria-hidden="true"
+                            ></span>
                         </div>
                         <span class="cam-float-name">{isSelf ? "You" : p.name}</span>
                     </div>
@@ -4845,8 +4849,7 @@
         box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
         pointer-events: none;
     }
-    .cam-float-circle::after {
-        content: "";
+    .cam-speaking-ring {
         position: absolute;
         inset: -2px;
         z-index: 2;
@@ -4866,7 +4869,7 @@
     .cam-float-circle.has-cam::before {
         background-color: rgba(8, 8, 11, 0.85);
     }
-    .cam-float-circle.speaking::after {
+    .cam-speaking-ring.active {
         opacity: 1;
     }
     .cam-float-circle.muted:not(.has-cam)::before,

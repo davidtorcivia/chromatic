@@ -513,7 +513,7 @@
                                         }}
                                     >
                                         <img
-                                            src={withJoinToken(msg.file.thumbnailUrl || msg.file.url)}
+                                            src={withJoinToken(msg.file.url)}
                                             alt={msg.file.name}
                                             onload={() => {
                                                 if (pinnedToBottom) scrollToBottom();
@@ -909,8 +909,8 @@
 
     .chat-message-file img {
         width: auto;
-        max-width: min(100%, 260px);
-        max-height: 180px;
+        max-width: min(100%, 220px);
+        max-height: 160px;
         border-radius: 10px;
         cursor: pointer;
         display: block;
@@ -1387,9 +1387,9 @@
         }
         .chat-message-file img {
             width: auto;
-            max-width: min(72vw, 280px);
+            max-width: min(58vw, 220px);
             height: auto;
-            max-height: min(30dvh, 190px);
+            max-height: min(24dvh, 160px);
             object-fit: contain;
         }
         .chat-message-file :global(.audio-msg) {
