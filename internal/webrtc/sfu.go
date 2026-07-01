@@ -1520,6 +1520,8 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("Subscriber %s connection state: %s", subscriberID, state)
 		switch state {
+		case webrtc.PeerConnectionStateConnected:
+			logSelectedICEPair("subscriber", subscriberID, pc)
 		case webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed:
 			room.removeSubscriberIfSame(subscriberID, sub)
@@ -2032,6 +2034,41 @@ type VoiceSession struct {
 	Muted atomic.Bool
 }
 
+// logSelectedICEPair inspects the PC's stats for the nominated ICE candidate
+// pair and logs the local/remote candidate types (host/srflx/prflx/relay),
+// protocol and addresses. Used to tell a direct LAN path apart from a
+// Cloudflare TURN relay path when diagnosing high-bitrate media loss.
+func logSelectedICEPair(tag, participantID string, pc *webrtc.PeerConnection) {
+	if pc == nil {
+		return
+	}
+	stats := pc.GetStats()
+	cands := make(map[string]webrtc.ICECandidateStats)
+	for _, st := range stats {
+		if c, ok := st.(webrtc.ICECandidateStats); ok {
+			cands[c.ID] = c
+		}
+	}
+	for _, st := range stats {
+		p, ok := st.(webrtc.ICECandidatePairStats)
+		if !ok || !p.Nominated {
+			continue
+		}
+		l := cands[p.LocalCandidateID]
+		r := cands[p.RemoteCandidateID]
+		relay := ""
+		if l.RelayProtocol != "" {
+			relay = " relayProto=" + l.RelayProtocol
+		}
+		log.Printf("ICE selected pair [%s %s]: local=%s/%s %s:%d%s remote=%s/%s %s:%d state=%s",
+			tag, participantID,
+			l.CandidateType, l.Protocol, l.IP, l.Port, relay,
+			r.CandidateType, r.Protocol, r.IP, r.Port, p.State)
+		return
+	}
+	log.Printf("ICE selected pair [%s %s]: none nominated yet", tag, participantID)
+}
+
 // HandlePublisherOffer processes an offer on a participant's dedicated
 // publisher peer connection (microphone + screen share). The client is
 // ALWAYS the offerer on this PC and the server only answers; combined with
@@ -2040,7 +2077,7 @@ type VoiceSession struct {
 // set SSL role" wedges both stem from mixing offer directions on one PC).
 // An offer arriving for a live publisher renegotiates it in place (e.g.
 // adding a screen-share track to an existing mic session).
-func (s *SFU) HandlePublisherOffer(roomSlug, participantID, offerSDP, offerID string, onTrack func(participantID string, track *webrtc.TrackRemote)) (string, error) {
+func (s *SFU) HandlePublisherOffer(roomSlug, participantID, offerSDP, offerID string, onTrack func(participantID string, track *webrtc.TrackRemote, mid string)) (string, error) {
 	room := s.GetRoomTracks(roomSlug)
 
 	room.mu.Lock()
@@ -2160,7 +2197,7 @@ func (s *SFU) flushPendingPublisherCandidates(room *RoomTracks, participantID st
 // HandleVoiceOffer processes an offer from a client wanting to send media
 // over a dedicated publisher peer connection. Returns the SDP answer (with
 // candidates pre-gathered) to send back.
-func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP, offerID string, onTrack func(participantID string, track *webrtc.TrackRemote)) (string, error) {
+func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP, offerID string, onTrack func(participantID string, track *webrtc.TrackRemote, mid string)) (string, error) {
 	// Create a peer connection
 	pc, err := s.CreatePeerConnection()
 	if err != nil {
@@ -2170,8 +2207,19 @@ func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP, offerID string
 	// Forward every published track (mic audio AND screen-share video) —
 	// the caller routes by kind.
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		log.Printf("Received published track from %s: %s", participantID, track.Kind())
-		onTrack(participantID, track)
+		// Resolve the transceiver mid for this track. The mid is the negotiation
+		// anchor (identical on client and server) and — unlike track.ID(), which
+		// Firefox/Safari rewrite in the SDP msid — reliably distinguishes the
+		// webcam m-line from the screen-share m-line on the publisher PC.
+		mid := ""
+		for _, tr := range pc.GetTransceivers() {
+			if tr.Receiver() == receiver {
+				mid = tr.Mid()
+				break
+			}
+		}
+		log.Printf("Received published track from %s: %s (mid=%s)", participantID, track.Kind(), mid)
+		onTrack(participantID, track, mid)
 	})
 
 	// Set the remote description (the offer)
@@ -2233,6 +2281,8 @@ func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP, offerID string
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("Voice connection state for %s: %s", participantID, state)
 		switch state {
+		case webrtc.PeerConnectionStateConnected:
+			logSelectedICEPair("publisher", participantID, pc)
 		case webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed:
 			s.removeVoiceSessionIfSame(roomSlug, participantID, newSession)

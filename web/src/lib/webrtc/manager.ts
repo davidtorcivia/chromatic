@@ -936,6 +936,15 @@ export class WebRTCManager {
                 });
             } catch (err) {
                 console.error('Failed to get microphone access:', err);
+                const name = (err as { name?: string })?.name ?? '';
+                // A saved/selected mic that has vanished (hot-plugged capture or
+                // Blackmagic audio churn) fails NotFound/Overconstrained. Forget
+                // it and retry ONCE with the OS default before surfacing "blocked"
+                // — otherwise a stale device id locks the user out of their mic.
+                if ((name === 'OverconstrainedError' || name === 'NotFoundError') && deviceId) {
+                    storeMicDeviceId(null);
+                    return this.acquireMic(null, false);
+                }
                 return false;
             }
 
@@ -1299,6 +1308,13 @@ export class WebRTCManager {
                     opusPreferencesFor(this.audioMode)
                 );
                 await pc.setLocalDescription({ type: offer.type, sdp: tunedSdp });
+                // Re-announce the webcam by its now-assigned transceiver mid
+                // (set by setLocalDescription) BEFORE the offer reaches the
+                // server, so its OnTrack can route the cam by mid. track.id is
+                // announced too but Firefox/Safari rewrite it in the msid; the
+                // mid is the reliable anchor. Idempotent, so running on every
+                // negotiation also re-maps the cam after a publisher rebuild.
+                this.announceWebcamMid(pc);
                 if (!this.sendSignal('publish:offer', { sdp: tunedSdp, offerId })) {
                     throw new Error('publisher offer send failed');
                 }
@@ -1337,6 +1353,19 @@ export class WebRTCManager {
                 return false;
             }
         });
+    }
+
+    // Announce the live webcam by its transceiver mid so the SFU can tell it
+    // apart from a screen share on the shared publisher PC. The mid (assigned by
+    // setLocalDescription) is stable across browsers; the local track id is sent
+    // too for the id-matching path. No-op when the cam isn't broadcasting.
+    private announceWebcamMid(pc: RTCPeerConnection): void {
+        if (!this.cameraSender) return;
+        const tr = pc.getTransceivers().find((t) => t.sender === this.cameraSender);
+        const mid = tr?.mid ?? '';
+        const trackId = this.cameraSender.track?.id ?? '';
+        if (!mid && !trackId) return;
+        this.sendSignal('webcam:start', { trackId, mid });
     }
 
     // Apply the server's answer to the publisher offer.

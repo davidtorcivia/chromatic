@@ -573,13 +573,21 @@ func (h *WebSocketHandler) handlePublishOffer(client *websocket.Client, payload 
 	}
 
 	roomSlug := client.RoomSlug
-	answer, err := h.sfu.HandlePublisherOffer(roomSlug, client.ID, data.SDP, data.OfferID, func(pid string, track *pionwebrtc.TrackRemote) {
+	answer, err := h.sfu.HandlePublisherOffer(roomSlug, client.ID, data.SDP, data.OfferID, func(pid string, track *pionwebrtc.TrackRemote, mid string) {
 		if track.Kind() == pionwebrtc.RTPCodecTypeVideo {
 			// A presence cam and a screen share are both VP8 video on the
-			// publisher PC. The client announces its cam track id via
-			// webcam:start (before negotiating), so route by that here. Cams
-			// are presence — allowed for everyone, no share permission needed.
-			if h.sfu.IsWebcamTrack(roomSlug, pid, track.ID()) {
+			// publisher PC. The client announces its cam via webcam:start
+			// (before the offer) using BOTH the transceiver mid and the local
+			// track id. Match on either: Chrome preserves track.ID() in the
+			// msid, but Firefox/Safari rewrite it — the mid always survives.
+			// Cams are presence — allowed for everyone, no share permission.
+			isCam := h.sfu.IsWebcamTrack(roomSlug, pid, track.ID()) ||
+				(mid != "" && h.sfu.IsWebcamTrack(roomSlug, pid, mid))
+			logger.Debug("Publisher video track routing",
+				"participant_id", pid, "room", roomSlug, "mid", mid,
+				"track_id", track.ID(), "stream_id", track.StreamID(),
+				"rid", track.RID(), "is_webcam", isCam)
+			if isCam {
 				h.forwardWebcamTrack(roomSlug, pid, track)
 				return
 			}
@@ -2026,13 +2034,23 @@ func (h *WebSocketHandler) handleScreenShareStop(client *websocket.Client) {
 func (h *WebSocketHandler) handleWebcamStart(client *websocket.Client, payload json.RawMessage) {
 	var data struct {
 		TrackID string `json:"trackId"`
+		Mid     string `json:"mid"`
 	}
-	if err := json.Unmarshal(payload, &data); err != nil || data.TrackID == "" {
+	if err := json.Unmarshal(payload, &data); err != nil || (data.TrackID == "" && data.Mid == "") {
 		logger.Warn("Invalid webcam:start", "participant_id", client.ID)
 		return
 	}
-	h.sfu.RegisterWebcamTrackID(client.RoomSlug, client.ID, data.TrackID)
-	logger.Debug("Registered webcam track id", "participant_id", client.ID, "room", client.RoomSlug)
+	// Register BOTH identifiers the client can offer so the publisher OnTrack can
+	// match on whichever survives the browser's SDP: track.ID() (preserved by
+	// Chrome) or the transceiver mid (stable everywhere, incl. Firefox/Safari
+	// which rewrite the msid track id).
+	if data.TrackID != "" {
+		h.sfu.RegisterWebcamTrackID(client.RoomSlug, client.ID, data.TrackID)
+	}
+	if data.Mid != "" {
+		h.sfu.RegisterWebcamTrackID(client.RoomSlug, client.ID, data.Mid)
+	}
+	logger.Debug("Registered webcam ids", "participant_id", client.ID, "room", client.RoomSlug, "announced_track_id", data.TrackID, "mid", data.Mid)
 }
 
 // handleWebcamStop tears down the client's webcam relay and renegotiates the

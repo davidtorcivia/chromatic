@@ -25,7 +25,28 @@
     let micPending = $state(false);
     let camPending = $state(false);
     let micDenied = $state(false);
+    let micErrorMsg = $state("Microphone blocked — allow access in your browser.");
     let camDenied = $state(false);
+
+    // Map a getUserMedia failure to a specific, actionable message. The generic
+    // "blocked — allow access" is wrong (and misleading) for the non-permission
+    // cases: a busy device, a vanished device, or no input at all.
+    function describeGumError(err: unknown, kind: "Microphone" | "Camera"): string {
+        const name = (err as { name?: string })?.name ?? "";
+        switch (name) {
+            case "NotAllowedError":
+            case "SecurityError":
+                return `${kind} blocked — allow access in your browser (and macOS System Settings › Privacy › ${kind}).`;
+            case "NotReadableError":
+            case "AbortError":
+                return `${kind} is in use by another app or tab — close it (e.g. OBS or another window) and retry.`;
+            case "NotFoundError":
+            case "OverconstrainedError":
+                return `No available ${kind.toLowerCase()} — the saved device may be gone. Retrying with the default…`;
+            default:
+                return `${kind} unavailable${name ? ` (${name})` : ""}. Check the browser and OS permissions.`;
+        }
+    }
     let micLevel = $state(0); // 0..1 smoothed
     let audioInputs = $state<MediaDeviceInfo[]>([]);
     let videoInputs = $state<MediaDeviceInfo[]>([]);
@@ -71,7 +92,7 @@
         micOn = false;
     }
 
-    async function enableMic(deviceId?: string | null) {
+    async function enableMic(deviceId?: string | null, allowDefaultRetry = true) {
         if (micPending) return;
         micPending = true;
         micDenied = false;
@@ -88,12 +109,30 @@
             stopMic();
             micStream = stream;
             micOn = true;
+            micDenied = false;
             activeMicId = stream.getAudioTracks()[0]?.getSettings().deviceId ?? activeMicId;
             if (activeMicId) storeMicDeviceId(activeMicId);
             startMeter(stream);
             await refreshDevices();
-        } catch {
+        } catch (err) {
+            console.error("Mic enable failed:", err);
+            const name = (err as { name?: string })?.name ?? "";
+            // A saved mic that has since vanished (very common with hot-plugged
+            // capture/Blackmagic audio) fails NotFound/Overconstrained. Drop the
+            // stored device and retry once with the OS default before giving up.
+            if (
+                allowDefaultRetry &&
+                (name === "NotFoundError" || name === "OverconstrainedError") &&
+                (deviceId ?? activeMicId)
+            ) {
+                storeMicDeviceId("");
+                activeMicId = null;
+                micPending = false;
+                await enableMic(null, false);
+                return;
+            }
             micDenied = true;
+            micErrorMsg = describeGumError(err, "Microphone");
         } finally {
             if (!destroyed) micPending = false;
         }
@@ -241,7 +280,7 @@
                 </select>
             {/if}
         {:else if micDenied}
-            <p class="device-hint error">Microphone blocked — allow access in your browser.</p>
+            <p class="device-hint error">{micErrorMsg}</p>
         {/if}
     </div>
 

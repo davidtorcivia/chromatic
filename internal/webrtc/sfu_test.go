@@ -757,7 +757,7 @@ func TestSFU_HandlePublisherOffer_WaitsForExistingSignaling(t *testing.T) {
 	vs.SignalingMu.Lock()
 	done := make(chan error, 1)
 	go func() {
-		_, err := sfu.HandlePublisherOffer(roomSlug, participantID, "not sdp", "publish-1", func(string, *webrtc.TrackRemote) {})
+		_, err := sfu.HandlePublisherOffer(roomSlug, participantID, "not sdp", "publish-1", func(string, *webrtc.TrackRemote, string) {})
 		done <- err
 	}()
 

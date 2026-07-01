@@ -186,11 +186,38 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 		// never blocks and latency stays bounded to the buffer depth.
 		// Video: shallow buffer (drop stale frames fast). Audio: deeper (small
 		// packets; prefer buffering over dropping talk spurts).
-		forwarderBufSize := 32
+		// Video buffer sized to absorb a full keyframe burst plus fan-out
+		// jitter: at 1080p48/8Mbps a keyframe alone can exceed 100 packets, so
+		// the old 32-packet depth guaranteed mid-keyframe drops whenever the
+		// synchronous WriteRTP drain hitched (a slow subscriber socket, GC, or
+		// scheduler stall) — corrupting frames for EVERY viewer at once. A
+		// stale frame is still dropped-oldest, so latency stays bounded.
+		forwarderBufSize := 512
 		if remoteTrack.Kind() == webrtc.RTPCodecTypeAudio {
-			forwarderBufSize = 128
+			forwarderBufSize = 256
 		}
 		forwarder := newAsyncForwarder(forwarderBufSize, localTrack.WriteRTP)
+
+		// DIAGNOSTIC: report ingest packets dropped by the forwarder. A nonzero
+		// delta means the fan-out drain stalled and buffer-full drops corrupted
+		// frames for all viewers simultaneously — the signature of sync stutter.
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			var last int64
+			for {
+				select {
+				case <-session.done:
+					return
+				case <-ticker.C:
+					if d := forwarder.Dropped(); d != last {
+						log.Printf("WHIP ingest forwarder dropped %d packets (+%d/2s, kind=%s, key=%s...)",
+							d, d-last, remoteTrack.Kind(), keyPrefix(token))
+						last = d
+					}
+				}
+			}
+		}()
 
 		// Forward RTP packets. Exits when the peer connection closes (Read
 		// returns an error) or when session teardown closes session.done.

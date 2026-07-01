@@ -222,7 +222,6 @@
     let activeCameraId = $state<string | null>(null);
     let videoInputs = $state<MediaDeviceInfo[]>([]);
     let remoteCamStreams = $state<Map<string, MediaStream>>(new Map());
-    let camsHidden = $state(false);
     // One-time "turn on your camera?" nudge after the mic is enabled. Dismissed
     // permanently (for the session) once the user acts on it or turns the cam on.
     let camNudgeDismissed = $state(false);
@@ -753,7 +752,6 @@
             isCameraOn = false;
             selfCamStream = null;
             remoteCamStreams = new Map();
-            camsHidden = false;
             streamPaused = false;
             streamError = null;
         });
@@ -1617,10 +1615,6 @@
         selfCamStream = stream;
         activeCameraId = manager.getCurrentCameraDeviceId() ?? activeCameraId;
         await refreshAudioDevices();
-    }
-
-    function toggleCamsHidden() {
-        camsHidden = !camsHidden;
     }
 
     // Svelte action: attach a MediaStream to a <video> and keep it in sync.
@@ -2780,6 +2774,7 @@
 <main
     class="session-page"
     class:controls-hidden={!isControlsVisible}
+    class:chat-open={isChatOpen}
     class:loupe-on={isLoupeEnabled}
     onmousemove={handleMouseMove}
     onpointerdown={handlePagePointerDown}
@@ -3402,7 +3397,7 @@
              the video beside chat (chat also stacks above it). pointer-events:
              none so it never blocks the laser/loupe on the video beneath; only
              the hide button is live. -->
-        {#if anyCamActive && !camsHidden}
+        {#if anyCamActive}
             <div class="cam-float" class:flush={!isControlsVisible} class:chat-open={isChatOpen}>
                 {#each participants.slice(0, 12) as p (p.id)}
                     {@const isSelf = p.id === sessionData?.participantId}
@@ -3438,13 +3433,21 @@
                 {#if participants.length > 12}
                     <span class="cam-float-overflow">+{participants.length - 12}</span>
                 {/if}
+                <!-- Fast self-cam toggle: flips YOUR webcam on/off for everyone
+                     using the already-selected device — no picker dialog (that's
+                     the control-bar Camera button's job). -->
                 <button
                     class="cam-hide-btn cam-float-hide"
-                    onclick={toggleCamsHidden}
-                    aria-label="Hide cameras"
-                    title="Hide cameras"
+                    onclick={() => toggleCamera()}
+                    disabled={cameraPending || myCamDisabled}
+                    aria-label={isCameraOn ? "Turn my camera off" : "Turn my camera on"}
+                    title={myCamDisabled ? "Camera disabled by host" : isCameraOn ? "Turn my camera off" : "Turn my camera on"}
                 >
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><line x1="2" x2="22" y1="2" y2="22"/></svg>
+                    {#if isCameraOn}
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+                    {:else}
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><line x1="2" x2="22" y1="2" y2="22"/><path d="M10.66 5H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"/><path d="M16 16a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/></svg>
+                    {/if}
                 </button>
             </div>
         {/if}
@@ -3475,55 +3478,25 @@
                          hidden) — then it behaves like before and hides with the
                          UI. When cams are showing, the persistent .cam-float
                          below takes over. -->
-                    {#if (participants.length > 1 || anyCamActive) && !(anyCamActive && !camsHidden)}
+                    {#if participants.length > 1 && !anyCamActive}
                         <div
                             class="presence-row"
                             bind:this={presenceRowEl}
                         >
                             {#each participants.slice(0, 8) as p (p.id)}
                                 {@const isSelf = p.id === sessionData?.participantId}
-                                {@const camStream = isSelf
-                                    ? (isCameraOn ? selfCamStream : null)
-                                    : (remoteCamStreams.get(p.id) ?? null)}
                                 <span
                                     class="presence-dot"
                                     class:speaking={speakingParticipants.has(p.id)}
                                     class:muted={!p.audioEnabled}
-                                    class:has-cam={!!camStream && !camsHidden}
                                     style="--participant-color: {p.color}"
                                     title="{p.name}{isSelf ? ' (you)' : ''}{p.audioEnabled ? '' : ' (muted)'}"
                                 >
-                                    {#if camStream && !camsHidden}
-                                        <!-- svelte-ignore a11y_media_has_caption -->
-                                        <video
-                                            class="cam-video"
-                                            class:mirror={isSelf}
-                                            use:bindStream={camStream}
-                                            muted
-                                            autoplay
-                                            playsinline
-                                        ></video>
-                                    {:else}
-                                        {p.name.charAt(0).toUpperCase()}
-                                    {/if}
+                                    {p.name.charAt(0).toUpperCase()}
                                 </span>
                             {/each}
                             {#if participants.length > 8}
                                 <span class="presence-overflow">+{participants.length - 8}</span>
-                            {/if}
-                            {#if anyCamActive}
-                                <button
-                                    class="cam-hide-btn"
-                                    onclick={toggleCamsHidden}
-                                    aria-label={camsHidden ? "Show cameras" : "Hide cameras"}
-                                    title={camsHidden ? "Show cameras" : "Hide cameras"}
-                                >
-                                    {#if camsHidden}
-                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
-                                    {:else}
-                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><line x1="2" x2="22" y1="2" y2="22"/></svg>
-                                    {/if}
-                                </button>
                             {/if}
                         </div>
                     {/if}
@@ -5072,16 +5045,28 @@
     /* 3-column grid keeps the control bar truly centered */
     .bottom-bar {
         display: grid;
-        grid-template-columns: 1fr auto 1fr;
+        /* minmax(0, …) side cells let the LIVE/signal cluster shrink instead of
+           forcing the bar wider than the video column — the old `1fr auto 1fr`
+           overflowed right and painted the control bar / status over the chat
+           entry field (z 20 vs chat z 9) when chat was open on a small window.
+           The control bar itself is kept compact (not wrapped) via the
+           chat-open media queries below. */
+        grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
         align-items: end;
         gap: var(--space-sm);
+        min-width: 0;
     }
 
     .bottom-right {
         display: flex;
         align-items: center;
+        justify-content: flex-end;
         gap: var(--space-sm);
         justify-self: end;
+        /* Shrink/wrap the LIVE + signal + latency cluster rather than pushing it
+           out of the video column and over the chat. */
+        min-width: 0;
+        flex-wrap: wrap;
     }
 
     .live-pill {
@@ -6373,5 +6358,27 @@
             gap: var(--space-xs);
         }
         .bottom-left { display: none; }
+    }
+
+    /* Chat open steals ~320px from the video column. On a constrained (but still
+       desktop-layout, >768px) window that can push the control bar toward the
+       chat. Rather than wrap to an ugly second row, SHRINK the bar so it stays a
+       single row inside the video area and the chat entry field stays clear.
+       Two tiers: compact buttons first, then icon-only when very tight. */
+    @media (min-width: 769px) and (max-width: 1100px) {
+        .session-page.chat-open .control-bar { gap: 5px; padding: 6px; }
+        .session-page.chat-open .control-btn { min-width: 50px; padding: 7px 10px; }
+        .session-page.chat-open .control-btn svg { width: 19px; height: 19px; }
+        .session-page.chat-open .control-label { font-size: 0.5625rem; }
+        /* "Stream Audio/Muted" is the widest label; drop it first (state still
+           reads via the dot/colour + tooltip). */
+        .session-page.chat-open .program-audio-btn .control-label { display: none; }
+        .session-page.chat-open .bar-divider { display: none; }
+    }
+    @media (min-width: 769px) and (max-width: 920px) {
+        /* Very tight: icon-only so ~9 buttons still fit one row beside chat. */
+        .session-page.chat-open .control-label { display: none; }
+        .session-page.chat-open .control-btn { min-width: 44px; padding: 6px 8px; }
+        .session-page.chat-open .control-btn svg { width: 18px; height: 18px; }
     }
 </style>
