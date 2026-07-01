@@ -115,7 +115,7 @@ func TestMigrate_Tables(t *testing.T) {
 	defer cleanup()
 
 	// Verify core tables exist
-	tables := []string{"rooms", "participants", "files", "sessions"}
+	tables := []string{"rooms", "participants", "files", "sessions", "admin_audit_logs"}
 
 	for _, table := range tables {
 		var name string

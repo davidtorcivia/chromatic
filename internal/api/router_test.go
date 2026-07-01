@@ -76,11 +76,11 @@ func TestSPAHandlerCacheControl(t *testing.T) {
 			wantBody:   "<html>index</html>",
 		},
 		{
-			name:       "missing immutable asset falls back to index.html with no-cache",
+			name:       "missing immutable asset returns 404",
 			path:       "/_app/immutable/chunks/gone.js",
-			wantStatus: http.StatusOK,
-			wantCache:  "no-cache",
-			wantBody:   "<html>index</html>",
+			wantStatus: http.StatusNotFound,
+			wantCache:  "",
+			wantBody:   "404 page not found\n",
 		},
 	}
 
@@ -98,6 +98,57 @@ func TestSPAHandlerCacheControl(t *testing.T) {
 			}
 			if got := rec.Body.String(); got != tt.wantBody {
 				t.Errorf("body = %q, want %q", got, tt.wantBody)
+			}
+		})
+	}
+}
+
+func TestIsStaticAssetPath(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: "/_app/immutable/chunks/app.js", want: true},
+		{path: "/assets/logo.png", want: true},
+		{path: "/audio/gate-worklet.js", want: true},
+		{path: "/icons/icon.svg", want: true},
+		{path: "/images/poster.jpg", want: true},
+		{path: "/admin/rooms/demo", want: false},
+		{path: "/room/demo", want: false},
+		{path: "/favicon.png", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			if got := isStaticAssetPath(tt.path); got != tt.want {
+				t.Fatalf("isStaticAssetPath(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldApplyGlobalRateLimit(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: "/api/rooms", want: true},
+		{path: "/api/rooms/demo/info", want: true},
+		{path: "/ws/room/demo", want: true},
+		{path: "/whip/key", want: true},
+		{path: "/metrics", want: true},
+		{path: "/health", want: false},
+		{path: "/", want: false},
+		{path: "/admin/rooms/demo", want: false},
+		{path: "/room/demo", want: false},
+		{path: "/_app/immutable/chunks/app.abc123.js", want: false},
+		{path: "/favicon.png", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			if got := shouldApplyGlobalRateLimit(tt.path); got != tt.want {
+				t.Fatalf("shouldApplyGlobalRateLimit(%q) = %v, want %v", tt.path, got, tt.want)
 			}
 		})
 	}

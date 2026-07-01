@@ -1,0 +1,44 @@
+# VCS and local agent state
+.git
+.github
+.agents
+.claude
+.codex
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+!deployments/.env.example
+
+# Build/test outputs
+build
+dist
+coverage
+coverage.out
+.gocache
+.gopath
+*.out
+*.exe
+*.test
+
+# Frontend local installs and generated output
+node_modules
+web/node_modules
+e2e/node_modules
+web/.svelte-kit
+web/build
+web/coverage
+web/dist
+e2e/playwright-report
+e2e/test-results
+
+# Logs and editor noise
+*.log
+.DS_Store
+Thumbs.db
+
+# Local data stores
+*.db
+*.sqlite
+*.sqlite3

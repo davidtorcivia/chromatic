@@ -350,11 +350,9 @@
         if (storedName) {
             participantName = storedName;
         }
-        // The join token is signed over the name used at join time; that name
-        // is stored with the session payload. Prefer it over the global
+        // Prefer the name stored with the session payload over the global
         // localStorage name, which a later join (other room/tab) may have
-        // overwritten — a mismatch made the WS upgrade fail on refresh and
-        // the page hang on "the host hasn't started streaming yet".
+        // overwritten.
         if (sessionData?.name) {
             participantName = sessionData.name;
         }
@@ -441,6 +439,7 @@
         });
 
         session.onMessage("room:ended", () => {
+            clearStoredSession();
             cleanupWebRTC();
             session.disconnect();
             endState = {
@@ -451,6 +450,7 @@
 
         session.onMessage("kicked", (payload: unknown) => {
             const data = payload as { reason?: string };
+            clearStoredSession();
             cleanupWebRTC();
             session.disconnect();
             endState = {
@@ -782,7 +782,7 @@
         // Connect only after handlers are registered so early messages aren't dropped.
         // Pass our participant id so session.state.participantId is populated
         // (the laser's local cursor, self-identification, etc. depend on it).
-        session.connect(slug, sessionData!.token, participantName, sessionData!.participantId);
+        session.connect(slug, participantName, sessionData!.participantId);
 
         window.addEventListener("chromatic:tampering", handleTampering);
 
@@ -1893,6 +1893,7 @@
     }
 
     function handleTampering() {
+        clearStoredSession();
         cleanupWebRTC();
         session.disconnect();
         endState = {
@@ -1903,8 +1904,12 @@
 
     // Leave control + end-state exit: clear stored credentials for this room
     // and return to the join page.
-    function leaveToRoomPage() {
+    function clearStoredSession() {
         removeStorageItem("session", `chromatic_session_${slug}`);
+    }
+
+    function leaveToRoomPage() {
+        clearStoredSession();
         goto(`/room/${slug}`);
     }
 
@@ -2289,7 +2294,6 @@
             const uploaded = await uploadFile(
                 slug,
                 file,
-                sessionData?.token || "",
                 undefined,
                 controller.signal,
             );
@@ -4110,7 +4114,6 @@
         onClose={() => (isChatOpen = false)}
         typing={typingList}
         roomSlug={slug}
-        joinToken={sessionData?.token || ""}
         {participantColors}
         selfId={sessionData?.participantId || ""}
         canModerate={isAdmin}

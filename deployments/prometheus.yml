@@ -29,6 +29,9 @@ scrape_configs:
     static_configs:
       - targets: ['chromatic:3000']
     metrics_path: '/metrics'
+    authorization:
+      type: Bearer
+      credentials: __ADMIN_TOKEN__
     scrape_interval: 10s
     scrape_timeout: 5s
 

@@ -123,6 +123,53 @@ func TestSanitizeText(t *testing.T) {
 	}
 }
 
+func TestSanitizeFilename(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "path traversal reduced to base",
+			input:    `..\..\client-shot.png`,
+			expected: "client-shot.png",
+		},
+		{
+			name:     "posix path traversal reduced to base",
+			input:    "../../client-shot.png",
+			expected: "client-shot.png",
+		},
+		{
+			name:     "header metacharacters stripped",
+			input:    "bad\r\nna\"me.jpg",
+			expected: "badname.jpg",
+		},
+		{
+			name:     "bidi extension spoofing stripped",
+			input:    "invoice\u202Egpj.exe",
+			expected: "invoicegpj.exe",
+		},
+		{
+			name:     "blank fallback",
+			input:    "\r\n\t",
+			expected: "file",
+		},
+		{
+			name:     "empty fallback",
+			input:    "",
+			expected: "file",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sanitizeFilename(tt.input); got != tt.expected {
+				t.Fatalf("sanitizeFilename(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
 // TestRateLimiter tests the rate limiter functionality
 func TestRateLimiter(t *testing.T) {
 	t.Run("allows requests under limit", func(t *testing.T) {

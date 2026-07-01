@@ -33,6 +33,7 @@ var slugRegex = regexp.MustCompile(`^[a-z0-9-]{3,64}$`)
 const (
 	defaultEarlyOpenMinutes = 10
 	maxEarlyOpenMinutes     = 120
+	joinReservationWindow   = 2 * time.Minute
 )
 
 // maxWaitingSubscriptions caps concurrent waiting-room SSE connections to
@@ -127,12 +128,14 @@ type RoomHandler struct {
 	sfu interface {
 		BindIngestToRoom(streamKeyToken, roomSlug string) ([]string, error)
 		RenegotiateSubscriber(roomSlug, subscriberID string) (string, string, error)
+		CloseRoom(roomSlug string)
 	}
 	hub interface {
 		BroadcastJSON(roomSlug string, msgType string, payload interface{}, excludeID string) error
 		SendToJSON(roomSlug, clientID, msgType string, payload interface{}) error
 		BroadcastToAdminsJSON(roomSlug, msgType string, payload interface{}) error
 		RoomClientCount(roomSlug string) int
+		CloseRoom(roomSlug string)
 	}
 	onRoomLive          func(roomSlug string) // Called when room goes live
 	tokenManager        *TokenManager         // For generating signed WebSocket tokens
@@ -142,6 +145,8 @@ type RoomHandler struct {
 	maxParticipants     int                   // Cap on non-ended participants per room
 	uploadPath          string                // Root of per-room upload dirs (for delete-with-files)
 	obsReconnectTimeout time.Duration
+	productionMode      bool
+	joinMu              sync.Mutex
 	timerMu             sync.Mutex
 	streamEndTimers     map[string]*time.Timer
 	// openTimers fire when a scheduled room reaches scheduled_at so lobby
@@ -164,6 +169,7 @@ func NewRoomHandler(db *database.DB, cfg *config.Config, tokenSecret []byte) *Ro
 		maxParticipants:     maxParticipants,
 		uploadPath:          cfg.UploadPath,
 		obsReconnectTimeout: cfg.OBSReconnectTimeout,
+		productionMode:      cfg.ProductionMode,
 		streamEndTimers:     make(map[string]*time.Timer),
 		openTimers:          make(map[string]*time.Timer),
 	}
@@ -186,10 +192,24 @@ func (h *RoomHandler) hasAdminSession(r *http.Request) bool {
 	return err == nil && c.Value != "" && h.validateSession(c.Value)
 }
 
+func joinTokenFromRequest(r *http.Request, roomSlug string, allowQuery bool) string {
+	if token := r.Header.Get("X-Join-Token"); token != "" {
+		return token
+	}
+	if c, err := r.Cookie(JoinTokenCookieName(roomSlug)); err == nil && c.Value != "" {
+		return c.Value
+	}
+	if allowQuery {
+		return r.URL.Query().Get("token")
+	}
+	return ""
+}
+
 // SetSFU sets the SFU reference (for stream binding)
 func (h *RoomHandler) SetSFU(sfu interface {
 	BindIngestToRoom(streamKeyToken, roomSlug string) ([]string, error)
 	RenegotiateSubscriber(roomSlug, subscriberID string) (string, string, error)
+	CloseRoom(roomSlug string)
 }) {
 	h.sfu = sfu
 }
@@ -200,8 +220,24 @@ func (h *RoomHandler) SetHub(hub interface {
 	SendToJSON(roomSlug, clientID, msgType string, payload interface{}) error
 	BroadcastToAdminsJSON(roomSlug, msgType string, payload interface{}) error
 	RoomClientCount(roomSlug string) int
+	CloseRoom(roomSlug string)
 }) {
 	h.hub = hub
+}
+
+func (h *RoomHandler) closeRoomRuntime(slug string, notify bool) {
+	h.cancelOpenTimer(slug)
+	h.cancelStreamEndTimer(slug)
+
+	if h.hub != nil && notify {
+		_ = h.hub.BroadcastJSON(slug, "room:ended", map[string]interface{}{}, "")
+	}
+	if h.sfu != nil {
+		h.sfu.CloseRoom(slug)
+	}
+	if h.hub != nil {
+		h.hub.CloseRoom(slug)
+	}
 }
 
 // SetOnRoomLive sets the callback for when a room goes live
@@ -243,8 +279,8 @@ func (h *RoomHandler) scheduleStreamEnd(roomSlug string) {
 		}
 
 		affected, _ := result.RowsAffected()
-		if affected > 0 && h.hub != nil {
-			h.hub.BroadcastJSON(roomSlug, "room:ended", map[string]interface{}{}, "")
+		if affected > 0 {
+			h.closeRoomRuntime(roomSlug, true)
 		}
 
 		h.timerMu.Lock()
@@ -560,7 +596,12 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate ID
-	id := generateID()
+	id, err := generateID()
+	if err != nil {
+		logger.Error("Failed to generate room ID", "error", err)
+		http.Error(w, "Failed to create room", http.StatusInternalServerError)
+		return
+	}
 
 	// Hash password if provided (minimum 8 characters for security)
 	var passwordHash *string
@@ -645,7 +686,7 @@ func (h *RoomHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	// Insert room
 	insertCtx, insertCancel := database.WithTimeout(r.Context())
-	_, err := h.db.ExecContext(insertCtx, `
+	_, err = h.db.ExecContext(insertCtx, `
 		INSERT INTO rooms (
 			id, slug, name, scheduled_at, duration_minutes, early_open_minutes,
 			password_hash,
@@ -1010,7 +1051,7 @@ func (h *RoomHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.cancelOpenTimer(slug)
+	h.closeRoomRuntime(slug, true)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1036,11 +1077,7 @@ func (h *RoomHandler) EndSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.cancelOpenTimer(slug)
-
-	if h.hub != nil {
-		h.hub.BroadcastJSON(slug, "room:ended", map[string]interface{}{}, "")
-	}
+	h.closeRoomRuntime(slug, true)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1182,10 +1219,22 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 	if roomMaxParticipants != nil && *roomMaxParticipants > 0 {
 		maxParticipants = *roomMaxParticipants
 	}
-	// Count people actually connected right now, not historical participant
-	// rows — every rejoin inserts a new row, so the old COUNT(*) marked a
-	// room "full" after enough leave/rejoin churn even when nearly empty.
-	if h.hub != nil && h.hub.RoomClientCount(slug) >= maxParticipants {
+	h.joinMu.Lock()
+	defer h.joinMu.Unlock()
+
+	// Count currently connected viewers plus short-lived join reservations.
+	// The reservation window covers the gap between POST /join and the
+	// WebSocket opening; without it, a burst of joins can all pass while the
+	// hub still reports zero clients. Waiting/lobby participants are counted
+	// until admitted or denied so approval queues cannot grow past capacity.
+	currentParticipants := h.countRecentParticipants(roomID, joinReservationWindow)
+	if h.hub != nil {
+		if connected := h.hub.RoomClientCount(slug); connected > currentParticipants {
+			currentParticipants = connected
+		}
+	}
+	currentParticipants += h.countWaiting(roomID)
+	if currentParticipants >= maxParticipants {
 		http.Error(w, "Room is full", http.StatusServiceUnavailable)
 		return
 	}
@@ -1193,7 +1242,12 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 	// Create participant. Admins bypass the waiting room; lobby joiners stay
 	// unadmitted until the room opens (then waiting-room-disabled rooms
 	// auto-admit, waiting-room-enabled rooms fall into the approval flow).
-	participantID := generateID()
+	participantID, err := generateID()
+	if err != nil {
+		logger.Error("Failed to generate participant ID", "error", err, "room", slug)
+		http.Error(w, "Failed to join room", http.StatusInternalServerError)
+		return
+	}
 	color := h.assignRoomColor(roomID, participantID)
 	isAdmitted := isAdmin || (!waitingRoom && !inLobby)
 	role := "viewer"
@@ -1220,6 +1274,15 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to generate authentication token", http.StatusInternalServerError)
 		return
 	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     JoinTokenCookieName(slug),
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   h.productionMode,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   int((24 * time.Hour).Seconds()),
+	})
 
 	// Track join request
 	metrics.Get().TotalJoinRequests.Add(1)
@@ -1250,16 +1313,7 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 		h.ensureOpenTimer(slug, *scheduledAt)
 	}
 
-	response := map[string]interface{}{
-		"participantId": participantID,
-		"token":         token,
-		"isAdmitted":    isAdmitted,
-		"waitingRoom":   !isAdmitted,
-		"color":         color,
-		"name":          req.Name,
-		"role":          role,
-		"serverTime":    now.UTC(),
-	}
+	response := buildJoinResponse(participantID, token, isAdmitted, color, req.Name, role, now.UTC(), !h.productionMode)
 	if inLobby {
 		response["lobby"] = map[string]interface{}{
 			"scheduledAt":        scheduledAt.UTC(),
@@ -1271,11 +1325,42 @@ func (h *RoomHandler) Join(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, response)
 }
 
+func buildJoinResponse(participantID, token string, isAdmitted bool, color, name, role string, serverTime time.Time, includeToken bool) map[string]interface{} {
+	response := map[string]interface{}{
+		"participantId": participantID,
+		"isAdmitted":    isAdmitted,
+		"waitingRoom":   !isAdmitted,
+		"color":         color,
+		"name":          name,
+		"role":          role,
+		"serverTime":    serverTime,
+	}
+	if includeToken {
+		response["token"] = token
+	}
+	return response
+}
+
 // countWaiting returns the number of unadmitted participants in a room.
 func (h *RoomHandler) countWaiting(roomID string) int {
 	var n int
 	ctx, cancel := database.WithTimeout(context.Background())
 	err := h.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM participants WHERE room_id = ? AND is_admitted = FALSE`, roomID).Scan(&n)
+	cancel()
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func (h *RoomHandler) countRecentParticipants(roomID string, window time.Duration) int {
+	var n int
+	cutoff := time.Now().Add(-window)
+	ctx, cancel := database.WithTimeout(context.Background())
+	err := h.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM participants
+		WHERE room_id = ? AND joined_at >= ? AND is_admitted = TRUE
+	`, roomID, cutoff).Scan(&n)
 	cancel()
 	if err != nil {
 		return 0
@@ -1481,14 +1566,13 @@ func (h *RoomHandler) AdmitAll(w http.ResponseWriter, r *http.Request) {
 }
 
 // CheckParticipantStatus checks if a participant has been admitted.
-// The join token is taken from the X-Join-Token header only — query params
-// are logged by proxies and must not carry credentials. (The SSE endpoint
-// WaitingEvents keeps a query-param fallback because EventSource cannot set
-// headers.)
+// The join token is taken from the X-Join-Token header or the HttpOnly
+// per-room join cookie. Query params are logged by proxies and must not carry
+// credentials.
 func (h *RoomHandler) CheckParticipantStatus(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 	participantID := r.PathValue("id")
-	token := r.Header.Get("X-Join-Token")
+	token := joinTokenFromRequest(r, slug, false)
 
 	if token == "" {
 		http.Error(w, "Missing token", http.StatusUnauthorized)
@@ -1722,10 +1806,12 @@ func (h *RoomHandler) getRoomBySlug(slug string) (*models.Room, error) {
 
 // Helper functions
 
-func generateID() string {
+func generateID() (string, error) {
 	bytes := make([]byte, 16)
-	rand.Read(bytes)
-	return hex.EncodeToString(bytes)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes), nil
 }
 
 // High-visibility participant colors: bright, saturated, maximally separated
@@ -1791,12 +1877,9 @@ func respondJSON(w http.ResponseWriter, data interface{}) {
 func (h *RoomHandler) WaitingEvents(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 	participantID := r.PathValue("id")
-	// Prefer the X-Join-Token header; fall back to the query param because
-	// EventSource cannot set request headers.
-	token := r.Header.Get("X-Join-Token")
-	if token == "" {
-		token = r.URL.Query().Get("token")
-	}
+	// Prefer the X-Join-Token header or HttpOnly join cookie. Query fallback
+	// stays development-only because EventSource cannot set request headers.
+	token := joinTokenFromRequest(r, slug, !h.productionMode)
 
 	if token == "" {
 		http.Error(w, "Missing token", http.StatusUnauthorized)

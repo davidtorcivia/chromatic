@@ -61,7 +61,7 @@ describe('SessionStore WebSocket sends', () => {
 
     function connectedStore() {
         const store = createSessionStore();
-        store.connect('review-room', 'signed-token', 'Viewer One');
+        store.connect('review-room', 'Viewer One');
         const socket = FakeWebSocket.instances.at(-1);
         if (!socket) throw new Error('WebSocket was not created');
         socket.open();
@@ -150,7 +150,7 @@ describe('SessionStore WebSocket sends', () => {
         online = false;
         const store = createSessionStore();
 
-        store.connect('review-room', 'signed-token', 'Viewer One');
+        store.connect('review-room', 'Viewer One');
 
         expect(FakeWebSocket.instances).toHaveLength(0);
         expect(store.state.reconnecting).toBe(true);

@@ -110,12 +110,12 @@ func waitForICEGather(pc *webrtc.PeerConnection) {
 
 // IngestSession represents an active OBS WHIP connection
 type IngestSession struct {
-	StreamKeyToken    string
-	PeerConnection    *webrtc.PeerConnection
-	VideoTrack        *webrtc.TrackLocalStaticRTP
-	AudioTrack        *webrtc.TrackLocalStaticRTP
-	done              chan struct{}
-	closeOnce         sync.Once  // Ensures done channel is closed only once
+	StreamKeyToken string
+	PeerConnection *webrtc.PeerConnection
+	VideoTrack     *webrtc.TrackLocalStaticRTP
+	AudioTrack     *webrtc.TrackLocalStaticRTP
+	done           chan struct{}
+	closeOnce      sync.Once // Ensures done channel is closed only once
 	// iceCandidateCount/iceWindowStart form a sliding-window budget that bounds
 	// trickle-ICE flooding per time window (whipCandidateWindow) instead of over
 	// the whole session. A monotonically-growing lifetime counter would, on a
@@ -251,10 +251,10 @@ type Subscriber struct {
 	// whether the queued offer was an ICE restart (so the replay uses the right
 	// answer transport and offerId). OnDeferredClientOffer delivers the replayed
 	// answer back to the client. All guarded by SignalingMu.
-	pendingClientOffer         string
-	pendingClientOfferID       string
+	pendingClientOffer          string
+	pendingClientOfferID        string
 	pendingClientOfferIsRestart bool
-	OnDeferredClientOffer      func(isRestart bool, offerID, answerSDP string)
+	OnDeferredClientOffer       func(isRestart bool, offerID, answerSDP string)
 }
 
 // pcHasTrack reports whether the peer connection already has a sender bound
@@ -745,6 +745,97 @@ func (s *SFU) Shutdown() {
 	}
 
 	log.Println("SFU shutdown complete")
+}
+
+// CloseRoom tears down all WebRTC state for one room: subscribers, voice
+// sessions, relays, screen share, webcams, and the currently bound OBS ingest.
+// PeerConnections are closed after locks are released because Pion callbacks
+// re-enter SFU/room locks during Close.
+func (s *SFU) CloseRoom(roomSlug string) {
+	var pcs []*webrtc.PeerConnection
+	var ingests []*IngestSession
+
+	s.mu.Lock()
+	room := s.rooms[roomSlug]
+	if room == nil {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.rooms, roomSlug)
+
+	room.mu.Lock()
+	ingestPC := room.IngestPC
+	if ingestPC != nil {
+		for _, session := range s.ingests {
+			if session != nil && session.PeerConnection == ingestPC {
+				ingests = append(ingests, session)
+			}
+		}
+	}
+
+	subIDs := make([]string, 0, len(room.Subscribers))
+	for id := range room.Subscribers {
+		subIDs = append(subIDs, id)
+	}
+	for _, id := range subIDs {
+		subPCs, _ := room.removeSubscriberLocked(id)
+		pcs = append(pcs, subPCs...)
+	}
+
+	for id, vs := range room.VoiceSessions {
+		vs.closeOnce.Do(func() {
+			close(vs.done)
+		})
+		if vs.PeerConnection != nil {
+			pcs = append(pcs, vs.PeerConnection)
+		}
+		delete(room.VoiceSessions, id)
+	}
+	for id, ch := range room.voiceRelayDone {
+		close(ch)
+		delete(room.voiceRelayDone, id)
+	}
+	for id, ch := range room.webcamRelayDone {
+		close(ch)
+		delete(room.webcamRelayDone, id)
+	}
+	if room.screenShareDone != nil {
+		close(room.screenShareDone)
+		room.screenShareDone = nil
+	}
+
+	room.VideoTrack = nil
+	room.AudioTrack = nil
+	room.IngestPC = nil
+	room.ScreenShareParticipantID = ""
+	room.ScreenShareRemoteTrack = nil
+	room.ScreenShareLocalTrack = nil
+	room.PendingPublisherICE = nil
+	room.VoiceRemoteTracks = nil
+	room.VoiceLocalTracks = nil
+	room.voiceMuteFlags = nil
+	room.WebcamLocalTracks = nil
+	room.webcamTrackIDs = nil
+	room.webcamDisabled = nil
+	room.mu.Unlock()
+	s.mu.Unlock()
+
+	for _, session := range ingests {
+		if session.teardown != nil {
+			session.teardown()
+			continue
+		}
+		session.closeOnce.Do(func() {
+			close(session.done)
+		})
+		if session.PeerConnection != nil {
+			_ = session.PeerConnection.Close()
+		}
+	}
+	for _, pc := range pcs {
+		_ = pc.Close()
+	}
+	log.Printf("Closed WebRTC room %s", roomSlug)
 }
 
 // AddSubscriber adds a subscriber to a room. If a subscriber with the same

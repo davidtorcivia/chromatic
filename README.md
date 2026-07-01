@@ -247,10 +247,12 @@ A pre-built Grafana dashboard is included:
 ```bash
 # Start monitoring stack with Chromatic
 cd deployments
+export GRAFANA_ADMIN_PASSWORD="$(openssl rand -base64 32)"
 docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
 ```
 
-Access Grafana at `http://localhost:3001` (admin/admin)
+Access Grafana at `http://localhost:3001` with user `admin` and the
+`GRAFANA_ADMIN_PASSWORD` value you set.
 
 The dashboard shows:
 - Active rooms, viewers, and streams

@@ -1,7 +1,7 @@
 package handlers
 
 import (
-	"path/filepath"
+	"path"
 	"regexp"
 	"strings"
 	"unicode"
@@ -40,12 +40,19 @@ func sanitizeText(input string) string {
 
 // sanitizeFilename normalizes a filename for safe header usage.
 func sanitizeFilename(name string) string {
-	base := filepath.Base(name)
-	base = strings.ReplaceAll(base, `"`, "")
-	base = strings.ReplaceAll(base, "\n", "")
-	base = strings.ReplaceAll(base, "\r", "")
+	normalized := strings.ReplaceAll(name, "\\", "/")
+	base := path.Base(normalized)
+	if base == "." || base == "/" {
+		base = ""
+	}
+	base = strings.Map(func(r rune) rune {
+		if r == '"' || r == '\\' || unicode.IsControl(r) || isBidiOverride(r) {
+			return -1
+		}
+		return r
+	}, base)
 	base = strings.TrimSpace(base)
-	if base == "" {
+	if base == "" || base == "." {
 		return "file"
 	}
 	return base

@@ -44,6 +44,7 @@ Edit `.env` with at least:
 
 ```bash
 ADMIN_TOKEN=<strong-random-token>
+GRAFANA_ADMIN_PASSWORD=<strong-random-password> # if enabling monitoring
 PUBLIC_URL=https://stream.yourdomain.com
 DOMAIN=stream.yourdomain.com
 CHROMATIC_IMAGE=ghcr.io/davidtorcivia/chromatic:sha-<commit>
@@ -181,6 +182,13 @@ Rollback is just changing `CHROMATIC_IMAGE` back to an older pinned tag/digest a
         - targets: ['stream.yourdomain.com']
       scheme: https
   ```
+- Optional bundled monitoring:
+  ```bash
+  GRAFANA_ADMIN_PASSWORD=<strong-random-password>
+  docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+  ```
+  Grafana and Prometheus bind to localhost-only ports (`3001` and `9090`);
+  use a VPN or SSH tunnel for remote access.
 - Backup/restore docs: `docs/BACKUP.md`
 - Troubleshooting: `docs/TROUBLESHOOTING.md`
 

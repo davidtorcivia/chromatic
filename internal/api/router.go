@@ -39,11 +39,30 @@ func spaHandler(staticRoot string) http.Handler {
 				}
 			}
 		}
+		if isStaticAssetPath(r.URL.Path) {
+			http.NotFound(w, r)
+			return
+		}
 		// SPA fallback: index.html must never be cached as immutable, even
 		// when the request path looked like a hashed asset.
 		w.Header().Set("Cache-Control", "no-cache")
 		http.ServeFile(w, r, filepath.Join(staticRoot, "index.html"))
 	})
+}
+
+func isStaticAssetPath(path string) bool {
+	return strings.HasPrefix(path, "/_app/") ||
+		strings.HasPrefix(path, "/assets/") ||
+		strings.HasPrefix(path, "/audio/") ||
+		strings.HasPrefix(path, "/icons/") ||
+		strings.HasPrefix(path, "/images/")
+}
+
+func shouldApplyGlobalRateLimit(path string) bool {
+	return path == "/metrics" ||
+		strings.HasPrefix(path, "/api/") ||
+		strings.HasPrefix(path, "/ws/") ||
+		strings.HasPrefix(path, "/whip/")
 }
 
 // NewRouter creates the HTTP router with all routes configured
@@ -98,6 +117,12 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 		SessionCookie:   handlers.SessionCookieName,
 		ValidateSession: authHandler.ValidateSession,
 	}
+	auditConfig := middleware.AuditLoggerConfig{
+		DB:             db,
+		Actor:          "admin",
+		SessionCookie:  handlers.SessionCookieName,
+		TrustedProxies: cfg.TrustedProxies,
+	}
 
 	// Health check (public — used by load balancers and Caddy)
 	mux.HandleFunc("GET /health", handlers.HealthCheck)
@@ -109,8 +134,12 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	mux.Handle("GET /metrics", middleware.RequireAuth(authConfig)(http.HandlerFunc(metrics.Handler())))
 
 	// Auth endpoints (no auth required) - login rate limited: 5 per minute per IP
-	mux.Handle("POST /api/auth/login", middleware.LoginRateLimiter(cfg.TrustedProxies)(http.HandlerFunc(authHandler.Login)))
-	mux.HandleFunc("POST /api/auth/logout", authHandler.Logout)
+	mux.Handle("POST /api/auth/login",
+		middleware.AuditLogger(auditConfig)(
+			middleware.LoginRateLimiter(cfg.TrustedProxies)(http.HandlerFunc(authHandler.Login)),
+		),
+	)
+	mux.Handle("POST /api/auth/logout", middleware.AuditLogger(auditConfig)(http.HandlerFunc(authHandler.Logout)))
 
 	// WHIP endpoints (no auth - stream key is in URL). Rate-limited per IP to
 	// throttle stream-key brute force and PeerConnection/DB amplification; a
@@ -153,8 +182,9 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	adminMux.HandleFunc("DELETE /api/config/logo", configHandler.DeleteLogo)
 	adminMux.HandleFunc("POST /api/config/test-turn", configHandler.TestTURN)
 
-	// Wrap admin routes with auth middleware
-	mux.Handle("/api/", middleware.RequireAuth(authConfig)(adminMux))
+	// Wrap admin routes with auth and audit middleware. Audit wraps auth so
+	// failed mutating admin attempts are recorded with their final status code.
+	mux.Handle("/api/", middleware.AuditLogger(auditConfig)(middleware.RequireAuth(authConfig)(adminMux)))
 
 	// File endpoints (session auth) - rate limited: 10 per minute
 	mux.Handle("POST /api/rooms/{slug}/files", middleware.FileUploadRateLimiter(cfg.TrustedProxies)(http.HandlerFunc(fileHandler.Upload)))
@@ -183,6 +213,8 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 		AllowedOrigins: cfg.AllowedOrigins,
 		ProductionMode: cfg.ProductionMode,
 	}
+	handler = middleware.LimitJSONBody(1 << 20)(handler)
+	handler = middleware.EnforceTrustedOrigins(corsConfig)(handler)
 	handler = middleware.CORS(corsConfig)(handler)
 
 	// Rate limiting - protect against abuse
@@ -191,7 +223,15 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 		BurstSize:         50,
 		TrustedProxies:    cfg.TrustedProxies,
 	}
-	handler = middleware.RateLimiter(rateLimitConfig)(handler)
+	baseHandler := handler
+	rateLimitedHandler := middleware.RateLimiter(rateLimitConfig)(baseHandler)
+	handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if shouldApplyGlobalRateLimit(r.URL.Path) {
+			rateLimitedHandler.ServeHTTP(w, r)
+			return
+		}
+		baseHandler.ServeHTTP(w, r)
+	})
 
 	// Security headers
 	handler = middleware.SecurityHeaders(cfg.ProductionMode)(handler)

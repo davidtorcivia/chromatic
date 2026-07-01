@@ -12,7 +12,6 @@
         isOpen: boolean;
         onClose: () => void;
         roomSlug: string;
-        joinToken: string;
         /** Map of participant id → display color (tints author names). */
         participantColors?: Record<string, string>;
         /** Own participant id, used to distinguish own messages. */
@@ -27,7 +26,6 @@
         isOpen,
         onClose,
         roomSlug,
-        joinToken,
         participantColors = {},
         selfId = "",
         canModerate = false,
@@ -75,7 +73,10 @@
         "image/webp",
         "audio/mpeg",
         "audio/wav",
+        "audio/wave",
+        "audio/x-wav",
         "audio/ogg",
+        "application/ogg",
         "application/pdf",
     ];
     const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
@@ -96,14 +97,7 @@
     }
 
     function withJoinToken(url: string | undefined): string | undefined {
-        if (!url || !joinToken) return url;
-        try {
-            const parsed = new URL(url, window.location.origin);
-            parsed.searchParams.set("token", joinToken);
-            return parsed.toString();
-        } catch {
-            return url;
-        }
+        return url;
     }
 
     let messageInput = $state("");
@@ -311,7 +305,6 @@
             const uploadedFile = await uploadFile(
                 roomSlug,
                 file,
-                joinToken,
                 (progress) => {
                     if (uploadAbortController !== controller) return;
                     uploadProgress = progress;

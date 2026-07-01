@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	_ "image/gif"
 	"image/jpeg"
 	"image/png"
 	"io"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,12 +24,14 @@ import (
 	"chromatic/internal/metrics"
 
 	"golang.org/x/image/draw"
+	_ "golang.org/x/image/webp"
 )
 
 const (
 	thumbnailMaxWidth  = 200
 	thumbnailMaxHeight = 200
 	thumbnailQuality   = 80
+	maxImagePixels     = 40_000_000
 )
 
 // Allowed MIME types and max file size
@@ -95,12 +99,17 @@ func isPathWithin(baseDir, target string) bool {
 	return strings.HasPrefix(absTarget, absBase+string(filepath.Separator))
 }
 
-// getJoinToken extracts a join token from headers or query params.
-func (h *FileHandler) getJoinToken(r *http.Request) string {
+// getJoinToken extracts a join token from headers, the HttpOnly room cookie,
+// bearer auth, or development-only query params. First-party browsers should
+// rely on the cookie so signed tokens do not end up in URLs, logs or referrers.
+func (h *FileHandler) getJoinToken(r *http.Request, roomSlug string) string {
 	if token := r.Header.Get("X-Join-Token"); token != "" {
 		return token
 	}
-	if token := r.URL.Query().Get("token"); token != "" {
+	if c, err := r.Cookie(JoinTokenCookieName(roomSlug)); err == nil && c.Value != "" {
+		return c.Value
+	}
+	if token := r.URL.Query().Get("token"); token != "" && (h.cfg == nil || !h.cfg.ProductionMode) {
 		return token
 	}
 	auth := r.Header.Get("Authorization")
@@ -112,7 +121,7 @@ func (h *FileHandler) getJoinToken(r *http.Request) string {
 
 // authorizeParticipant validates the join token and ensures the participant is admitted to the room.
 func (h *FileHandler) authorizeParticipant(r *http.Request, roomSlug string) (string, error) {
-	token := h.getJoinToken(r)
+	token := h.getJoinToken(r, roomSlug)
 	if token == "" {
 		return "", errors.New("missing join token")
 	}
@@ -190,31 +199,33 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Detect MIME type
-	buffer := make([]byte, 512)
-	_, err = file.Read(buffer)
+	// Detect MIME type from content, not from the client-supplied filename or
+	// part header.
+	mimeType, err := detectFileContentType(file)
 	if err != nil {
 		http.Error(w, "Failed to read file", http.StatusBadRequest)
 		return
 	}
-	mimeType := http.DetectContentType(buffer)
-
-	// Reset file position
-	file.Seek(0, io.SeekStart)
 
 	// Validate MIME type
 	if !allowedMIMETypes[mimeType] {
 		http.Error(w, "File type not allowed", http.StatusBadRequest)
 		return
 	}
+	if err := validateImageDimensions(file, mimeType, maxImagePixels); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	// Generate file ID and path
-	fileID := generateFileID()
-	originalName := sanitizeFilename(header.Filename)
-	ext := filepath.Ext(originalName)
-	if ext == "" {
-		ext = getExtensionForMIME(mimeType)
+	fileID, err := generateFileID()
+	if err != nil {
+		logger.Error("Failed to generate file ID", "error", err)
+		http.Error(w, "Failed to save file", http.StatusInternalServerError)
+		return
 	}
+	originalName := sanitizeFilename(header.Filename)
+	ext := getExtensionForMIME(mimeType)
 	storedName := fileID + ext
 	storedPath := filepath.Join(h.cfg.UploadPath, roomID, storedName)
 
@@ -332,7 +343,9 @@ func (h *FileHandler) Download(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", mimeType)
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`%s; filename="%s"`, disposition, sanitizeFilename(originalName)))
+	w.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{
+		"filename": sanitizeFilename(originalName),
+	}))
 
 	http.ServeFile(w, r, storedPath)
 }
@@ -510,10 +523,12 @@ func (h *FileHandler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, storedPath)
 }
 
-func generateFileID() string {
+func generateFileID() (string, error) {
 	bytes := make([]byte, 16)
-	rand.Read(bytes)
-	return hex.EncodeToString(bytes)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes), nil
 }
 
 // fileIDRe matches the format generateFileID produces: 32 lowercase hex chars.
@@ -554,15 +569,81 @@ func getExtensionForMIME(mimeType string) string {
 		return ".webp"
 	case "audio/mpeg":
 		return ".mp3"
-	case "audio/wav":
+	case "audio/wav", "audio/wave", "audio/x-wav":
 		return ".wav"
-	case "audio/ogg":
+	case "audio/ogg", "application/ogg":
 		return ".ogg"
 	case "application/pdf":
 		return ".pdf"
 	default:
 		return ".bin"
 	}
+}
+
+func validateImageDimensions(file io.ReadSeeker, mimeType string, maxPixels int64) error {
+	if !strings.HasPrefix(mimeType, "image/") {
+		return nil
+	}
+
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to inspect image")
+	}
+	cfg, _, err := image.DecodeConfig(file)
+	if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil {
+		return fmt.Errorf("failed to inspect image")
+	}
+	if err != nil {
+		return fmt.Errorf("invalid image file")
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return fmt.Errorf("invalid image dimensions")
+	}
+	pixels := int64(cfg.Width) * int64(cfg.Height)
+	if pixels > maxPixels {
+		return fmt.Errorf("image dimensions too large (max %d megapixels)", maxPixels/1_000_000)
+	}
+	return nil
+}
+
+func detectFileContentType(file io.ReadSeeker) (string, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+
+	buffer := make([]byte, 512)
+	n, err := file.Read(buffer)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	if n == 0 {
+		return "", errors.New("empty file")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+
+	return normalizeDetectedMIMEType(http.DetectContentType(buffer[:n])), nil
+}
+
+func normalizeDetectedMIMEType(mimeType string) string {
+	switch mimeType {
+	case "audio/wave", "audio/x-wav":
+		return "audio/wav"
+	case "application/ogg":
+		return "audio/ogg"
+	default:
+		return mimeType
+	}
+}
+
+func detectPathContentType(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	return detectFileContentType(file)
 }
 
 // generateThumbnail creates a resized thumbnail from an image file

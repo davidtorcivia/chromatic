@@ -209,12 +209,20 @@ POST /api/rooms/{slug}/join
 ```json
 {
   "participantId": "uuid",
-  "token": "jwt-token-for-websocket",
   "isAdmitted": false,
   "waitingRoom": true,
-  "color": "#4F46E5"
+  "color": "#4F46E5",
+  "name": "Viewer Name",
+  "role": "viewer",
+  "serverTime": "2026-07-01T12:00:00Z"
 }
 ```
+
+The response also sets a room-scoped HttpOnly cookie
+`chromatic_join_{slug}`. In production mode the signed join token is not
+returned in the JSON body, so browser clients should authenticate subsequent
+status, upload, file, SSE, and WebSocket requests with that cookie. Development
+mode may include a `token` field for local tooling compatibility.
 
 ### Check Participant Status
 
@@ -223,6 +231,8 @@ GET /api/rooms/{slug}/status/{participantId}
 ```
 
 Used to poll for admission status in waiting room.
+Browser clients authenticate with the room join cookie. Non-browser clients may
+send `X-Join-Token: <signed-token>` when they were issued a token out of band.
 
 **Response:**
 ```json
@@ -398,7 +408,7 @@ POST /api/rooms/{slug}/files
 
 **Allowed Types:**
 - `image/jpeg`, `image/png`, `image/gif`, `image/webp`
-- `audio/mpeg`, `audio/wav`, `audio/ogg`
+- `audio/mpeg`, `audio/wav`/`audio/wave`, `audio/ogg`/`application/ogg`
 - `application/pdf`
 
 **Response:**
@@ -492,8 +502,13 @@ This endpoint is used by OBS for WHIP streaming.
 Connect to the WebSocket endpoint:
 
 ```
-ws://host/ws/room/{slug}?token={jwt}&name={viewerName}
+ws://host/ws/room/{slug}?name={viewerName}
 ```
+
+Browser WebSocket upgrades authenticate with the room-scoped HttpOnly join
+cookie set by `POST /api/rooms/{slug}/join`. Production mode ignores join
+tokens in WebSocket query strings to avoid leaking credentials into logs,
+history, and referrers.
 
 ### Client → Server Messages
 

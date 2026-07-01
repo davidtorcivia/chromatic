@@ -68,10 +68,18 @@ func (h *StreamKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := generateStreamKeyID()
-	keyToken := generateKeyToken()
+	id, err := generateStreamKeyID()
+	if err != nil {
+		http.Error(w, "Failed to create stream key", http.StatusInternalServerError)
+		return
+	}
+	keyToken, err := generateKeyToken()
+	if err != nil {
+		http.Error(w, "Failed to create stream key", http.StatusInternalServerError)
+		return
+	}
 
-	_, err := h.db.Exec(`
+	_, err = h.db.Exec(`
 		INSERT INTO stream_keys (id, name, key_token) VALUES (?, ?, ?)
 	`, id, req.Name, keyToken)
 
@@ -126,15 +134,19 @@ func (h *StreamKeyHandler) GetKeyID(token string) (string, error) {
 	return id, err
 }
 
-func generateStreamKeyID() string {
+func generateStreamKeyID() (string, error) {
 	bytes := make([]byte, 16)
-	rand.Read(bytes)
-	return hex.EncodeToString(bytes)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes), nil
 }
 
-func generateKeyToken() string {
+func generateKeyToken() (string, error) {
 	// Generate a longer, more secure token for stream keys
 	bytes := make([]byte, 32)
-	rand.Read(bytes)
-	return hex.EncodeToString(bytes)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes), nil
 }

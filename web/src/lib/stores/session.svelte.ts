@@ -81,7 +81,7 @@ export function createSessionStore() {
     let hasConnectedOnce = false;
 
     // Store connection params for reconnection
-    let connectionParams: { roomSlug: string; token: string; name: string; participantId: string } | null = null;
+    let connectionParams: { roomSlug: string; name: string; participantId: string } | null = null;
 
     // Calculate exponential backoff delay with jitter
     function getReconnectDelay(attempt: number): number {
@@ -152,7 +152,7 @@ export function createSessionStore() {
             reconnectTimer = setTimeout(() => {
                 reconnectTimer = null;
                 if (connectionParams) {
-                    connect(connectionParams.roomSlug, connectionParams.token, connectionParams.name, connectionParams.participantId);
+                    connect(connectionParams.roomSlug, connectionParams.name, connectionParams.participantId);
                 }
             }, delay);
         } else {
@@ -177,17 +177,17 @@ export function createSessionStore() {
         state.error = null;
         state.reconnecting = true;
         state.reconnectAttempt = 0;
-        connect(connectionParams.roomSlug, connectionParams.token, connectionParams.name, connectionParams.participantId);
+        connect(connectionParams.roomSlug, connectionParams.name, connectionParams.participantId);
     }
 
-    function connect(roomSlug: string, token: string, name: string, participantId = '') {
+    function connect(roomSlug: string, name: string, participantId = '') {
         attachNetworkListeners();
         // Clear any pending reconnect timer so a manual connect plus a
         // pending timer can't create parallel sockets.
         clearReconnectTimer();
 
         // Store params for reconnection
-        connectionParams = { roomSlug, token, name, participantId };
+        connectionParams = { roomSlug, name, participantId };
         // Our own participant id — used to identify the local cursor (laser),
         // self in rosters, etc. Set here (and re-applied on every reconnect via
         // connectionParams) so it survives socket drops. Empty string from
@@ -206,7 +206,7 @@ export function createSessionStore() {
         }
 
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const url = `${protocol}//${window.location.host}/ws/room/${roomSlug}?token=${token}&name=${encodeURIComponent(name)}`;
+        const url = `${protocol}//${window.location.host}/ws/room/${roomSlug}?name=${encodeURIComponent(name)}`;
 
         ws = new WebSocket(url);
 

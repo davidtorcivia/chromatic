@@ -34,5 +34,8 @@
 		"@fontsource/space-grotesk": "^5.2.10",
 		"@fontsource/work-sans": "^5.2.8",
 		"@jitsi/rnnoise-wasm": "^0.2.1"
+	},
+	"overrides": {
+		"cookie": "0.7.2"
 	}
 }

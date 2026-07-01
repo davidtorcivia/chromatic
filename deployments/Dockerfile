@@ -1,5 +1,5 @@
 # Build stage for SvelteKit
-FROM node:20-alpine AS frontend
+FROM node:24-alpine3.22 AS frontend
 WORKDIR /build
 COPY web/package*.json ./
 RUN npm ci
@@ -7,7 +7,7 @@ COPY web/ .
 RUN npm run build
 
 # Build stage for Go
-FROM golang:1.24-alpine AS backend
+FROM golang:1.24.11-alpine3.22 AS backend
 WORKDIR /build
 RUN apk add --no-cache gcc musl-dev
 
@@ -18,7 +18,7 @@ COPY . .
 RUN CGO_ENABLED=1 go build -o chromatic ./cmd/chromatic
 
 # Runtime stage
-FROM alpine:3.19
+FROM alpine:3.22
 WORKDIR /app
 
 RUN apk add --no-cache ca-certificates curl sqlite

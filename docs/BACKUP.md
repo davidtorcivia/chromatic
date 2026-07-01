@@ -13,8 +13,8 @@ Run all commands from the repository root (for example `/opt/chromatic`).
 `./scripts/backup.sh` creates timestamped artifacts in your backup directory:
 
 - `chromatic-YYYYMMDD_HHMMSS.db` - SQLite database backup
-- `files-YYYYMMDD_HHMMSS.tar.gz` - Uploaded files (if present)
-- `logos-YYYYMMDD_HHMMSS.tar.gz` - Watermark logos (if present)
+- `files-YYYYMMDD_HHMMSS.tar.gz` - Uploaded files archive, always present (may be empty)
+- `logos-YYYYMMDD_HHMMSS.tar.gz` - Watermark logos archive, always present (may be empty)
 - `manifest-YYYYMMDD_HHMMSS.txt` - Backup manifest
 
 ## Quick Backup
@@ -45,6 +45,13 @@ After backup, run verification before updates or maintenance:
 
 Replace `20260206_231500` with your backup timestamp.
 
+Verification checks:
+
+- SQLite `PRAGMA integrity_check`
+- required application tables, including audit logs
+- readable media/logo archives
+- archive member paths are relative and do not contain parent traversal
+
 ## Quick Restore
 
 1. Pick the backup timestamp you want to restore.
@@ -56,10 +63,18 @@ Replace `20260206_231500` with your backup timestamp.
 
 Restore behavior:
 
+- Validates the database backup before modifying live data
+- Validates media/logo archives before extraction
 - Creates a pre-restore DB snapshot (`chromatic-pre-restore-*.db`)
 - Stops `chromatic`
 - Restores DB and media artifacts from the selected timestamp
 - Starts `chromatic` again
+
+Current backups always include files and logos archives, even when those
+directories are empty. Restoring a current backup therefore replaces the live
+media/logo directories with the exact backed-up state. Older backups that lack
+one of those archives are treated as legacy backups and leave that directory
+unchanged.
 
 ## Update Safety Pattern (Recommended)
 
@@ -108,14 +123,14 @@ docker compose -f deployments/docker-compose.yml run --rm --no-deps \
   -v /opt/chromatic/backups:/backup \
   chromatic sh -ec "sqlite3 /data/chromatic.db \".backup '/backup/chromatic-${TIMESTAMP}.db'\""
 
-# Files and logos archives (optional)
+# Files and logos archives (always create them, even when empty)
 docker compose -f deployments/docker-compose.yml run --rm --no-deps \
   -v /opt/chromatic/backups:/backup \
-  chromatic sh -ec "[ -d /data/files ] && [ \"\$(ls -A /data/files 2>/dev/null)\" ] && tar -czf '/backup/files-${TIMESTAMP}.tar.gz' -C /data files || true"
+  chromatic sh -ec "mkdir -p /data/files && tar -czf '/backup/files-${TIMESTAMP}.tar.gz' -C /data files"
 
 docker compose -f deployments/docker-compose.yml run --rm --no-deps \
   -v /opt/chromatic/backups:/backup \
-  chromatic sh -ec "[ -d /data/logos ] && [ \"\$(ls -A /data/logos 2>/dev/null)\" ] && tar -czf '/backup/logos-${TIMESTAMP}.tar.gz' -C /data logos || true"
+  chromatic sh -ec "mkdir -p /data/logos && tar -czf '/backup/logos-${TIMESTAMP}.tar.gz' -C /data logos"
 ```
 
 ## Restore Validation Checklist

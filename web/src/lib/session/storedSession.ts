@@ -2,7 +2,6 @@ import type { LobbyInfo } from "$lib/api/client";
 
 export interface StoredSessionData {
     participantId: string;
-    token: string;
     color: string;
     name?: string;
     role?: "admin" | "viewer";
@@ -30,7 +29,7 @@ export function parseStoredSession(raw: string | null): StoredSessionData | null
         const parsed = JSON.parse(raw) as unknown;
         if (!parsed || typeof parsed !== "object") return null;
         const data = parsed as Record<string, unknown>;
-        if (!isString(data.participantId) || !isString(data.token) || !isString(data.color)) {
+        if (!isString(data.participantId) || !isString(data.color)) {
             return null;
         }
         if (
@@ -40,8 +39,17 @@ export function parseStoredSession(raw: string | null): StoredSessionData | null
         ) {
             return null;
         }
+        if (data.name !== undefined && !isString(data.name)) return null;
+        if (data.serverTime !== undefined && !isString(data.serverTime)) return null;
         if (data.lobby !== undefined && !isLobbyInfo(data.lobby)) return null;
-        return parsed as StoredSessionData;
+        return {
+            participantId: data.participantId,
+            color: data.color,
+            name: data.name,
+            role: data.role,
+            serverTime: data.serverTime,
+            lobby: data.lobby,
+        } as StoredSessionData;
     } catch {
         return null;
     }

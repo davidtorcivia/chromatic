@@ -7,11 +7,16 @@ import "testing"
 // generateFileID produces 32 lowercase hex chars; anything else is rejected so
 // a path value like "%" can't over-match and delete unrelated file messages.
 func TestValidFileID(t *testing.T) {
+	generatedID, err := generateFileID()
+	if err != nil {
+		t.Fatalf("generateFileID returned error: %v", err)
+	}
+
 	valid := []string{
 		"00000000000000000000000000000000", // 32 hex
 		"abcdef0123456789abcdef0123456789",
 		"deadbeefdeadbeefdeadbeefdeadbeef",
-		generateFileID(), // a real generated id
+		generatedID, // a real generated id
 	}
 	for _, id := range valid {
 		if !validFileID(id) {
@@ -20,17 +25,17 @@ func TestValidFileID(t *testing.T) {
 	}
 
 	invalid := []string{
-		"",                  // empty
-		"abc",               // too short
-		"ABCDEFGHIJKLMNOP",  // uppercase (not hex-lowercase)
-		"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", // not hex
-		"abcdef0123456789abcdef012345678",  // 31 chars
+		"",                                  // empty
+		"abc",                               // too short
+		"ABCDEFGHIJKLMNOP",                  // uppercase (not hex-lowercase)
+		"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",  // not hex
+		"abcdef0123456789abcdef012345678",   // 31 chars
 		"abcdef0123456789abcdef0123456789a", // 33 chars
-		"%",                 // LIKE wildcard
-		"_",                 // LIKE single-char wildcard
-		"abc%",              // hex prefix + wildcard
-		"../etc/passwd",     // path traversal attempt
-		"a]b",               // bracket
+		"%",                                 // LIKE wildcard
+		"_",                                 // LIKE single-char wildcard
+		"abc%",                              // hex prefix + wildcard
+		"../etc/passwd",                     // path traversal attempt
+		"a]b",                               // bracket
 	}
 	for _, id := range invalid {
 		if validFileID(id) {
@@ -48,11 +53,11 @@ func TestEscapeLikeForID(t *testing.T) {
 		in, want string
 	}{
 		{"abcdef0123456789abcdef0123456789", "abcdef0123456789abcdef0123456789"},
-		{"a%c_d", `a\%c\_d`},        // wildcard chars escaped
-		{`a\b`, `a\\b`},             // backslash escaped
-		{"%", `\%`},                 // bare wildcard
-		{"", ""},                    // empty passes through
-		{"normal", "normal"},        // plain hex-ish unchanged
+		{"a%c_d", `a\%c\_d`}, // wildcard chars escaped
+		{`a\b`, `a\\b`},      // backslash escaped
+		{"%", `\%`},          // bare wildcard
+		{"", ""},             // empty passes through
+		{"normal", "normal"}, // plain hex-ish unchanged
 	}
 	for _, c := range cases {
 		got := escapeLikeForID(c.in)

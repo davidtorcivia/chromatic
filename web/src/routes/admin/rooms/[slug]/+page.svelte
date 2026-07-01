@@ -453,10 +453,10 @@
         </div>
         {#if room && room.status !== "ended"}
             <div class="header-actions">
-                <a href="/room/{slug}?host=1" target="_blank" class="btn btn-primary">
+                <a href="/room/{slug}?host=1" target="_blank" rel="noopener noreferrer" class="btn btn-primary">
                     Join as host
                 </a>
-                <a href="/room/{slug}" target="_blank" class="btn btn-secondary">
+                <a href="/room/{slug}" target="_blank" rel="noopener noreferrer" class="btn btn-secondary">
                     View Room
                 </a>
             </div>
@@ -488,7 +488,7 @@
                 <div class="card health-card">
                     <div class="card-header">
                         <h3>Room Health</h3>
-                        <a href="/room/{slug}?host=1" target="_blank" class="btn btn-secondary btn-sm">
+                        <a href="/room/{slug}?host=1" target="_blank" rel="noopener noreferrer" class="btn btn-secondary btn-sm">
                             Open Host Diagnostics
                         </a>
                     </div>
@@ -596,7 +596,7 @@
                                     </span>
                                 {/if}
                                 <div class="file-info">
-                                    <a class="file-name" href={file.url} target="_blank" rel="noopener">{file.originalName}</a>
+                                    <a class="file-name" href={file.url} target="_blank" rel="noopener noreferrer">{file.originalName}</a>
                                     <span class="file-meta">
                                         {formatBytes(file.sizeBytes)} · {file.uploaderName} · {formatDate(new Date(file.createdAt).toISOString())}
                                     </span>

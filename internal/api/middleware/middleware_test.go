@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -500,6 +501,118 @@ func TestSecurityHeaders(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestEnforceTrustedOrigins(t *testing.T) {
+	handler := EnforceTrustedOrigins(CORSConfig{
+		AllowedOrigins: []string{"https://stream.example.com"},
+		ProductionMode: true,
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	tests := []struct {
+		name   string
+		method string
+		origin string
+		want   int
+	}{
+		{name: "allowed unsafe origin", method: http.MethodPost, origin: "https://stream.example.com", want: http.StatusOK},
+		{name: "blocked unsafe origin", method: http.MethodPost, origin: "https://evil.example", want: http.StatusForbidden},
+		{name: "no origin non browser client", method: http.MethodPost, origin: "", want: http.StatusOK},
+		{name: "safe method ignored", method: http.MethodGet, origin: "https://evil.example", want: http.StatusOK},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, "/api/rooms", nil)
+			if tt.origin != "" {
+				req.Header.Set("Origin", tt.origin)
+			}
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+			if rr.Code != tt.want {
+				t.Fatalf("expected status %d, got %d", tt.want, rr.Code)
+			}
+		})
+	}
+}
+
+func TestLimitJSONBody(t *testing.T) {
+	var readErr error
+	handler := LimitJSONBody(8)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, readErr = io.ReadAll(r.Body)
+		if readErr != nil {
+			http.Error(w, "read failed", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	t.Run("allows small json", func(t *testing.T) {
+		readErr = nil
+		req := httptest.NewRequest(http.MethodPost, "/api/test", strings.NewReader(`{"a":1}`))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+
+		handler.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d", http.StatusOK, rr.Code)
+		}
+		if readErr != nil {
+			t.Fatalf("unexpected read error: %v", readErr)
+		}
+	})
+
+	t.Run("rejects known oversized json before handler", func(t *testing.T) {
+		called := false
+		rejectingHandler := LimitJSONBody(8)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called = true
+			w.WriteHeader(http.StatusOK)
+		}))
+		req := httptest.NewRequest(http.MethodPost, "/api/test", strings.NewReader(`{"payload":"too-large"}`))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+
+		rejectingHandler.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("expected status %d, got %d", http.StatusRequestEntityTooLarge, rr.Code)
+		}
+		if called {
+			t.Fatal("handler should not be called for known oversized JSON bodies")
+		}
+	})
+
+	t.Run("wraps unknown length json bodies", func(t *testing.T) {
+		readErr = nil
+		req := httptest.NewRequest(http.MethodPost, "/api/test", strings.NewReader(`{"payload":"too-large"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.ContentLength = -1
+		rr := httptest.NewRecorder()
+
+		handler.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("expected status %d, got %d", http.StatusBadRequest, rr.Code)
+		}
+		if readErr == nil {
+			t.Fatal("expected a read error from MaxBytesReader")
+		}
+	})
+
+	t.Run("ignores multipart uploads", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/test", strings.NewReader(strings.Repeat("x", 32)))
+		req.Header.Set("Content-Type", "multipart/form-data; boundary=test")
+		rr := httptest.NewRecorder()
+
+		handler.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d", http.StatusOK, rr.Code)
+		}
+	})
 }
 
 // TestRecoverer tests the panic recovery middleware

@@ -37,10 +37,31 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+require_cmd() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        log_error "Required command not found: $1"
+        exit 1
+    fi
+}
+
+validate_timestamp() {
+    case "$1" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+        *)
+            log_error "Invalid backup timestamp format: $1"
+            exit 1
+            ;;
+    esac
+}
+
 if [ ! -f "$COMPOSE_FILE" ]; then
     log_error "Compose file not found: $COMPOSE_FILE"
     exit 1
 fi
+
+require_cmd docker
+require_cmd tar
+validate_timestamp "$TIMESTAMP"
 
 if [ ! -f "$DB_BACKUP" ]; then
     log_error "Database backup not found: $DB_BACKUP"
@@ -52,6 +73,29 @@ COMPOSE_CMD=(docker compose -f "$COMPOSE_FILE")
 log_info "Starting Chromatic restore"
 log_info "Backup timestamp: $TIMESTAMP"
 log_info "Backup directory: $BACKUP_DIR_ABS"
+
+log_info "Validating database backup before restore"
+INTEGRITY="$("${COMPOSE_CMD[@]}" run --rm --no-deps -v "$BACKUP_DIR_ABS:/backup:ro" chromatic sh -ec "sqlite3 '/backup/chromatic-$TIMESTAMP.db' 'PRAGMA integrity_check;'" 2>&1 || true)"
+if [ "$INTEGRITY" != "ok" ]; then
+    log_error "SQLite integrity check failed: $INTEGRITY"
+    exit 1
+fi
+
+log_info "Validating media archives before restore"
+for archive in "$FILES_BACKUP" "$LOGOS_BACKUP"; do
+    if [ ! -f "$archive" ]; then
+        log_warn "Archive not found and will not be restored: $(basename "$archive")"
+        continue
+    fi
+    if ! tar -tzf "$archive" >/dev/null; then
+        log_error "Archive is unreadable or corrupted: $(basename "$archive")"
+        exit 1
+    fi
+    if tar -tzf "$archive" | grep -E '(^/|(^|/)\.\.(/|$))' >/dev/null; then
+        log_error "Archive contains unsafe absolute or parent-traversal paths: $(basename "$archive")"
+        exit 1
+    fi
+done
 
 echo ""
 log_warn "WARNING: This will overwrite the current database and media data."
@@ -88,6 +132,7 @@ if [ -f '/backup/logos-$TIMESTAMP.tar.gz' ]; then
   mkdir -p /data
   tar -xzf '/backup/logos-$TIMESTAMP.tar.gz' -C /data
 fi
+mkdir -p /data/files /data/logos
 "
 
 log_info "Starting chromatic service"
@@ -97,12 +142,12 @@ log_info "Restore completed successfully"
 if [ -f "$FILES_BACKUP" ]; then
     log_info "Restored media archive: $(basename "$FILES_BACKUP")"
 else
-    log_warn "No files archive found for this timestamp; existing /data/files was left unchanged"
+    log_warn "No files archive found for this timestamp; /data/files was left unchanged for legacy backup compatibility"
 fi
 if [ -f "$LOGOS_BACKUP" ]; then
     log_info "Restored logos archive: $(basename "$LOGOS_BACKUP")"
 else
-    log_warn "No logos archive found for this timestamp; existing /data/logos was left unchanged"
+    log_warn "No logos archive found for this timestamp; /data/logos was left unchanged for legacy backup compatibility"
 fi
 
 log_info "Next steps:"

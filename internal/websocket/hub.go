@@ -530,6 +530,37 @@ func (h *Hub) RoomClientCount(roomSlug string) int {
 	return 0
 }
 
+// CloseRoom forcibly closes every WebSocket client in a room and removes the
+// room from the hub. It is used when an admin ends or deletes a room, where the
+// room itself is no longer a valid presence container and waiting for each read
+// pump to unregister lazily would leave stale active-room/client metrics.
+func (h *Hub) CloseRoom(roomSlug string) {
+	h.mu.Lock()
+	room, ok := h.rooms[roomSlug]
+	if !ok {
+		h.mu.Unlock()
+		return
+	}
+	delete(h.rooms, roomSlug)
+	h.mu.Unlock()
+
+	closedClients := 0
+	for _, client := range room.Clients {
+		client.closeOnce.Do(func() {
+			close(client.Done)
+		})
+		if client.Conn != nil {
+			client.Conn.Close()
+		}
+		closedClients++
+	}
+
+	if closedClients > 0 {
+		metrics.Get().ActiveWebsockets.Add(-int64(closedClients))
+	}
+	metrics.Get().ActiveRooms.Add(-1)
+}
+
 // GetClient returns a specific client
 func (h *Hub) GetClient(roomSlug, clientID string) *Client {
 	h.mu.RLock()

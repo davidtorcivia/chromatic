@@ -3,13 +3,23 @@
 
 const API_BASE = '';
 
+export class ApiError extends Error {
+    constructor(
+        public status: number,
+        message: string
+    ) {
+        super(message);
+        this.name = "ApiError";
+    }
+}
+
 export async function apiGet<T>(path: string): Promise<T> {
     const res = await fetch(`${API_BASE}${path}`, {
         credentials: 'include' // Include httpOnly cookies
     });
 
     if (!res.ok) {
-        throw new Error(await res.text());
+        throw new ApiError(res.status, await res.text());
     }
 
     return res.json();
@@ -26,7 +36,7 @@ export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
     });
 
     if (!res.ok) {
-        throw new Error(await res.text());
+        throw new ApiError(res.status, await res.text());
     }
 
     // Several endpoints (admit, deny, end) reply 204 No Content; res.json()
@@ -46,7 +56,7 @@ export async function apiPatch<T>(path: string, body: unknown): Promise<T> {
     });
 
     if (!res.ok) {
-        throw new Error(await res.text());
+        throw new ApiError(res.status, await res.text());
     }
 
     return res.json();
@@ -59,7 +69,7 @@ export async function apiDelete(path: string): Promise<void> {
     });
 
     if (!res.ok) {
-        throw new Error(await res.text());
+        throw new ApiError(res.status, await res.text());
     }
 }
 
@@ -141,7 +151,7 @@ export interface LobbyInfo {
 
 export interface JoinResult {
     participantId: string;
-    token: string;
+    token?: string;
     isAdmitted: boolean;
     waitingRoom: boolean;
     color: string;
@@ -194,13 +204,11 @@ export const rooms = {
     admit: (slug: string, participantId: string) => apiPost(`/api/rooms/${slug}/admit/${participantId}`),
     admitAll: (slug: string) => apiPost(`/api/rooms/${slug}/admit-all`),
     deny: (slug: string, participantId: string) => apiPost(`/api/rooms/${slug}/deny/${participantId}`),
-    checkStatus: async (slug: string, participantId: string, token: string): Promise<{ isAdmitted: boolean; roomStatus: string; serverTime?: string }> => {
-        // The join token travels in a header rather than a query param so it
-        // doesn't leak into server/proxy logs. (The SSE waitingEvents endpoint
-        // keeps the query param — EventSource can't set headers.)
+    checkStatus: async (slug: string, participantId: string): Promise<{ isAdmitted: boolean; roomStatus: string; serverTime?: string }> => {
+        // Browser joins use the HttpOnly join cookie set by POST /join so the
+        // signed join token does not need to live in localStorage or URLs.
         const res = await fetch(`${API_BASE}/api/rooms/${slug}/status/${participantId}`, {
             credentials: 'include',
-            headers: { 'X-Join-Token': token }
         });
         if (!res.ok) {
             throw new Error(await res.text());
@@ -304,7 +312,6 @@ export interface UploadedFile {
 export async function uploadFile(
     roomSlug: string,
     file: File,
-    joinToken: string,
     onProgress?: (percent: number) => void,
     signal?: AbortSignal
 ): Promise<UploadedFile> {
@@ -357,7 +364,6 @@ export async function uploadFile(
 
         xhr.open('POST', `${API_BASE}/api/rooms/${roomSlug}/files`);
         xhr.withCredentials = true;
-        xhr.setRequestHeader('X-Join-Token', joinToken);
         xhr.send(formData);
     });
 }

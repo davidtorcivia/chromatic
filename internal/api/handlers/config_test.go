@@ -291,7 +291,7 @@ func TestConfigHandler_UploadLogo_ValidPNG(t *testing.T) {
 
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
-	part, _ := writer.CreateFormFile("logo", "test.png")
+	part, _ := writer.CreateFormFile("logo", "watermark.html")
 	part.Write(pngData)
 	writer.Close()
 
@@ -311,6 +311,9 @@ func TestConfigHandler_UploadLogo_ValidPNG(t *testing.T) {
 	if resp["logoUrl"] != "/api/config/logo" {
 		t.Errorf("expected logoUrl '/api/config/logo', got %s", resp["logoUrl"])
 	}
+	if filepath.Ext(resp["path"]) != ".png" {
+		t.Errorf("expected stored logo extension '.png' from detected MIME, got %q", filepath.Ext(resp["path"]))
+	}
 
 	// Verify logo can be retrieved
 	getReq := httptest.NewRequest("GET", "/api/config/logo", nil)
@@ -319,6 +322,9 @@ func TestConfigHandler_UploadLogo_ValidPNG(t *testing.T) {
 
 	if getRR.Code != http.StatusOK {
 		t.Errorf("expected status %d for GetLogo, got %d", http.StatusOK, getRR.Code)
+	}
+	if getRR.Header().Get("Content-Type") != "image/png" {
+		t.Errorf("expected logo Content-Type image/png, got %q", getRR.Header().Get("Content-Type"))
 	}
 }
 

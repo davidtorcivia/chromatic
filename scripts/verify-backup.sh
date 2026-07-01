@@ -39,10 +39,48 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_pass() { echo -e "${GREEN}[PASS]${NC} $1"; }
 log_fail() { echo -e "${RED}[FAIL]${NC} $1"; }
 
+require_cmd() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        log_error "Required command not found: $1"
+        exit 1
+    fi
+}
+
+validate_timestamp() {
+    case "$1" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+        *)
+            log_error "Invalid backup timestamp format: $1"
+            exit 1
+            ;;
+    esac
+}
+
+validate_archive_paths() {
+    archive="$1"
+    label="$2"
+
+    if ! tar -tzf "$archive" >/dev/null 2>&1; then
+        log_fail "$label archive is corrupted: $(basename "$archive")"
+        ERRORS=$((ERRORS + 1))
+        return
+    fi
+    if tar -tzf "$archive" | grep -E '(^/|(^|/)\.\.(/|$))' >/dev/null; then
+        log_fail "$label archive contains unsafe absolute or parent-traversal paths: $(basename "$archive")"
+        ERRORS=$((ERRORS + 1))
+        return
+    fi
+    log_pass "$label archive valid: $(basename "$archive")"
+}
+
 if [ ! -f "$COMPOSE_FILE" ]; then
     log_error "Compose file not found: $COMPOSE_FILE"
     exit 1
 fi
+
+require_cmd docker
+require_cmd tar
+validate_timestamp "$TIMESTAMP"
 
 if [ ! -f "$DB_BACKUP" ]; then
     log_error "Database backup not found: $DB_BACKUP"
@@ -77,7 +115,7 @@ else
 fi
 
 TABLES="$("${COMPOSE_CMD[@]}" run --rm --no-deps -v "$BACKUP_DIR_ABS:/backup:ro" chromatic sh -ec "sqlite3 '/backup/chromatic-$TIMESTAMP.db' '.tables'" 2>&1 || true)"
-for table in stream_keys rooms participants messages files config sessions; do
+for table in stream_keys rooms participants messages files config sessions admin_audit_logs; do
     if echo "$TABLES" | grep -q "\b$table\b"; then
         log_pass "Table exists: $table"
     else
@@ -89,25 +127,15 @@ done
 echo ""
 echo "Checking media archives..."
 if [ -f "$FILES_BACKUP" ]; then
-    if tar -tzf "$FILES_BACKUP" >/dev/null 2>&1; then
-        log_pass "Files archive valid: $(basename "$FILES_BACKUP")"
-    else
-        log_fail "Files archive is corrupted: $(basename "$FILES_BACKUP")"
-        ERRORS=$((ERRORS + 1))
-    fi
+    validate_archive_paths "$FILES_BACKUP" "Files"
 else
-    log_warn "Files archive not found for timestamp (may be expected)"
+    log_warn "Files archive not found for timestamp (legacy backups only; current backups always include it)"
 fi
 
 if [ -f "$LOGOS_BACKUP" ]; then
-    if tar -tzf "$LOGOS_BACKUP" >/dev/null 2>&1; then
-        log_pass "Logos archive valid: $(basename "$LOGOS_BACKUP")"
-    else
-        log_fail "Logos archive is corrupted: $(basename "$LOGOS_BACKUP")"
-        ERRORS=$((ERRORS + 1))
-    fi
+    validate_archive_paths "$LOGOS_BACKUP" "Logos"
 else
-    log_warn "Logos archive not found for timestamp (may be expected)"
+    log_warn "Logos archive not found for timestamp (legacy backups only; current backups always include it)"
 fi
 
 echo ""

@@ -4,7 +4,6 @@ import { parseStoredSession } from './storedSession';
 
 const validSession = {
     participantId: 'participant-1',
-    token: 'join-token',
     color: '#48b6a6',
     name: 'Viewer',
     role: 'viewer',
@@ -14,11 +13,15 @@ describe('parseStoredSession', () => {
     it('rejects missing and malformed stored session data', () => {
         expect(parseStoredSession(null)).toBeNull();
         expect(parseStoredSession('not-json')).toBeNull();
-        expect(parseStoredSession(JSON.stringify({ token: 'join-token' }))).toBeNull();
+        expect(parseStoredSession(JSON.stringify({ color: '#48b6a6' }))).toBeNull();
     });
 
     it('accepts a valid room session payload', () => {
         expect(parseStoredSession(JSON.stringify(validSession))).toMatchObject(validSession);
+    });
+
+    it('drops legacy signed join tokens from stored payloads', () => {
+        expect(parseStoredSession(JSON.stringify({ ...validSession, token: 'join-token' }))).toEqual(validSession);
     });
 
     it('rejects invalid roles and incomplete lobby payloads', () => {

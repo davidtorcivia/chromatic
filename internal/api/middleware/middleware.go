@@ -148,6 +148,65 @@ func CORS(cfg CORSConfig) func(http.Handler) http.Handler {
 	}
 }
 
+// EnforceTrustedOrigins rejects unsafe browser requests from origins that are
+// not explicitly allowed. CORS controls whether a browser can read a response;
+// this middleware prevents the state change itself, which matters for
+// cookie-authenticated admin routes. Requests without an Origin header are
+// allowed so CLI clients, Prometheus, OBS, and same-origin legacy user agents
+// keep working.
+func EnforceTrustedOrigins(cfg CORSConfig) func(http.Handler) http.Handler {
+	validator := NewOriginValidator(cfg.AllowedOrigins, cfg.ProductionMode)
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			origin := r.Header.Get("Origin")
+			if origin != "" && !validator.IsAllowed(origin) {
+				http.Error(w, "Origin not allowed", http.StatusForbidden)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// LimitJSONBody caps JSON request bodies before handlers decode them. File and
+// logo uploads keep their multipart-specific limits in the upload handlers.
+func LimitJSONBody(maxBytes int64) func(http.Handler) http.Handler {
+	if maxBytes <= 0 {
+		maxBytes = 1 << 20
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Body == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			contentType := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0]))
+			isJSON := contentType == "application/json" || strings.HasSuffix(contentType, "+json")
+			if !isJSON {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			if r.ContentLength > maxBytes {
+				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+
+			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // RateLimiterConfig holds rate limiter configuration
 type RateLimiterConfig struct {
 	RequestsPerSecond int           // Max requests per second per IP

@@ -42,6 +42,7 @@ type WebSocketHandler struct {
 	tokenManager    *TokenManager
 	validateSession SessionValidator
 	waitingActions  WaitingActions
+	productionMode  bool
 	upgrader        gorillaws.Upgrader
 
 	// subMu guards subStates: per-connection subscription bookkeeping keyed by
@@ -91,6 +92,7 @@ func NewWebSocketHandler(
 		originValidator: validator,
 		tokenManager:    NewTokenManager(tokenSecret),
 		validateSession: validateSession,
+		productionMode:  productionMode,
 		subStates:       make(map[*websocket.Client]*subscriptionState),
 	}
 
@@ -131,11 +133,23 @@ func safeGo(label string, fn func()) {
 // HandleConnection handles WebSocket connection upgrades
 func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
-	token := r.URL.Query().Get("token")
+	var token string
+	if !h.productionMode {
+		token = r.URL.Query().Get("token")
+	}
 	name := r.URL.Query().Get("name")
+	if token == "" {
+		if c, err := r.Cookie(JoinTokenCookieName(slug)); err == nil && c.Value != "" {
+			token = c.Value
+		}
+	}
 
-	if token == "" || name == "" {
-		http.Error(w, "Missing token or name", http.StatusBadRequest)
+	if name == "" {
+		http.Error(w, "Missing name", http.StatusBadRequest)
+		return
+	}
+	if token == "" {
+		http.Error(w, "Missing token", http.StatusBadRequest)
 		return
 	}
 
@@ -1059,7 +1073,11 @@ func (h *WebSocketHandler) handleChatSend(client *websocket.Client, payload json
 	}
 
 	now := time.Now()
-	msgID := generateID()
+	msgID, err := generateID()
+	if err != nil {
+		logger.Error("Failed to generate chat message ID", "error", err, "room", client.RoomSlug, "participant_id", client.ID)
+		return
+	}
 
 	// Persist to database
 	msgCtx, msgCancel := database.WithTimeout(context.Background())
@@ -1146,7 +1164,11 @@ func (h *WebSocketHandler) handleChatFile(client *websocket.Client, payload json
 	}
 
 	now := time.Now()
-	msgID := generateID()
+	msgID, err := generateID()
+	if err != nil {
+		logger.Error("Failed to generate file chat message ID", "error", err, "room", client.RoomSlug, "participant_id", client.ID)
+		return
+	}
 
 	// Persist to database (store file reference as JSON content)
 	fileJSON, _ := json.Marshal(filePayload)
@@ -1677,6 +1699,25 @@ func (h *WebSocketHandler) handleAdminKick(client *websocket.Client, payload jso
 	if err := json.Unmarshal(payload, &data); err != nil {
 		return
 	}
+	if data.ParticipantID == "" {
+		return
+	}
+
+	kickCtx, kickCancel := database.WithTimeout(context.Background())
+	result, err := h.db.ExecContext(kickCtx, `
+		UPDATE participants SET is_admitted = FALSE
+		WHERE id = ? AND room_id = (SELECT id FROM rooms WHERE slug = ?)
+	`, data.ParticipantID, client.RoomSlug)
+	kickCancel()
+	if err != nil {
+		logger.Error("Failed to revoke participant admission for kick",
+			"participant_id", data.ParticipantID, "room", client.RoomSlug, "error", err)
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		logger.Warn("Admin kick target not found", "by", client.ID, "target", data.ParticipantID, "room", client.RoomSlug)
+		return
+	}
 
 	// Send kick message to the target
 	h.hub.SendToJSON(client.RoomSlug, data.ParticipantID, "kicked", map[string]interface{}{
@@ -1718,6 +1759,8 @@ func (h *WebSocketHandler) handleAdminEndSession(client *websocket.Client) {
 
 	// Broadcast session end to all
 	h.hub.BroadcastJSON(client.RoomSlug, "room:ended", map[string]interface{}{}, "")
+	h.sfu.CloseRoom(client.RoomSlug)
+	h.hub.CloseRoom(client.RoomSlug)
 }
 
 // handleWaitingApprove admits a waiting participant from the in-session

@@ -22,6 +22,10 @@ type TokenManager struct {
 	secret []byte
 }
 
+func JoinTokenCookieName(roomSlug string) string {
+	return "chromatic_join_" + roomSlug
+}
+
 // NewTokenManager creates a new TokenManager with the given secret
 func NewTokenManager(secret []byte) *TokenManager {
 	return &TokenManager{

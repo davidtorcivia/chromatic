@@ -122,9 +122,19 @@
             // Store sanitized participant name for future sessions
             setStorageItem("local", "chromatic_name", result.name || joinedName);
 
-            // Store session info (includes the server-assigned role and any
-            // countdown-lobby payload for the waiting page)
-            if (!setStorageItem("session", `chromatic_session_${slug}`, JSON.stringify(result))) {
+            const sessionPayload = {
+                participantId: result.participantId,
+                isAdmitted: result.isAdmitted,
+                waitingRoom: result.waitingRoom,
+                color: result.color,
+                name: result.name,
+                role: result.role,
+                serverTime: result.serverTime,
+                lobby: result.lobby,
+            };
+            // Store non-secret session metadata. The signed join token itself
+            // stays in the HttpOnly room cookie set by the join response.
+            if (!setStorageItem("session", `chromatic_session_${slug}`, JSON.stringify(sessionPayload))) {
                 throw new Error("session storage unavailable");
             }
         } catch {

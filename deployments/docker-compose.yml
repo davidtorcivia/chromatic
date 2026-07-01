@@ -1,34 +1,63 @@
 services:
   chromatic:
-    build:
-      context: ..
-      dockerfile: deployments/Dockerfile
+    image: ${CHROMATIC_IMAGE:?Set CHROMATIC_IMAGE to a pinned ghcr.io image tag or digest}
     container_name: chromatic
     restart: unless-stopped
-    network_mode: host
     environment:
       - DATABASE_PATH=/data/chromatic.db
       - UPLOAD_PATH=/data/files
       - LOGO_PATH=/data/logos
-      - ADMIN_TOKEN=${ADMIN_TOKEN}
-      - PUBLIC_URL=${PUBLIC_URL}
+      - ADMIN_TOKEN=${ADMIN_TOKEN:?Set ADMIN_TOKEN}
+      - PUBLIC_URL=${PUBLIC_URL:?Set PUBLIC_URL}
       - TURN_MODE=${TURN_MODE:-external}
-      - TURN_SECRET=${TURN_SECRET}
-      - TURN_REALM=${TURN_REALM}
-      - TURN_EXTERNAL_URLS=${TURN_EXTERNAL_URLS}
-      - TURN_EXTERNAL_URL=${TURN_EXTERNAL_URL}
-      - TURN_EXTERNAL_USER=${TURN_EXTERNAL_USER}
-      - TURN_EXTERNAL_PASS=${TURN_EXTERNAL_PASS}
-      - TURN_CLOUDFLARE_KEY_ID=${TURN_CLOUDFLARE_KEY_ID}
-      - TURN_CLOUDFLARE_API_TOKEN=${TURN_CLOUDFLARE_API_TOKEN}
+      - TURN_SECRET=${TURN_SECRET:-}
+      - TURN_REALM=${TURN_REALM:-}
+      - TURN_EXTERNAL_URLS=${TURN_EXTERNAL_URLS:-}
+      - TURN_EXTERNAL_URL=${TURN_EXTERNAL_URL:-}
+      - TURN_EXTERNAL_USER=${TURN_EXTERNAL_USER:-}
+      - TURN_EXTERNAL_PASS=${TURN_EXTERNAL_PASS:-}
+      - TURN_CLOUDFLARE_KEY_ID=${TURN_CLOUDFLARE_KEY_ID:-}
+      - TURN_CLOUDFLARE_API_TOKEN=${TURN_CLOUDFLARE_API_TOKEN:-}
       - TURN_CLOUDFLARE_CREDENTIAL_TTL=${TURN_CLOUDFLARE_CREDENTIAL_TTL:-3600}
       - TURN_CLOUDFLARE_CREDENTIAL_SKEW=${TURN_CLOUDFLARE_CREDENTIAL_SKEW:-60}
-      - PORT=${CHROMATIC_PORT:-3000}
-      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
-      - PRODUCTION_MODE=${PRODUCTION_MODE:-false}
-      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-172.16.0.0/12,10.0.0.0/8}
+      - PORT=3000
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:?Set ALLOWED_ORIGINS to PUBLIC_URL origin}
+      - PRODUCTION_MODE=${PRODUCTION_MODE:-true}
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-172.28.20.0/24}
+    expose:
+      - "3000"
     volumes:
       - chromatic_data:/data
+    networks:
+      chromatic_net:
+        ipv4_address: 172.28.20.10
+
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: chromatic_caddy
+    restart: unless-stopped
+    depends_on:
+      - chromatic
+    environment:
+      - DOMAIN=${DOMAIN:?Set DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      chromatic_net:
+        ipv4_address: 172.28.20.5
 
 volumes:
   chromatic_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  chromatic_net:
+    ipam:
+      config:
+        - subnet: 172.28.20.0/24

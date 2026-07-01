@@ -2,7 +2,7 @@
     import { onDestroy, onMount } from "svelte";
     import { goto } from "$app/navigation";
     import { page } from "$app/stores";
-    import { auth, rooms } from "$lib/api/client";
+    import { ApiError, auth, rooms } from "$lib/api/client";
 
     let destroyed = false;
 
@@ -15,8 +15,8 @@
         // If not authenticated, the httpOnly cookie will be missing and we'll get 401
         try {
             await rooms.list();
-        } catch {
-            if (!destroyed) {
+        } catch (e) {
+            if (!destroyed && e instanceof ApiError && (e.status === 401 || e.status === 403)) {
                 goto("/");
             }
         }

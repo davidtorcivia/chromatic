@@ -18,6 +18,12 @@ import (
 	"chromatic/internal/webrtc"
 )
 
+var allowedLogoMIMETypes = map[string]bool{
+	"image/png":  true,
+	"image/jpeg": true,
+	"image/webp": true,
+}
+
 // ConfigHandler handles application configuration endpoints
 type ConfigHandler struct {
 	db  *database.DB
@@ -180,34 +186,28 @@ func (h *ConfigHandler) UploadLogo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	file, header, err := r.FormFile("logo")
+	file, _, err := r.FormFile("logo")
 	if err != nil {
 		http.Error(w, "Missing logo file", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
 
-	// Validate file type
-	buffer := make([]byte, 512)
-	_, err = file.Read(buffer)
+	// Validate file type from content, not from the user-supplied filename.
+	mimeType, err := detectFileContentType(file)
 	if err != nil {
 		http.Error(w, "Failed to read file", http.StatusBadRequest)
 		return
 	}
-	mimeType := http.DetectContentType(buffer)
 
-	allowedTypes := map[string]bool{
-		"image/png":  true,
-		"image/jpeg": true,
-		"image/webp": true,
-	}
-	if !allowedTypes[mimeType] {
+	if !allowedLogoMIMETypes[mimeType] {
 		http.Error(w, "Invalid file type. Use PNG, JPEG, or WebP.", http.StatusBadRequest)
 		return
 	}
-
-	// Reset file position
-	file.Seek(0, 0)
+	if err := validateImageDimensions(file, mimeType, maxImagePixels); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	// Create logos directory if it doesn't exist
 	if err := os.MkdirAll(h.cfg.LogoPath, 0755); err != nil {
@@ -217,17 +217,7 @@ func (h *ConfigHandler) UploadLogo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Save logo with fixed name (overwrite previous)
-	ext := filepath.Ext(header.Filename)
-	if ext == "" {
-		switch mimeType {
-		case "image/png":
-			ext = ".png"
-		case "image/jpeg":
-			ext = ".jpg"
-		case "image/webp":
-			ext = ".webp"
-		}
-	}
+	ext := getExtensionForMIME(mimeType)
 	logoPath := filepath.Join(h.cfg.LogoPath, "default_watermark"+ext)
 
 	// Read all file content
@@ -294,6 +284,14 @@ func (h *ConfigHandler) GetLogo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	mimeType, err := detectPathContentType(*logoPath)
+	if err != nil || !allowedLogoMIMETypes[mimeType] {
+		logger.Warn("Blocked invalid logo content", "path", *logoPath, "mime_type", mimeType, "error", err)
+		http.Error(w, "Invalid logo file", http.StatusUnsupportedMediaType)
+		return
+	}
+
+	w.Header().Set("Content-Type", mimeType)
 	http.ServeFile(w, r, *logoPath)
 }
 

@@ -3,10 +3,12 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -130,7 +132,7 @@ func TestFileHandler_Upload(t *testing.T) {
 	}{
 		{
 			name:           "upload valid PNG",
-			filename:       "test.png",
+			filename:       "test.php",
 			content:        createTestPNG(),
 			contentType:    "image/png",
 			participantID:  "user-123",
@@ -139,8 +141,8 @@ func TestFileHandler_Upload(t *testing.T) {
 			checkResponse: func(t *testing.T, body []byte) {
 				var resp map[string]interface{}
 				json.Unmarshal(body, &resp)
-				if resp["originalName"] != "test.png" {
-					t.Errorf("expected originalName 'test.png', got %v", resp["originalName"])
+				if resp["originalName"] != "test.php" {
+					t.Errorf("expected originalName 'test.php', got %v", resp["originalName"])
 				}
 				if resp["mimeType"] != "image/png" {
 					t.Errorf("expected mimeType 'image/png', got %v", resp["mimeType"])
@@ -150,6 +152,13 @@ func TestFileHandler_Upload(t *testing.T) {
 				}
 				if resp["thumbnailUrl"] == nil {
 					t.Error("expected thumbnailUrl for image")
+				}
+				var storedPath string
+				if err := db.QueryRow("SELECT stored_path FROM files WHERE id = ?", resp["id"]).Scan(&storedPath); err != nil {
+					t.Fatalf("failed to read stored path: %v", err)
+				}
+				if filepath.Ext(storedPath) != ".png" {
+					t.Fatalf("stored extension = %q, want .png for detected MIME", filepath.Ext(storedPath))
 				}
 			},
 		},
@@ -176,6 +185,52 @@ func TestFileHandler_Upload(t *testing.T) {
 				// PDFs shouldn't have thumbnails
 				if resp["thumbnailUrl"] != nil {
 					t.Error("PDF should not have thumbnailUrl")
+				}
+			},
+		},
+		{
+			name:           "upload WAV normalized from sniffed audio/wave",
+			filename:       "sample.wav",
+			content:        createTestWAV(),
+			contentType:    "audio/wav",
+			participantID:  "user-123",
+			token:          tokens["user-123"],
+			expectedStatus: http.StatusCreated,
+			checkResponse: func(t *testing.T, body []byte) {
+				var resp map[string]interface{}
+				json.Unmarshal(body, &resp)
+				if resp["mimeType"] != "audio/wav" {
+					t.Errorf("expected normalized mimeType 'audio/wav', got %v", resp["mimeType"])
+				}
+				var storedPath string
+				if err := db.QueryRow("SELECT stored_path FROM files WHERE id = ?", resp["id"]).Scan(&storedPath); err != nil {
+					t.Fatalf("failed to read stored path: %v", err)
+				}
+				if filepath.Ext(storedPath) != ".wav" {
+					t.Fatalf("stored extension = %q, want .wav", filepath.Ext(storedPath))
+				}
+			},
+		},
+		{
+			name:           "upload OGG normalized from sniffed application/ogg",
+			filename:       "sample.ogg",
+			content:        createTestOGG(),
+			contentType:    "audio/ogg",
+			participantID:  "user-456",
+			token:          tokens["user-456"],
+			expectedStatus: http.StatusCreated,
+			checkResponse: func(t *testing.T, body []byte) {
+				var resp map[string]interface{}
+				json.Unmarshal(body, &resp)
+				if resp["mimeType"] != "audio/ogg" {
+					t.Errorf("expected normalized mimeType 'audio/ogg', got %v", resp["mimeType"])
+				}
+				var storedPath string
+				if err := db.QueryRow("SELECT stored_path FROM files WHERE id = ?", resp["id"]).Scan(&storedPath); err != nil {
+					t.Fatalf("failed to read stored path: %v", err)
+				}
+				if filepath.Ext(storedPath) != ".ogg" {
+					t.Fatalf("stored extension = %q, want .ogg", filepath.Ext(storedPath))
 				}
 			},
 		},
@@ -335,6 +390,35 @@ func TestFileHandler_Download(t *testing.T) {
 		}
 	})
 
+	t.Run("download filename is formatted as a safe disposition parameter", func(t *testing.T) {
+		maliciousName := "evil\"; filename=\"pwned.pdf"
+		_, err := db.Exec("UPDATE files SET original_name = ? WHERE id = ?", maliciousName, fileID)
+		if err != nil {
+			t.Fatalf("failed to update original name: %v", err)
+		}
+
+		req := httptest.NewRequest("GET", "/api/files/"+fileID, nil)
+		req.SetPathValue("id", fileID)
+		req.Header.Set("X-Join-Token", token)
+
+		rr := httptest.NewRecorder()
+		fileHandler.Download(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected status %d, got %d", http.StatusOK, rr.Code)
+		}
+		disposition, params, err := mime.ParseMediaType(rr.Header().Get("Content-Disposition"))
+		if err != nil {
+			t.Fatalf("invalid Content-Disposition header: %v", err)
+		}
+		if disposition != "inline" {
+			t.Fatalf("disposition = %q, want inline", disposition)
+		}
+		if params["filename"] != "evil; filename=pwned.pdf" {
+			t.Fatalf("filename param = %q, want sanitized filename", params["filename"])
+		}
+	})
+
 	t.Run("download nonexistent file", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "/api/files/nonexistent", nil)
 		req.SetPathValue("id", "nonexistent")
@@ -413,7 +497,10 @@ func TestFileHandler_MIME_Detection(t *testing.T) {
 		{"image/webp", ".webp"},
 		{"audio/mpeg", ".mp3"},
 		{"audio/wav", ".wav"},
+		{"audio/wave", ".wav"},
+		{"audio/x-wav", ".wav"},
 		{"audio/ogg", ".ogg"},
+		{"application/ogg", ".ogg"},
 		{"application/pdf", ".pdf"},
 		{"application/octet-stream", ".bin"},
 	}
@@ -423,6 +510,27 @@ func TestFileHandler_MIME_Detection(t *testing.T) {
 			ext := getExtensionForMIME(tt.mimeType)
 			if ext != tt.extension {
 				t.Errorf("expected extension %s for MIME %s, got %s", tt.extension, tt.mimeType, ext)
+			}
+		})
+	}
+}
+
+func TestNormalizeDetectedMIMEType(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"audio/wave", "audio/wav"},
+		{"audio/x-wav", "audio/wav"},
+		{"application/ogg", "audio/ogg"},
+		{"audio/mpeg", "audio/mpeg"},
+		{"image/png", "image/png"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			if got := normalizeDetectedMIMEType(tt.in); got != tt.want {
+				t.Fatalf("normalizeDetectedMIMEType(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
 	}
@@ -496,4 +604,29 @@ func createTestJPEG() []byte {
 func createTestPDF() []byte {
 	// Minimal valid PDF
 	return []byte("%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj\nxref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000052 00000 n \n0000000101 00000 n \ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n178\n%%EOF\n")
+}
+
+func createTestWAV() []byte {
+	// Minimal RIFF/WAVE header with a short PCM data chunk.
+	return []byte{
+		'R', 'I', 'F', 'F', 0x2c, 0x00, 0x00, 0x00,
+		'W', 'A', 'V', 'E',
+		'f', 'm', 't', ' ', 0x10, 0x00, 0x00, 0x00,
+		0x01, 0x00, // PCM
+		0x01, 0x00, // mono
+		0x40, 0x1f, 0x00, 0x00, // 8000 Hz
+		0x80, 0x3e, 0x00, 0x00, // byte rate
+		0x02, 0x00, // block align
+		0x10, 0x00, // 16-bit
+		'd', 'a', 't', 'a', 0x08, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+	}
+}
+
+func createTestOGG() []byte {
+	// Ogg page capture pattern plus enough bytes for http.DetectContentType.
+	data := make([]byte, 64)
+	copy(data, []byte{'O', 'g', 'g', 'S', 0x00, 0x02})
+	return data
 }

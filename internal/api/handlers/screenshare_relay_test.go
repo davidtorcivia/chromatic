@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"net/http"
 	"testing"
 	"time"
 
@@ -136,8 +137,10 @@ func TestScreenShareRelay_EndToEnd(t *testing.T) {
 
 func dialWith(t *testing.T, env *rejoinTestEnv, token, name string) *gorillaws.Conn {
 	t.Helper()
-	url := "ws" + env.server.URL[len("http"):] + "/ws/room/" + env.slug + "?token=" + token + "&name=" + urlEncodeSpaces(name)
-	conn, _, err := gorillaws.DefaultDialer.Dial(url, nil)
+	url := "ws" + env.server.URL[len("http"):] + "/ws/room/" + env.slug + "?name=" + urlEncodeSpaces(name)
+	headers := http.Header{}
+	headers.Add("Cookie", (&http.Cookie{Name: JoinTokenCookieName(env.slug), Value: token}).String())
+	conn, _, err := gorillaws.DefaultDialer.Dial(url, headers)
 	if err != nil {
 		t.Fatalf("failed to dial websocket: %v", err)
 	}

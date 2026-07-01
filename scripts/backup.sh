@@ -57,26 +57,29 @@ log_info "Backup directory: $BACKUP_DIR_ABS"
 
 log_info "Database backup created: chromatic-$TIMESTAMP.db"
 
-# Backup uploaded files if present.
+# Backup uploaded files. Always emit an archive, even when empty, so restore can
+# faithfully remove stale files that were created after this backup.
 "${COMPOSE_CMD[@]}" run --rm --no-deps \
     -v "$BACKUP_DIR_ABS:/backup" \
-    chromatic sh -ec "if [ -d /data/files ] && [ \"\$(ls -A /data/files 2>/dev/null)\" ]; then tar -czf '/backup/files-$TIMESTAMP.tar.gz' -C /data files; fi"
+    chromatic sh -ec "mkdir -p /data/files && tar -czf '/backup/files-$TIMESTAMP.tar.gz' -C /data files"
 
 if [ -f "$BACKUP_DIR_ABS/files-$TIMESTAMP.tar.gz" ]; then
     log_info "Files backup created: files-$TIMESTAMP.tar.gz"
 else
-    log_warn "No uploaded files found to backup"
+    log_error "Files backup was not created"
+    exit 1
 fi
 
-# Backup logos if present.
+# Backup logos. Always emit an archive, even when empty, for exact restores.
 "${COMPOSE_CMD[@]}" run --rm --no-deps \
     -v "$BACKUP_DIR_ABS:/backup" \
-    chromatic sh -ec "if [ -d /data/logos ] && [ \"\$(ls -A /data/logos 2>/dev/null)\" ]; then tar -czf '/backup/logos-$TIMESTAMP.tar.gz' -C /data logos; fi"
+    chromatic sh -ec "mkdir -p /data/logos && tar -czf '/backup/logos-$TIMESTAMP.tar.gz' -C /data logos"
 
 if [ -f "$BACKUP_DIR_ABS/logos-$TIMESTAMP.tar.gz" ]; then
     log_info "Logos backup created: logos-$TIMESTAMP.tar.gz"
 else
-    log_warn "No logos found to backup"
+    log_error "Logos backup was not created"
+    exit 1
 fi
 
 MANIFEST="$BACKUP_DIR_ABS/manifest-$TIMESTAMP.txt"

@@ -1149,6 +1149,7 @@ func (s *capTestHub) BroadcastJSON(string, string, interface{}, string) error { 
 func (s *capTestHub) SendToJSON(string, string, string, interface{}) error    { return nil }
 func (s *capTestHub) BroadcastToAdminsJSON(string, string, interface{}) error { return nil }
 func (s *capTestHub) RoomClientCount(string) int                              { return s.count }
+func (s *capTestHub) CloseRoom(string)                                        {}
 
 // TestRoomHandler_ParticipantCap tests the per-room participant limit
 func TestRoomHandler_ParticipantCap(t *testing.T) {
@@ -1210,6 +1211,9 @@ func TestRoomHandler_ParticipantCap(t *testing.T) {
 
 	// A leave/rejoin churn must NOT consume capacity: even after many
 	// historical participant rows, joins succeed while live count is low.
+	if _, err := db.Exec("UPDATE participants SET joined_at = ?", time.Now().Add(-joinReservationWindow*2)); err != nil {
+		t.Fatalf("failed to age participant rows: %v", err)
+	}
 	hub.count = 1
 	if rr := join(t, "Returning User"); rr.Code != http.StatusOK {
 		t.Errorf("expected rejoin to succeed with free capacity, got %d: %s", rr.Code, rr.Body.String())

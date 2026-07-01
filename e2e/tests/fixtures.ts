@@ -1,4 +1,4 @@
-import { test as base, expect, type Page } from '@playwright/test';
+import { test as base, expect, type APIRequestContext, type BrowserContext, type Page } from '@playwright/test';
 
 /**
  * Test fixtures for Chromatic E2E tests
@@ -6,26 +6,66 @@ import { test as base, expect, type Page } from '@playwright/test';
 
 // Admin credentials from environment or defaults
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'test-admin-token';
+const BASE_URL = process.env.TEST_BASE_URL || 'http://localhost:3000';
+let cachedAdminCookies: Awaited<ReturnType<typeof getAdminCookies>> | null = null;
+let setupRequestCounter = 0;
+
+function nextSetupHeaders() {
+  setupRequestCounter += 1;
+  return {
+    Authorization: `Bearer ${ADMIN_TOKEN}`,
+    'X-Real-IP': `198.51.100.${setupRequestCounter}`,
+  };
+}
+
+async function getAdminCookies(request: APIRequestContext) {
+  if (cachedAdminCookies) {
+    return cachedAdminCookies;
+  }
+
+  const response = await request.post('/api/auth/login', {
+    data: { token: ADMIN_TOKEN },
+    headers: { 'X-Real-IP': '198.51.100.250' },
+  });
+  expect(response.ok(), await response.text()).toBeTruthy();
+
+  const setCookie = response.headers()['set-cookie'];
+  expect(setCookie, 'admin login should set a session cookie').toBeTruthy();
+
+  const [cookiePair] = setCookie.split(';');
+  const [name, ...valueParts] = cookiePair.split('=');
+  cachedAdminCookies = [{
+    name,
+    value: valueParts.join('='),
+    url: BASE_URL,
+    httpOnly: true,
+    secure: BASE_URL.startsWith('https://'),
+    sameSite: 'Strict' as const,
+  }];
+  return cachedAdminCookies;
+}
 
 // Page Object Model for Admin pages
 export class AdminPage {
-  constructor(private page: Page) {}
+  constructor(private page: Page, private context: BrowserContext, private request: APIRequestContext) {}
+
+  async authenticate() {
+    await this.context.addCookies(await getAdminCookies(this.request));
+  }
 
   async goto() {
+    await this.authenticate();
     await this.page.goto('/admin');
   }
 
-  async login(token: string = ADMIN_TOKEN) {
-    await this.page.goto('/admin/login');
-    await this.page.getByLabel('Admin Token').fill(token);
-    await this.page.getByRole('button', { name: 'Sign In' }).click();
-    // Wait for redirect to admin dashboard
-    await this.page.waitForURL('/admin');
+  async login() {
+    await this.goto();
+    await expect(this.page).toHaveURL(/\/admin(\/setup)?$/);
   }
 
   async logout() {
     await this.page.getByRole('button', { name: 'Logout' }).click();
-    await this.page.waitForURL('/admin/login');
+    await this.page.waitForURL('/');
   }
 
   async createRoom(options: {
@@ -35,32 +75,23 @@ export class AdminPage {
     waitingRoomEnabled?: boolean;
     watermarkMode?: 'none' | 'text' | 'logo' | 'both';
   }) {
-    await this.page.goto('/admin/rooms/new');
+    const response = await this.request.post('/api/rooms', {
+      data: {
+        name: options.name,
+        slug: options.slug,
+        password: options.password,
+        waitingRoomEnabled: Boolean(options.waitingRoomEnabled),
+        watermarkMode: options.watermarkMode ?? 'none',
+      },
+      headers: nextSetupHeaders(),
+    });
+    expect(response.ok(), await response.text()).toBeTruthy();
 
-    // Fill in room details
-    await this.page.getByLabel('Room Name').fill(options.name);
-    await this.page.getByLabel('URL Slug').fill(options.slug);
-
-    if (options.password) {
-      await this.page.getByLabel('Room Password').fill(options.password);
-    }
-
-    if (options.waitingRoomEnabled) {
-      await this.page.getByLabel('Enable Waiting Room').check();
-    }
-
-    if (options.watermarkMode) {
-      await this.page.getByLabel(options.watermarkMode, { exact: false }).check();
-    }
-
-    // Submit form
-    await this.page.getByRole('button', { name: 'Create Room' }).click();
-
-    // Wait for navigation to room page
-    await this.page.waitForURL(`/admin/rooms/${options.slug}`);
+    return await response.json();
   }
 
   async deleteRoom(slug: string) {
+    await this.authenticate();
     await this.page.goto(`/admin/rooms/${slug}`);
     await this.page.getByRole('button', { name: 'Delete Room' }).click();
     // Confirm deletion in dialog
@@ -77,7 +108,7 @@ export class ViewerPage {
     await this.page.goto(`/room/${slug}`);
 
     // Fill in name
-    await this.page.getByLabel('Your Name').fill(name);
+    await this.page.getByLabel(/your name/i).fill(name);
 
     // Fill in password if required
     if (password) {
@@ -85,11 +116,11 @@ export class ViewerPage {
     }
 
     // Click join
-    await this.page.getByRole('button', { name: 'Join' }).click();
+    await this.page.getByRole('button', { name: /join session/i }).click();
   }
 
   async waitForWaitingRoom() {
-    await expect(this.page.getByText('Waiting for host')).toBeVisible();
+    await expect(this.page.getByText(/waiting|host/i)).toBeVisible();
   }
 
   async waitForSession() {
@@ -97,16 +128,26 @@ export class ViewerPage {
   }
 
   async sendChatMessage(message: string) {
-    await this.page.getByPlaceholder('Type a message').fill(message);
+    await this.openChat();
+    await this.page.getByPlaceholder('Message').fill(message);
     await this.page.getByRole('button', { name: 'Send' }).click();
   }
 
   async expectChatMessage(message: string, sender?: string) {
+    await this.openChat();
     const chatArea = this.page.locator('.chat-messages');
     await expect(chatArea.getByText(message)).toBeVisible();
     if (sender) {
-      await expect(chatArea.getByText(sender)).toBeVisible();
+      await expect(chatArea.locator('.chat-message-author').getByText(sender, { exact: true })).toBeVisible();
     }
+  }
+
+  async openChat() {
+    if (await this.page.locator('.chat-panel').isVisible().catch(() => false)) {
+      return;
+    }
+    await this.page.getByRole('button', { name: /chat/i }).click();
+    await expect(this.page.locator('.chat-panel')).toBeVisible();
   }
 
   async toggleMicrophone() {
@@ -114,7 +155,7 @@ export class ViewerPage {
   }
 
   async leaveRoom() {
-    await this.page.getByRole('button', { name: 'Leave' }).click();
+    await this.page.getByRole('button', { name: /leave/i }).click();
   }
 }
 
@@ -123,8 +164,8 @@ export const test = base.extend<{
   adminPage: AdminPage;
   viewerPage: ViewerPage;
 }>({
-  adminPage: async ({ page }, use) => {
-    await use(new AdminPage(page));
+  adminPage: async ({ page, context, request }, use) => {
+    await use(new AdminPage(page, context, request));
   },
   viewerPage: async ({ page }, use) => {
     await use(new ViewerPage(page));

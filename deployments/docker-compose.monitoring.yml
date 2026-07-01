@@ -6,34 +6,42 @@
 #   docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
 #
 # Access:
-#   - Grafana: http://localhost:3001 (admin/admin)
+#   - Grafana: http://localhost:3001 (${GRAFANA_ADMIN_USER:-admin}/GRAFANA_ADMIN_PASSWORD)
 #   - Prometheus: http://localhost:9090
+# These ports bind to localhost only. Put them behind a VPN or SSH tunnel for remote access.
 
 services:
   prometheus:
     image: prom/prometheus:v2.48.0
     container_name: chromatic_prometheus
     restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--storage.tsdb.retention.time=15d'
-      - '--web.enable-lifecycle'
+      - >
+        sed "s|__ADMIN_TOKEN__|$${ADMIN_TOKEN}|g" /etc/prometheus/prometheus.yml
+        > /tmp/prometheus.yml &&
+        /bin/prometheus
+        --config.file=/tmp/prometheus.yml
+        --storage.tsdb.path=/prometheus
+        --storage.tsdb.retention.time=15d
+        --web.enable-lifecycle
+    environment:
+      - ADMIN_TOKEN=${ADMIN_TOKEN:?Set ADMIN_TOKEN}
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     networks:
       - chromatic_net
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
 
   grafana:
     image: grafana/grafana:10.2.2
     container_name: chromatic_grafana
     restart: unless-stopped
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD}
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/chromatic.json
     volumes:
@@ -43,7 +51,7 @@ services:
     networks:
       - chromatic_net
     ports:
-      - "3001:3000"
+      - "127.0.0.1:3001:3000"
     depends_on:
       - prometheus
 

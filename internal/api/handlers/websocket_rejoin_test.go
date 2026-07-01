@@ -115,8 +115,10 @@ func newRejoinTestEnv(t *testing.T) (*rejoinTestEnv, func()) {
 func (env *rejoinTestEnv) dial() *gorillaws.Conn {
 	env.t.Helper()
 	url := "ws" + strings.TrimPrefix(env.server.URL, "http") +
-		"/ws/room/" + env.slug + "?token=" + env.token + "&name=" + strings.ReplaceAll(env.name, " ", "%20")
-	conn, _, err := gorillaws.DefaultDialer.Dial(url, nil)
+		"/ws/room/" + env.slug + "?name=" + strings.ReplaceAll(env.name, " ", "%20")
+	headers := http.Header{}
+	headers.Add("Cookie", (&http.Cookie{Name: JoinTokenCookieName(env.slug), Value: env.token}).String())
+	conn, _, err := gorillaws.DefaultDialer.Dial(url, headers)
 	if err != nil {
 		env.t.Fatalf("failed to dial websocket: %v", err)
 	}

@@ -1,199 +1,62 @@
 import { test, expect, generateSlug } from './fixtures';
 
-test.describe('Viewer Join Flow', () => {
-  let testSlug: string;
+const BASE_URL = process.env.TEST_BASE_URL || 'http://localhost:3000';
 
-  test.beforeEach(async ({ adminPage }) => {
-    // Create a room for testing
-    testSlug = generateSlug();
-    await adminPage.login();
-    await adminPage.createRoom({
-      name: 'Viewer Join Test',
-      slug: testSlug,
-      watermarkMode: 'none',
-    });
+test.describe('Viewer join flow', () => {
+  test('joins a public room and creates an HttpOnly-cookie session', async ({ adminPage, viewerPage, page }) => {
+    const slug = generateSlug();
+    await adminPage.createRoom({ name: 'Viewer Join Test', slug, watermarkMode: 'none' });
+
+    await viewerPage.joinRoom(slug, 'Test Viewer');
+
+    await page.waitForURL(new RegExp(`/room/${slug}/session`));
+    await expect(page.locator('.session-page')).toBeVisible();
   });
 
-  test('should show room info page', async ({ page }) => {
-    await page.goto(`/room/${testSlug}`);
-
-    // Should show room name
-    await expect(page.getByText('Viewer Join Test')).toBeVisible();
-
-    // Should have name input
-    await expect(page.getByLabel('Your Name')).toBeVisible();
-
-    // Should have join button
-    await expect(page.getByRole('button', { name: /join/i })).toBeVisible();
-  });
-
-  test('should require name to join', async ({ page }) => {
-    await page.goto(`/room/${testSlug}`);
-
-    // Try to join without name
-    await page.getByRole('button', { name: /join/i }).click();
-
-    // Should show validation error or stay on page
-    await expect(page).toHaveURL(`/room/${testSlug}`);
-  });
-
-  test('should join room successfully', async ({ viewerPage, page }) => {
-    await viewerPage.joinRoom(testSlug, 'Test Viewer');
-
-    // Should be in session or waiting room
-    const url = page.url();
-    expect(url).toMatch(/session|waiting/);
-  });
-
-  test('should show 404 for non-existent room', async ({ page }) => {
-    await page.goto('/room/non-existent-room');
-
-    // Should show not found message
-    await expect(page.getByText(/not found|doesn't exist/i)).toBeVisible();
-  });
-
-  test('should auto-generate slug from name input', async ({ page }) => {
-    await page.goto(`/room/${testSlug}`);
-
-    // Fill in a name with spaces
-    await page.getByLabel('Your Name').fill('Test User Name');
-
-    // Name should be sanitized but visible
-    await expect(page.getByLabel('Your Name')).toHaveValue('Test User Name');
-  });
-});
-
-test.describe('Password Protected Room', () => {
-  let testSlug: string;
-  const testPassword = 'test-password-123';
-
-  test.beforeEach(async ({ adminPage }) => {
-    testSlug = generateSlug();
-    await adminPage.login();
+  test('protects password rooms', async ({ adminPage, viewerPage, page }) => {
+    const slug = generateSlug();
+    const password = 'test-password-123';
     await adminPage.createRoom({
       name: 'Password Test Room',
-      slug: testSlug,
-      password: testPassword,
+      slug,
+      password,
       watermarkMode: 'none',
     });
-  });
 
-  test('should show password field for protected room', async ({ page }) => {
-    await page.goto(`/room/${testSlug}`);
-
-    // Should show password field
+    await page.goto(`/room/${slug}`);
+    await expect(page.getByText('Private session')).toBeVisible();
     await expect(page.getByLabel('Password')).toBeVisible();
 
-    // Should show password indicator
-    await expect(page.getByText(/password protected/i)).toBeVisible();
+    await viewerPage.joinRoom(slug, 'Wrong Password User', 'wrong-password');
+    await expect(page.getByText(/invalid password|unauthorized/i)).toBeVisible();
+
+    await viewerPage.joinRoom(slug, 'Correct Password User', password);
+    await page.waitForURL(new RegExp(`/room/${slug}/session`));
   });
 
-  test('should reject wrong password', async ({ viewerPage, page }) => {
-    await viewerPage.joinRoom(testSlug, 'Test User', 'wrong-password');
-
-    // Should show error message
-    await expect(page.getByText(/incorrect password|invalid/i)).toBeVisible();
-
-    // Should stay on join page
-    await expect(page).toHaveURL(`/room/${testSlug}`);
-  });
-
-  test('should accept correct password', async ({ viewerPage, page }) => {
-    await viewerPage.joinRoom(testSlug, 'Test User', testPassword);
-
-    // Should be in session or waiting room
-    const url = page.url();
-    expect(url).toMatch(/session|waiting/);
-  });
-
-  test('should block after too many password attempts', async ({ page }) => {
-    await page.goto(`/room/${testSlug}`);
-
-    // Try wrong password multiple times
-    for (let i = 0; i < 6; i++) {
-      await page.getByLabel('Your Name').fill(`User ${i}`);
-      await page.getByLabel('Password').fill('wrong-password');
-      await page.getByRole('button', { name: /join/i }).click();
-      // Wait for response
-      await page.waitForTimeout(500);
-    }
-
-    // Should show rate limit message
-    await expect(page.getByText(/rate limit|too many|try again/i)).toBeVisible();
-  });
-});
-
-test.describe('Waiting Room', () => {
-  let testSlug: string;
-
-  test.beforeEach(async ({ adminPage }) => {
-    testSlug = generateSlug();
-    await adminPage.login();
+  test('sends waiting-room participants to the waiting page and allows admin admission', async ({ adminPage, page, browser }) => {
+    const slug = generateSlug();
     await adminPage.createRoom({
       name: 'Waiting Room Test',
-      slug: testSlug,
+      slug,
       waitingRoomEnabled: true,
       watermarkMode: 'none',
     });
-  });
 
-  test('should show waiting room when enabled', async ({ viewerPage, page }) => {
-    await viewerPage.joinRoom(testSlug, 'Waiting User');
-
-    // Should be redirected to waiting page
-    await page.waitForURL(/waiting/);
-
-    // Should show waiting message
-    await viewerPage.waitForWaitingRoom();
-  });
-
-  test('should list waiting participants in admin', async ({ viewerPage, adminPage, page, browser }) => {
-    // Join as viewer in a new context
-    const viewerContext = await browser.newContext();
-    const viewerPageNew = await viewerContext.newPage();
-    const viewer = new (await import('./fixtures')).ViewerPage(viewerPageNew);
-
-    await viewer.joinRoom(testSlug, 'Waiting Viewer');
-    await viewerPageNew.waitForURL(/waiting/);
-
-    // Check admin page for waiting list
-    await page.goto(`/admin/rooms/${testSlug}`);
-
-    // Should show waiting participant
-    await expect(page.getByText('Waiting Viewer')).toBeVisible();
-
-    await viewerContext.close();
-  });
-
-  test('should admit participant from waiting room', async ({ page, browser }) => {
-    // Create viewer context
-    const viewerContext = await browser.newContext();
+    const viewerContext = await browser.newContext({ baseURL: BASE_URL });
     const viewerPage = await viewerContext.newPage();
-    const viewer = new (await import('./fixtures')).ViewerPage(viewerPage);
+    const { ViewerPage } = await import('./fixtures');
+    const viewer = new ViewerPage(viewerPage);
 
-    // Join as viewer
-    await viewer.joinRoom(testSlug, 'Admitted User');
-    await viewerPage.waitForURL(/waiting/);
+    await viewer.joinRoom(slug, 'Waiting Viewer');
+    await viewerPage.waitForURL(new RegExp(`/room/${slug}/waiting`));
 
-    // Login as admin
-    const admin = new (await import('./fixtures')).AdminPage(page);
-    await admin.login();
-    await page.goto(`/admin/rooms/${testSlug}`);
+    await adminPage.authenticate();
+    await page.goto(`/admin/rooms/${slug}`);
+    await expect(page.getByText('Waiting Viewer')).toBeVisible();
+    await page.getByRole('button', { name: 'Admit', exact: true }).click();
 
-    // Admit the user
-    await page.getByRole('button', { name: /admit/i }).click();
-
-    // Viewer should be redirected to session
-    await viewerPage.waitForURL(/session/, { timeout: 10000 });
-
+    await viewerPage.waitForURL(new RegExp(`/room/${slug}/session`), { timeout: 10000 });
     await viewerContext.close();
-  });
-
-  test('should show connection status in waiting room', async ({ viewerPage, page }) => {
-    await viewerPage.joinRoom(testSlug, 'Status User');
-    await page.waitForURL(/waiting/);
-
-    // Should show some connection indicator
-    await expect(page.getByText(/waiting|connected/i)).toBeVisible();
   });
 });

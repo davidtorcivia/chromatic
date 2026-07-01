@@ -212,7 +212,7 @@
         // Close existing connection if any
         closeSSE();
 
-        const url = `/api/rooms/${slug}/waiting/events/${sessionData.participantId}?token=${encodeURIComponent(sessionData.token)}`;
+        const url = `/api/rooms/${slug}/waiting/events/${sessionData.participantId}`;
         const generation = ++sseGeneration;
         const source = new EventSource(url);
         eventSource = source;
@@ -289,7 +289,7 @@
         const generation = sseGeneration;
 
         try {
-            const result = await rooms.checkStatus(slug, sessionData.participantId, sessionData.token);
+            const result = await rooms.checkStatus(slug, sessionData.participantId);
             if (destroyed || generation !== sseGeneration || isTerminalStatus()) return;
 
             if (result.roomStatus === "ended") {

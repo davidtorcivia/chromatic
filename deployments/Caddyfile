@@ -1,61 +1,71 @@
 # Chromatic Reverse Proxy Configuration
 # Caddy automatically provisions TLS certificates via Let's Encrypt
 
+(chromatic_proxy) {
+	reverse_proxy chromatic:3000 {
+		# WebSocket support
+		header_up Connection {http.request.header.Connection}
+		header_up Upgrade {http.request.header.Upgrade}
+
+		# Timeouts for WebRTC signaling
+		transport http {
+			read_timeout 120s
+			write_timeout 120s
+		}
+	}
+}
+
 {$DOMAIN:localhost} {
-    # Enable compression
-    encode gzip zstd
+	# Enable compression
+	encode gzip zstd
 
-    # Security headers
-    header {
-        X-Content-Type-Options nosniff
-        X-Frame-Options DENY
-        X-XSS-Protection "1; mode=block"
-        Referrer-Policy strict-origin-when-cross-origin
-        -Server
-    }
+	# Security headers
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		X-XSS-Protection "1; mode=block"
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
 
-    # WebSocket upgrade for /ws/*
-    @websocket {
-        header Connection *Upgrade*
-        header Upgrade websocket
-    }
+	# Health check endpoint (no caching)
+	@health path /health
+	handle @health {
+		header Cache-Control "no-cache, no-store, must-revalidate"
+		import chromatic_proxy
+	}
 
-    # Reverse proxy to Chromatic backend
-    reverse_proxy chromatic:3000 {
-        # WebSocket support
-        header_up Connection {http.request.header.Connection}
-        header_up Upgrade {http.request.header.Upgrade}
+	# Static assets caching
+	@static path /assets/* /_app/*
+	handle @static {
+		header Cache-Control "public, max-age=31536000, immutable"
+		import chromatic_proxy
+	}
 
-        # Timeouts for WebRTC signaling
-        transport http {
-            read_timeout 120s
-            write_timeout 120s
-        }
-    }
+	# WebSocket upgrade for /ws/*
+	@websocket {
+		path /ws/*
+		header Connection *Upgrade*
+		header Upgrade websocket
+	}
+	handle @websocket {
+		import chromatic_proxy
+	}
 
-    # Health check endpoint (no caching)
-    @health path /health
-    handle @health {
-        reverse_proxy chromatic:3000
-        header Cache-Control "no-cache, no-store, must-revalidate"
-    }
+	# Reverse proxy to Chromatic backend
+	handle {
+		import chromatic_proxy
+	}
 
-    # Static assets caching
-    @static path /assets/* /_app/*
-    handle @static {
-        reverse_proxy chromatic:3000
-        header Cache-Control "public, max-age=31536000, immutable"
-    }
-
-    # Log requests (in production, consider logging to file)
-    log {
-        output stdout
-        format json
-        level INFO
-    }
+	# Log requests (in production, consider logging to file)
+	log {
+		output stdout
+		format json
+		level INFO
+	}
 }
 
 # Health check endpoint for Caddy itself
 :8080 {
-    respond /health "OK" 200
+	respond /health "OK" 200
 }
