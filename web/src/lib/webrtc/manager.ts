@@ -1356,6 +1356,12 @@ export class WebRTCManager {
                     this.publisherPc = null;
                     this.audioSender = null;
                     this.screenShareSender = null;
+                    // Also drop cameraSender — it references a sender on the PC
+                    // we just closed. Leaving it set makes isCameraOn() report a
+                    // live cam that no peer receives, and enableCamera() early-
+                    // returns "already broadcasting", so the user can never
+                    // restore it. Every other publisher-teardown site clears it.
+                    this.cameraSender = null;
                 }
                 return false;
             }

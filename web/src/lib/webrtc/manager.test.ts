@@ -44,6 +44,10 @@ class FakePublisherPeerConnection {
         return {} as RTCRtpSender;
     }
 
+    getTransceivers(): RTCRtpTransceiver[] {
+        return [];
+    }
+
     close() {
         this.closed = true;
         this.connectionState = 'closed';
@@ -239,6 +243,32 @@ describe('WebRTCManager publisher signaling', () => {
         expect(sent.map((msg) => msg.type)).toContain('publish:offer');
         expect(sent.map((msg) => msg.type)).not.toContain('publish:candidate');
         expect(managerInternals.ensurePublisher()).not.toBe(pc);
+    });
+
+    it('clears cameraSender when publisher negotiation fails so the cam is not stuck on', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakePublisherPeerConnection);
+
+        const manager = newManager((type) => type !== 'publish:offer');
+        const managerInternals = manager as unknown as {
+            ensurePublisher(): RTCPeerConnection;
+            negotiatePublisher(): Promise<boolean>;
+            cameraSender: RTCRtpSender | null;
+        };
+
+        const pc = managerInternals.ensurePublisher();
+        expect(pc).toBeTruthy();
+        // Simulate a live webcam sender on the publisher PC.
+        managerInternals.cameraSender = {} as RTCRtpSender;
+        expect(manager.isCameraOn()).toBe(true);
+
+        const negotiated = await managerInternals.negotiatePublisher();
+
+        // The failed negotiation closes the publisher PC; cameraSender must be
+        // cleared too, otherwise isCameraOn() reports a dead cam and
+        // enableCamera() refuses to restore it (regression guard).
+        expect(negotiated).toBe(false);
+        expect(manager.isCameraOn()).toBe(false);
+        expect(managerInternals.cameraSender).toBeNull();
     });
 
     it('keeps tagging late publisher ICE candidates after the answer is applied', async () => {
