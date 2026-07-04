@@ -1,6 +1,43 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createSessionStore } from './session.svelte';
+import { createSessionStore, getReconnectDelay } from './session.svelte';
+
+describe('getReconnectDelay backoff', () => {
+    afterEach(() => vi.restoreAllMocks());
+
+    it('grows exponentially from ~250ms and caps at 30s (jitter neutralized)', () => {
+        // random()=0.5 makes the jitter factor exactly 1.0, exposing the raw
+        // exponential curve: 250 * 2^attempt, capped at 30000.
+        vi.spyOn(Math, 'random').mockReturnValue(0.5);
+        expect(getReconnectDelay(0)).toBe(250);
+        expect(getReconnectDelay(1)).toBe(500);
+        expect(getReconnectDelay(2)).toBe(1000);
+        expect(getReconnectDelay(6)).toBe(16000);
+        // 250 * 2^7 = 32000 > 30000 → capped.
+        expect(getReconnectDelay(7)).toBe(30000);
+        expect(getReconnectDelay(20)).toBe(30000);
+    });
+
+    it('applies ±20% jitter around the capped delay', () => {
+        const cap = 30000;
+        vi.spyOn(Math, 'random').mockReturnValue(0); // factor 0.8 → lower bound
+        expect(getReconnectDelay(50)).toBe(Math.round(cap * 0.8));
+        vi.restoreAllMocks();
+        vi.spyOn(Math, 'random').mockReturnValue(1); // factor 1.2 → upper bound
+        expect(getReconnectDelay(50)).toBe(Math.round(cap * 1.2));
+    });
+
+    it('keeps every attempt within its ±20% jitter window across the real RNG', () => {
+        for (let attempt = 0; attempt <= 12; attempt++) {
+            const base = Math.min(250 * 2 ** attempt, 30000);
+            for (let i = 0; i < 200; i++) {
+                const d = getReconnectDelay(attempt);
+                expect(d).toBeGreaterThanOrEqual(Math.round(base * 0.8) - 1);
+                expect(d).toBeLessThanOrEqual(Math.round(base * 1.2) + 1);
+            }
+        }
+    });
+});
 
 class FakeWebSocket {
     static CONNECTING = 0;

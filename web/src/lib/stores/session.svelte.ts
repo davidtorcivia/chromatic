@@ -46,6 +46,17 @@ const RECONNECT_BASE_DELAY = 250; // 200-300ms after jitter on the first retry
 const RECONNECT_MAX_DELAY = 30000; // 30 seconds
 const RECONNECT_MAX_ATTEMPTS = 10;
 
+// Exponential backoff with ±20% jitter. Jitter desynchronizes clients so a
+// server restart doesn't trigger a synchronized reconnect stampede. Module-
+// scoped and exported so the backoff curve can be unit-tested directly (it
+// captures no per-store state — only the constants above).
+export function getReconnectDelay(attempt: number): number {
+    const exponentialDelay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
+    const cappedDelay = Math.min(exponentialDelay, RECONNECT_MAX_DELAY);
+    const jitter = cappedDelay * (0.8 + Math.random() * 0.4);
+    return Math.round(jitter);
+}
+
 // Browser-side WebSocket backpressure guardrails. `bufferedAmount` is bytes
 // queued in the browser but not yet written to the network; once it grows,
 // sending more real-time cursor samples only increases end-to-end latency.
@@ -83,16 +94,6 @@ export function createSessionStore() {
     // Store connection params for reconnection
     let connectionParams: { roomSlug: string; name: string; participantId: string } | null = null;
 
-    // Calculate exponential backoff delay with jitter
-    function getReconnectDelay(attempt: number): number {
-        // Exponential backoff: base * 2^attempt
-        const exponentialDelay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
-        // Cap at max delay
-        const cappedDelay = Math.min(exponentialDelay, RECONNECT_MAX_DELAY);
-        // Add jitter (±20%)
-        const jitter = cappedDelay * (0.8 + Math.random() * 0.4);
-        return Math.round(jitter);
-    }
 
     function browserOffline(): boolean {
         return typeof navigator !== 'undefined' && navigator.onLine === false;
