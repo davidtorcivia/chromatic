@@ -244,8 +244,15 @@ type Subscriber struct {
 	pendingTracks         []*webrtc.TrackLocalStaticRTP
 	OnRenegotiationNeeded func(offerSDP, offerID string)
 	OfferID               string
-	CandidateID           string
-	RenegotiationOfferID  string
+	// CandidateID is the offer id that currently-gathering trickle ICE
+	// candidates are stamped with. It is written under SignalingMu at each
+	// (re)negotiation point but READ from pion's ICE-gathering goroutine
+	// (OnICECandidate) and from AddSubscriberICECandidate, neither of which
+	// holds SignalingMu — so it is an atomic to make those cross-goroutine
+	// reads race-free. Use candidateID()/setCandidateID() rather than touching
+	// it directly.
+	CandidateID          atomic.Pointer[string]
+	RenegotiationOfferID string
 	// Deferred client offer (glare handling). Pion v4 cannot roll back a
 	// HaveLocalOffer, so when a client voice offer or ICE restart arrives while
 	// a server-initiated renegotiation offer is in flight, we queue the client
@@ -280,6 +287,22 @@ func (sub *Subscriber) resetICECandidateBudget() {
 	sub.remoteCandidateMu.Lock()
 	sub.iceCandidateCount = 0
 	sub.remoteCandidateMu.Unlock()
+}
+
+// setCandidateID atomically records the offer id that subsequently-gathered
+// trickle candidates should be stamped with. The string parameter is a fresh
+// copy per call, so &id is a unique, immutable target safe to publish.
+func (sub *Subscriber) setCandidateID(id string) {
+	sub.CandidateID.Store(&id)
+}
+
+// candidateID atomically loads the current candidate offer id (empty before the
+// first setCandidateID).
+func (sub *Subscriber) candidateID() string {
+	if p := sub.CandidateID.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // NewSFU creates a new SFU instance
@@ -1406,8 +1429,8 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 		PeerConnection: pc,
 		done:           make(chan struct{}),
 		OfferID:        offerID,
-		CandidateID:    offerID,
 	}
+	sub.setCandidateID(offerID)
 
 	// Set up trickle ICE: buffer candidates until EnableSubscriberTrickleICE is called.
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
@@ -1415,7 +1438,7 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 			return
 		}
 		init := c.ToJSON()
-		candidateID := sub.CandidateID
+		candidateID := sub.candidateID()
 		sub.candidateMu.Lock()
 		if sub.OnICECandidate != nil {
 			cb := sub.OnICECandidate
@@ -1886,8 +1909,8 @@ func (s *SFU) AddSubscriberICECandidate(roomSlug, subscriberID string, candidate
 		return fmt.Errorf("subscriber not found: %s", subscriberID)
 	}
 
-	if candidateID != "" && sub.CandidateID != "" && candidateID != sub.CandidateID {
-		return fmt.Errorf("%w: got %s, want %s", ErrStaleSubscriberCandidate, candidateID, sub.CandidateID)
+	if currentID := sub.candidateID(); candidateID != "" && currentID != "" && candidateID != currentID {
+		return fmt.Errorf("%w: got %s, want %s", ErrStaleSubscriberCandidate, candidateID, currentID)
 	}
 
 	// Enforce ICE candidate limit to prevent flooding attacks
@@ -1956,7 +1979,7 @@ func (s *SFU) HandleIceRestart(roomSlug, subscriberID, sdpOffer, offerID string)
 		return "", fmt.Errorf("failed to set remote description: %w", err)
 	}
 
-	sub.CandidateID = offerID
+	sub.setCandidateID(offerID)
 
 	// An ICE restart starts a brand-new candidate exchange (fresh ufrag/pwd),
 	// so the per-negotiation candidate budget starts over too. Without this,
@@ -2787,7 +2810,7 @@ func (s *SFU) tryAddTrackAndRenegotiate(sub *Subscriber, localTrack *webrtc.Trac
 	}
 
 	sub.RenegotiationOfferID = s.nextSignalingOfferID()
-	sub.CandidateID = sub.RenegotiationOfferID
+	sub.setCandidateID(sub.RenegotiationOfferID)
 
 	// ICE candidates are trickled via the subscriber's OnICECandidate callback
 	return offer.SDP, sub.RenegotiationOfferID, false, false, nil
@@ -2845,7 +2868,7 @@ func (s *SFU) flushPendingRenegotiationLocked(sub *Subscriber) {
 		return
 	}
 	sub.RenegotiationOfferID = s.nextSignalingOfferID()
-	sub.CandidateID = sub.RenegotiationOfferID
+	sub.setCandidateID(sub.RenegotiationOfferID)
 	sub.needsRenegotiation = false
 	log.Printf("Flushed pending renegotiation for subscriber %s", sub.ID)
 	// Deliver outside the signaling-critical path.
@@ -2936,7 +2959,7 @@ func (s *SFU) RenegotiateSubscriber(roomSlug, subscriberID string) (string, stri
 	}
 
 	sub.RenegotiationOfferID = s.nextSignalingOfferID()
-	sub.CandidateID = sub.RenegotiationOfferID
+	sub.setCandidateID(sub.RenegotiationOfferID)
 
 	// ICE candidates are trickled via the subscriber's OnICECandidate callback
 	log.Printf("Renegotiation offer created for subscriber %s", subscriberID)
@@ -3068,7 +3091,7 @@ func (s *SFU) replayDeferredClientOfferLocked(sub *Subscriber, subscriberID stri
 		log.Printf("Failed to apply deferred client offer for %s: %v", subscriberID, err)
 		return
 	}
-	sub.CandidateID = deferredOfferID
+	sub.setCandidateID(deferredOfferID)
 	sub.resetICECandidateBudget()
 
 	answer, err := sub.PeerConnection.CreateAnswer(nil)

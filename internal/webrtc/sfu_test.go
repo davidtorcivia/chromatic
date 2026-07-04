@@ -1334,10 +1334,10 @@ func TestSFU_AddSubscriberICECandidate_IgnoresStaleCandidateID(t *testing.T) {
 	roomSlug := "test-room"
 	room := sfu.GetRoomTracks(roomSlug)
 	sub := &Subscriber{
-		ID:          "sub-1",
-		done:        make(chan struct{}),
-		CandidateID: "current-offer",
+		ID:   "sub-1",
+		done: make(chan struct{}),
 	}
+	sub.setCandidateID("current-offer")
 	room.AddSubscriber(sub)
 
 	candidate := webrtc.ICECandidateInit{Candidate: "candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host"}
@@ -1362,14 +1362,14 @@ func TestSFU_EnableSubscriberTrickleICE_UsesDynamicCandidateIDs(t *testing.T) {
 	room := sfu.GetRoomTracks(roomSlug)
 	initialCandidate := webrtc.ICECandidateInit{Candidate: "candidate:initial 1 udp 2122260223 192.0.2.1 54321 typ host"}
 	sub := &Subscriber{
-		ID:          "sub-1",
-		done:        make(chan struct{}),
-		CandidateID: "initial-offer",
+		ID:   "sub-1",
+		done: make(chan struct{}),
 		pendingCandidates: []SubscriberICECandidate{{
 			Candidate:   initialCandidate,
 			CandidateID: "initial-offer",
 		}},
 	}
+	sub.setCandidateID("initial-offer")
 	room.AddSubscriber(sub)
 
 	var delivered []string
@@ -1377,12 +1377,12 @@ func TestSFU_EnableSubscriberTrickleICE_UsesDynamicCandidateIDs(t *testing.T) {
 		delivered = append(delivered, candidateID)
 	})
 
-	sub.CandidateID = "renegotiate-offer"
+	sub.setCandidateID("renegotiate-offer")
 	liveCandidate := webrtc.ICECandidateInit{Candidate: "candidate:renegotiate 1 udp 2122260223 192.0.2.2 54321 typ host"}
 	sub.candidateMu.Lock()
 	cb := sub.OnICECandidate
 	sub.candidateMu.Unlock()
-	cb(&liveCandidate, sub.CandidateID)
+	cb(&liveCandidate, sub.candidateID())
 
 	if got, want := delivered, []string{"initial-offer", "renegotiate-offer"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("delivered candidate IDs = %v, want %v", got, want)
@@ -1767,8 +1767,8 @@ func TestSFU_AbortSubscriberRenegotiation_RemovesUndeliveredOffer(t *testing.T) 
 		PeerConnection:       pc,
 		done:                 make(chan struct{}),
 		RenegotiationOfferID: "renegotiate-1",
-		CandidateID:          "renegotiate-1",
 	}
+	sub.setCandidateID("renegotiate-1")
 	room.AddSubscriber(sub)
 
 	if err := sfu.AbortSubscriberRenegotiation(roomSlug, "sub-1", "renegotiate-1"); err != nil {
