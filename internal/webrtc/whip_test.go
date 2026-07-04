@@ -1,9 +1,56 @@
 package webrtc
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
+
+// TestValidateSDP_BFrameGate locks in the B-frame latency gate that WHIP ingest
+// applies to untrusted OBS offers. Main/High/Extended H.264 profiles can carry
+// B-frames, which browsers reorder — adding 2+ seconds of latency — so they must
+// be rejected; Baseline (and non-H.264 / profile-less offers, which negotiate
+// against the Baseline-only MediaEngine) must pass.
+func TestValidateSDP_BFrameGate(t *testing.T) {
+	fmtp := func(profileLevelID string) string {
+		return "a=rtpmap:96 H264/90000\r\n" +
+			"a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=" + profileLevelID + "\r\n"
+	}
+
+	cases := []struct {
+		name    string
+		sdp     string
+		wantErr bool
+	}{
+		{name: "baseline passes", sdp: fmtp("42e01f"), wantErr: false},
+		{name: "constrained baseline passes", sdp: fmtp("42001f"), wantErr: false},
+		{name: "main profile rejected", sdp: fmtp("4d001f"), wantErr: true},
+		{name: "high profile rejected", sdp: fmtp("640c1f"), wantErr: true},
+		{name: "extended profile rejected", sdp: fmtp("58001f"), wantErr: true},
+		{name: "uppercase profile byte rejected", sdp: fmtp("4D001F"), wantErr: true},
+		{name: "unknown profile passes with warning", sdp: fmtp("ff001f"), wantErr: false},
+		{name: "h264 without profile-level-id passes", sdp: "a=rtpmap:96 H264/90000\r\n", wantErr: false},
+		{name: "non-h264 passes", sdp: "a=rtpmap:96 VP8/90000\r\n", wantErr: false},
+		{name: "empty sdp passes", sdp: "", wantErr: false},
+		// A multi-profile offer with Baseline first must pass: the Baseline-only
+		// MediaEngine negotiates Baseline, so the trailing High PT is never used.
+		// Rejecting it would break legitimate encoders that advertise both.
+		{name: "baseline-first multi-profile passes", sdp: fmtp("42e01f") + "a=rtpmap:98 H264/90000\r\na=fmtp:98 profile-level-id=640c1f\r\n", wantErr: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateSDP(tc.sdp)
+			if tc.wantErr {
+				if !errors.Is(err, ErrBFramesDetected) {
+					t.Errorf("validateSDP(%q) = %v, want ErrBFramesDetected", tc.name, err)
+				}
+			} else if err != nil {
+				t.Errorf("validateSDP(%q) = %v, want nil", tc.name, err)
+			}
+		})
+	}
+}
 
 // TestKeyPrefix_NoPanicOnShortTokens is a regression test for a process-crashing
 // DoS. The WHIP handler logged stream-key prefixes via token[:8], but the token
@@ -12,12 +59,12 @@ import (
 // whole server. keyPrefix must never panic regardless of token length.
 func TestKeyPrefix_NoPanicOnShortTokens(t *testing.T) {
 	cases := []string{
-		"",       // empty
-		"a",      // 1 byte
-		"ab",     // 2 bytes
-		"abcdef", // 6 bytes (< 8)
-		"abcdefg", // 7 bytes (< 8)
-		"abcdefgh", // exactly 8
+		"",                                     // empty
+		"a",                                    // 1 byte
+		"ab",                                   // 2 bytes
+		"abcdef",                               // 6 bytes (< 8)
+		"abcdefg",                              // 7 bytes (< 8)
+		"abcdefgh",                             // exactly 8
 		"abcdefghijklmnopqrstuvwxyz0123456789", // long
 	}
 	for _, token := range cases {
