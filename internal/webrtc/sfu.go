@@ -889,26 +889,32 @@ func (rt *RoomTracks) removeSubscriberIfSame(id string, expected *Subscriber) []
 		rt.mu.Unlock()
 		return nil
 	}
-	pcs, affected := rt.removeSubscriberLocked(id)
+	pcs, deadTracks := rt.removeSubscriberLocked(id)
 	rt.mu.Unlock()
 
 	// Close outside the lock — pion state callbacks re-enter rt.mu.
 	for _, pc := range pcs {
 		pc.Close()
 	}
-	return affected
+	// Tear the departed participant's dead relay tracks out of the remaining
+	// subscribers under their SignalingMu (never under rt.mu), and return the
+	// affected IDs for the caller to renegotiate.
+	return rt.removeSendersForTracks(deadTracks, id)
 }
 
 // RemoveSubscriber removes a subscriber from a room unconditionally.
 func (rt *RoomTracks) RemoveSubscriber(id string) {
 	rt.mu.Lock()
-	pcs, _ := rt.removeSubscriberLocked(id)
+	pcs, deadTracks := rt.removeSubscriberLocked(id)
 	rt.mu.Unlock()
 
 	// Close outside the lock — pion state callbacks re-enter rt.mu.
 	for _, pc := range pcs {
 		pc.Close()
 	}
+	// Detach the departed participant's dead relay tracks from the remaining
+	// subscribers (flags them for renegotiation under SignalingMu).
+	rt.removeSendersForTracks(deadTracks, id)
 }
 
 // removeSubscriberLocked performs subscriber removal. Caller must hold rt.mu
@@ -916,15 +922,21 @@ func (rt *RoomTracks) RemoveSubscriber(id string) {
 // releasing the lock (pion fires OnConnectionStateChange callbacks during
 // Close that call back into rt.mu, e.g. via removeSubscriberIfSame).
 //
-// When the removed subscriber was the screen sharer, it also tears down the
-// screen-share sender from every OTHER subscriber and returns those IDs in
-// affectedSharerRemoval so callers can renegotiate them. This matters because
-// the abrupt path (subscriber PC Failed while the WS survives, or any removal
-// that clears ScreenShareLocalTrack before RemoveScreenShareTrack runs) would
-// otherwise leave every viewer with a frozen last frame bound to a dead local
-// track — and RemoveScreenShareTrack alone can't fix it after the local track
-// is already nil (it early-returns).
-func (rt *RoomTracks) removeSubscriberLocked(id string) (pcs []*webrtc.PeerConnection, affectedSharerRemoval []string) {
+// When the removed subscriber was the screen sharer or a webcam owner, its
+// relay local track(s) become dead and must be torn down from every OTHER
+// subscriber, otherwise viewers keep a frozen last frame bound to a dead track.
+// The abrupt path (subscriber PC Failed while the WS survives, or any removal
+// that clears ScreenShareLocalTrack before RemoveScreenShareTrack runs) reaches
+// here, and RemoveScreenShareTrack alone can't fix it after the local track is
+// already nil (it early-returns).
+//
+// Those dead tracks are RETURNED rather than removed here: removing a sender and
+// flagging renegotiation mutate another subscriber's PeerConnection and
+// needsRenegotiation, both guarded by that subscriber's SignalingMu — which we
+// must NOT take while holding rt.mu (every other path takes SignalingMu alone;
+// inconsistent ordering would risk deadlock). The caller passes the returned
+// tracks to removeSendersForTracks AFTER releasing rt.mu.
+func (rt *RoomTracks) removeSubscriberLocked(id string) (pcs []*webrtc.PeerConnection, deadTracks []*webrtc.TrackLocalStaticRTP) {
 	if sub, ok := rt.Subscribers[id]; ok {
 		// Use sync.Once to prevent double-close panic
 		sub.closeOnce.Do(func() {
@@ -982,22 +994,11 @@ func (rt *RoomTracks) removeSubscriberLocked(id string) (pcs []*webrtc.PeerConne
 			delete(rt.webcamRelayDone, id)
 		}
 		if webcamLocal != nil {
-			for otherID, other := range rt.Subscribers {
-				if otherID == id {
-					continue
-				}
-				for _, sender := range other.PeerConnection.GetSenders() {
-					if sender.Track() == webcamLocal {
-						if err := other.PeerConnection.RemoveTrack(sender); err != nil {
-							log.Printf("Failed to remove webcam sender from %s during participant removal: %v", otherID, err)
-						} else {
-							other.needsRenegotiation = true
-							affectedSharerRemoval = append(affectedSharerRemoval, otherID)
-						}
-						break
-					}
-				}
-			}
+			// Torn down from every other subscriber by the caller under each
+			// subscriber's SignalingMu (see removeSendersForTracks); doing it
+			// here would touch another subscriber's PeerConnection/
+			// needsRenegotiation without its SignalingMu.
+			deadTracks = append(deadTracks, webcamLocal)
 		}
 	}
 	// Clean up screen share state if this participant was sharing. Remove the
@@ -1015,25 +1016,73 @@ func (rt *RoomTracks) removeSubscriberLocked(id string) (pcs []*webrtc.PeerConne
 			rt.screenShareDone = nil
 		}
 		if sharerLocalTrack != nil {
-			for otherID, other := range rt.Subscribers {
-				if otherID == id {
-					continue
-				}
-				for _, sender := range other.PeerConnection.GetSenders() {
-					if sender.Track() == sharerLocalTrack {
-						if err := other.PeerConnection.RemoveTrack(sender); err != nil {
-							log.Printf("Failed to remove screen share sender from %s during sharer removal: %v", otherID, err)
-						} else {
-							other.needsRenegotiation = true
-							affectedSharerRemoval = append(affectedSharerRemoval, otherID)
-						}
-						break
-					}
-				}
-			}
+			// Removed from other subscribers by the caller under SignalingMu
+			// (see removeSendersForTracks), for the same reason as the webcam
+			// track above.
+			deadTracks = append(deadTracks, sharerLocalTrack)
 		}
 	}
-	return pcs, affectedSharerRemoval
+	return pcs, deadTracks
+}
+
+// removeSendersForTracks removes, from every subscriber except excludeID, any
+// sender whose track is one of deadTracks (a departed participant's now-dead
+// webcam/screen-share relay tracks), flags each touched subscriber for
+// renegotiation, and returns the affected IDs so the caller can offer.
+//
+// It takes each subscriber's SignalingMu — and never rt.mu — so it MUST be
+// called after rt.mu is released. This mirrors RemoveScreenShareTrack and keeps
+// needsRenegotiation / PeerConnection mutations under the one lock that guards
+// them, closing the race with concurrent track-add renegotiation.
+func (rt *RoomTracks) removeSendersForTracks(deadTracks []*webrtc.TrackLocalStaticRTP, excludeID string) []string {
+	if len(deadTracks) == 0 {
+		return nil
+	}
+
+	rt.mu.RLock()
+	subs := make([]*Subscriber, 0, len(rt.Subscribers))
+	ids := make([]string, 0, len(rt.Subscribers))
+	for sid, sub := range rt.Subscribers {
+		if sid == excludeID {
+			continue
+		}
+		subs = append(subs, sub)
+		ids = append(ids, sid)
+	}
+	rt.mu.RUnlock()
+
+	var affected []string
+	for i, sub := range subs {
+		sub.SignalingMu.Lock()
+		removed := false
+		for _, sender := range sub.PeerConnection.GetSenders() {
+			track := sender.Track()
+			if track == nil {
+				continue
+			}
+			isDead := false
+			for _, dead := range deadTracks {
+				if track == dead {
+					isDead = true
+					break
+				}
+			}
+			if !isDead {
+				continue
+			}
+			if err := sub.PeerConnection.RemoveTrack(sender); err != nil {
+				log.Printf("Failed to remove dead relay sender from %s during participant removal: %v", ids[i], err)
+			} else {
+				removed = true
+			}
+		}
+		if removed {
+			sub.needsRenegotiation = true
+			affected = append(affected, ids[i])
+		}
+		sub.SignalingMu.Unlock()
+	}
+	return affected
 }
 
 // BindIngestToRoom binds an ingest session's tracks to a room for distribution.

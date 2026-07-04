@@ -502,6 +502,77 @@ func TestRemoveSubscriber_SharerRemovalTearsDownOtherViewers(t *testing.T) {
 	}
 }
 
+// TestRemoveSubscriber_WebcamOwnerRemovalTearsDownOtherViewers is the webcam
+// twin of the screen-share test above: when a participant whose webcam is being
+// relayed leaves, its now-dead webcam relay track must be removed from every
+// other subscriber and those viewers flagged for renegotiation. This guards the
+// second dead-track branch of removeSubscriberLocked / removeSendersForTracks.
+func TestRemoveSubscriber_WebcamOwnerRemovalTearsDownOtherViewers(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "webcam-room"
+	room := sfu.GetRoomTracks(roomSlug)
+
+	videoCodec := webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}
+	webcamTrack, err := webrtc.NewTrackLocalStaticRTP(videoCodec, "webcam-owner", "webcam-stream-owner")
+	if err != nil {
+		t.Fatalf("failed to create webcam track: %v", err)
+	}
+
+	ownerPC, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create owner pc: %v", err)
+	}
+	defer ownerPC.Close()
+	owner := &Subscriber{ID: "owner", PeerConnection: ownerPC, done: make(chan struct{})}
+
+	viewerPC, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create viewer pc: %v", err)
+	}
+	defer viewerPC.Close()
+	if _, err := viewerPC.AddTrack(webcamTrack); err != nil {
+		t.Fatalf("failed to add webcam track to viewer: %v", err)
+	}
+	viewer := &Subscriber{ID: "viewer", PeerConnection: viewerPC, done: make(chan struct{})}
+
+	room.mu.Lock()
+	room.Subscribers["owner"] = owner
+	room.Subscribers["viewer"] = viewer
+	if room.WebcamLocalTracks == nil {
+		room.WebcamLocalTracks = make(map[string]*webrtc.TrackLocalStaticRTP)
+	}
+	room.WebcamLocalTracks["owner"] = webcamTrack
+	room.mu.Unlock()
+
+	if !senderBound(viewerPC, webcamTrack) {
+		t.Fatal("viewer should have the webcam sender bound before owner removal")
+	}
+
+	affected := sfu.RemoveSubscriberIfSame(roomSlug, "owner", owner)
+	if len(affected) != 1 || affected[0] != "viewer" {
+		t.Fatalf("expected affected=[viewer], got %v", affected)
+	}
+	if senderBound(viewerPC, webcamTrack) {
+		t.Fatal("viewer webcam sender should have been removed when the owner left")
+	}
+	if !viewer.needsRenegotiation {
+		t.Fatal("viewer should be flagged needsRenegotiation after its webcam sender was removed")
+	}
+
+	room.mu.RLock()
+	_, stillPresent := room.WebcamLocalTracks["owner"]
+	room.mu.RUnlock()
+	if stillPresent {
+		t.Fatal("owner's webcam relay track should be cleared after removal")
+	}
+}
+
 func senderBound(pc *webrtc.PeerConnection, track *webrtc.TrackLocalStaticRTP) bool {
 	for _, s := range pc.GetSenders() {
 		if s.Track() == track {
