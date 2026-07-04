@@ -1627,8 +1627,12 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 	// reports with an advancing highest-sequence prove packets arrive (a
 	// black screen is then a decode problem); absent/stuck reports mean the
 	// transport never delivers video at all.
-	if sub.VideoSender != nil {
-		go logSubscriberVideoRTCP(sub, subscriberID)
+	// Snapshot the sender under the SignalingMu held here and hand it to the
+	// diagnostic goroutine. Re-reading sub.VideoSender inside the loop would
+	// race BindIngestToRoom, which reassigns the field (under SignalingMu) on
+	// the ReplaceTrack-failure rebind path.
+	if videoSender := sub.VideoSender; videoSender != nil {
+		go logSubscriberVideoRTCP(sub, videoSender, subscriberID)
 	}
 
 	return pc, sub, offer.SDP, sub.OfferID, nil
@@ -1642,7 +1646,7 @@ func (s *SFU) nextSignalingOfferID() string {
 // PLI requests from a subscriber's video stream, then exits. Purely
 // diagnostic — used to tell "not receiving video" apart from "receiving but
 // not decoding" (e.g. Chrome-only black screens).
-func logSubscriberVideoRTCP(sub *Subscriber, subscriberID string) {
+func logSubscriberVideoRTCP(sub *Subscriber, sender *webrtc.RTPSender, subscriberID string) {
 	const maxReports = 8
 	logged := 0
 	pliCount := 0
@@ -1655,7 +1659,7 @@ func logSubscriberVideoRTCP(sub *Subscriber, subscriberID string) {
 			return
 		default:
 		}
-		pkts, _, err := sub.VideoSender.ReadRTCP()
+		pkts, _, err := sender.ReadRTCP()
 		if err != nil {
 			return
 		}
