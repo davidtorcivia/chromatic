@@ -483,6 +483,22 @@ func TestSecurityHeaders(t *testing.T) {
 			}
 		}
 
+		// HSTS must be present in production (defends the login token / session
+		// cookie against SSL-strip) and absent in dev (so localhost/self-signed
+		// setups aren't pinned to HTTPS). It must never assert includeSubDomains
+		// or preload, which would leak onto sibling subdomains.
+		hsts := rr.Header().Get("Strict-Transport-Security")
+		if prod {
+			if hsts == "" {
+				t.Errorf("production must set Strict-Transport-Security")
+			}
+			if strings.Contains(hsts, "includeSubDomains") || strings.Contains(hsts, "preload") {
+				t.Errorf("HSTS must stay host-scoped (no includeSubDomains/preload), got %q", hsts)
+			}
+		} else if hsts != "" {
+			t.Errorf("dev must not set Strict-Transport-Security, got %q", hsts)
+		}
+
 		csp := rr.Header().Get("Content-Security-Policy")
 		if prod {
 			if strings.Contains(csp, "ws:") && !strings.Contains(csp, "wss:") {

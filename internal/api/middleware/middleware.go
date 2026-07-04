@@ -646,6 +646,18 @@ func SecurityHeaders(productionMode bool) func(http.Handler) http.Handler {
 			w.Header().Set("Content-Security-Policy", csp)
 			// Permissions Policy (limit browser features)
 			w.Header().Set("Permissions-Policy", "geolocation=(), payment=(), usb=()")
+			// HTTP Strict Transport Security: once a browser has seen this over
+			// HTTPS it refuses to talk to the host over plaintext, defeating
+			// SSL-strip / downgrade MITM against the login token, room passwords
+			// and session cookie. Production only — over plain HTTP browsers
+			// ignore it, and asserting it in dev (localhost, self-signed) would
+			// pin developers to HTTPS. Host-scoped: no includeSubDomains/preload,
+			// so deploying Chromatic at review.example.com never forces sibling
+			// subdomains (a client's HTTP blog, staging box) onto HTTPS. Operators
+			// on a dedicated apex can harden further at their edge/proxy.
+			if productionMode {
+				w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+			}
 			next.ServeHTTP(w, r)
 		})
 	}
