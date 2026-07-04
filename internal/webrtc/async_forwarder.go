@@ -32,9 +32,17 @@ import (
 // audio is small so a deeper buffer avoids dropping talk spurts. Callers pass the
 // capacity; see whip.go for the chosen values.
 type asyncForwarder struct {
-	buf       [][]byte
-	head      int // index of the oldest packet
-	count     int
+	buf   [][]byte
+	head  int // index of the oldest packet
+	count int
+	// free is a bounded LIFO of recycled packet buffers. At video bitrates the
+	// ingest produces hundreds of packets/sec; without reuse each write() would
+	// heap-allocate a ~1.4KB slice, churning the GC on the hottest media path.
+	// Buffers are recycled by the drain goroutine after WriteRTP returns (it
+	// copies the payload out synchronously, so the buffer is free to reuse) and
+	// by write() when drop-oldest discards a stale packet. Capped at len(buf)
+	// so the free list can't grow unbounded.
+	free      [][]byte
 	mu        sync.Mutex
 	cond      *sync.Cond
 	closeOnce sync.Once
@@ -62,11 +70,9 @@ func newAsyncForwarder(bufSize int, write func(*rtp.Packet) error) *asyncForward
 // write queues a packet for asynchronous fan-out. It never blocks on the
 // consumer: if the buffer is full the oldest packet is dropped (drop-oldest),
 // keeping the live ingest read loop moving. The packet bytes are copied since
-// the caller reuses its read buffer.
+// the caller reuses its read buffer; the copy reuses a recycled buffer when one
+// is available (see free) to avoid a heap allocation per packet.
 func (f *asyncForwarder) write(pkt []byte) {
-	cp := make([]byte, len(pkt))
-	copy(cp, pkt)
-
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed {
@@ -75,23 +81,63 @@ func (f *asyncForwarder) write(pkt []byte) {
 	if f.count == len(f.buf) {
 		// Buffer full: drop the oldest packet to keep latency bounded and the
 		// producer unblocked. For live video a stale frame is worthless; for
-		// audio this is the lesser evil vs. blocking OBS.
+		// audio this is the lesser evil vs. blocking OBS. Recycle its buffer.
+		old := f.buf[f.head]
 		f.buf[f.head] = nil
 		f.head = (f.head + 1) % len(f.buf)
 		f.count--
 		f.dropped++
+		f.recycleLocked(old)
 	}
+	cp := f.getBufLocked(len(pkt))
+	copy(cp, pkt)
 	tail := (f.head + f.count) % len(f.buf)
 	f.buf[tail] = cp
 	f.count++
 	f.cond.Signal()
 }
 
+// getBufLocked returns a byte slice of length n, reusing a recycled buffer when
+// one with sufficient capacity is available. Caller must hold f.mu.
+func (f *asyncForwarder) getBufLocked(n int) []byte {
+	if k := len(f.free); k > 0 {
+		b := f.free[k-1]
+		f.free[k-1] = nil
+		f.free = f.free[:k-1]
+		if cap(b) >= n {
+			return b[:n]
+		}
+		// Too small (a larger packet than this buffer held): let it go and
+		// allocate a right-sized one below.
+	}
+	return make([]byte, n)
+}
+
+// recycleLocked returns a buffer to the free list for reuse, bounding the list
+// to the ring capacity so it can't grow without limit. Caller must hold f.mu.
+func (f *asyncForwarder) recycleLocked(b []byte) {
+	if b == nil || len(f.free) >= len(f.buf) {
+		return
+	}
+	f.free = append(f.free, b[:0])
+}
+
 // drain is the consumer loop. It calls write() for each queued packet, exiting
 // when Close is called and the buffer is drained.
 func (f *asyncForwarder) drain() {
+	// p is reused across iterations. drain is single-goroutine and writeFn
+	// (WriteRTP) does not retain the packet past the call, so one packet struct
+	// serves every iteration instead of allocating one per packet.
+	var p rtp.Packet
+	// used holds the previous iteration's buffer so it can be recycled once we
+	// re-acquire the lock — writeFn has returned by then, so the bytes are free.
+	var used []byte
 	for {
 		f.mu.Lock()
+		if used != nil {
+			f.recycleLocked(used)
+			used = nil
+		}
 		for f.count == 0 && !f.closed {
 			f.cond.Wait()
 		}
@@ -105,8 +151,9 @@ func (f *asyncForwarder) drain() {
 		f.count--
 		f.mu.Unlock()
 
-		var p rtp.Packet
+		p = rtp.Packet{}
 		if err := p.Unmarshal(pkt); err != nil {
+			used = pkt
 			continue
 		}
 		stripHeaderExtensions(&p.Header)
@@ -115,6 +162,7 @@ func (f *asyncForwarder) drain() {
 				log.Printf("async forwarder write error: %v", err)
 			}
 		}
+		used = pkt
 	}
 }
 

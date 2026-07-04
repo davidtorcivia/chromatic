@@ -2,6 +2,7 @@ package webrtc
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -118,6 +119,104 @@ done:
 	for i := 1; i < len(written); i++ {
 		if written[i] <= written[i-1] {
 			t.Errorf("deliveries not monotonic at %d: %d after %d", i, written[i], written[i-1])
+		}
+	}
+}
+
+// TestAsyncForwarder_RecyclesBuffersUnderVaryingSizes exercises the buffer
+// free-list across packets larger than a previously-recycled buffer, ensuring
+// getBufLocked reallocates when capacity is insufficient and never returns a
+// short slice (which would corrupt the copied payload).
+func TestAsyncForwarder_RecyclesBuffersUnderVaryingSizes(t *testing.T) {
+	var mu sync.Mutex
+	got := map[uint16]int{} // seq -> payload length observed
+
+	f := newAsyncForwarder(4, func(p *rtp.Packet) error {
+		mu.Lock()
+		got[p.Header.SequenceNumber] = len(p.Payload)
+		mu.Unlock()
+		return nil
+	})
+	defer f.Close()
+
+	// Build packets with growing payloads so recycled small buffers must be
+	// grown, then shrinking so large buffers are reused for small packets.
+	sizes := []int{2, 64, 8, 512, 16, 512, 4}
+	build := func(seq uint16, payloadLen int) []byte {
+		pkt := &rtp.Packet{
+			Header:  rtp.Header{Version: 2, SequenceNumber: seq, PayloadType: 96},
+			Payload: make([]byte, payloadLen),
+		}
+		b, err := pkt.Marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	for i, n := range sizes {
+		// Serialize produce+drain by waiting for delivery, so the buffer is
+		// recycled before the next write and the reuse path is exercised.
+		f.write(build(uint16(i), n))
+		deadline := time.After(2 * time.Second)
+		for {
+			mu.Lock()
+			_, ok := got[uint16(i)]
+			mu.Unlock()
+			if ok {
+				break
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("packet %d never delivered", i)
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i, n := range sizes {
+		if got[uint16(i)] != n {
+			t.Errorf("packet %d: payload len = %d, want %d (buffer reuse corrupted the copy)", i, got[uint16(i)], n)
+		}
+	}
+}
+
+// BenchmarkAsyncForwarder_Throughput drives the produce/drain path at a video-
+// like packet rate. With buffer recycling the steady state should allocate far
+// less than one ~1.4KB slice per packet; run with -benchmem to observe B/op.
+func BenchmarkAsyncForwarder_Throughput(b *testing.B) {
+	var delivered int64
+	f := newAsyncForwarder(256, func(p *rtp.Packet) error {
+		atomic.AddInt64(&delivered, 1)
+		return nil
+	})
+	defer f.Close()
+
+	pkt := &rtp.Packet{
+		Header:  rtp.Header{Version: 2, SequenceNumber: 1, PayloadType: 96},
+		Payload: make([]byte, 1200),
+	}
+	raw, err := pkt.Marshal()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		f.write(raw)
+	}
+	// Under drop-oldest not every packet is delivered; wait until the drain has
+	// caught up so delivered + dropped == produced before stopping the timer.
+	deadline := time.After(10 * time.Second)
+	for atomic.LoadInt64(&delivered)+f.Dropped() < int64(b.N) {
+		select {
+		case <-deadline:
+			b.Fatalf("drain did not converge: delivered=%d dropped=%d want=%d",
+				atomic.LoadInt64(&delivered), f.Dropped(), b.N)
+		case <-time.After(time.Millisecond):
 		}
 	}
 }
