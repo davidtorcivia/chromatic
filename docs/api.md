@@ -342,10 +342,18 @@ GET /api/config
   "turnExternalUrl": "turn:global.turn.twilio.com:3478",
   "turnExternalUsername": "username",
   "hasTurnCredential": true,
+  "turnMode": "hybrid",
+  "turnCloudflareConfigured": false,
   "publicUrl": "https://stream.example.com",
   "whipFormat": "https://stream.example.com/whip/{stream_key_token}"
 }
 ```
+
+`turnMode` is one of `self-hosted`, `external`, or `hybrid`.
+`turnCloudflareConfigured` reports whether Cloudflare TURN credentials are
+present in the environment. `turnExternalUrl`/`turnExternalUsername` reflect the
+effective static TURN settings (DB override with per-field environment
+fallback), so the displayed config matches the tested and running config.
 
 ### Update Configuration
 
@@ -388,6 +396,110 @@ DELETE /api/config/logo
 ```
 
 **Response:** `204 No Content`
+
+### Test TURN Reachability
+
+```
+POST /api/config/test-turn
+```
+
+Runs a server-side socket reachability test against the effective TURN servers
+(self-hosted Coturn realm plus the effective external/static URLs). This is a
+reachability check, not an authenticated TURN allocation or a browser NAT proof.
+The result is persisted in `config` with a signature of the effective TURN
+settings so the setup status can tell whether a stored test is still valid;
+saving any TURN field clears that stored test.
+
+**Response:**
+```json
+{
+  "success": true,
+  "results": [
+    {
+      "server": "turn.example.com:3478",
+      "reachable": true,
+      "latency": 42,
+      "protocol": "udp",
+      "testType": "external"
+    }
+  ],
+  "message": "At least one TURN endpoint is reachable from this server"
+}
+```
+
+---
+
+## Setup
+
+The setup wizard status is owned by the backend and persisted in the `config`
+table, not browser localStorage.
+
+### Get Setup Status
+
+```
+GET /api/setup/status
+```
+
+Returns the server-computed setup status: completion/dismissal timestamps, the
+rollup progress, the per-check results, and the install facts Chromatic can
+derive from its own config and database.
+
+**Response:**
+```json
+{
+  "readyToComplete": false,
+  "firstRun": true,
+  "requiresAttention": false,
+  "progress": { "ready": 3, "required": 6, "total": 7 },
+  "checks": [
+    {
+      "id": "public-url",
+      "title": "Public URL",
+      "status": "ready",
+      "required": true,
+      "summary": "Local development URL"
+    }
+  ],
+  "facts": {
+    "publicUrl": "http://localhost:3000",
+    "productionMode": false,
+    "allowedOrigins": [],
+    "turnMode": "hybrid",
+    "turnCloudflareConfigured": false,
+    "turnStaticConfigured": false,
+    "hasTurnCredential": false,
+    "turnLastTestSuccess": false,
+    "turnLastTestValidForCurrentConfig": false,
+    "streamKeyCount": 0,
+    "roomCount": 0
+  }
+}
+```
+
+Check `status` values: `ready`, `needs-action`, `warning`, `optional`. Required
+checks block `readyToComplete` until every one is `ready`; the optional
+`branding` check never blocks completion. `firstRun` is true only when setup is
+neither completed nor dismissed and no stream keys or rooms exist yet.
+`requiresAttention` is true when setup was completed but a required check is no
+longer ready.
+
+### Complete Setup
+
+```
+POST /api/setup/complete
+```
+
+Stamps `setup_completed_at` (clearing any prior dismissal) and returns the
+updated status. Returns `409 Conflict` with the current status if any required
+check is not ready.
+
+### Dismiss Setup
+
+```
+POST /api/setup/dismiss
+```
+
+Stamps `setup_dismissed_at` and returns the updated status.
 
 ---
 

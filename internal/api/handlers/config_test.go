@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"mime/multipart"
@@ -16,22 +17,10 @@ import (
 )
 
 func setupConfigTest(t *testing.T) (*ConfigHandler, func()) {
+	// NewTestDB applies all migrations, so the config table (including the
+	// setup-status and TURN-test columns from 008_add_setup_status.sql) already
+	// exists with the singleton row.
 	db, dbCleanup := database.NewTestDB(t)
-
-	// Create config table
-	_, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS config (
-			id INTEGER PRIMARY KEY,
-			default_watermark_text TEXT,
-			default_watermark_logo_path TEXT,
-			turn_external_url TEXT,
-			turn_external_username TEXT,
-			turn_external_credential TEXT
-		)
-	`)
-	if err != nil {
-		t.Fatalf("failed to create config table: %v", err)
-	}
 
 	// Create temp dir for logos
 	tempDir, err := os.MkdirTemp("", "chromatic-config-test-*")
@@ -519,6 +508,237 @@ func TestParseTURNURL_TURNSSchemeDefaultsToTCP443(t *testing.T) {
 	if host != "turn.cloudflare.com:443" {
 		t.Fatalf("expected host turn.cloudflare.com:443, got %s", host)
 	}
+}
+
+// staleSetupTURNTest primes the config row with a stored TURN test so a later
+// update can prove it was cleared.
+func staleSetupTURNTest(t *testing.T, handler *ConfigHandler) {
+	t.Helper()
+	_, err := handler.db.Exec(`
+		UPDATE config
+		SET turn_last_tested_at = CURRENT_TIMESTAMP,
+		    turn_last_test_success = 1,
+		    turn_last_test_message = 'stale',
+		    turn_last_test_signature = 'stale-sig'
+		WHERE id = 1
+	`)
+	if err != nil {
+		t.Fatalf("failed to seed stale TURN test: %v", err)
+	}
+}
+
+func readTURNTestColumns(t *testing.T, handler *ConfigHandler) (testedAt sql.NullString, success sql.NullBool, msg sql.NullString, sig sql.NullString) {
+	t.Helper()
+	err := handler.db.QueryRow(`
+		SELECT turn_last_tested_at, turn_last_test_success, turn_last_test_message, turn_last_test_signature
+		FROM config WHERE id = 1
+	`).Scan(&testedAt, &success, &msg, &sig)
+	if err != nil {
+		t.Fatalf("failed to read TURN test columns: %v", err)
+	}
+	return
+}
+
+func TestConfigHandler_Update_TurnFieldClearsStoredReachabilityTest(t *testing.T) {
+	handler, cleanup := setupConfigTest(t)
+	defer cleanup()
+
+	staleSetupTURNTest(t, handler)
+
+	body := map[string]interface{}{
+		"turnExternalUsername": "only-user",
+	}
+	bodyBytes, _ := json.Marshal(body)
+	req := httptest.NewRequest("PATCH", "/api/config", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	handler.Update(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, rr.Code, rr.Body.String())
+	}
+
+	testedAt, success, msg, sig := readTURNTestColumns(t, handler)
+	if testedAt.Valid {
+		t.Errorf("expected turn_last_tested_at cleared, got %q", testedAt.String)
+	}
+	if success.Valid && success.Bool {
+		t.Errorf("expected turn_last_test_success cleared/false, got %v", success.Bool)
+	}
+	if msg.Valid {
+		t.Errorf("expected turn_last_test_message cleared, got %q", msg.String)
+	}
+	if sig.Valid {
+		t.Errorf("expected turn_last_test_signature cleared, got %q", sig.String)
+	}
+}
+
+func TestConfigHandler_Update_NonTurnFieldKeepsStoredReachabilityTest(t *testing.T) {
+	handler, cleanup := setupConfigTest(t)
+	defer cleanup()
+
+	staleSetupTURNTest(t, handler)
+
+	body := map[string]interface{}{
+		"defaultWatermarkText": "Branded",
+	}
+	bodyBytes, _ := json.Marshal(body)
+	req := httptest.NewRequest("PATCH", "/api/config", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	handler.Update(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, rr.Code, rr.Body.String())
+	}
+
+	_, success, _, sig := readTURNTestColumns(t, handler)
+	if !success.Valid || !success.Bool {
+		t.Errorf("expected stored TURN test preserved on non-TURN update, got success=%v", success)
+	}
+	if !sig.Valid || sig.String != "stale-sig" {
+		t.Errorf("expected stored TURN signature preserved, got %v", sig)
+	}
+}
+
+func TestConfigHandler_Update_MalformedTurnURLReturns400(t *testing.T) {
+	handler, cleanup := setupConfigTest(t)
+	defer cleanup()
+
+	body := map[string]interface{}{
+		"turnExternalUrl": "not-a-turn-url",
+	}
+	bodyBytes, _ := json.Marshal(body)
+	req := httptest.NewRequest("PATCH", "/api/config", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	handler.Update(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d for malformed TURN URL, got %d: %s", http.StatusBadRequest, rr.Code, rr.Body.String())
+	}
+
+	// The DB must be untouched by the rejected request.
+	var stored sql.NullString
+	err := handler.db.QueryRow(`SELECT turn_external_url FROM config WHERE id = 1`).Scan(&stored)
+	if err != nil {
+		t.Fatalf("failed to read config: %v", err)
+	}
+	if stored.Valid {
+		t.Errorf("expected turn_external_url unchanged (NULL), got %q", stored.String)
+	}
+}
+
+func TestConfigHandler_Update_UsernameOnlyPreservesEnvURL(t *testing.T) {
+	handler, cleanup := setupConfigTest(t)
+	defer cleanup()
+
+	// Environment provides the TURN URL; the admin saves only a username.
+	handler.cfg.TurnExternalURLs = []string{"turn:env.example.com:3478?transport=udp"}
+
+	body := map[string]interface{}{
+		"turnExternalUsername": "db-user",
+	}
+	bodyBytes, _ := json.Marshal(body)
+	req := httptest.NewRequest("PATCH", "/api/config", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	handler.Update(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, rr.Code, rr.Body.String())
+	}
+
+	// Effective URLs must still include the environment URL — the partial
+	// username save must not clobber it.
+	eff := effectiveTURNSettingsFor(handler.db, handler.cfg)
+	found := false
+	for _, u := range eff.URLs {
+		if u == "turn:env.example.com:3478?transport=udp" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected effective URLs to preserve env URL after username-only save, got %v", eff.URLs)
+	}
+	if eff.Username != "db-user" {
+		t.Errorf("expected effective username 'db-user', got %q", eff.Username)
+	}
+
+	// And the DB URL column stays NULL (only username was written).
+	var storedURL sql.NullString
+	if err := handler.db.QueryRow(`SELECT turn_external_url FROM config WHERE id = 1`).Scan(&storedURL); err != nil {
+		t.Fatalf("failed to read turn_external_url: %v", err)
+	}
+	if storedURL.Valid {
+		t.Errorf("expected turn_external_url to stay NULL after username-only save, got %q", storedURL.String)
+	}
+}
+
+func TestConfigHandler_TestTURN_PersistsResultAndSignature(t *testing.T) {
+	handler, cleanup := setupConfigTest(t)
+	defer cleanup()
+
+	// No servers configured -> success=false, but the result + signature must
+	// still be persisted.
+	req := httptest.NewRequest("POST", "/api/config/test-turn", nil)
+	rr := httptest.NewRecorder()
+	handler.TestTURN(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+
+	var resp TURNTestResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Message != "No TURN servers configured" {
+		t.Errorf("expected 'No TURN servers configured', got %q", resp.Message)
+	}
+
+	testedAt, success, msg, sig := readTURNTestColumns(t, handler)
+	if !testedAt.Valid {
+		t.Error("expected turn_last_tested_at to be set after TestTURN")
+	}
+	if success.Valid && success.Bool {
+		t.Errorf("expected stored success false for no servers, got %v", success.Bool)
+	}
+	if !msg.Valid || msg.String != "No TURN servers configured" {
+		t.Errorf("expected stored message, got %v", msg)
+	}
+	if !sig.Valid || sig.String == "" {
+		t.Error("expected a non-empty stored TURN signature")
+	}
+	// The stored signature must equal the live signature.
+	if live := currentTURNSignatureFor(handler.db, handler.cfg); sig.String != live {
+		t.Errorf("stored signature %q != live signature %q", sig.String, live)
+	}
+}
+
+func TestParseTURNURL_RejectsMissingScheme(t *testing.T) {
+	if _, _, err := parseTURNURL("turn.cloudflare.com:3478"); err == nil {
+		t.Fatal("expected error for URL without turn:/turns: scheme")
+	}
+}
+
+func TestParseTURNURL_RejectsUnsupportedTransport(t *testing.T) {
+	if _, _, err := parseTURNURL("turn:turn.example.com:3478?transport=sctp"); err == nil {
+		t.Fatal("expected error for unsupported transport")
+	}
+}
+
+func TestParseTURNURL_AcceptsTransportUDP(t *testing.T) {
+	host, protocol, err := parseTURNURL("turn:turn.example.com:3478?transport=udp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if protocol != "udp" {
+		t.Fatalf("expected protocol udp, got %s", protocol)
+	}
+	if host != "turn.example.com:3478" {
+		t.Fatalf("expected host turn.example.com:3478, got %s", host)
+}
 }
 
 func init() {

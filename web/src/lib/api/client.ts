@@ -298,6 +298,95 @@ export const appConfig = {
     testTurn: () => apiPost<TURNTestResponse>('/api/config/test-turn')
 };
 
+// Setup status types — mirrors the backend SetupStatusResponse contract.
+export type SetupCheckStatus = 'ready' | 'needs-action' | 'warning' | 'optional';
+
+export interface SetupCheck {
+    id: string;
+    title: string;
+    status: SetupCheckStatus;
+    required: boolean;
+    summary: string;
+    detail?: string;
+    action?: string;
+}
+
+export interface SetupProgress {
+    ready: number;
+    required: number;
+    total: number;
+}
+
+export interface SetupFacts {
+    publicUrl: string;
+    productionMode: boolean;
+    allowedOrigins: string[];
+    turnMode: 'self-hosted' | 'external' | 'hybrid' | string;
+    turnCloudflareConfigured: boolean;
+    turnStaticConfigured: boolean;
+    hasTurnCredential: boolean;
+    turnLastTestedAt?: string;
+    turnLastTestSuccess: boolean;
+    turnLastTestMessage?: string;
+    turnLastTestValidForCurrentConfig: boolean;
+    streamKeyCount: number;
+    firstStreamKeyId?: string;
+    roomCount: number;
+    firstRoomSlug?: string;
+    defaultWatermarkText?: string;
+    defaultWatermarkLogoUrl?: string;
+}
+
+export interface SetupStatusResponse {
+    completedAt?: string;
+    dismissedAt?: string;
+    readyToComplete: boolean;
+    firstRun: boolean;
+    requiresAttention: boolean;
+    progress: SetupProgress;
+    checks: SetupCheck[];
+    facts: SetupFacts;
+}
+
+// Thrown by setup.complete() when the server returns 409 Conflict because a
+// required check is no longer ready. Carries the fresh server status so the UI
+// can rerender without another round-trip.
+export class SetupIncompleteError extends ApiError {
+    constructor(public statusResponse: SetupStatusResponse) {
+        super(409, 'Setup is incomplete');
+        this.name = 'SetupIncompleteError';
+    }
+}
+
+// Setup API functions
+export const setup = {
+    status: () => apiGet<SetupStatusResponse>('/api/setup/status'),
+    complete: async (): Promise<SetupStatusResponse> => {
+        const res = await fetch('/api/setup/complete', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        const text = await res.text();
+        // 409 carries the fresh status so the UI can rerender without another
+        // round-trip; defend against a non-JSON body (proxy/gateway error) by
+        // falling back to a plain ApiError instead of throwing SyntaxError.
+        if (res.status === 409) {
+            let data: SetupStatusResponse | undefined;
+            try {
+                data = text ? (JSON.parse(text) as SetupStatusResponse) : undefined;
+            } catch {
+                data = undefined;
+            }
+            if (data) throw new SetupIncompleteError(data);
+            throw new ApiError(409, text || 'Setup is incomplete');
+        }
+        if (!res.ok) throw new ApiError(res.status, text);
+        return (text ? JSON.parse(text) : undefined) as SetupStatusResponse;
+    },
+    dismiss: () => apiPost<SetupStatusResponse>('/api/setup/dismiss')
+};
+
 // File upload types
 export interface UploadedFile {
     id: string;

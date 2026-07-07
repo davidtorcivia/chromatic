@@ -1,76 +1,52 @@
 <script lang="ts">
     import { onDestroy, onMount } from "svelte";
     import { goto } from "$app/navigation";
+    import { fade } from "svelte/transition";
     import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
+    import CopyField from "$lib/components/CopyField.svelte";
+    import StatusPill from "$lib/components/StatusPill.svelte";
     import {
         appConfig,
         rooms,
         streamKeys,
+        setup,
+        SetupIncompleteError,
         type AppConfig,
         type Room,
         type StreamKey,
+        type SetupStatusResponse,
+        type SetupCheck,
         type TURNTestResponse,
     } from "$lib/api/client";
+    import {
+        setupSteps,
+        stepForCheck,
+        nextSetupStep,
+        setupProgressPercent,
+        setupCheckTone,
+        checkById,
+        requiredMissingChecks,
+        type SetupStepId,
+    } from "$lib/setup/wizard";
 
-    const steps = [
-        {
-            id: "preflight",
-            title: "Preflight",
-            description: "Verify environment and security",
-        },
-        {
-            id: "turn",
-            title: "Connectivity",
-            description: "TURN and network checks",
-        },
-        {
-            id: "branding",
-            title: "Branding",
-            description: "Watermark defaults",
-        },
-        {
-            id: "stream",
-            title: "Stream setup",
-            description: "Create stream key + OBS",
-        },
-        {
-            id: "room",
-            title: "First room",
-            description: "Create and test a room",
-        },
-    ] as const;
+    const DEFAULT_WATERMARK_TEXT = "{{ name }} - {{ date }}";
 
-    const setupCompleteKey = "chromatic-setup-complete";
-    const setupDismissedKey = "chromatic-setup-dismissed";
-
-    let currentStep = $state(0);
+    let currentStep = $state<SetupStepId>("preflight");
     let isLoading = $state(true);
     let loadError = $state("");
     let confirmDeleteLogoOpen = $state(false);
+
+    // Server-owned setup state. The wizard no longer derives completion from
+    // browser localStorage or self-attested checkboxes.
+    let setupStatus = $state<SetupStatusResponse | null>(null);
+    let setupError = $state("");
+    let isCompletingSetup = $state(false);
+    let isDismissingSetup = $state(false);
 
     let config = $state<AppConfig | null>(null);
     let baseUrl = $state("");
     let healthStatus = $state<"checking" | "ok" | "error">("checking");
     let healthMessage = $state("");
-
-    let publicUrlStatus = $state<{
-        tone: "good" | "warn" | "bad";
-        label: string;
-        detail: string;
-    }>({
-        tone: "warn",
-        label: "Review",
-        detail: "",
-    });
-
-    let preflightChecks = $state({
-        dns: false,
-        ports: false,
-        ssl: false,
-        env: false,
-        origins: false,
-        localDev: false,
-    });
 
     let turnUrl = $state("");
     let turnUsername = $state("");
@@ -81,22 +57,18 @@
     let isTestingTurn = $state(false);
     let turnError = $state("");
     let turnSuccess = $state("");
-    let turnConfirmed = $state(false);
 
     let watermarkText = $state("");
     let isSavingBranding = $state(false);
     let isUploadingLogo = $state(false);
     let brandingError = $state("");
     let brandingSuccess = $state("");
-    let brandingConfirmed = $state(false);
 
     let keys = $state<StreamKey[]>([]);
     let selectedKeyId = $state("");
     let newKeyName = $state("");
     let isCreatingKey = $state(false);
     let streamError = $state("");
-    let copiedKeyId = $state<string | null>(null);
-    let obsConfirmed = $state(false);
 
     let roomsList = $state<Room[]>([]);
     let roomName = $state("");
@@ -106,24 +78,35 @@
     let roomError = $state("");
     let createdRoom = $state<Room | null>(null);
     let createdRoomSource = $state<"new" | "existing" | null>(null);
-    let copiedRoom = $state(false);
+
     let destroyed = false;
     let loadDataRequestId = 0;
+    let refreshStatusRequestId = 0;
     let refreshConfigRequestId = 0;
     let healthRequestId = 0;
     let healthAbortController: AbortController | null = null;
     let turnSuccessTimer: ReturnType<typeof setTimeout> | null = null;
     let brandingSuccessTimer: ReturnType<typeof setTimeout> | null = null;
-    let copiedKeyTimer: ReturnType<typeof setTimeout> | null = null;
-    let copiedRoomTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const currentStepIndex = $derived(
+        setupSteps.findIndex((s) => s.id === currentStep),
+    );
+    const progressPercent = $derived(setupProgressPercent(setupStatus));
+    const selectedKey = $derived(keys.find((k) => k.id === selectedKeyId));
+    const existingRoomSlug = $derived(setupStatus?.facts.firstRoomSlug ?? null);
+    const activeRoomSlug = $derived(
+        createdRoom?.slug ?? existingRoomSlug ?? "",
+    );
+    const activeRoomSource = $derived(
+        createdRoom ? createdRoomSource : existingRoomSlug ? "existing" : null,
+    );
+    const brandingCheck = $derived(checkById(setupStatus, "branding"));
 
     onDestroy(() => {
         destroyed = true;
         healthAbortController?.abort();
         clearTurnSuccess();
         clearBrandingSuccess();
-        clearCopiedKey();
-        clearCopiedRoom();
     });
 
     onMount(async () => {
@@ -174,59 +157,40 @@
         }, durationMs);
     }
 
-    function clearCopiedKey() {
-        clearTimer(copiedKeyTimer);
-        copiedKeyTimer = null;
-        copiedKeyId = null;
-    }
-
-    function showCopiedKey(keyId: string) {
-        clearCopiedKey();
-        copiedKeyId = keyId;
-        copiedKeyTimer = setTimeout(() => {
-            copiedKeyTimer = null;
-            if (!destroyed) {
-                copiedKeyId = null;
-            }
-        }, 2000);
-    }
-
-    function clearCopiedRoom() {
-        clearTimer(copiedRoomTimer);
-        copiedRoomTimer = null;
-        copiedRoom = false;
-    }
-
-    function showCopiedRoom() {
-        clearCopiedRoom();
-        copiedRoom = true;
-        copiedRoomTimer = setTimeout(() => {
-            copiedRoomTimer = null;
-            if (!destroyed) {
-                copiedRoom = false;
-            }
-        }, 2000);
+    // A step is complete when every required backend check mapped to it is
+    // ready. Branding has no required checks, so it is always "done" for the
+    // sidebar (it is optional and never blocks completion).
+    function stepComplete(stepId: SetupStepId): boolean {
+        if (!setupStatus) return false;
+        const required = setupStatus.checks.filter(
+            (c) => c.required && stepForCheck(c.id) === stepId,
+        );
+        if (required.length === 0) return true;
+        return required.every((c) => c.status === "ready");
     }
 
     async function loadData() {
         const requestId = ++loadDataRequestId;
-        isLoading = true;
+
         loadError = "";
 
         try {
-            const [configData, keysData, roomsData] = await Promise.all([
-                appConfig.get(),
-                streamKeys.list(),
-                rooms.list(),
-            ]);
+            const [statusData, configData, keysData, roomsData] =
+                await Promise.all([
+                    setup.status(),
+                    appConfig.get(),
+                    streamKeys.list(),
+                    rooms.list(),
+                ]);
             if (destroyed || requestId !== loadDataRequestId) return;
 
+            setupStatus = statusData;
             config = configData;
             baseUrl =
                 configData.publicUrl ||
-                (typeof window !== "undefined" ? window.location.origin : "");
-
-            updatePublicUrlStatus(configData.publicUrl);
+                (typeof window !== "undefined"
+                    ? window.location.origin
+                    : "");
 
             keys = keysData ?? [];
             roomsList = roomsData ?? [];
@@ -242,14 +206,18 @@
 
             if (!watermarkText) {
                 watermarkText =
-                    configData.defaultWatermarkText ||
-                    "{{ name }} - {{ date }}";
+                    configData.defaultWatermarkText || DEFAULT_WATERMARK_TEXT;
             }
 
             turnUrl = configData.turnExternalUrl || "";
             turnUsername = configData.turnExternalUsername || "";
 
             await checkHealth();
+            if (destroyed || requestId !== loadDataRequestId) return;
+            currentStep = nextSetupStep(
+                setupStatus,
+                healthStatus === "ok",
+            );
         } catch (e) {
             if (destroyed || requestId !== loadDataRequestId) return;
             loadError = getErrorMessage(e, "Failed to load setup data");
@@ -257,6 +225,29 @@
             if (!destroyed && requestId === loadDataRequestId) {
                 isLoading = false;
             }
+        }
+    }
+
+    // Re-fetch the server setup status after any mutating action so the checks
+    // reflect the new state. Preserves the current step unless it is now
+    // complete and the next required action is later in the flow.
+    async function refreshSetupStatus() {
+        const requestId = ++refreshStatusRequestId;
+        try {
+            const next = await setup.status();
+            if (destroyed || requestId !== refreshStatusRequestId) return;
+            setupStatus = next;
+            if (stepComplete(currentStep)) {
+                const target = nextSetupStep(next, healthStatus === "ok");
+                const targetIndex = setupSteps.findIndex(
+                    (s) => s.id === target,
+                );
+                if (targetIndex > currentStepIndex) {
+                    currentStep = target;
+                }
+            }
+        } catch (e) {
+            console.error("Failed to refresh setup status", e);
         }
     }
 
@@ -269,8 +260,9 @@
             config = nextConfig;
             baseUrl =
                 config?.publicUrl ||
-                (typeof window !== "undefined" ? window.location.origin : "");
-            updatePublicUrlStatus(config?.publicUrl);
+                (typeof window !== "undefined"
+                    ? window.location.origin
+                    : "");
         } catch (e) {
             console.error("Failed to refresh config", e);
         }
@@ -318,116 +310,71 @@
         }
     }
 
-    function updatePublicUrlStatus(url?: string) {
-        if (!url) {
-            publicUrlStatus = {
-                tone: "bad",
-                label: "Missing",
-                detail: "Set PUBLIC_URL in .env",
-            };
-            return;
-        }
-
-        if (url.startsWith("https://") && !isLocalUrl(url)) {
-            publicUrlStatus = {
-                tone: "good",
-                label: "Ready",
-                detail: url,
-            };
-            return;
-        }
-
-        if (url.startsWith("http://")) {
-            publicUrlStatus = {
-                tone: "warn",
-                label: "No TLS",
-                detail: url,
-            };
-            return;
-        }
-
-        publicUrlStatus = {
-            tone: "warn",
-            label: "Review",
-            detail: url,
-        };
+    function healthTone(): "checking" | "good" | "bad" {
+        if (healthStatus === "checking") return "checking";
+        return healthStatus === "ok" ? "good" : "bad";
     }
 
-    function isLocalUrl(url: string) {
-        return url.includes("localhost") || url.includes("127.0.0.1");
-    }
-
-    function isPreflightComplete() {
-        const { dns, ports, ssl, env, origins, localDev } = preflightChecks;
-        return localDev || (dns && ports && ssl && env && origins);
-    }
-
-    function isTurnComplete() {
-        return turnConfirmed || turnTestResults?.success;
-    }
-
-    function isBrandingComplete() {
-        return brandingConfirmed || Boolean(config?.defaultWatermarkLogoUrl);
-    }
-
-    function isStreamComplete() {
-        return obsConfirmed && Boolean(selectedKeyId);
-    }
-
-    function isRoomComplete() {
-        return Boolean(createdRoom) || roomsList.length > 0;
-    }
-
-    function isStepComplete(stepId: string) {
-        switch (stepId) {
-            case "preflight":
-                return isPreflightComplete();
-            case "turn":
-                return isTurnComplete();
-            case "branding":
-                return isBrandingComplete();
-            case "stream":
-                return isStreamComplete();
-            case "room":
-                return isRoomComplete();
-            default:
-                return false;
-        }
-    }
-
-    function completedStepsCount() {
-        return steps.filter((step) => isStepComplete(step.id)).length;
+    function healthLabel(): string {
+        if (healthStatus === "checking") return "Checking";
+        return healthStatus === "ok" ? "Healthy" : "Needs attention";
     }
 
     function goNext() {
-        if (currentStep < steps.length - 1) {
-            currentStep += 1;
+        const next = currentStepIndex + 1;
+        if (next < setupSteps.length) {
+            currentStep = setupSteps[next].id;
         }
     }
 
     function goBack() {
-        if (currentStep > 0) {
-            currentStep -= 1;
+        const prev = currentStepIndex - 1;
+        if (prev >= 0) {
+            currentStep = setupSteps[prev].id;
         }
     }
 
-    function skipSetup() {
-        if (typeof localStorage !== "undefined") {
-            localStorage.setItem(setupDismissedKey, "true");
-        }
-        goto("/admin");
-    }
-
-    function finishSetup() {
-        if (typeof localStorage !== "undefined") {
-            localStorage.setItem(setupCompleteKey, "true");
-            localStorage.removeItem(setupDismissedKey);
+    async function skipSetup() {
+        if (isDismissingSetup) return;
+        isDismissingSetup = true;
+        try {
+            await setup.dismiss();
+        } catch (e) {
+            console.error("Failed to dismiss setup", e);
+        } finally {
+            if (!destroyed) {
+                isDismissingSetup = false;
+            }
         }
         goto("/admin");
     }
 
     function exitSetup() {
         goto("/admin");
+    }
+
+    async function finishSetup() {
+        if (isCompletingSetup || !setupStatus?.readyToComplete) return;
+        isCompletingSetup = true;
+        setupError = "";
+        try {
+            await setup.complete();
+            if (destroyed) return;
+            goto("/admin");
+        } catch (e) {
+            if (destroyed) return;
+            if (e instanceof SetupIncompleteError) {
+                setupStatus = e.statusResponse;
+                setupError =
+                    "Finish the required checks before completing setup.";
+            } else {
+                setupError = getErrorMessage(e, "Failed to complete setup");
+            }
+        } finally {
+            if (!destroyed) {
+                isCompletingSetup = false;
+            }
+        }
     }
 
     async function handleSaveTurn(e: SubmitEvent) {
@@ -456,14 +403,18 @@
             config = nextConfig;
             baseUrl =
                 config?.publicUrl ||
-                (typeof window !== "undefined" ? window.location.origin : "");
-            updatePublicUrlStatus(config?.publicUrl);
+                (typeof window !== "undefined"
+                    ? window.location.origin
+                    : "");
             turnUrl = config?.turnExternalUrl || "";
             turnUsername = config?.turnExternalUsername || "";
+            // Leave the credential field empty after save. The backend clears the
+            // stale reachability-test signature, so refreshSetupStatus() will
+            // show turn-connectivity as needing a new test.
             turnCredential = "";
             clearTurnCredential = false;
-            turnConfirmed = true;
             showTurnSuccess("TURN settings saved");
+            await refreshSetupStatus();
         } catch (e) {
             if (destroyed) return;
             turnError = getErrorMessage(e, "Failed to save TURN settings");
@@ -486,16 +437,46 @@
 
             turnTestResults = nextResults;
             if (nextResults.success) {
-                showTurnSuccess("TURN connectivity test passed", 4000);
+                showTurnSuccess("TURN reachability test passed", 4000);
             } else {
                 turnError = nextResults.message || "TURN test failed";
             }
+            await refreshSetupStatus();
         } catch (e) {
             if (destroyed) return;
-            turnError = getErrorMessage(e, "Failed to test TURN connectivity");
+            turnError = getErrorMessage(
+                e,
+                "Failed to test TURN reachability",
+            );
         } finally {
             if (!destroyed) {
                 isTestingTurn = false;
+            }
+        }
+    }
+
+    async function handleUseDefaultWatermark() {
+        isSavingBranding = true;
+        brandingError = "";
+        clearBrandingSuccess();
+        try {
+            watermarkText = DEFAULT_WATERMARK_TEXT;
+            const nextConfig = await appConfig.update({
+                defaultWatermarkText: DEFAULT_WATERMARK_TEXT,
+            });
+            if (destroyed) return;
+            config = nextConfig;
+            showBrandingSuccess("Default watermark applied");
+            await refreshSetupStatus();
+        } catch (e) {
+            if (destroyed) return;
+            brandingError = getErrorMessage(
+                e,
+                "Failed to apply default watermark",
+            );
+        } finally {
+            if (!destroyed) {
+                isSavingBranding = false;
             }
         }
     }
@@ -513,8 +494,8 @@
             if (destroyed) return;
 
             config = nextConfig;
-            brandingConfirmed = true;
             showBrandingSuccess("Watermark saved");
+            await refreshSetupStatus();
         } catch (e) {
             if (destroyed) return;
             brandingError = getErrorMessage(e, "Failed to save watermark");
@@ -551,8 +532,8 @@
             await refreshConfig();
             if (destroyed) return;
 
-            brandingConfirmed = true;
             showBrandingSuccess("Logo uploaded");
+            await refreshSetupStatus();
         } catch (e) {
             if (destroyed) return;
             brandingError = getErrorMessage(e, "Failed to upload logo");
@@ -576,6 +557,7 @@
             if (destroyed) return;
 
             showBrandingSuccess("Logo removed");
+            await refreshSetupStatus();
         } catch (e) {
             if (destroyed) return;
             brandingError = getErrorMessage(e, "Failed to delete logo");
@@ -596,30 +578,13 @@
             keys = [...keys, key];
             selectedKeyId = key.id;
             newKeyName = "";
+            await refreshSetupStatus();
         } catch (e) {
             if (destroyed) return;
             streamError = getErrorMessage(e, "Failed to create stream key");
         } finally {
             if (!destroyed) {
                 isCreatingKey = false;
-            }
-        }
-    }
-
-    async function copyWhipUrl() {
-        const key = keys.find((k) => k.id === selectedKeyId);
-        if (!key) return;
-        const url = `${baseUrl}/whip/${key.keyToken}`;
-        streamError = "";
-
-        try {
-            await navigator.clipboard.writeText(url);
-            if (!destroyed) {
-                showCopiedKey(key.id);
-            }
-        } catch (e) {
-            if (!destroyed) {
-                streamError = getErrorMessage(e, "Failed to copy WHIP URL");
             }
         }
     }
@@ -672,7 +637,7 @@
 
             if (watermarkMode === "text" || watermarkMode === "both") {
                 payload.watermarkText =
-                    watermarkText || "{{ name }} - {{ date }}";
+                    watermarkText || DEFAULT_WATERMARK_TEXT;
             }
 
             const room = await rooms.create(payload);
@@ -681,6 +646,7 @@
             createdRoom = room;
             createdRoomSource = "new";
             roomsList = [room, ...roomsList];
+            await refreshSetupStatus();
         } catch (e) {
             if (destroyed) return;
             roomError = getErrorMessage(e, "Failed to create room");
@@ -692,30 +658,13 @@
     }
 
     function roomUrl() {
-        if (!createdRoom) return "";
-        return `${baseUrl}/room/${createdRoom.slug}`;
+        if (!activeRoomSlug) return "";
+        return `${baseUrl}/room/${activeRoomSlug}`;
     }
 
     function adminRoomUrl() {
-        if (!createdRoom) return "";
-        return `/admin/rooms/${createdRoom.slug}`;
-    }
-
-    async function copyRoomUrl() {
-        const url = roomUrl();
-        if (!url) return;
-        roomError = "";
-
-        try {
-            await navigator.clipboard.writeText(url);
-            if (!destroyed) {
-                showCopiedRoom();
-            }
-        } catch (e) {
-            if (!destroyed) {
-                roomError = getErrorMessage(e, "Failed to copy room URL");
-            }
-        }
+        if (!activeRoomSlug) return "";
+        return `/admin/rooms/${activeRoomSlug}`;
     }
 
     function turnModeLabel(mode?: string) {
@@ -742,36 +691,48 @@
             <span class="eyebrow">First-run setup</span>
             <h1>Launch a perfect Chromatic install</h1>
             <p class="hero-subtitle">
-                Follow the checklist to verify infrastructure, configure TURN,
+                Follow the guided flow to verify infrastructure, configure TURN,
                 brand your rooms, and start your first stream.
             </p>
         </div>
         <div class="hero-actions">
             <button class="btn btn-ghost" onclick={exitSetup}>Exit</button>
-            <button class="btn btn-secondary" onclick={skipSetup}>
-                Skip for now
+            <button
+                class="btn btn-secondary"
+                onclick={skipSetup}
+                disabled={isDismissingSetup}
+            >
+                {#if isDismissingSetup}
+                    <span class="btn-spinner" aria-hidden="true"></span>
+                    Skipping...
+                {:else}
+                    Skip for now
+                {/if}
             </button>
         </div>
     </header>
 
     {#if isLoading}
-        <div class="loading">
-            <div class="waiting-spinner"></div>
+        <div class="setup-skeletons" aria-busy="true" aria-label="Loading setup">
+            <div class="skeleton skeleton-progress"></div>
+            <div class="skeleton skeleton-card"></div>
+            <div class="skeleton skeleton-card"></div>
         </div>
     {:else if loadError}
         <div class="alert alert-error">{loadError}</div>
+        <div class="button-row">
+            <button class="btn btn-secondary" onclick={loadData}>Retry</button>
+        </div>
     {:else}
         <section class="setup-progress card">
             <div class="progress-meta">
                 <span>Progress</span>
-                <span>{completedStepsCount()}/{steps.length} completed</span>
+                <span>{progressPercent}% ready</span>
             </div>
             <div class="progress-bar">
                 <div
                     class="progress-fill"
-                    style="width: {Math.round(
-                        (completedStepsCount() / steps.length) * 100,
-                    )}%"
+                    style="width: {progressPercent}%"
                 ></div>
             </div>
         </section>
@@ -779,14 +740,14 @@
         <div class="setup-body">
             <aside class="setup-steps">
                 <ol>
-                    {#each steps as step, index}
+                    {#each setupSteps as step, index (step.id)}
                         <li
-                            class:active={index === currentStep}
-                            class:complete={isStepComplete(step.id)}
+                            class:active={step.id === currentStep}
+                            class:complete={stepComplete(step.id)}
                         >
                             <button
                                 class="step-button"
-                                onclick={() => (currentStep = index)}
+                                onclick={() => (currentStep = step.id)}
                             >
                                 <span class="step-index">{index + 1}</span>
                                 <span class="step-text">
@@ -802,13 +763,15 @@
             </aside>
 
             <section class="setup-content">
-                {#if currentStep === 0}
+                {#if currentStep === "preflight"}
                     <div class="step-panel">
                         <div class="panel-header">
                             <h2>Preflight checks</h2>
                             <p>
-                                Confirm the server is healthy and the deployment
-                                basics are in place.
+                                These are computed from your running Chromatic
+                                server. No manual checkboxes &mdash; fix the
+                                flagged items in your <code>.env</code> and
+                                restart.
                             </p>
                         </div>
 
@@ -816,14 +779,10 @@
                             <div class="status-card">
                                 <div class="status-header">
                                     <span class="status-label">Health</span>
-                                    <span
-                                        class="status-pill {healthStatus}"
-                                        >{healthStatus === "checking"
-                                            ? "Checking"
-                                            : healthStatus === "ok"
-                                              ? "Healthy"
-                                              : "Needs attention"}</span
-                                    >
+                                    <StatusPill
+                                        tone={healthTone()}
+                                        label={healthLabel()}
+                                    />
                                 </div>
                                 <p class="status-detail">
                                     Endpoint: <code>/health</code>
@@ -839,101 +798,45 @@
                                 </button>
                             </div>
 
-                            <div class="status-card">
-                                <div class="status-header">
-                                    <span class="status-label">Public URL</span>
-                                    <span
-                                        class="status-pill {publicUrlStatus.tone}"
-                                        >{publicUrlStatus.label}</span
-                                    >
+                            {#each ["public-url", "security"] as checkId (checkId)}
+                                {@const c = checkById(setupStatus, checkId)}
+                                <div class="status-card">
+                                    <div class="status-header">
+                                        <span class="status-label"
+                                            >{c?.title ?? checkId}</span
+                                        >
+                                        <StatusPill
+                                            tone={setupCheckTone(c)}
+                                            label={c?.summary ?? "Checking"}
+                                        />
+                                    </div>
+                                    {#if c?.detail}
+                                        <p class="status-detail">{c.detail}</p>
+                                    {/if}
+                                    {#if c?.action}
+                                        <p class="status-note status-action">
+                                            {c.action}
+                                        </p>
+                                    {/if}
                                 </div>
-                                <p class="status-detail">
-                                    {publicUrlStatus.detail ||
-                                        "Set PUBLIC_URL in .env"}
-                                </p>
-                                <p class="status-note">
-                                    Use HTTPS for production streaming.
-                                </p>
-                            </div>
-
-                            <div class="status-card">
-                                <div class="status-header">
-                                    <span class="status-label">WHIP</span>
-                                    <span class="status-pill neutral">Format</span>
-                                </div>
-                                <p class="status-detail">
-                                    {config?.whipFormat ||
-                                        "Not configured yet"}
-                                </p>
-                                <p class="status-note">
-                                    Stream keys replace
-                                    <code>{"{stream_key_token}"}</code>.
-                                </p>
-                            </div>
+                            {/each}
                         </div>
 
-                        <div class="card checklist-card">
-                            <h3>Production checklist</h3>
-                            <p class="section-description">
-                                If you are running locally, check the box to
-                                skip the production items.
-                            </p>
-                            <div class="checklist-grid">
-                                <label class="check-item">
-                                    <input
-                                        type="checkbox"
-                                        bind:checked={preflightChecks.env}
-                                    />
-                                    <span>
-                                        Environment vars set (PUBLIC_URL,
-                                        ADMIN_TOKEN, TURN_MODE + TURN provider
-                                        credentials)
-                                    </span>
-                                </label>
-                                <label class="check-item">
-                                    <input
-                                        type="checkbox"
-                                        bind:checked={preflightChecks.dns}
-                                    />
-                                    <span>DNS points to server IP</span>
-                                </label>
-                                <label class="check-item">
-                                    <input
-                                        type="checkbox"
-                                        bind:checked={preflightChecks.ssl}
-                                    />
-                                    <span>SSL certificate is valid</span>
-                                </label>
-                                <label class="check-item">
-                                    <input
-                                        type="checkbox"
-                                        bind:checked={preflightChecks.ports}
-                                    />
-                                    <span>
-                                        Firewall open: 80, 443 (plus TURN ports
-                                        only when self-hosting TURN)
-                                    </span>
-                                </label>
-                                <label class="check-item">
-                                    <input
-                                        type="checkbox"
-                                        bind:checked={preflightChecks.origins}
-                                    />
-                                    <span>
-                                        PRODUCTION_MODE + ALLOWED_ORIGINS set
-                                    </span>
-                                </label>
+                        <div class="status-card">
+                            <div class="status-header">
+                                <span class="status-label">WHIP</span>
+                                <StatusPill tone="neutral" label="Format" />
                             </div>
-                            <label class="check-item check-item-alt">
-                                <input
-                                    type="checkbox"
-                                    bind:checked={preflightChecks.localDev}
-                                />
-                                <span>Running locally (skip production)</span>
-                            </label>
+                            <p class="status-detail">
+                                {config?.whipFormat || "Not configured yet"}
+                            </p>
+                            <p class="status-note">
+                                Stream keys replace
+                                <code>{"{stream_key_token}"}</code>.
+                            </p>
                         </div>
                     </div>
-                {:else if currentStep === 1}
+                {:else if currentStep === "turn"}
                     <div class="step-panel">
                         <div class="panel-header">
                             <h2>Connectivity and TURN</h2>
@@ -942,6 +845,31 @@
                                 non-self-hosted deployments. Add static TURN
                                 fallback only when needed.
                             </p>
+                        </div>
+
+                        <div class="status-grid">
+                            {#each ["turn-config", "turn-connectivity"] as checkId (checkId)}
+                                {@const c = checkById(setupStatus, checkId)}
+                                <div class="status-card">
+                                    <div class="status-header">
+                                        <span class="status-label"
+                                            >{c?.title ?? checkId}</span
+                                        >
+                                        <StatusPill
+                                            tone={setupCheckTone(c)}
+                                            label={c?.summary ?? "Checking"}
+                                        />
+                                    </div>
+                                    {#if c?.detail}
+                                        <p class="status-detail">{c.detail}</p>
+                                    {/if}
+                                    {#if c?.action}
+                                        <p class="status-note status-action">
+                                            {c.action}
+                                        </p>
+                                    {/if}
+                                </div>
+                            {/each}
                         </div>
 
                         <div class="split-grid">
@@ -959,14 +887,14 @@
                                             <span class="status-label"
                                                 >Cloudflare TURN</span
                                             >
-                                            <span
-                                                class="status-pill {config?.turnCloudflareConfigured
-                                                    ? 'good'
-                                                    : 'warn'}"
-                                                >{config?.turnCloudflareConfigured
+                                            <StatusPill
+                                                tone={config?.turnCloudflareConfigured
+                                                    ? "good"
+                                                    : "warn"}
+                                                label={config?.turnCloudflareConfigured
                                                     ? "Configured"
-                                                    : "Not configured"}</span
-                                            >
+                                                    : "Not configured"}
+                                            />
                                         </div>
                                         <p class="status-detail">
                                             {config?.turnCloudflareConfigured
@@ -977,11 +905,19 @@
                                 </div>
 
                                 {#if turnError}
-                                    <div class="alert alert-error">{turnError}</div>
+                                    <div
+                                        class="alert alert-error"
+                                        transition:fade={{ duration: 150 }}
+                                    >
+                                        {turnError}
+                                    </div>
                                 {/if}
 
                                 {#if turnSuccess}
-                                    <div class="alert alert-success">
+                                    <div
+                                        class="alert alert-success"
+                                        transition:fade={{ duration: 150 }}
+                                    >
                                         {turnSuccess}
                                     </div>
                                 {/if}
@@ -1083,29 +1019,18 @@
                                                 <span class="btn-spinner" aria-hidden="true"></span>
                                                 Testing...
                                             {:else}
-                                                Test Connectivity
+                                                Test TURN reachability
                                             {/if}
                                         </button>
                                     </div>
                                 </form>
-
-                                <label class="check-item check-item-alt">
-                                    <input
-                                        type="checkbox"
-                                        bind:checked={turnConfirmed}
-                                    />
-                                    <span>
-                                        TURN configuration validated for this
-                                        deployment
-                                    </span>
-                                </label>
                             </section>
 
                             <section class="card">
-                                <h3>Connectivity results</h3>
+                                <h3>Server reachability results</h3>
                                 <p class="section-description">
                                     Run a quick socket test to confirm TURN is
-                                    reachable.
+                                    reachable from this Chromatic server.
                                 </p>
 
                                 {#if turnTestResults}
@@ -1142,15 +1067,15 @@
                                                         </td>
                                                         <td>
                                                             {#if result.reachable}
-                                                                <span
-                                                                    class="status-pill good"
-                                                                    >Reachable</span
-                                                                >
+                                                                <StatusPill
+                                                                    tone="good"
+                                                                    label="Reachable"
+                                                                />
                                                             {:else}
-                                                                <span
-                                                                    class="status-pill bad"
-                                                                    >Failed</span
-                                                                >
+                                                                <StatusPill
+                                                                    tone="bad"
+                                                                    label="Failed"
+                                                                />
                                                             {/if}
                                                         </td>
                                                         <td>
@@ -1176,38 +1101,75 @@
                                         No tests run yet.
                                     </div>
                                 {/if}
+
+                                <p class="hint reachability-caveat">
+                                    This checks whether the Chromatic server can
+                                    reach the TURN endpoint. A live viewer test
+                                    still verifies the viewer's NAT path.
+                                </p>
                             </section>
                         </div>
                     </div>
-                {:else if currentStep === 2}
+                {:else if currentStep === "branding"}
                     <div class="step-panel">
                         <div class="panel-header">
                             <h2>Branding and watermark</h2>
                             <p>
-                                Set defaults for new rooms. You can override
-                                these per room later.
+                                Optional. Set defaults for new rooms &mdash; you
+                                can override these per room later.
                             </p>
+                        </div>
+
+
+                        <div class="status-card">
+                            <div class="status-header">
+                                <span class="status-label"
+                                    >Default branding</span
+                                >
+                                <StatusPill
+                                    tone={setupCheckTone(brandingCheck)}
+                                    label={brandingCheck?.summary ??
+                                        "Default branding can be set later."}
+                                />
+                            </div>
                         </div>
 
                         <div class="split-grid">
                             <section class="card">
                                 <h3>Default watermark text</h3>
                                 <p class="section-description">
-                                    Keep the default template or customize it
-                                    now.
+                                    Apply the recommended default or customize
+                                    it now.
                                 </p>
 
                                 {#if brandingError}
-                                    <div class="alert alert-error">
+                                    <div
+                                        class="alert alert-error"
+                                        transition:fade={{ duration: 150 }}
+                                    >
                                         {brandingError}
                                     </div>
                                 {/if}
 
                                 {#if brandingSuccess}
-                                    <div class="alert alert-success">
+                                    <div
+                                        class="alert alert-success"
+                                        transition:fade={{ duration: 150 }}
+                                    >
                                         {brandingSuccess}
                                     </div>
                                 {/if}
+
+                                <div class="button-row">
+                                    <button
+                                        type="button"
+                                        class="btn btn-secondary btn-sm"
+                                        onclick={handleUseDefaultWatermark}
+                                        disabled={isSavingBranding}
+                                    >
+                                        Use default watermark
+                                    </button>
+                                </div>
 
                                 <form onsubmit={handleSaveWatermark}>
                                     <div class="form-group">
@@ -1219,7 +1181,7 @@
                                             id="watermarkText"
                                             class="input"
                                             bind:value={watermarkText}
-                                            placeholder={"{{name}} - {{date}}"}
+                                            placeholder={DEFAULT_WATERMARK_TEXT}
                                         />
                                         <p class="hint">
                                             Variables:
@@ -1243,14 +1205,6 @@
                                         {/if}
                                     </button>
                                 </form>
-
-                                <label class="check-item check-item-alt">
-                                    <input
-                                        type="checkbox"
-                                        bind:checked={brandingConfirmed}
-                                    />
-                                    <span>Keep current branding as-is</span>
-                                </label>
                             </section>
 
                             <section class="card">
@@ -1268,7 +1222,8 @@
                                         />
                                         <button
                                             class="btn btn-secondary btn-sm btn-danger-text"
-                                            onclick={() => (confirmDeleteLogoOpen = true)}
+                                            onclick={() =>
+                                                (confirmDeleteLogoOpen = true)}
                                         >
                                             Delete
                                         </button>
@@ -1302,7 +1257,7 @@
                             </section>
                         </div>
                     </div>
-                {:else if currentStep === 3}
+                {:else if currentStep === "stream"}
                     <div class="step-panel">
                         <div class="panel-header">
                             <h2>Stream setup</h2>
@@ -1320,7 +1275,10 @@
                                 </p>
 
                                 {#if streamError}
-                                    <div class="alert alert-error">
+                                    <div
+                                        class="alert alert-error"
+                                        transition:fade={{ duration: 150 }}
+                                    >
                                         {streamError}
                                     </div>
                                 {/if}
@@ -1367,35 +1325,23 @@
                                     </div>
                                 {/if}
 
-                                {#if selectedKeyId}
-                                    <div class="whip-block">
-                                        <span class="field-label">WHIP URL</span>
-                                        <div class="copy-row">
-                                            <code>
-                                                {baseUrl}/whip/{keys.find((k) => k.id === selectedKeyId)?.keyToken}
-                                            </code>
-                                            <button
-                                                class="btn btn-secondary btn-sm"
-                                                onclick={copyWhipUrl}
-                                            >
-                                                {copiedKeyId === selectedKeyId
-                                                    ? "Copied"
-                                                    : "Copy"}
-                                            </button>
-                                        </div>
-                                        <p class="hint">
-                                            In OBS, paste this into <strong>Server</strong> and leave <strong>Bearer Token empty</strong>.
-                                        </p>
-                                    </div>
+                                {#if selectedKey}
+                                    <CopyField
+                                        label="WHIP URL"
+                                        value={`${baseUrl}/whip/${selectedKey.keyToken}`}
+                                    />
+                                    <p class="hint">
+                                        In OBS, paste this into <strong>Server</strong> and leave <strong>Bearer Token empty</strong>.
+                                    </p>
                                 {/if}
                             </section>
 
                             <section class="card">
                                 <h3>OBS settings (critical)</h3>
                                 <p class="section-description">
-                                    Requires OBS 30 or newer (WHIP output).
-                                    Late joiners wait for the next keyframe, so
-                                    the keyframe interval matters most.
+                                    Requires OBS 30 or newer (WHIP output). Late
+                                    joiners wait for the next keyframe, so the
+                                    keyframe interval matters most.
                                 </p>
                                 <ol class="obs-steps">
                                     <li>
@@ -1527,21 +1473,10 @@
                                         </p>
                                     </li>
                                 </ol>
-                                <label class="check-item check-item-alt">
-                                    <input
-                                        type="checkbox"
-                                        bind:checked={obsConfirmed}
-                                    />
-                                    <span>
-                                        OBS configured per the steps above
-                                        (WHIP URL, baseline profile, 1 s
-                                        keyframes)
-                                    </span>
-                                </label>
                             </section>
                         </div>
                     </div>
-                {:else if currentStep === 4}
+                {:else if currentStep === "room"}
                     <div class="step-panel">
                         <div class="panel-header">
                             <h2>Create your first room</h2>
@@ -1551,11 +1486,52 @@
                             </p>
                         </div>
 
+                        {#if activeRoomSlug}
+                            <section class="card existing-room-card">
+                                <h3>
+                                    {#if activeRoomSource === "existing"}
+                                        Existing room detected
+                                    {:else}
+                                        Room created successfully
+                                    {/if}
+                                </h3>
+                                <p class="section-description">
+                                    Existing rooms count as ready &mdash; no need
+                                    to create a duplicate.
+                                </p>
+                                <CopyField
+                                    label="Viewer URL"
+                                    value={roomUrl()}
+                                />
+                                <div class="button-row">
+                                    <a
+                                        class="btn btn-secondary"
+                                        href={adminRoomUrl()}
+                                    >
+                                        Open Admin Room
+                                    </a>
+                                    <a
+                                        class="btn btn-primary"
+                                        href={roomUrl()}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                    >
+                                        Open Viewer
+                                    </a>
+                                </div>
+                            </section>
+                        {/if}
+
                         <div class="split-grid">
                             <section class="card">
                                 <h3>Room details</h3>
                                 {#if roomError}
-                                    <div class="alert alert-error">{roomError}</div>
+                                    <div
+                                        class="alert alert-error"
+                                        transition:fade={{ duration: 150 }}
+                                    >
+                                        {roomError}
+                                    </div>
                                 {/if}
                                 <form onsubmit={handleCreateRoom}>
                                     <div class="form-group">
@@ -1634,48 +1610,6 @@
                             </section>
 
                             <section class="card">
-                                <h3>Room launch</h3>
-                                {#if createdRoom}
-                                    <p class="section-description">
-                                        {createdRoomSource === "existing"
-                                            ? "Existing room detected."
-                                            : "Room created successfully."}
-                                    </p>
-                                    <div class="whip-block">
-                                        <span class="field-label">Viewer URL</span>
-                                        <div class="copy-row">
-                                            <code>{roomUrl()}</code>
-                                            <button
-                                                class="btn btn-secondary btn-sm"
-                                                onclick={copyRoomUrl}
-                                            >
-                                                {copiedRoom ? "Copied" : "Copy"}
-                                            </button>
-                                        </div>
-                                    </div>
-                                    <div class="button-row">
-                                        <a
-                                            class="btn btn-secondary"
-                                            href={adminRoomUrl()}
-                                        >
-                                            Open Admin Room
-                                        </a>
-                                        <a
-                                            class="btn btn-primary"
-                                            href={roomUrl()}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                        >
-                                            Open Viewer
-                                        </a>
-                                    </div>
-                                {:else}
-                                    <p class="section-description">
-                                        Create a room to get the viewer link and
-                                        test the stream.
-                                    </p>
-                                {/if}
-
                                 <div class="callout">
                                     <h4>Quick test</h4>
                                     <ol>
@@ -1687,6 +1621,77 @@
                             </section>
                         </div>
                     </div>
+                {:else if currentStep === "finish"}
+                    <div class="step-panel">
+                        <div class="panel-header">
+                            <h2>Finish setup</h2>
+                            <p>
+                                Review the required checks before completing
+                                setup.
+                            </p>
+                        </div>
+
+                        {#if setupError}
+                            <div
+                                class="alert alert-error"
+                                transition:fade={{ duration: 150 }}
+                            >
+                                {setupError}
+                            </div>
+                        {/if}
+
+                        {#if setupStatus?.readyToComplete}
+                            <div class="card ready-card">
+                                <h3>Chromatic is ready for the first stream</h3>
+                                <p class="section-description">
+                                    Every required check passed. Complete setup
+                                    to dismiss this wizard.
+                                </p>
+                                <button
+                                    class="btn btn-primary"
+                                    onclick={finishSetup}
+                                    disabled={isCompletingSetup}
+                                >
+                                    {#if isCompletingSetup}
+                                        <span class="btn-spinner" aria-hidden="true"></span>
+                                        Completing...
+                                    {:else}
+                                        Finish setup
+                                    {/if}
+                                </button>
+                            </div>
+                        {:else}
+                            <div class="card">
+                                <h3>Required checks still need action</h3>
+                                <ul class="missing-list">
+                                    {#each requiredMissingChecks(setupStatus) as c (c.id)}
+                                        <li>
+                                            <div class="missing-row">
+                                                <StatusPill
+                                                    tone="bad"
+                                                    label={c.title}
+                                                />
+                                                <span class="missing-summary"
+                                                    >{c.summary}</span
+                                                >
+                                            </div>
+                                            {#if c.action}
+                                                <p class="status-action">
+                                                    {c.action}
+                                                </p>
+                                            {/if}
+                                        </li>
+                                    {/each}
+                                </ul>
+                                <button
+                                    class="btn btn-primary"
+                                    disabled
+                                >
+                                    Finish setup
+                                </button>
+                            </div>
+                        {/if}
+                    </div>
                 {/if}
             </section>
         </div>
@@ -1695,16 +1700,12 @@
             <button
                 class="btn btn-secondary"
                 onclick={goBack}
-                disabled={currentStep === 0}
+                disabled={currentStepIndex === 0}
             >
                 Back
             </button>
-            {#if currentStep < steps.length - 1}
+            {#if currentStep !== "finish"}
                 <button class="btn btn-primary" onclick={goNext}>Next</button>
-            {:else}
-                <button class="btn btn-primary" onclick={finishSetup}>
-                    Finish Setup
-                </button>
             {/if}
         </footer>
     {/if}
@@ -1737,7 +1738,7 @@
         border: 1px solid var(--color-border);
         background: linear-gradient(
             135deg,
-            rgba(72, 182, 166, 0.1),
+            color-mix(in srgb, var(--color-primary) 12%, transparent),
             var(--color-surface)
         );
         display: flex;
@@ -1755,7 +1756,7 @@
         top: -140px;
         background: radial-gradient(
             circle,
-            rgba(72, 182, 166, 0.18),
+            color-mix(in srgb, var(--color-primary) 22%, transparent),
             transparent 70%
         );
         opacity: 0.8;
@@ -1780,6 +1781,17 @@
     .hero-actions {
         display: flex;
         gap: var(--space-sm);
+    }
+
+    .setup-skeletons {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-lg);
+    }
+
+    .skeleton-progress {
+        height: 60px;
+        border-radius: var(--radius-md);
     }
 
     .setup-progress {
@@ -1942,60 +1954,15 @@
         color: var(--color-text-subtle);
     }
 
-    .status-pill {
-        padding: 0.2rem 0.5rem;
-        border-radius: var(--radius-full);
-        font-size: 0.75rem;
-        border: 1px solid transparent;
-        background: var(--color-neutral-bg);
+    .status-action {
         color: var(--color-text-muted);
-    }
-
-    .status-pill.ok,
-    .status-pill.good {
-        background: var(--color-success-bg);
-        border-color: rgba(47, 191, 113, 0.35);
-        color: var(--color-success);
-    }
-
-    .status-pill.warn {
-        background: var(--color-warning-bg);
-        border-color: rgba(230, 162, 60, 0.35);
-        color: var(--color-warning);
-    }
-
-    .status-pill.bad,
-    .status-pill.error {
-        background: var(--color-error-bg);
-        border-color: rgba(239, 90, 90, 0.35);
-        color: var(--color-error);
-    }
-
-    .status-pill.checking {
-        background: var(--color-neutral-bg);
-        border-color: var(--color-border);
-        color: var(--color-text-muted);
-    }
-
-    .status-pill.neutral {
-        background: var(--color-neutral-bg);
-        border-color: var(--color-border);
-        color: var(--color-text-muted);
-    }
-
-    .checklist-card h3 {
-        margin-bottom: var(--space-sm);
+        font-size: 0.8125rem;
     }
 
     .section-description {
         color: var(--color-text-muted);
         font-size: 0.875rem;
         margin-bottom: var(--space-md);
-    }
-
-    .checklist-grid {
-        display: grid;
-        gap: var(--space-sm);
     }
 
     .check-item {
@@ -2030,6 +1997,10 @@
         font-size: 0.75rem;
         color: var(--color-text-subtle);
         margin-top: var(--space-xs);
+    }
+
+    .reachability-caveat {
+        margin-top: var(--space-md);
     }
 
     .button-row {
@@ -2076,10 +2047,6 @@
     .test-results-table td:first-child code {
         display: block;
         word-break: break-all;
-    }
-
-    .test-results-table .status-pill {
-        white-space: nowrap;
     }
 
     .test-results-table th {
@@ -2144,29 +2111,6 @@
         clip: rect(0, 0, 0, 0);
         white-space: nowrap;
         border: 0;
-    }
-
-    .whip-block .field-label {
-        display: block;
-        font-size: 0.75rem;
-        color: var(--color-text-muted);
-        margin-bottom: var(--space-xs);
-    }
-
-    .copy-row {
-        display: flex;
-        gap: var(--space-sm);
-        align-items: center;
-    }
-
-    .copy-row code {
-        flex: 1;
-        padding: var(--space-sm);
-        background: var(--color-surface-elevated);
-        border-radius: var(--radius-md);
-        font-size: 0.75rem;
-        overflow-x: auto;
-        white-space: nowrap;
     }
 
     .obs-steps {
@@ -2258,8 +2202,8 @@
         margin-top: var(--space-lg);
         padding: var(--space-md);
         border-radius: var(--radius-md);
-        background: rgba(72, 182, 166, 0.12);
-        border: 1px solid rgba(72, 182, 166, 0.3);
+        background: color-mix(in srgb, var(--color-primary) 12%, transparent);
+        border: 1px solid color-mix(in srgb, var(--color-primary) 30%, transparent);
     }
 
     .callout h4 {
@@ -2272,6 +2216,35 @@
         font-size: 0.875rem;
         display: grid;
         gap: var(--space-xs);
+    }
+
+    .existing-room-card {
+        border-color: var(--color-primary);
+    }
+
+    .ready-card h3 {
+        margin-bottom: var(--space-sm);
+    }
+
+    .missing-list {
+        list-style: none;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-md);
+        margin-bottom: var(--space-md);
+    }
+
+    .missing-row {
+        display: flex;
+        align-items: center;
+        gap: var(--space-sm);
+        flex-wrap: wrap;
+    }
+
+    .missing-summary {
+        color: var(--color-text);
+        font-size: 0.875rem;
     }
 
     .setup-footer {

@@ -57,7 +57,7 @@ If using self-hosted/hybrid:
 
 - [ ] `curl -fsS https://stream.yourdomain.com/health`
 - [ ] Admin login works at `/admin`
-- [ ] Setup Wizard TURN test passes
+- [ ] Setup wizard shows Ready and the TURN server reachability test passes
 - [ ] OBS stream starts with WHIP URL
 - [ ] Viewer receives low-latency stream
 

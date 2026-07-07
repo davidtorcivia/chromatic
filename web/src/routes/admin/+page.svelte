@@ -4,14 +4,17 @@
     import {
         rooms,
         streamKeys,
+        setup,
         type Room,
         type StreamKey,
+        type SetupStatusResponse,
     } from "$lib/api/client";
     import StatusBadge from "$lib/components/StatusBadge.svelte";
 
     let allRooms = $state<Room[]>([]);
     let keys = $state<StreamKey[]>([]);
     let isLoading = $state(true);
+    let setupStatus = $state<SetupStatusResponse | null>(null);
     let showSetupBanner = $state(false);
     let destroyed = false;
     let loadRequestId = 0;
@@ -23,6 +26,11 @@
     let scheduledCount = $derived(
         allRooms.filter((r) => r.status === "pending").length,
     );
+    // Setup needs attention after completion; otherwise it is a normal
+    // "not yet completed/dismissed" nudge.
+    let setupRequiresAttention = $derived(
+        setupStatus?.requiresAttention ?? false,
+    );
 
     onDestroy(() => {
         destroyed = true;
@@ -31,25 +39,27 @@
     onMount(async () => {
         const requestId = ++loadRequestId;
         try {
-            const [roomsData, keysData] = await Promise.all([
+            const [roomsData, keysData, statusData] = await Promise.all([
                 rooms.list(),
                 streamKeys.list(),
+                setup.status(),
             ]);
             if (destroyed || requestId !== loadRequestId) return;
 
             allRooms = roomsData ?? [];
             keys = keysData ?? [];
-            if (typeof localStorage !== "undefined") {
-                const setupComplete =
-                    localStorage.getItem("chromatic-setup-complete") === "true";
-                const setupDismissed =
-                    localStorage.getItem("chromatic-setup-dismissed") === "true";
-                const isFirstRun =
-                    allRooms.length === 0 && keys.length === 0;
-                showSetupBanner = !setupComplete && isFirstRun;
-                if (!setupComplete && !setupDismissed && isFirstRun) {
-                    goto("/admin/setup");
-                }
+            setupStatus = statusData ?? null;
+
+            const showBanner =
+                (!statusData.completedAt && !statusData.dismissedAt) ||
+                statusData.requiresAttention;
+            showSetupBanner = showBanner;
+
+            // Only a true first run (nothing set up, never completed/dismissed)
+            // auto-redirects into the wizard. Returning admins with prior state
+            // land on the dashboard and see the banner instead.
+            if (statusData.firstRun) {
+                goto("/admin/setup");
             }
         } catch (e) {
             if (destroyed || requestId !== loadRequestId) return;
@@ -61,11 +71,16 @@
         }
     });
 
-    function dismissSetup() {
-        if (typeof localStorage !== "undefined") {
-            localStorage.setItem("chromatic-setup-dismissed", "true");
+    async function dismissSetup() {
+        try {
+            const next = await setup.dismiss();
+            if (destroyed) return;
+            setupStatus = next;
+            showSetupBanner = false;
+        } catch (e) {
+            // Keep the banner visible if the server-side dismiss failed.
+            console.error("Failed to dismiss setup", e);
         }
-        showSetupBanner = false;
     }
 
     function formatDate(dateStr: string): string {
@@ -91,16 +106,24 @@
     {#if showSetupBanner}
         <section class="setup-banner card">
             <div class="setup-banner-content">
-                <h2>First-run setup</h2>
-                <p>
-                    Finish the setup wizard to configure TURN, branding, stream
-                    keys, and your first room.
-                </p>
+                {#if setupRequiresAttention}
+                    <h2>Setup needs attention</h2>
+                    <p>
+                        A required setup check changed or failed. Review it
+                        before the next stream.
+                    </p>
+                {:else}
+                    <h2>Finish setup</h2>
+                    <p>
+                        Chromatic has a few required checks before the first
+                        stream.
+                    </p>
+                {/if}
             </div>
             <div class="setup-banner-actions">
-                <a href="/admin/setup" class="btn btn-primary"
-                    >Launch Wizard</a
-                >
+                <a href="/admin/setup" class="btn btn-primary">
+                    {setupRequiresAttention ? "Review setup" : "Open setup"}
+                </a>
                 <button class="btn btn-ghost" onclick={dismissSetup}>
                     Dismiss
                 </button>

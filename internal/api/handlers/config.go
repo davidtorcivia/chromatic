@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -70,29 +72,21 @@ func (h *ConfigHandler) Get(w http.ResponseWriter, r *http.Request) {
 		logger.Debug("No config found, returning defaults", "error", err)
 	}
 
-	fallbackTurnURL := ""
-	if len(h.cfg.TurnExternalURLs) > 0 {
-		fallbackTurnURL = strings.Join(h.cfg.TurnExternalURLs, ",")
-	} else {
-		fallbackTurnURL = h.cfg.TurnExternalURL
-	}
-	fallbackTurnUsername := h.cfg.TurnExternalUser
-	fallbackHasTurnCredential := h.cfg.TurnExternalPass != ""
-
 	response.DefaultWatermarkText = watermarkText
 	response.DefaultWatermarkLogoPath = watermarkLogoPath
-	response.TurnExternalURL = turnURL
-	if response.TurnExternalURL == nil && fallbackTurnURL != "" {
-		response.TurnExternalURL = &fallbackTurnURL
+
+	// TURN fields come from the same effective-settings calculation that the
+	// SFU runtime and the setup status use, so the displayed config matches
+	// the tested config and the running config.
+	turn := effectiveTURNSettingsFor(h.db, h.cfg)
+	if len(turn.URLs) > 0 {
+		joined := strings.Join(turn.URLs, ",")
+		response.TurnExternalURL = &joined
 	}
-	response.TurnExternalUsername = turnUsername
-	if response.TurnExternalUsername == nil && fallbackTurnUsername != "" {
-		response.TurnExternalUsername = &fallbackTurnUsername
+	if turn.Username != "" {
+		response.TurnExternalUsername = &turn.Username
 	}
-	response.HasTurnCredential = turnCredential != nil && *turnCredential != ""
-	if turnCredential == nil {
-		response.HasTurnCredential = fallbackHasTurnCredential
-	}
+	response.HasTurnCredential = turn.HasCredential
 	response.TurnMode = h.cfg.TurnMode
 	response.TurnCloudflareConfigured = h.cfg.HasCloudflareTURN()
 
@@ -106,8 +100,7 @@ func (h *ConfigHandler) Get(w http.ResponseWriter, r *http.Request) {
 	response.PublicURL = h.cfg.PublicURL
 	response.WHIPFormat = h.cfg.PublicURL + "/whip/{stream_key_token}"
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	respondJSON(w, response)
 }
 
 // UpdateConfigRequest is the request structure for updating config
@@ -118,7 +111,13 @@ type UpdateConfigRequest struct {
 	TurnExternalCredential *string `json:"turnExternalCredential"`
 }
 
-// Update updates the application configuration
+// Update updates the application configuration.
+//
+// Pointer semantics are preserved: omitted JSON fields leave DB values
+// unchanged; provided empty strings write empty strings. Every write happens in
+// a single transaction so a failure rolls the whole update back, and any change
+// to a TURN field clears the stored reachability test (it was run against the
+// previous configuration).
 func (h *ConfigHandler) Update(w http.ResponseWriter, r *http.Request) {
 	var req UpdateConfigRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -126,18 +125,35 @@ func (h *ConfigHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate TURN URLs when provided. Empty string means "clear the DB static
+	// URL override" and is allowed; non-empty values must each parse as a
+	// turn:/turns: URL with a non-empty host.
+	if req.TurnExternalURL != nil {
+		for _, entry := range splitTURNURLList(*req.TurnExternalURL) {
+			if _, _, err := parseTURNURL(entry); err != nil {
+				http.Error(w, fmt.Sprintf("Invalid TURN URL: %s", err), http.StatusBadRequest)
+				return
+			}
+		}
+	}
+
 	// Ensure config row exists (upsert pattern)
-	_, err := h.db.Exec(`INSERT OR IGNORE INTO config (id) VALUES (1)`)
-	if err != nil {
+	if _, err := h.db.Exec(`INSERT OR IGNORE INTO config (id) VALUES (1)`); err != nil {
 		logger.Error("Failed to ensure config exists", "error", err)
 		http.Error(w, "Failed to update configuration", http.StatusInternalServerError)
 		return
 	}
 
-	// Update only the fields that were provided
+	tx, err := h.db.Begin()
+	if err != nil {
+		logger.Error("Failed to begin config transaction", "error", err)
+		http.Error(w, "Failed to update configuration", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback() // no-op after Commit
+
 	if req.DefaultWatermarkText != nil {
-		_, err = h.db.Exec(`UPDATE config SET default_watermark_text = ? WHERE id = 1`, *req.DefaultWatermarkText)
-		if err != nil {
+		if _, err := tx.Exec(`UPDATE config SET default_watermark_text = ? WHERE id = 1`, *req.DefaultWatermarkText); err != nil {
 			logger.Error("Failed to update watermark text", "error", err)
 			http.Error(w, "Failed to update watermark settings", http.StatusInternalServerError)
 			return
@@ -145,8 +161,7 @@ func (h *ConfigHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.TurnExternalURL != nil {
-		_, err = h.db.Exec(`UPDATE config SET turn_external_url = ? WHERE id = 1`, *req.TurnExternalURL)
-		if err != nil {
+		if _, err := tx.Exec(`UPDATE config SET turn_external_url = ? WHERE id = 1`, *req.TurnExternalURL); err != nil {
 			logger.Error("Failed to update TURN URL", "error", err)
 			http.Error(w, "Failed to update TURN settings", http.StatusInternalServerError)
 			return
@@ -154,8 +169,7 @@ func (h *ConfigHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.TurnExternalUsername != nil {
-		_, err = h.db.Exec(`UPDATE config SET turn_external_username = ? WHERE id = 1`, *req.TurnExternalUsername)
-		if err != nil {
+		if _, err := tx.Exec(`UPDATE config SET turn_external_username = ? WHERE id = 1`, *req.TurnExternalUsername); err != nil {
 			logger.Error("Failed to update TURN username", "error", err)
 			http.Error(w, "Failed to update TURN settings", http.StatusInternalServerError)
 			return
@@ -163,12 +177,34 @@ func (h *ConfigHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.TurnExternalCredential != nil {
-		_, err = h.db.Exec(`UPDATE config SET turn_external_credential = ? WHERE id = 1`, *req.TurnExternalCredential)
-		if err != nil {
+		if _, err := tx.Exec(`UPDATE config SET turn_external_credential = ? WHERE id = 1`, *req.TurnExternalCredential); err != nil {
 			logger.Error("Failed to update TURN credential", "error", err)
 			http.Error(w, "Failed to update TURN settings", http.StatusInternalServerError)
 			return
 		}
+	}
+
+	// Any TURN field change invalidates the last stored reachability test —
+	// it was run against the previous effective configuration.
+	if req.TurnExternalURL != nil || req.TurnExternalUsername != nil || req.TurnExternalCredential != nil {
+		if _, err := tx.Exec(`
+			UPDATE config
+			SET turn_last_tested_at = NULL,
+			    turn_last_test_success = 0,
+			    turn_last_test_message = NULL,
+			    turn_last_test_signature = NULL
+			WHERE id = 1
+		`); err != nil {
+			logger.Error("Failed to clear stale TURN test", "error", err)
+			http.Error(w, "Failed to update TURN settings", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		logger.Error("Failed to commit config update", "error", err)
+		http.Error(w, "Failed to update configuration", http.StatusInternalServerError)
+		return
 	}
 
 	// Return updated config
@@ -349,7 +385,9 @@ type TURNTestResponse struct {
 	Message string           `json:"message,omitempty"`
 }
 
-// TestTURN tests connectivity to configured TURN servers
+// TestTURN tests reachability of the configured TURN servers from this Chromatic
+// server. It is a server-side socket test, not an authenticated TURN allocation
+// or a browser NAT-traversal proof; the UI labels it as such.
 func (h *ConfigHandler) TestTURN(w http.ResponseWriter, r *http.Request) {
 	results := []TURNTestResult{}
 
@@ -360,17 +398,15 @@ func (h *ConfigHandler) TestTURN(w http.ResponseWriter, r *http.Request) {
 			turnHost = turnHost + ":3478"
 		}
 
-		result := testTURNServer(turnHost, "udp", "self-hosted")
-		results = append(results, result)
-
-		// Also test TCP
-		tcpResult := testTURNServer(turnHost, "tcp", "self-hosted")
-		results = append(results, tcpResult)
+		results = append(results, testTURNServer(turnHost, "udp", "self-hosted"))
+		results = append(results, testTURNServer(turnHost, "tcp", "self-hosted"))
 	}
 
-	// Test external TURN servers from environment/runtime settings.
+	// Test external/static TURN from the same effective settings the runtime
+	// and /api/config expose, so the tested configuration matches the visible
+	// configuration.
 	if h.cfg.TurnMode != config.TurnModeSelfHosted {
-		for _, external := range h.currentExternalTURNURLs() {
+		for _, external := range effectiveTURNSettingsFor(h.db, h.cfg).URLs {
 			host, protocol, err := parseTURNURL(external)
 			if err != nil {
 				results = append(results, TURNTestResult{
@@ -381,30 +417,7 @@ func (h *ConfigHandler) TestTURN(w http.ResponseWriter, r *http.Request) {
 				})
 				continue
 			}
-			result := testTURNServer(host, protocol, "external")
-			results = append(results, result)
-		}
-	}
-
-	// Also check database for configured TURN if it differs from current runtime value.
-	var turnURL *string
-	h.db.QueryRow(`SELECT turn_external_url FROM config WHERE id = 1`).Scan(&turnURL)
-	for _, dbURL := range splitTURNURLList(derefString(turnURL)) {
-		if contains(h.currentExternalTURNURLs(), dbURL) {
-			continue
-		}
-
-		host, protocol, err := parseTURNURL(dbURL)
-		if err != nil {
-			results = append(results, TURNTestResult{
-				Server:    dbURL,
-				Reachable: false,
-				Error:     fmt.Sprintf("Invalid TURN URL: %v", err),
-				TestType:  "external (database)",
-			})
-		} else {
-			result := testTURNServer(host, protocol, "external (database)")
-			results = append(results, result)
+			results = append(results, testTURNServer(host, protocol, "external"))
 		}
 	}
 
@@ -425,54 +438,123 @@ func (h *ConfigHandler) TestTURN(w http.ResponseWriter, r *http.Request) {
 	if len(results) == 0 {
 		response.Message = "No TURN servers configured"
 	} else if success {
-		response.Message = "At least one TURN server is reachable"
+		response.Message = "At least one TURN endpoint is reachable from this server"
 	} else {
-		response.Message = "No TURN servers are reachable"
+		response.Message = "No TURN endpoints are reachable from this server"
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	// Persist the result with the current effective TURN signature so the setup
+	// status can tell whether a stored test is still valid for this config.
+	if _, err := h.db.Exec(`INSERT OR IGNORE INTO config (id) VALUES (1)`); err != nil {
+		logger.Error("Failed to ensure config exists", "error", err)
+	} else if _, err := h.db.Exec(`
+		UPDATE config
+		SET turn_last_tested_at = CURRENT_TIMESTAMP,
+		    turn_last_test_success = ?,
+		    turn_last_test_message = ?,
+		    turn_last_test_signature = ?
+		WHERE id = 1
+	`, success, response.Message, currentTURNSignatureFor(h.db, h.cfg)); err != nil {
+		logger.Error("Failed to persist TURN test result", "error", err)
+	}
+
+	respondJSON(w, response)
 }
 
+// syncRuntimeTURNFromDB pushes the effective external TURN settings (DB override
+// with per-field environment fallback) into the SFU runtime. Per-field fallback
+// fixes the partial-save clobber: saving only a username no longer erases the
+// environment URL that the displayed config still shows.
 func (h *ConfigHandler) syncRuntimeTURNFromDB() {
 	if h.sfu == nil {
 		return
 	}
-
-	fallbackURLs := ""
-	if len(h.cfg.TurnExternalURLs) > 0 {
-		fallbackURLs = strings.Join(h.cfg.TurnExternalURLs, ",")
-	} else {
-		fallbackURLs = h.cfg.TurnExternalURL
-	}
-	fallbackUser := h.cfg.TurnExternalUser
-	fallbackCredential := h.cfg.TurnExternalPass
-
-	var turnURL, turnUsername, turnCredential *string
-	err := h.db.QueryRow(`
-		SELECT turn_external_url, turn_external_username, turn_external_credential
-		FROM config WHERE id = 1
-	`).Scan(&turnURL, &turnUsername, &turnCredential)
-	if err != nil {
-		// No DB override yet. Use environment/default values.
-		h.sfu.SetExternalTURNConfig(fallbackURLs, fallbackUser, fallbackCredential)
-		return
-	}
-
-	hasDBOverride := turnURL != nil || turnUsername != nil || turnCredential != nil
-	if !hasDBOverride {
-		h.sfu.SetExternalTURNConfig(fallbackURLs, fallbackUser, fallbackCredential)
-		return
-	}
-
-	h.sfu.SetExternalTURNConfig(derefString(turnURL), derefString(turnUsername), derefString(turnCredential))
+	turn := effectiveTURNSettingsFor(h.db, h.cfg)
+	h.sfu.SetExternalTURNConfig(strings.Join(turn.URLs, ","), turn.Username, turn.Credential)
 }
 
-func (h *ConfigHandler) currentExternalTURNURLs() []string {
-	if len(h.cfg.TurnExternalURLs) > 0 {
-		return append([]string(nil), h.cfg.TurnExternalURLs...)
+// effectiveTURNSettings is the resolved external/static TURN configuration after
+// merging DB overrides with environment fallbacks.
+type effectiveTURNSettings struct {
+	URLs          []string
+	Username      string
+	Credential    string
+	HasCredential bool
+	// Source is "database" when any DB override is present, "environment" when
+	// the values come from the process environment, or "none".
+	Source string
+}
+
+// effectiveTURNSettingsFor resolves the effective external/static TURN settings.
+//
+// Each field falls back to the environment independently: a DB override for the
+// username leaves the environment URL intact, and a DB override for the URL
+// leaves the environment credential intact. A NULL DB column means "no
+// override"; an empty-string DB column means "explicitly cleared" and is used
+// as-is. This matches what Get displays and what the SFU runtime receives.
+func effectiveTURNSettingsFor(db *database.DB, cfg *config.Config) effectiveTURNSettings {
+	var dbURL, dbUser, dbCred *string
+	// A missing config row is fine — every column stays nil and we fall back to
+	// the environment.
+	_ = db.QueryRow(`
+		SELECT turn_external_url, turn_external_username, turn_external_credential
+		FROM config WHERE id = 1
+	`).Scan(&dbURL, &dbUser, &dbCred)
+
+	envURL := ""
+	if len(cfg.TurnExternalURLs) > 0 {
+		envURL = strings.Join(cfg.TurnExternalURLs, ",")
+	} else {
+		envURL = cfg.TurnExternalURL
 	}
-	return splitTURNURLList(h.cfg.TurnExternalURL)
+	envUser := cfg.TurnExternalUser
+	envCredential := cfg.TurnExternalPass
+
+	s := effectiveTURNSettings{}
+	if dbURL != nil {
+		s.URLs = splitTURNURLList(*dbURL)
+	} else {
+		s.URLs = splitTURNURLList(envURL)
+	}
+	if dbUser != nil {
+		s.Username = *dbUser
+	} else {
+		s.Username = envUser
+	}
+	if dbCred != nil {
+		s.Credential = *dbCred
+	} else {
+		s.Credential = envCredential
+	}
+	s.HasCredential = s.Credential != ""
+
+	switch {
+	case dbURL != nil || dbUser != nil || dbCred != nil:
+		s.Source = "database"
+	case envURL != "" || envUser != "" || envCredential != "":
+		s.Source = "environment"
+	default:
+		s.Source = "none"
+	}
+	return s
+}
+
+// currentTURNSignatureFor returns a stable SHA-256 fingerprint of the inputs
+// that determine whether a stored TURN reachability test is still valid. The
+// credential itself is never stored — only its hash.
+func currentTURNSignatureFor(db *database.DB, cfg *config.Config) string {
+	turn := effectiveTURNSettingsFor(db, cfg)
+	credentialHash := sha256.Sum256([]byte(turn.Credential))
+
+	h := sha256.New()
+	fmt.Fprintln(h, cfg.TurnMode)
+	fmt.Fprintln(h, cfg.TurnRealm)
+	fmt.Fprintln(h, cfg.HasCloudflareTURN())
+	fmt.Fprintln(h, strings.Join(turn.URLs, ","))
+	fmt.Fprintln(h, turn.Username)
+	fmt.Fprintln(h, hex.EncodeToString(credentialHash[:]))
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:])
 }
 
 func splitTURNURLList(raw string) []string {
@@ -491,22 +573,6 @@ func splitTURNURLList(raw string) []string {
 		result = append(result, value)
 	}
 	return result
-}
-
-func derefString(v *string) string {
-	if v == nil {
-		return ""
-	}
-	return *v
-}
-
-func contains(items []string, target string) bool {
-	for _, item := range items {
-		if item == target {
-			return true
-		}
-	}
-	return false
 }
 
 // testTURNServer tests connectivity to a TURN server
@@ -542,32 +608,50 @@ func testTURNServer(host, protocol, testType string) TURNTestResult {
 	return result
 }
 
-// parseTURNURL parses a TURN URL and returns host:port and protocol
+// parseTURNURL parses a TURN URL and returns host:port and protocol.
+//
+// The URL must use the turn: or turns: scheme with a non-empty host. The
+// optional ?transport= query selects udp (default for turn:), tcp (default for
+// turns:), or tls; any other value is rejected.
 func parseTURNURL(turnURL string) (host string, protocol string, err error) {
-	// Handle turn: and turns: schemes
-	isTURNSTLS := strings.HasPrefix(turnURL, "turns:")
-	turnURL = strings.TrimPrefix(turnURL, "turn:")
-	turnURL = strings.TrimPrefix(turnURL, "turns:")
-	turnURL = strings.TrimPrefix(turnURL, "//")
+	raw := strings.TrimSpace(turnURL)
+	if raw == "" {
+		return "", "", fmt.Errorf("empty TURN URL")
+	}
 
-	// Check for transport parameter
+	isTLS := strings.HasPrefix(raw, "turns:")
+	isTURN := strings.HasPrefix(raw, "turn:")
+	if !isTURN && !isTLS {
+		return "", "", fmt.Errorf("TURN URL must use the turn: or turns: scheme: %q", turnURL)
+	}
+
+	rest := strings.TrimPrefix(raw, "turn:")
+	rest = strings.TrimPrefix(rest, "turns:")
+	rest = strings.TrimPrefix(rest, "//")
+
 	protocol = "udp" // default
-	if isTURNSTLS {
+	if isTLS {
 		protocol = "tcp"
 	}
-	if strings.Contains(turnURL, "?") {
-		parts := strings.SplitN(turnURL, "?", 2)
-		turnURL = parts[0]
-		query, err := url.ParseQuery(parts[1])
-		if err == nil {
+	if i := strings.Index(rest, "?"); i >= 0 {
+		query, qErr := url.ParseQuery(rest[i+1:])
+		rest = rest[:i]
+		if qErr == nil {
 			if transport := query.Get("transport"); transport != "" {
 				protocol = strings.ToLower(transport)
 			}
 		}
 	}
+	switch protocol {
+	case "udp", "tcp", "tls":
+	default:
+		return "", "", fmt.Errorf("unsupported transport %q in TURN URL %q", protocol, turnURL)
+	}
 
-	// Parse host:port
-	host = turnURL
+	host = rest
+	if host == "" {
+		return "", "", fmt.Errorf("TURN URL missing host: %q", turnURL)
+	}
 	if !strings.Contains(host, ":") {
 		// Add default port based on protocol
 		if protocol == "tcp" || protocol == "tls" {
@@ -575,6 +659,14 @@ func parseTURNURL(turnURL string) (host string, protocol string, err error) {
 		} else {
 			host = host + ":3478"
 		}
+	}
+
+	hostOnly := host
+	if i := strings.LastIndex(host, ":"); i >= 0 {
+		hostOnly = host[:i]
+	}
+	if hostOnly == "" {
+		return "", "", fmt.Errorf("TURN URL missing host: %q", turnURL)
 	}
 
 	return host, protocol, nil

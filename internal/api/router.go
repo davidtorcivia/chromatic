@@ -181,6 +181,11 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 	adminMux.HandleFunc("POST /api/config/logo", configHandler.UploadLogo)
 	adminMux.HandleFunc("DELETE /api/config/logo", configHandler.DeleteLogo)
 	adminMux.HandleFunc("POST /api/config/test-turn", configHandler.TestTURN)
+	// Setup status (admin)
+	setupHandler := handlers.NewSetupHandler(db, cfg)
+	adminMux.HandleFunc("GET /api/setup/status", setupHandler.Status)
+	adminMux.HandleFunc("POST /api/setup/complete", setupHandler.Complete)
+	adminMux.HandleFunc("POST /api/setup/dismiss", setupHandler.Dismiss)
 
 	// Wrap admin routes with auth and audit middleware. Audit wraps auth so
 	// failed mutating admin attempts are recorded with their final status code.
