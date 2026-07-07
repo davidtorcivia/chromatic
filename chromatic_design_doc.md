@@ -573,9 +573,9 @@ async function handleJoinClick() {
 
 export class VoicePlaybackManager {
   private streamElement: HTMLMediaElement;
-  private voiceGainNodes: Map<string, GainNode>;
-  private baseStreamVolume: number;
-  private voiceVolume: number;
+  private voiceGainNodes: Map<string, GainNode> = new Map();
+  private baseStreamVolume: number = 1.0;
+  private voiceVolume: number = 1.0;
 
   constructor(streamElement: HTMLMediaElement) {
     this.streamElement = streamElement;
@@ -823,7 +823,7 @@ OBS 30.0+:
 
 - Sample Rate: 48000 Hz
 - Channels: Stereo
-- Codec: Opus (handled by WebRTC, ~128kbps)
+- Codec: Opus stereo; bitrate is controlled by OBS/WebRTC and is **not** capped by Chromatic (program audio is relayed untouched)
 
 ---
 

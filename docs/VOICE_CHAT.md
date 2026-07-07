@@ -37,9 +37,14 @@ caused unrecoverable wedges in both Chrome and Safari).
 
 When a viewer's microphone is enabled:
 
-1. Browser requests microphone permission (audio is routed through a light
-   cleanup chain: high-pass filter + soft noise gate, on top of the
-   browser's `noiseSuppression`/`echoCancellation` constraints)
+1. Browser requests microphone permission. Capture processing depends on the
+   selected mode:
+   - **Talkback** (default): browser `echoCancellation`/`noiseSuppression` plus
+     an in-app high-pass filter + soft noise gate when a denoiser is active —
+     mono speech tuned for low-bitrate, low-latency conversation.
+   - **Studio**: browser processing is OFF (no NS/AGC; echo cancellation only
+     unless headphones are confirmed) and there is **no** in-app cleanup chain —
+     the mic is captured as pristine full-bandwidth stereo for critical review.
 2. Client lazily creates the publisher RTCPeerConnection
 3. Client adds the audio track and sends `publish:offer`
 

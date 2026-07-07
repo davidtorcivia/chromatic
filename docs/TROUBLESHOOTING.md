@@ -362,7 +362,7 @@ every platform. Field-verified fix.
 
 2. **Network latency**: Run ping test between participants
 
-3. **Audio processing**: Studio mic mode is higher-latency by design (no NS/AGC, full-bandwidth stereo); talkback mode is optimized for low-latency speech
+3. **Audio processing**: Studio mic mode raises fidelity and bitrate (full-bandwidth stereo, NS/AGC off) — on constrained links switch to talkback, which uses mono voice settings with lighter processing
 
 ### Measuring latency
 

@@ -38,6 +38,12 @@ export class VoicePlaybackManager {
     // / destroy record cancellation here so the post-await code knows to abort
     // instead of building a graph for a departed participant.
     private addCancelled: Set<string> = new Set();
+    // The MediaStreamTrack currently registered per participant, plus its
+    // 'ended' cleanup handler. A remote voice track can end without a
+    // participant:left (publisher PC tear-down, ICE failure) — without an
+    // 'ended' handler the sink/source/gain would leak until explicit removal.
+    private voiceTracks: Map<string, MediaStreamTrack> = new Map();
+    private voiceEndHandlers: Map<string, () => void> = new Map();
 
     constructor(streamElement: HTMLMediaElement) {
         this.streamElement = streamElement;
@@ -118,6 +124,23 @@ export class VoicePlaybackManager {
 
         this.voiceGainNodes.set(participantId, gainNode);
         this.voiceSources.set(participantId, source);
+
+        // A remote track can end without a participant:left (publisher PC
+        // tear-down, ICE failure). Tear the graph down when it does so the
+        // sink/source/gain don't leak. The identity guard means a track that
+        // was already replaced by a renegotiation can't evict its successor.
+        // (A real MediaStreamTrack always exposes addEventListener; the guard
+        // keeps minimal test/runtime mocks from throwing.)
+        if (typeof track.addEventListener === 'function') {
+            const onEnded = () => {
+                if (!this.destroyed && this.voiceTracks.get(participantId) === track) {
+                    this.removeVoiceTrack(participantId);
+                }
+            };
+            track.addEventListener('ended', onEnded);
+            this.voiceTracks.set(participantId, track);
+            this.voiceEndHandlers.set(participantId, onEnded);
+        }
     }
 
     removeVoiceTrack(participantId: string): void {
@@ -125,6 +148,17 @@ export class VoicePlaybackManager {
         // its await resolves (it would otherwise build a graph for a track we
         // are now removing).
         this.addCancelled.add(participantId);
+
+        // Drop the 'ended' listener for the registered track before tearing its
+        // graph down, so the ending track can't re-enter removeVoiceTrack and a
+        // later renegotiation's new track isn't evicted by a stale handler.
+        const endHandler = this.voiceEndHandlers.get(participantId);
+        const trackedTrack = this.voiceTracks.get(participantId);
+        if (endHandler && trackedTrack) {
+            trackedTrack.removeEventListener('ended', endHandler);
+        }
+        this.voiceEndHandlers.delete(participantId);
+        this.voiceTracks.delete(participantId);
 
         const sink = this.voiceSinks.get(participantId);
         if (sink) {
@@ -155,6 +189,15 @@ export class VoicePlaybackManager {
         // Cancel every in-flight setup so the post-await guard fires for all.
         for (const pid of this.voiceSources.keys()) this.addCancelled.add(pid);
         for (const pid of this.voiceGainNodes.keys()) this.addCancelled.add(pid);
+
+        // Detach the per-participant 'ended' listeners before nulling sinks so
+        // an ending track can't fire into a half-destroyed manager.
+        for (const [pid, handler] of this.voiceEndHandlers) {
+            const t = this.voiceTracks.get(pid);
+            if (t) t.removeEventListener('ended', handler);
+        }
+        this.voiceEndHandlers.clear();
+        this.voiceTracks.clear();
 
         for (const sink of this.voiceSinks.values()) {
             sink.srcObject = null;

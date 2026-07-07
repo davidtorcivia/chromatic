@@ -27,6 +27,24 @@ function makeMockContext() {
     return { ctx, source, gain, calls };
 }
 
+// A minimal EventTarget-like track mock: records listeners and can dispatch.
+function makeFakeTrack() {
+    const handlers: Record<string, Array<() => void>> = {};
+    const track = {
+        addEventListener: vi.fn((type: string, h: () => void) => {
+            (handlers[type] ??= []).push(h);
+        }),
+        removeEventListener: vi.fn((type: string, h: () => void) => {
+            handlers[type] = (handlers[type] ?? []).filter((x) => x !== h);
+        })
+    };
+    return Object.assign(track as unknown as MediaStreamTrack, {
+        dispatch(type: string) {
+            for (const h of handlers[type] ?? []) h();
+        }
+    });
+}
+
 const ctxRef: { ctx: ReturnType<typeof makeMockContext> | null } = { ctx: null };
 
 vi.mock('./context', () => ({
@@ -157,5 +175,48 @@ describe('VoicePlaybackManager', () => {
             expect(ctxRef.ctx!.ctx.createMediaStreamSource).not.toHaveBeenCalled();
             expect(ctxRef.ctx!.ctx.createGain).not.toHaveBeenCalled();
         });
+    });
+
+    it('tears the voice graph down when the remote track ends', async () => {
+        manager = new VoicePlaybackManager(mockStreamElement);
+        const track = makeFakeTrack();
+        await manager.addVoiceTrack('p1', track);
+
+        // Setup wired the audible graph and registered an ended listener.
+        expect(track.addEventListener).toHaveBeenCalledWith('ended', expect.any(Function));
+        expect(ctxRef.ctx!.calls.sourceToGain).toBe(1);
+
+        // A remote track can end without a participant:left (publisher PC
+        // tear-down / ICE failure). The manager must clean up, not leak.
+        track.dispatch('ended');
+        expect(ctxRef.ctx!.source.disconnect).toHaveBeenCalledTimes(1);
+        expect(ctxRef.ctx!.gain.disconnect).toHaveBeenCalledTimes(1);
+
+        // The listener is detached once the graph is gone, so a second 'ended'
+        // cannot re-enter removeVoiceTrack.
+        expect(track.removeEventListener).toHaveBeenCalledWith('ended', expect.any(Function));
+        track.dispatch('ended');
+        expect(ctxRef.ctx!.source.disconnect).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not let an ended predecessor track evict its renegotiated successor', async () => {
+        manager = new VoicePlaybackManager(mockStreamElement);
+        const trackA = makeFakeTrack();
+        await manager.addVoiceTrack('p1', trackA);
+        // Renegotiation replaces the track; addVoiceTrack tears A down first.
+        const trackB = makeFakeTrack();
+        await manager.addVoiceTrack('p1', trackB);
+
+        // The post-swap disconnect count from tearing A down.
+        const swaps = ctxRef.ctx!.source.disconnect.mock.calls.length;
+
+        // The predecessor ending must NOT tear down the successor's graph.
+        trackA.dispatch('ended');
+        expect(ctxRef.ctx!.source.disconnect.mock.calls.length).toBe(swaps);
+        expect(trackB.addEventListener).toHaveBeenCalledWith('ended', expect.any(Function));
+
+        // The successor ending DOES clean up.
+        trackB.dispatch('ended');
+        expect(ctxRef.ctx!.source.disconnect.mock.calls.length).toBe(swaps + 1);
     });
 });
