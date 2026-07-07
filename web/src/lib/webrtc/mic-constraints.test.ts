@@ -37,6 +37,23 @@ describe('micConstraints', () => {
         expect(asRec(c).echoCancellationType).toBeUndefined();
     });
 
+    it('studio requests stereo capture (non-mandatory ideal); talkback does not', () => {
+        const studio = micConstraints({ mode: 'studio', studioHeadphones: true, noiseSuppression: false });
+        expect(studio.channelCount).toEqual({ ideal: 2 });
+
+        const talkback = micConstraints({ mode: 'talkback', studioHeadphones: false, noiseSuppression: false });
+        expect(talkback.channelCount).toBeUndefined();
+    });
+
+    it('studio stereo hint is independent of NS/AGC/EC invariants', () => {
+        // Stereo capture must be requested even with EC on (no headphones) and
+        // must not disturb the always-off NS/AGC studio invariants.
+        const c = micConstraints({ mode: 'studio', studioHeadphones: false, noiseSuppression: true });
+        expect(c.channelCount).toEqual({ ideal: 2 });
+        expect(c.noiseSuppression).toBe(false);
+        expect(c.autoGainControl).toBe(false);
+    });
+
     it('applies deviceId as ideal vs exact', () => {
         expect(
             micConstraints({ mode: 'talkback', studioHeadphones: false, noiseSuppression: false, deviceId: 'mic1' })

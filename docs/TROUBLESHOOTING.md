@@ -360,9 +360,9 @@ every platform. Field-verified fix.
 
 1. **Check if using relay**: Voice goes through TURN if direct fails
 
-2. **Audio ducking**: When voice is active, stream is ducked (intentional)
+2. **Network latency**: Run ping test between participants
 
-3. **Network latency**: Run ping test between participants
+3. **Audio processing**: Studio mic mode is higher-latency by design (no NS/AGC, full-bandwidth stereo); talkback mode is optimized for low-latency speech
 
 ### Measuring latency
 

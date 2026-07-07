@@ -238,11 +238,7 @@ func (env *streamStartTestEnv) startIngest() {
 		env.t.Fatalf("failed to create video track: %v", err)
 	}
 	audioTrack, err := pionwebrtc.NewTrackLocalStaticRTP(
-		pionwebrtc.RTPCodecCapability{
-			MimeType:  pionwebrtc.MimeTypeOpus,
-			ClockRate: 48000,
-			Channels:  2,
-		}, "audio", "chromatic-stream")
+		webrtc.ProgramAudioOpusCapability(), "audio", "chromatic-stream")
 	if err != nil {
 		env.t.Fatalf("failed to create audio track: %v", err)
 	}

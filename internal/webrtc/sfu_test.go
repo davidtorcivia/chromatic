@@ -2015,3 +2015,41 @@ func TestSFU_AddSubscriberICECandidate_BudgetResetsPerNegotiation(t *testing.T) 
 		t.Fatal("expected candidate over the fresh budget to be rejected")
 	}
 }
+
+// TestSFU_CreateSubscriberConnection_OffersProgramAudioAsStereoOpus verifies the
+// server-generated subscriber offer advertises the program-audio Opus stereo
+// capability. The subscriber PC builds its offer from the SFU's MediaEngine
+// (which registers ProgramAudioOpusCapability), so the relay offer must carry
+// stereo=1;sprop-stereo=1 with no maxaveragebitrate — locking in that browsers
+// decode full-stereo program audio and the path is never silently capped.
+func TestSFU_CreateSubscriberConnection_OffersProgramAudioAsStereoOpus(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "stereo-sub-room"
+	room := sfu.GetRoomTracks(roomSlug)
+
+	// Bind a program-audio relay track built from the shared capability, exactly
+	// as handleOffer would, so the subscriber offer has an audio m-line to carry
+	// the Opus fmtp.
+	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
+		ProgramAudioOpusCapability(), "audio", "chromatic-stream")
+	if err != nil {
+		t.Fatalf("failed to create audio track: %v", err)
+	}
+	room.AudioTrack = audioTrack
+
+	pc, _, offerSDP, _, err := sfu.CreateSubscriberConnection(roomSlug, "sub-1")
+	if err != nil {
+		t.Fatalf("CreateSubscriberConnection failed: %v", err)
+	}
+	if pc != nil {
+		defer pc.Close()
+	}
+
+	assertProgramStereoFmtp(t, opusFmtpFromSDP(offerSDP), "subscriber offer")
+}

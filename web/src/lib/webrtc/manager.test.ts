@@ -88,13 +88,14 @@ class FakeSubscriberPeerConnection {
     statsReport = new Map<string, unknown>();
     receivers: RTCRtpReceiver[] = [];
     rejectRemoteOffers = false;
+    answerSDP: string | null = null;
+    lastLocalSDP: string | undefined;
 
     async createOffer(options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
         return { type: 'offer', sdp: options?.iceRestart ? 'ice-restart-offer' : 'offer' };
     }
-
     async createAnswer(): Promise<RTCSessionDescriptionInit> {
-        return { type: 'answer', sdp: 'subscriber-answer' };
+        return { type: 'answer', sdp: this.answerSDP ?? 'subscriber-answer' };
     }
 
     async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
@@ -115,6 +116,7 @@ class FakeSubscriberPeerConnection {
 
     async setLocalDescription(description?: RTCSessionDescriptionInit): Promise<void> {
         if (!description) return;
+        if (description.sdp !== undefined) this.lastLocalSDP = description.sdp;
         if (description.type === 'offer') {
             this.signalingState = 'have-local-offer';
             this.onicecandidate?.({
@@ -1025,6 +1027,107 @@ describe('WebRTCManager subscriber signaling', () => {
 
         expect(receiver.jitterBufferTarget).toBe(20);
         expect(receiver.playoutDelayHint).toBe(0.02);
+    });
+
+    it('leaves audio receivers untouched by low-latency hints but still fires onTrack', () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        let onTrackFired = false;
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => { onTrackFired = true; },
+            sendSignal: () => {}
+        });
+
+        const managerInternals = manager as unknown as {
+            createPeerConnection(): void;
+            pc: FakeSubscriberPeerConnection | null;
+        };
+        managerInternals.createPeerConnection();
+
+        // An audio receiver keeps its original jitter/playout values — the
+        // low-latency hints target the program VIDEO path only, so program
+        // audio is not squeezed toward a video-style jitter target.
+        const receiver = { jitterBufferTarget: 50, playoutDelayHint: 0.1 };
+        managerInternals.pc?.ontrack?.({
+            track: { kind: 'audio', id: 'program-audio' },
+            streams: [{ id: 'main-stream' }],
+            receiver
+        } as unknown as RTCTrackEvent);
+
+        expect(onTrackFired).toBe(true);
+        expect(receiver.jitterBufferTarget).toBe(50);
+        expect(receiver.playoutDelayHint).toBe(0.1);
+    });
+
+    // A browser-style answer SDP: Opus PT 111 rtpmap with a minimal fmtp that
+    // omits the stereo decode params. Used by both the initial-answer and
+    // renegotiation-answer tuning tests.
+    const OPUS_ANSWER_NO_STEREO = [
+        'v=0',
+        'o=- 1 2 IN IP4 127.0.0.1',
+        's=-',
+        't=0 0',
+        'm=audio 9 UDP/TLS/RTP/SAVPF 111',
+        'c=IN IP4 0.0.0.0',
+        'a=rtpmap:111 opus/48000/2',
+        'a=fmtp:111 minptime=10;useinbandfec=1'
+    ].join('\r\n');
+
+    it('tunes the initial subscriber answer for stereo Opus decode', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: (type, payload) => { sent.push({ type, payload }); }
+        });
+        const managerInternals = manager as unknown as {
+            createPeerConnection(): void;
+            pc: FakeSubscriberPeerConnection | null;
+        };
+        managerInternals.createPeerConnection();
+        const pc = managerInternals.pc;
+        // Reuse the PC (handleOffer rebuilds unless state is 'new').
+        pc!.connectionState = 'new';
+        pc!.answerSDP = OPUS_ANSWER_NO_STEREO;
+
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+
+        // setLocalDescription received the tuned SDP...
+        expect(pc!.lastLocalSDP).toContain('stereo=1');
+        expect(pc!.lastLocalSDP).toContain('sprop-stereo=1');
+        expect(pc!.lastLocalSDP).not.toContain('maxaveragebitrate');
+        // ...and the SAME tuned SDP is what we signal to the server.
+        expect(sent).toEqual([
+            { type: 'signal:answer', payload: { sdp: pc!.lastLocalSDP, offerId: 'offer-123' } }
+        ]);
+    });
+
+    it('tunes the renegotiation answer for stereo Opus decode', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: (type, payload) => { sent.push({ type, payload }); }
+        });
+
+        // Establish the subscriber first (default non-Opus answer).
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+        const pc = (manager as unknown as { pc: FakeSubscriberPeerConnection | null }).pc;
+        pc!.answerSDP = OPUS_ANSWER_NO_STEREO;
+        sent.length = 0;
+
+        await manager.handleRenegotiation('renegotiation-offer', 'speaker-1', 'renegotiate-456');
+
+        expect(pc!.lastLocalSDP).toContain('stereo=1');
+        expect(pc!.lastLocalSDP).toContain('sprop-stereo=1');
+        expect(sent).toEqual([
+            { type: 'signal:renegotiate-answer', payload: { sdp: pc!.lastLocalSDP, offerId: 'renegotiate-456' } }
+        ]);
     });
 
     it('refreshes ICE servers on both subscriber and publisher peer connections', async () => {

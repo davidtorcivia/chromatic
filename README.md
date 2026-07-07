@@ -15,7 +15,7 @@ Chromatic enables real-time color-critical streaming from DaVinci Resolve via OB
 ### Collaboration
 - **Laser pointer**: Interactive pointing visible to all participants — works on the stream and on screen shares
 - **Screen sharing**: Any participant can share their screen (admin-approved), shown split-screen beside the stream
-- **Voice chat**: Built-in audio with light noise reduction and intelligent ducking when speaking
+- **Voice chat**: Built-in audio with talkback and studio mic modes, light noise reduction, and independent program/voice volume
 - **Chat messaging**: Text communication during sessions, with admin moderation
 - **File sharing**: Share images, audio references, and PDFs; admins can review and remove room files
 

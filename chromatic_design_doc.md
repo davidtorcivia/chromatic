@@ -132,22 +132,29 @@ Comfortable headroom at all quality levels.
 
 Since we are not mixing audio server-side, we manage echo prevention client-side.
 
-**Audio Ducking Strategy:**
+**Program audio is relayed untouched.** The OBS/WHIP ingest (the Resolve
+playback — dialogue, music, the full mix) is an opaque Opus RTP relay: no
+server-side decode, remix, resample, or gain. It is advertised as stereo Opus
+(`stereo=1;sprop-stereo=1`, no bitrate cap) end to end so a mono negotiation
+can never collapse the program to mono. Multichannel/surround ingest
+(`multiopus` or >2-channel Opus) is rejected with HTTP 422 rather than silently
+downmixed.
 
 | Track | Description |
 |-------|-------------|
-| Stream Audio | High-quality audio from Resolve (dialogue, music, mix) |
-| Voice Audio | Voice chat from all participants |
+| Program (Stream) Audio | Uncapped stereo Opus from Resolve, relayed without server gain/ducking |
+| Voice Audio | Per-participant voice chat, played through its own WebAudio gain path |
 
 **Client Behavior:**
-1. When voice activity detected (VAD threshold exceeded):
-   - Stream audio volume ramps to 20% over 50ms.
-2. When voice activity ceases for 800ms:
-   - Stream audio ramps back to 100% over 200ms.
-3. Prevents feedback loop where client mic picks up stream audio from speakers.
-
-**Admin Exemption:**
-The colorist (admin) is exempt from audio ducking. Assumption: colorist monitors on separate reference speakers/headphones and controls their own environment. Admin hears stream at full volume always; voice chat is mixed at a fixed level they can adjust.
+1. Program playback level is controlled ONLY by the user's explicit volume
+   slider and the browser's autoplay mute.
+2. Voice is played through an independent per-participant gain node, so the
+   voice-volume slider never affects the program and vice versa.
+3. There is no voice-activity-driven ducking. (An earlier design automatically
+   reduced the program to 20% under detected speech; that fought the reviewer
+   during critical listening and was removed.)
+4. Echo prevention stays client-side: browser AEC on talkback, and AEC removed
+   in studio mode only when the user confirms headphones.
 
 ### 3.3 Browser Color Management
 
@@ -548,7 +555,7 @@ export async function unlockAudio(): Promise<void> {
 }
 ```
 
-**Integration Point:** The "Join Session" button handler must call `unlockAudio()` before initializing the ducking manager.
+**Integration Point:** The "Join Session" button handler must call `unlockAudio()` before initializing the voice-playback manager.
 
 ```typescript
 // routes/room/[slug]/session/+page.svelte
@@ -559,62 +566,48 @@ async function handleJoinClick() {
 }
 ```
 
-**Ducking Implementation:**
+**Voice Playback + Program Volume:**
 
 ```typescript
-// lib/audio/ducking.ts
+// lib/audio/voice-playback.ts
 
-interface DuckingConfig {
-  duckLevel: number;        // 0.2 = 20% volume when ducked
-  attackTime: number;       // 50ms ramp down
-  releaseTime: number;      // 200ms ramp up
-  holdTime: number;         // 800ms before release
-  vadThreshold: number;     // -50dB activation threshold
-}
-
-const DEFAULT_CONFIG: DuckingConfig = {
-  duckLevel: 0.2,
-  attackTime: 50,
-  releaseTime: 200,
-  holdTime: 800,
-  vadThreshold: -50
-};
-
-export class AudioDuckingManager {
+export class VoicePlaybackManager {
   private streamElement: HTMLMediaElement;
-  private voiceTracks: Map<string, MediaStreamTrack>;
-  private audioContext: AudioContext;
-  private isAdmin: boolean;
-  
-  constructor(streamElement: HTMLMediaElement, isAdmin: boolean) {
+  private voiceGainNodes: Map<string, GainNode>;
+  private baseStreamVolume: number;
+  private voiceVolume: number;
+
+  constructor(streamElement: HTMLMediaElement) {
     this.streamElement = streamElement;
-    this.isAdmin = isAdmin;
-    this.voiceTracks = new Map();
-    this.audioContext = new AudioContext();
+    this.baseStreamVolume = streamElement.volume;
   }
-  
-  addVoiceTrack(participantId: string, track: MediaStreamTrack) {
-    // Create analyser for this track
-    // Monitor for voice activity
+
+  // The ONLY path that sets the program element's volume — never voice activity.
+  setStreamVolume(volume: number) {
+    this.baseStreamVolume = clamp(volume, 0, 1);
+    this.streamElement.volume = this.baseStreamVolume;
   }
-  
-  private onVoiceActivity(active: boolean) {
-    // Admin exempt from ducking
-    if (this.isAdmin) return;
-    
-    if (active) {
-      this.duckStream();
-    } else {
-      this.scheduleRelease();
-    }
+
+  setVoiceVolume(volume: number) {
+    this.voiceVolume = clamp(volume, 0, 1);
+    for (const gain of this.voiceGainNodes.values()) gain.gain.value = this.voiceVolume;
   }
-  
-  private duckStream() {
-    // Ramp streamElement.volume to duckLevel over attackTime
-  }
-  
-  private scheduleRelease() {
-    // After holdTime, ramp volume back to 1.0 over releaseTime
+
+  async addVoiceTrack(participantId: string, track: MediaStreamTrack) {
+    const ctx = await getAudioContext();
+    // Chromium needs a muted media-element sink or a remote audio track
+    // consumed only via WebAudio decodes to silence.
+    const sink = new Audio();
+    sink.srcObject = new MediaStream([track]);
+    sink.muted = true;
+    void sink.play().catch(() => {});
+    // Audible path: source -> gain -> destination (no analyser/VAD loop).
+    const source = ctx.createMediaStreamSource(sink.srcObject);
+    const gain = ctx.createGain();
+    gain.gain.value = this.voiceVolume;
+    source.connect(gain);
+    gain.connect(ctx.destination);
+    this.voiceGainNodes.set(participantId, gain);
   }
 }
 ```
@@ -1153,8 +1146,8 @@ pending ──[OBS connects]──▶ live ──[admin ends OR timeout]──�
 - [ ] SvelteKit project
 - [ ] Join flow (password, name, device setup)
 - [ ] Stream viewer with WebRTC
-- [ ] Audio ducking implementation
-- [ ] Volume controls (stream/voice separate)
+- [ ] Voice playback + untouched program relay (stereo Opus, no ducking)
+- [ ] Volume controls (stream/voice independent)
 
 ### Phase 4: Communication (Week 4–5)
 - [ ] Voice chat integration

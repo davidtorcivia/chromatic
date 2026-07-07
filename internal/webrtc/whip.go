@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -132,25 +133,15 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 		return
 	}
 
-	// Keep this fmtp in lockstep with the Opus codec registered in NewSFU
-	// (stereo=1;sprop-stereo=1) so the relay capability matches the negotiated
-	// codec and the program audio is carried/decoded as full stereo, not mono.
+	// Program-audio relay track. Uses the shared ProgramAudioOpusCapability()
+	// (see opus.go) so the relay stays in lockstep with the MediaEngine
+	// registration in NewSFU — stereo=1;sprop-stereo=1, no bitrate cap — and
+	// OBS's program audio is carried/decoded as full stereo, not mono.
 	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeOpus,
-			ClockRate:   48000,
-			Channels:    2,
-			SDPFmtpLine: "minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1",
-		},
+		ProgramAudioOpusCapability(),
 		"audio",
 		"chromatic-stream",
 	)
-	if err != nil {
-		pc.Close()
-		log.Printf("Failed to create audio track: %v", err)
-		http.Error(w, "Failed to create audio track", http.StatusInternalServerError)
-		return
-	}
 
 	// Create ingest session
 	session := &IngestSession{
@@ -435,9 +426,21 @@ func (h *WHIPHandler) handleDelete(w http.ResponseWriter, r *http.Request, token
 	log.Printf("WHIP session terminated for key: %s...", keyPrefix(token))
 }
 
-// validateSDP validates the incoming SDP offer
-// CRITICAL: Checks for B-frame configuration which causes latency issues
+// validateSDP validates the incoming SDP offer. It rejects two classes of
+// configuration that the SFU cannot carry faithfully:
+//   - B-frame-capable H.264 profiles (Main/High/Extended), which add 2+ s of
+//     reorder latency in browsers.
+//   - Multichannel/surround audio (multiopus, or Opus with >2 channels). The
+//     SFU relay is a two-channel Opus path; forcing multichannel through it
+//     would downmix at the source and violate the "relay program audio
+//     untouched" contract. True surround needs a dedicated multiopus path.
 func validateSDP(sdp string) error {
+	// Reject multichannel/surround audio before anything else: the relay is a
+	// two-channel Opus path and must never silently negotiate a downmix.
+	if err := validateAudioChannels(sdp); err != nil {
+		return err
+	}
+
 	// Check for B-frames in H.264 configuration
 	// B-frames in WebRTC cause 2+ second latency due to browser reordering issues
 
@@ -519,3 +522,46 @@ func extractProfileLevelID(sdp string) string {
 
 // ErrBFramesDetected indicates B-frames are configured
 var ErrBFramesDetected = errors.New("B-frames detected: Main/High profile can use B-frames which cause 2+ second latency. Set encoder to Baseline profile or disable B-frames in OBS")
+
+// ErrUnsupportedAudioChannels indicates the offer advertises audio the relay
+// cannot carry without downmixing (multichannel surround via multiopus, or an
+// Opus channel count above two). Forcing such a stream through the two-channel
+// Opus relay would violate the "relay program audio untouched" contract, so the
+// WHIP offer is rejected with 422 instead of being silently negotiated down.
+var ErrUnsupportedAudioChannels = errors.New("unsupported audio channels: multichannel/surround ingest (multiopus or >2-channel Opus) is not supported; configure OBS for stereo or mono")
+
+// validateAudioChannels rejects audio codec advertisements the two-channel Opus
+// relay cannot faithfully carry. multichannel surround over WebRTC uses a
+// separate "multiopus" codec, which is draft/non-default and not registered in
+// this SFU; an Opus rtpmap advertising more than two channels is malformed for
+// this relay. Either would be silently downmixed if negotiated, so they are
+// rejected up front with a clear error rather than accepted as a lossy mono
+// fallback. Offered codec name + channel count are logged for diagnosis.
+func validateAudioChannels(sdp string) error {
+	for _, raw := range strings.Split(sdp, "\n") {
+		line := strings.TrimSpace(raw)
+		if !strings.HasPrefix(line, "a=rtpmap:") {
+			continue
+		}
+		// a=rtpmap:<payload-type> <codec>/<clockrate>[/<channels>]
+		rest := strings.TrimPrefix(line, "a=rtpmap:")
+		spaced := strings.SplitN(rest, " ", 2)
+		if len(spaced) != 2 {
+			continue
+		}
+		desc := strings.Split(strings.TrimSpace(spaced[1]), "/")
+		codec := strings.ToLower(desc[0])
+		if codec == "multiopus" {
+			log.Printf("Rejecting multichannel ingest: %s", strings.TrimSpace(spaced[1]))
+			return ErrUnsupportedAudioChannels
+		}
+		if codec == "opus" && len(desc) >= 3 {
+			channels := strings.TrimSpace(desc[2])
+			if n, err := strconv.Atoi(channels); err == nil && n > 2 {
+				log.Printf("Rejecting multichannel ingest: opus/%s/%s", desc[1], channels)
+				return ErrUnsupportedAudioChannels
+			}
+		}
+	}
+	return nil
+}

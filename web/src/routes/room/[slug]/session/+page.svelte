@@ -16,7 +16,7 @@
     } from "$lib/webrtc/manager";
     import { loadAudioModeState, getJoinWithCamera, type AudioMode, type DenoiserEngine } from "$lib/audio/audio-mode";
     import { deriveStreamOverlayState } from "$lib/video/stream-overlay";
-    import { AudioDuckingManager } from "$lib/audio/ducking";
+    import { VoicePlaybackManager } from "$lib/audio/voice-playback";
     import { playShareRequestChime, playWaitingRoomChime, playJoinChime, playLeaveChime, playChatReceiveChime, getUiSoundsEnabled, setUiSoundsEnabled } from "$lib/audio/chimes";
     import LaserPointerOverlay from "$lib/components/LaserPointerOverlay.svelte";
     import LoupeOverlay from "$lib/components/LoupeOverlay.svelte";
@@ -51,7 +51,7 @@
     let controlsTimer: ReturnType<typeof setTimeout> | null = null;
     let participantName = $state("Viewer");
     let webrtcManager: WebRTCManager | null = null;
-    let audioDuckingManager: AudioDuckingManager | null = null;
+    let voicePlaybackManager: VoicePlaybackManager | null = null;
     let iceServers: RTCIceServer[] = [];
     let hasStream = $state(false);
     let isMuted = $state(true); // Start muted for autoplay compliance
@@ -268,7 +268,7 @@
     // flight" so the source node gets disconnected instead of leaking.
     let activeVoicePids = new Set<string>();
     let vadFrame: ReturnType<typeof requestAnimationFrame> | null = null;
-    // Buffer voice tracks that arrive before audioDuckingManager is created
+    // Buffer voice tracks that arrive before voicePlaybackManager is created
     // (can happen when voice relay tracks are in the initial offer and ontrack
     // fires for them before the main video/audio track triggers handleTrack).
     let pendingVoiceTracks = new Map<string, MediaStreamTrack>();
@@ -658,9 +658,10 @@
             lobbyCount = data?.count ?? 0;
         });
 
-        // Release per-participant audio graph (VAD + ducking) when someone
-        // leaves the room — otherwise their analyser/source nodes and GainNode
-        // stay connected to the shared AudioContext and the graph grows with churn.
+        // Release per-participant audio graph (VAD speaking indicator +
+        // voice-playback gain) when someone leaves the room — otherwise their
+        // analyser/source/gain nodes stay connected to the shared AudioContext
+        // and the graph grows with churn.
         session.onMessage("participant:left", (payload: unknown) => {
             const data = payload as { participantId: string };
             if (data?.participantId) cleanupParticipantVoice(data.participantId);
@@ -739,9 +740,9 @@
             reconnectEvents++;
             debugLog("WebSocket reconnected, resetting WebRTC state");
             cleanupWebRTC();
-            if (audioDuckingManager) {
-                audioDuckingManager.destroy();
-                audioDuckingManager = null;
+            if (voicePlaybackManager) {
+                voicePlaybackManager.destroy();
+                voicePlaybackManager = null;
             }
             // Allow the auto-mic flow to run again against the new manager
             // (the new peer connection has no local stream).
@@ -821,9 +822,9 @@
         stopLoadMonitor();
         releaseFrames();
         cleanupWebRTC();
-        if (audioDuckingManager) {
-            audioDuckingManager.destroy();
-            audioDuckingManager = null;
+        if (voicePlaybackManager) {
+            voicePlaybackManager.destroy();
+            voicePlaybackManager = null;
         }
         session.disconnect();
         closeAudioContext();
@@ -1049,7 +1050,7 @@
             hasStream = true;
             attemptAutoplay();
 
-            ensureAudioDuckingManager();
+            ensureVoicePlaybackManager();
             startStatsPolling();
         } catch (err) {
             console.error('Failed to attach stream:', err);
@@ -1338,22 +1339,22 @@
     // fires, and buffering it until stream start meant participants could
     // not hear each other while waiting for the host (voice tracks flowed,
     // playback never started).
-    function ensureAudioDuckingManager() {
-        if (audioDuckingManager || !videoElement) return;
-        audioDuckingManager = new AudioDuckingManager(videoElement, isAdmin);
-        audioDuckingManager.setStreamVolume(streamVolume);
-        audioDuckingManager.setVoiceVolume(voiceVolume);
+    function ensureVoicePlaybackManager() {
+        if (voicePlaybackManager || !videoElement) return;
+        voicePlaybackManager = new VoicePlaybackManager(videoElement);
+        voicePlaybackManager.setStreamVolume(streamVolume);
+        voicePlaybackManager.setVoiceVolume(voiceVolume);
         // Flush any voice tracks that arrived before we were created
         for (const [pid, vTrack] of pendingVoiceTracks) {
-            audioDuckingManager.addVoiceTrack(pid, vTrack);
+            voicePlaybackManager.addVoiceTrack(pid, vTrack);
         }
         pendingVoiceTracks.clear();
     }
 
     function handleVoiceTrack(participantId: string, track: MediaStreamTrack) {
-        ensureAudioDuckingManager();
-        if (audioDuckingManager) {
-            audioDuckingManager.addVoiceTrack(participantId, track);
+        ensureVoicePlaybackManager();
+        if (voicePlaybackManager) {
+            voicePlaybackManager.addVoiceTrack(participantId, track);
         } else {
             // videoElement not bound yet (very early in mount): buffer for
             // the ensure call that runs on the next voice/main track.
@@ -1472,7 +1473,7 @@
             voiceAnalysers.delete(participantId);
         }
         pendingVoiceTracks.delete(participantId);
-        audioDuckingManager?.removeVoiceTrack(participantId);
+        voicePlaybackManager?.removeVoiceTrack(participantId);
         // Stop the VAD loop when the last analyser is gone
         if (voiceAnalysers.size === 0 && vadFrame) {
             cancelAnimationFrame(vadFrame);
@@ -2406,13 +2407,13 @@
     function handleStreamVolumeChange(event: Event) {
         const target = event.target as HTMLInputElement;
         streamVolume = parseFloat(target.value);
-        audioDuckingManager?.setStreamVolume(streamVolume);
+        voicePlaybackManager?.setStreamVolume(streamVolume);
     }
 
     function handleVoiceVolumeChange(event: Event) {
         const target = event.target as HTMLInputElement;
         voiceVolume = parseFloat(target.value);
-        audioDuckingManager?.setVoiceVolume(voiceVolume);
+        voicePlaybackManager?.setVoiceVolume(voiceVolume);
     }
 
     async function toggleMic() {

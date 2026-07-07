@@ -9,7 +9,7 @@ import {
     opusPreferencesFor
 } from '$lib/audio/audio-mode';
 import { isDenoiserImplemented } from '$lib/audio/denoiser';
-import { applyOpusPreferences } from './sdp';
+import { applyOpusPreferences, tuneSubscriberAnswerOpus } from './sdp';
 
 const DEBUG = import.meta.env.DEV;
 const debugLog = (...args: unknown[]) => {
@@ -122,6 +122,13 @@ export function micConstraints(opts: MicConstraintOptions): MediaTrackConstraint
         // Prefer the OS echo canceller where available; falls back to the
         // browser one otherwise.
         constraints.echoCancellationType = { ideal: 'system' };
+    }
+    if (studio) {
+        // Studio carries reference music/instruments, so ask for a stereo
+        // capture (non-mandatory `ideal` — a mono-only source still satisfies
+        // the constraint). Talkback stays mono and is never given a channel
+        // count hint, so it doesn't fight the mono Opus relay.
+        constraints.channelCount = { ideal: 2 };
     }
     if (opts.deviceId) {
         // `ideal` lets getUserMedia fall back to the default mic when the
@@ -331,10 +338,19 @@ export class WebRTCManager {
                 debugLog('Set remote description');
 
                 const answer = await pc.createAnswer();
-                await pc.setLocalDescription(answer);
+                // Munge the Opus fmtp to advertise full-stereo program decode
+                // before committing the local answer — the browser's default
+                // answer follows RFC 7587 (mono) and would downmix the program
+                // stream. Receive-side params only; no DTX/bitrate cap. The same
+                // tuned SDP is what we signal, so both peers agree.
+                const tunedAnswer: RTCSessionDescriptionInit = {
+                    type: answer.type,
+                    sdp: tuneSubscriberAnswerOpus(answer.sdp ?? '')
+                };
+                await pc.setLocalDescription(tunedAnswer);
                 debugLog('Created and set local description (answer)');
 
-                const payload: { sdp: string | undefined; offerId?: string } = { sdp: answer.sdp };
+                const payload: { sdp: string | undefined; offerId?: string } = { sdp: tunedAnswer.sdp };
                 if (offerId) {
                     payload.offerId = offerId;
                 }
@@ -415,7 +431,14 @@ export class WebRTCManager {
             const streamId = event.streams[0]?.id ?? '';
             const trackId = event.track.id;
             debugLog('Received track:', event.track.kind, 'trackId:', trackId, 'streamId:', streamId, 'streams:', event.streams.length);
-            this.tuneReceiverForLowLatency(event.receiver);
+            // Low-latency receiver hints target the program VIDEO path (a
+            // 20 ms jitter target / playout hint). Applying them to audio
+            // receivers would push program/voice audio toward video-style
+            // jitter targets and can shrink the audio jitter buffer below what smooth
+            // Opus decode needs. Only video receivers get the hints.
+            if (event.track.kind === 'video') {
+                this.tuneReceiverForLowLatency(event.receiver);
+            }
 
             // Identify screen share tracks by stream/track ID.
             // Server creates relay tracks with:
@@ -1563,9 +1586,16 @@ export class WebRTCManager {
                 this.subscriberCandidateOfferId = offerId ?? null;
                 await this.pc.setRemoteDescription({ type: 'offer', sdp });
                 const answer = await this.pc.createAnswer();
-                await this.pc.setLocalDescription(answer);
+                // Same stereo-decode munge as the initial answer: server
+                // renegotiation (e.g. a new program/voice track) must not let
+                // the browser fall back to a mono Opus answer.
+                const tunedAnswer: RTCSessionDescriptionInit = {
+                    type: answer.type,
+                    sdp: tuneSubscriberAnswerOpus(answer.sdp ?? '')
+                };
+                await this.pc.setLocalDescription(tunedAnswer);
 
-                const payload: { sdp: string | undefined; offerId?: string } = { sdp: answer.sdp };
+                const payload: { sdp: string | undefined; offerId?: string } = { sdp: tunedAnswer.sdp };
                 if (offerId) {
                     payload.offerId = offerId;
                 }
@@ -1608,6 +1638,13 @@ export class WebRTCManager {
                     height: { ideal: 2160 },
                     frameRate: { ideal: 30 }
                 },
+                // Screen-share AUDIO stays off: the SFU's publisher audio
+                // branch classifies any audio track as voice, so tab/system
+                // audio captured here would be relayed as a talkback voice
+                // track and mixed at voice gain — wrong for shared program
+                // audio. Enabling audio:true needs a dedicated screen-share
+                // audio relay + a frontend track classifier BEFORE this offer
+                // is negotiated. Keep it false until that path exists.
                 audio: false
             });
             if (this.isClosed()) {

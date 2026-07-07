@@ -365,22 +365,15 @@ func NewSFU(cfg *config.Config) (*SFU, error) {
 
 	// Opus audio (for both stream audio and voice chat).
 	//
-	// stereo=1;sprop-stereo=1 is essential for a post-production app: without
-	// them Opus negotiates MONO (RFC 7587 defaults stereo to 0), so the SFU's
-	// answer to OBS would make OBS downmix the program audio to mono at the
-	// source, and the relay offer would make browsers decode mono. With these
-	// set, program audio stays full stereo end-to-end and studio-mode voice can
-	// carry stereo music. We intentionally set NO maxaveragebitrate here so the
-	// program path is never capped — OBS's own (high) bitrate passes through the
-	// opaque RTP relay untouched. Per-mode voice bitrate is capped client-side.
+	// The codec capability is the shared program-audio definition
+	// (programAudioOpusCapability): stereo=1;sprop-stereo=1 with no bitrate cap,
+	// so OBS's program audio stays full stereo through the opaque RTP relay and
+	// is never downmixed. See opus.go for why this MUST match the WHIP ingest
+	// relay track. Per-mode voice bitrate is capped client-side (TALKBACK_OPUS /
+	// STUDIO_OPUS in the publisher offer, not here).
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeOpus,
-			ClockRate:   48000,
-			Channels:    2,
-			SDPFmtpLine: "minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1",
-		},
-		PayloadType: 111,
+		RTPCodecCapability: ProgramAudioOpusCapability(),
+		PayloadType:        111,
 	}, webrtc.RTPCodecTypeAudio); err != nil {
 		return nil, fmt.Errorf("failed to register Opus codec: %w", err)
 	}

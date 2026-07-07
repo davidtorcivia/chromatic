@@ -106,7 +106,7 @@ pc.ontrack = (event) => {
   const trackId = event.track.id;
   if (trackId.startsWith('voice-')) {
     const participantId = trackId.substring(6);
-    // Handle voice track (e.g., for audio ducking)
+    // Hand the voice track to the voice-playback manager (own gain path)
   }
 };
 ```
@@ -116,40 +116,43 @@ pc.ontrack = (event) => {
 `admin:mute` flips a server-side gate on the speaker's relay: incoming RTP
 is dropped at the SFU, so muting works even if the muted client ignores it.
 
-## Audio Ducking
+## Program vs Voice Playback
 
-Audio ducking automatically reduces the stream volume when someone is speaking.
+Chromatic is a color-critical review tool, so the program stream (the OBS/WHIP
+ingest carrying the Resolve playback — dialogue, music, the full mix) is
+relayed as an untouched Opus stream and played back exactly as provided. It is
+**never** automatically ducked, gated, or remixed in response to voice.
 
-### How It Works
+### What the voice-playback manager does
 
-1. `AudioDuckingManager` monitors all voice audio tracks
-2. Uses Voice Activity Detection (VAD) to detect speech
-3. When speech is detected, main stream volume is reduced to 20%
-4. When speech stops, volume smoothly returns to 100%
-
-### Implementation Details
+`VoicePlaybackManager` (`web/src/lib/audio/voice-playback.ts`) plays each remote
+participant's voice through its own WebAudio gain node — independent of the
+program element — so the listener's voice-volume slider does not affect the
+program, and vice versa. It owns the explicit user program-volume slider too.
+The ONLY things that change the program element's level are the user's explicit
+volume control and the browser's own autoplay mute.
 
 ```javascript
-// Voice track detection (in WebRTCManager)
-if (trackId.startsWith('voice-')) {
-  const participantId = trackId.substring(6);
-  onVoiceTrack(participantId, event.track);
-}
-
-// Audio ducking (in session/+page.svelte)
+// Voice track handling (in session/+page.svelte)
 function handleVoiceTrack(participantId: string, track: MediaStreamTrack) {
-  audioDuckingManager?.addVoiceTrack(participantId, track);
+  voicePlaybackManager?.addVoiceTrack(participantId, track);
 }
 ```
 
-### Parameters
+### What it does NOT do
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| Duck level | 20% | Volume when someone is speaking |
-| Ramp time | 100ms | Fade duration for volume changes |
-| Release time | 300ms | Time after speech stops before returning |
-| VAD threshold | -50dB | Sound level to detect speech |
+There is no voice-activity-driven ducking, no attack/hold/release ramps, and no
+admin exemption. Earlier versions automatically reduced the program to 20% under
+detected speech; that fought the reviewer during critical listening and was
+removed. The speaking indicator still runs (a separate VAD analyser feeds the
+UI tile only — it never touches program volume).
+
+### Chromium decoder sink
+
+A remote WebRTC audio track consumed only through WebAudio decodes to silence in
+Chromium unless it also has a media-element sink. Each voice track is therefore
+attached to a muted `<audio>` element that exists solely to drive the decoder;
+the audible path is the WebAudio gain graph.
 
 ## Troubleshooting
 
@@ -159,11 +162,18 @@ function handleVoiceTrack(participantId: string, track: MediaStreamTrack) {
 2. **Check peer connection state**: Ensure WebRTC connection is established
 3. **Check console for errors**: Look for `Failed to negotiate publisher` messages (client) or `Failed to handle publish offer` (server logs)
 
-### Audio Ducking Not Working
+### Voice Playback Not Working
 
 1. **Check voice track detection**: Track ID should start with `voice-`
-2. **Check AudioDuckingManager initialization**: Ensure manager is created
+2. **Check VoicePlaybackManager initialization**: Ensure the manager is created
 3. **Check audio context state**: Context must be "running" (user interaction required)
+
+### Program Audio Sounds Mono / Wrong Level
+
+Program audio is relayed untouched as stereo Opus. If it sounds mono or at the
+wrong level, check the user volume slider and the browser autoplay mute — those
+are the only things that affect program playback. Verify OBS is exporting stereo
+(Chromatic cannot undo an upstream OBS mixdown).
 
 ### High Latency
 
@@ -199,10 +209,10 @@ function handleVoiceTrack(participantId: string, track: MediaStreamTrack) {
 
 ## Performance Considerations
 
-- Voice tracks use Opus codec (48kHz, mono)
-- Typical bitrate: 32-64 kbps per voice stream
-- VAD processing uses minimal CPU (< 1%)
-- Audio ducking adds negligible latency (< 10ms)
+- Voice (talkback) tracks use Opus (48 kHz, mono, DTX/FEC) at a voice bitrate; studio mic mode requests stereo Opus at a high bitrate for reference music/instruments
+- Typical talkback bitrate: 32-64 kbps per voice stream
+- Program audio is uncapped stereo Opus, relayed without server gain/ducking
+- The speaking-indicator VAD uses minimal CPU (< 1%); it never affects program volume
 
 ## Browser Support
 
