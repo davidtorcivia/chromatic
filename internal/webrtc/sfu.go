@@ -2094,10 +2094,15 @@ func (s *SFU) IsRoomLive(roomSlug string) bool {
 
 // VoiceSession represents a participant's voice connection
 type VoiceSession struct {
-	ParticipantID    string
-	PeerConnection   *webrtc.PeerConnection
-	AudioTrack       *webrtc.TrackLocalStaticRTP
-	PublisherOfferID string
+	ParticipantID  string
+	PeerConnection *webrtc.PeerConnection
+	AudioTrack     *webrtc.TrackLocalStaticRTP
+	// publisherOfferID identifies the most recent publisher offer for this
+	// session (stale-offer/candidate rejection). It is read on paths that hold
+	// room.mu and written on paths that hold SignalingMu — two different locks
+	// that must not nest in that order — so access is atomic instead of being
+	// guarded by either. Use PublisherOfferID()/SetPublisherOfferID().
+	publisherOfferID atomic.Value // string
 	done             chan struct{}
 	closeOnce        sync.Once
 	SignalingMu      sync.Mutex
@@ -2106,6 +2111,19 @@ type VoiceSession struct {
 	// writing them to the local track — so admin:mute is effective even if a
 	// malicious client ignores the client-side mute request.
 	Muted atomic.Bool
+}
+
+// PublisherOfferID returns the ID of the most recent publisher offer, or ""
+// if none has been recorded.
+func (vs *VoiceSession) PublisherOfferID() string {
+	id, _ := vs.publisherOfferID.Load().(string)
+	return id
+}
+
+// SetPublisherOfferID records the ID of the publisher offer currently being
+// negotiated so later candidates/aborts for a superseded offer are rejected.
+func (vs *VoiceSession) SetPublisherOfferID(id string) {
+	vs.publisherOfferID.Store(id)
 }
 
 // logSelectedICEPair inspects the PC's stats for the nominated ICE candidate
@@ -2180,7 +2198,7 @@ func (s *SFU) HandlePublisherOffer(roomSlug, participantID, offerSDP, offerID st
 			if err := pc.SetLocalDescription(answer); err != nil {
 				return "", fmt.Errorf("failed to set publisher local description: %w", err)
 			}
-			existing.PublisherOfferID = offerID
+			existing.SetPublisherOfferID(offerID)
 			log.Printf("Publisher renegotiated for %s in room %s", participantID, roomSlug)
 			return answer.SDP, nil
 		}
@@ -2206,12 +2224,9 @@ func (s *SFU) AbortPublisherOffer(roomSlug, participantID, offerID string) error
 		return fmt.Errorf("publisher session not found: %s", participantID)
 	}
 
-	session.SignalingMu.Lock()
-	if offerID != "" && session.PublisherOfferID != "" && offerID != session.PublisherOfferID {
-		session.SignalingMu.Unlock()
-		return fmt.Errorf("%w: got %s, want %s", ErrStalePublisherOffer, offerID, session.PublisherOfferID)
+	if current := session.PublisherOfferID(); offerID != "" && current != "" && offerID != current {
+		return fmt.Errorf("%w: got %s, want %s", ErrStalePublisherOffer, offerID, current)
 	}
-	session.SignalingMu.Unlock()
 
 	s.removeVoiceSessionIfSame(roomSlug, participantID, session)
 	return nil
@@ -2237,7 +2252,7 @@ func (s *SFU) AddPublisherCandidate(roomSlug, participantID string, candidate we
 		room.mu.Unlock()
 		return nil
 	}
-	if offerID != "" && vs.PublisherOfferID != "" && offerID != vs.PublisherOfferID {
+	if current := vs.PublisherOfferID(); offerID != "" && current != "" && offerID != current {
 		room.mu.Unlock()
 		return ErrStalePublisherCandidate
 	}
@@ -2253,7 +2268,7 @@ func (s *SFU) flushPendingPublisherCandidates(room *RoomTracks, participantID st
 	delete(room.PendingPublisherICE, participantID)
 	var offerID string
 	if vs := room.VoiceSessions[participantID]; vs != nil {
-		offerID = vs.PublisherOfferID
+		offerID = vs.PublisherOfferID()
 	}
 	room.mu.Unlock()
 
@@ -2326,11 +2341,11 @@ func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP, offerID string
 	// close the old PC first so its terminal-state callback can't later tear
 	// down the replacement.
 	newSession := &VoiceSession{
-		ParticipantID:    participantID,
-		PeerConnection:   pc,
-		PublisherOfferID: offerID,
-		done:             make(chan struct{}),
+		ParticipantID:  participantID,
+		PeerConnection: pc,
+		done:           make(chan struct{}),
 	}
+	newSession.SetPublisherOfferID(offerID)
 	room := s.GetRoomTracks(roomSlug)
 	room.mu.Lock()
 	if room.VoiceSessions == nil {

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -29,7 +30,10 @@ type StreamKey struct {
 
 // List returns all stream keys
 func (h *StreamKeyHandler) List(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.db.Query(`
+	ctx, cancel := database.WithTimeout(r.Context())
+	defer cancel()
+
+	rows, err := h.db.QueryContext(ctx, `
 		SELECT id, name, key_token, created_at FROM stream_keys ORDER BY created_at DESC
 	`)
 	if err != nil {
@@ -45,6 +49,10 @@ func (h *StreamKeyHandler) List(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
 	}
 
 	respondJSON(w, keys)
@@ -79,7 +87,10 @@ func (h *StreamKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = h.db.Exec(`
+	ctx, cancel := database.WithTimeout(r.Context())
+	defer cancel()
+
+	_, err = h.db.ExecContext(ctx, `
 		INSERT INTO stream_keys (id, name, key_token) VALUES (?, ?, ?)
 	`, id, req.Name, keyToken)
 
@@ -102,7 +113,10 @@ func (h *StreamKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 func (h *StreamKeyHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	result, err := h.db.Exec("DELETE FROM stream_keys WHERE id = ?", id)
+	ctx, cancel := database.WithTimeout(r.Context())
+	defer cancel()
+
+	result, err := h.db.ExecContext(ctx, "DELETE FROM stream_keys WHERE id = ?", id)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -117,21 +131,19 @@ func (h *StreamKeyHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ValidateKey checks if a stream key token is valid
-func (h *StreamKeyHandler) ValidateKey(token string) (bool, error) {
+// ValidateKey checks if a stream key token is valid. It runs on the WHIP
+// ingest hot path, so the lookup is bounded by the standard query deadline —
+// a stalled connection must not hold up an OBS publish.
+func (h *StreamKeyHandler) ValidateKey(ctx context.Context, token string) (bool, error) {
+	ctx, cancel := database.WithTimeout(ctx)
+	defer cancel()
+
 	var count int
-	err := h.db.QueryRow("SELECT COUNT(*) FROM stream_keys WHERE key_token = ?", token).Scan(&count)
+	err := h.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM stream_keys WHERE key_token = ?", token).Scan(&count)
 	if err != nil {
 		return false, err
 	}
 	return count > 0, nil
-}
-
-// GetKeyID gets the stream key ID for a token
-func (h *StreamKeyHandler) GetKeyID(token string) (string, error) {
-	var id string
-	err := h.db.QueryRow("SELECT id FROM stream_keys WHERE key_token = ?", token).Scan(&id)
-	return id, err
 }
 
 func generateStreamKeyID() (string, error) {

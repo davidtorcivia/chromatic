@@ -1,6 +1,7 @@
 package webrtc
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -239,7 +240,7 @@ func TestWHIPHandler_AnswerNegotiatesStereoOpus(t *testing.T) {
 	defer sfu.Shutdown()
 
 	handler := NewWHIPHandler(sfu,
-		func(string) (bool, error) { return true, nil },
+		func(context.Context, string) (bool, error) { return true, nil },
 		func(string) error { return nil },
 		func(string) {},
 	)
@@ -307,7 +308,7 @@ func TestWHIPHandler_RejectsMultichannelIngest(t *testing.T) {
 	defer sfu.Shutdown()
 
 	handler := NewWHIPHandler(sfu,
-		func(string) (bool, error) { return true, nil },
+		func(context.Context, string) (bool, error) { return true, nil },
 		func(string) error { return nil },
 		func(string) {},
 	)

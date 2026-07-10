@@ -49,6 +49,9 @@ type asyncForwarder struct {
 	writeFn   func(*rtp.Packet) error
 	dropped   int64
 	closed    bool
+	// doneCh is closed by Close so observers (e.g. the WHIP drop-diagnostic
+	// goroutine) can end with the forwarder instead of outliving it.
+	doneCh chan struct{}
 }
 
 // newAsyncForwarder creates a forwarder with the given buffer capacity (in
@@ -61,6 +64,7 @@ func newAsyncForwarder(bufSize int, write func(*rtp.Packet) error) *asyncForward
 	f := &asyncForwarder{
 		buf:     make([][]byte, bufSize),
 		writeFn: write,
+		doneCh:  make(chan struct{}),
 	}
 	f.cond = sync.NewCond(&f.mu)
 	go f.drain()
@@ -127,7 +131,10 @@ func (f *asyncForwarder) recycleLocked(b []byte) {
 func (f *asyncForwarder) drain() {
 	// p is reused across iterations. drain is single-goroutine and writeFn
 	// (WriteRTP) does not retain the packet past the call, so one packet struct
-	// serves every iteration instead of allocating one per packet.
+	// serves every iteration instead of allocating one per packet. It is NOT
+	// zeroed between iterations: Unmarshal overwrites every field and reuses
+	// the CSRC/Extensions backing arrays, so zeroing would just discard that
+	// capacity and force a fresh allocation per packet.
 	var p rtp.Packet
 	// used holds the previous iteration's buffer so it can be recycled once we
 	// re-acquire the lock — writeFn has returned by then, so the bytes are free.
@@ -151,7 +158,6 @@ func (f *asyncForwarder) drain() {
 		f.count--
 		f.mu.Unlock()
 
-		p = rtp.Packet{}
 		if err := p.Unmarshal(pkt); err != nil {
 			used = pkt
 			continue
@@ -173,6 +179,11 @@ func (f *asyncForwarder) Dropped() int64 {
 	return f.dropped
 }
 
+// Done returns a channel closed when the forwarder is closed.
+func (f *asyncForwarder) Done() <-chan struct{} {
+	return f.doneCh
+}
+
 // Close stops accepting packets and exits the drain goroutine once queued work
 // is flushed. Safe to call multiple times.
 func (f *asyncForwarder) Close() {
@@ -181,5 +192,6 @@ func (f *asyncForwarder) Close() {
 		f.closed = true
 		f.cond.Broadcast()
 		f.mu.Unlock()
+		close(f.doneCh)
 	})
 }

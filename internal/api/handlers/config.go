@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"chromatic/internal/config"
@@ -31,6 +33,20 @@ type ConfigHandler struct {
 	db  *database.DB
 	cfg *config.Config
 	sfu *webrtc.SFU
+
+	// logoMIME caches the sniffed content type of the watermark logo, keyed by
+	// (path, mtime, size). GetLogo is fetched by every viewer; without the
+	// cache each request opens the file twice (sniff + serve).
+	logoMIMEMu    sync.Mutex
+	logoMIMEKey   logoStatKey
+	logoMIMEValue string
+}
+
+// logoStatKey identifies a logo file revision for MIME caching.
+type logoStatKey struct {
+	path    string
+	modTime time.Time
+	size    int64
 }
 
 // NewConfigHandler creates a new ConfigHandler
@@ -59,9 +75,12 @@ type ConfigResponse struct {
 func (h *ConfigHandler) Get(w http.ResponseWriter, r *http.Request) {
 	var response ConfigResponse
 
+	ctx, cancel := database.WithTimeout(r.Context())
+	defer cancel()
+
 	// Query config from database
 	var watermarkText, watermarkLogoPath, turnURL, turnUsername, turnCredential *string
-	err := h.db.QueryRow(`
+	err := h.db.QueryRowContext(ctx, `
 		SELECT default_watermark_text, default_watermark_logo_path,
 		       turn_external_url, turn_external_username, turn_external_credential
 		FROM config WHERE id = 1
@@ -137,14 +156,17 @@ func (h *ConfigHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	ctx, cancel := database.WithTimeout(r.Context())
+	defer cancel()
+
 	// Ensure config row exists (upsert pattern)
-	if _, err := h.db.Exec(`INSERT OR IGNORE INTO config (id) VALUES (1)`); err != nil {
+	if _, err := h.db.ExecContext(ctx, `INSERT OR IGNORE INTO config (id) VALUES (1)`); err != nil {
 		logger.Error("Failed to ensure config exists", "error", err)
 		http.Error(w, "Failed to update configuration", http.StatusInternalServerError)
 		return
 	}
 
-	tx, err := h.db.Begin()
+	tx, err := h.db.BeginTx(ctx, nil)
 	if err != nil {
 		logger.Error("Failed to begin config transaction", "error", err)
 		http.Error(w, "Failed to update configuration", http.StatusInternalServerError)
@@ -153,7 +175,7 @@ func (h *ConfigHandler) Update(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback() // no-op after Commit
 
 	if req.DefaultWatermarkText != nil {
-		if _, err := tx.Exec(`UPDATE config SET default_watermark_text = ? WHERE id = 1`, *req.DefaultWatermarkText); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE config SET default_watermark_text = ? WHERE id = 1`, *req.DefaultWatermarkText); err != nil {
 			logger.Error("Failed to update watermark text", "error", err)
 			http.Error(w, "Failed to update watermark settings", http.StatusInternalServerError)
 			return
@@ -161,7 +183,7 @@ func (h *ConfigHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.TurnExternalURL != nil {
-		if _, err := tx.Exec(`UPDATE config SET turn_external_url = ? WHERE id = 1`, *req.TurnExternalURL); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE config SET turn_external_url = ? WHERE id = 1`, *req.TurnExternalURL); err != nil {
 			logger.Error("Failed to update TURN URL", "error", err)
 			http.Error(w, "Failed to update TURN settings", http.StatusInternalServerError)
 			return
@@ -169,7 +191,7 @@ func (h *ConfigHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.TurnExternalUsername != nil {
-		if _, err := tx.Exec(`UPDATE config SET turn_external_username = ? WHERE id = 1`, *req.TurnExternalUsername); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE config SET turn_external_username = ? WHERE id = 1`, *req.TurnExternalUsername); err != nil {
 			logger.Error("Failed to update TURN username", "error", err)
 			http.Error(w, "Failed to update TURN settings", http.StatusInternalServerError)
 			return
@@ -177,7 +199,7 @@ func (h *ConfigHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.TurnExternalCredential != nil {
-		if _, err := tx.Exec(`UPDATE config SET turn_external_credential = ? WHERE id = 1`, *req.TurnExternalCredential); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE config SET turn_external_credential = ? WHERE id = 1`, *req.TurnExternalCredential); err != nil {
 			logger.Error("Failed to update TURN credential", "error", err)
 			http.Error(w, "Failed to update TURN settings", http.StatusInternalServerError)
 			return
@@ -187,7 +209,7 @@ func (h *ConfigHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// Any TURN field change invalidates the last stored reachability test —
 	// it was run against the previous effective configuration.
 	if req.TurnExternalURL != nil || req.TurnExternalUsername != nil || req.TurnExternalCredential != nil {
-		if _, err := tx.Exec(`
+		if _, err := tx.ExecContext(ctx, `
 			UPDATE config
 			SET turn_last_tested_at = NULL,
 			    turn_last_test_success = 0,
@@ -274,8 +296,11 @@ func (h *ConfigHandler) UploadLogo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, cancel := database.WithTimeout(r.Context())
+	defer cancel()
+
 	// Ensure config row exists
-	_, err = h.db.Exec(`INSERT OR IGNORE INTO config (id) VALUES (1)`)
+	_, err = h.db.ExecContext(ctx, `INSERT OR IGNORE INTO config (id) VALUES (1)`)
 	if err != nil {
 		logger.Error("Failed to ensure config exists", "error", err)
 		http.Error(w, "Failed to save logo configuration", http.StatusInternalServerError)
@@ -283,7 +308,7 @@ func (h *ConfigHandler) UploadLogo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update database with logo path
-	_, err = h.db.Exec(`UPDATE config SET default_watermark_logo_path = ? WHERE id = 1`, logoPath)
+	_, err = h.db.ExecContext(ctx, `UPDATE config SET default_watermark_logo_path = ? WHERE id = 1`, logoPath)
 	if err != nil {
 		logger.Error("Failed to update logo path in database", "path", logoPath, "error", err)
 		http.Error(w, "Failed to save logo configuration", http.StatusInternalServerError)
@@ -297,10 +322,17 @@ func (h *ConfigHandler) UploadLogo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetLogo serves the default watermark logo
+// GetLogo serves the default watermark logo. This is the hottest static-asset
+// path in the app — every viewer fetches it for the watermark overlay — so the
+// content-sniff result is cached per file revision and the response carries
+// Cache-Control (ServeFile's Last-Modified handling turns revalidations into
+// 304s).
 func (h *ConfigHandler) GetLogo(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := database.WithTimeout(r.Context())
+	defer cancel()
+
 	var logoPath *string
-	err := h.db.QueryRow(`SELECT default_watermark_logo_path FROM config WHERE id = 1`).Scan(&logoPath)
+	err := h.db.QueryRowContext(ctx, `SELECT default_watermark_logo_path FROM config WHERE id = 1`).Scan(&logoPath)
 	if err != nil || logoPath == nil || *logoPath == "" {
 		http.Error(w, "No logo configured", http.StatusNotFound)
 		return
@@ -314,27 +346,46 @@ func (h *ConfigHandler) GetLogo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if file exists
-	if _, err := os.Stat(*logoPath); os.IsNotExist(err) {
+	info, err := os.Stat(*logoPath)
+	if err != nil {
 		http.Error(w, "Logo file not found", http.StatusNotFound)
 		return
 	}
 
-	mimeType, err := detectPathContentType(*logoPath)
-	if err != nil || !allowedLogoMIMETypes[mimeType] {
-		logger.Warn("Blocked invalid logo content", "path", *logoPath, "mime_type", mimeType, "error", err)
-		http.Error(w, "Invalid logo file", http.StatusUnsupportedMediaType)
-		return
+	// Sniff the content type once per file revision. The sniff (not the stored
+	// extension) stays authoritative so a swapped-on-disk file can't be served
+	// under a stale type, but repeat requests skip the extra open+read.
+	statKey := logoStatKey{path: *logoPath, modTime: info.ModTime(), size: info.Size()}
+	h.logoMIMEMu.Lock()
+	mimeType := h.logoMIMEValue
+	cached := h.logoMIMEKey == statKey && mimeType != ""
+	h.logoMIMEMu.Unlock()
+
+	if !cached {
+		mimeType, err = detectPathContentType(*logoPath)
+		if err != nil || !allowedLogoMIMETypes[mimeType] {
+			logger.Warn("Blocked invalid logo content", "path", *logoPath, "mime_type", mimeType, "error", err)
+			http.Error(w, "Invalid logo file", http.StatusUnsupportedMediaType)
+			return
+		}
+		h.logoMIMEMu.Lock()
+		h.logoMIMEKey = statKey
+		h.logoMIMEValue = mimeType
+		h.logoMIMEMu.Unlock()
 	}
 
 	w.Header().Set("Content-Type", mimeType)
+	w.Header().Set("Cache-Control", "public, max-age=3600")
 	http.ServeFile(w, r, *logoPath)
 }
 
 // DeleteLogo removes the default watermark logo
 func (h *ConfigHandler) DeleteLogo(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := database.WithTimeout(r.Context())
+	defer cancel()
+
 	var logoPath *string
-	err := h.db.QueryRow(`SELECT default_watermark_logo_path FROM config WHERE id = 1`).Scan(&logoPath)
+	err := h.db.QueryRowContext(ctx, `SELECT default_watermark_logo_path FROM config WHERE id = 1`).Scan(&logoPath)
 	if err != nil || logoPath == nil || *logoPath == "" {
 		http.Error(w, "No logo configured", http.StatusNotFound)
 		return
@@ -358,7 +409,7 @@ func (h *ConfigHandler) DeleteLogo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Clear database reference
-	_, err = h.db.Exec(`UPDATE config SET default_watermark_logo_path = NULL WHERE id = 1`)
+	_, err = h.db.ExecContext(ctx, `UPDATE config SET default_watermark_logo_path = NULL WHERE id = 1`)
 	if err != nil {
 		logger.Error("Failed to clear logo path in database", "error", err)
 		http.Error(w, "Failed to remove logo configuration", http.StatusInternalServerError)
@@ -445,9 +496,11 @@ func (h *ConfigHandler) TestTURN(w http.ResponseWriter, r *http.Request) {
 
 	// Persist the result with the current effective TURN signature so the setup
 	// status can tell whether a stored test is still valid for this config.
-	if _, err := h.db.Exec(`INSERT OR IGNORE INTO config (id) VALUES (1)`); err != nil {
+	ctx, cancel := database.WithTimeout(r.Context())
+	defer cancel()
+	if _, err := h.db.ExecContext(ctx, `INSERT OR IGNORE INTO config (id) VALUES (1)`); err != nil {
 		logger.Error("Failed to ensure config exists", "error", err)
-	} else if _, err := h.db.Exec(`
+	} else if _, err := h.db.ExecContext(ctx, `
 		UPDATE config
 		SET turn_last_tested_at = CURRENT_TIMESTAMP,
 		    turn_last_test_success = ?,
@@ -493,10 +546,16 @@ type effectiveTURNSettings struct {
 // override"; an empty-string DB column means "explicitly cleared" and is used
 // as-is. This matches what Get displays and what the SFU runtime receives.
 func effectiveTURNSettingsFor(db *database.DB, cfg *config.Config) effectiveTURNSettings {
+	// Bounded internally rather than by a caller context: this helper is also
+	// invoked outside request scope (SFU runtime sync at construction), and a
+	// stalled read here must not pin a pooled connection indefinitely.
+	ctx, cancel := database.WithTimeout(context.Background())
+	defer cancel()
+
 	var dbURL, dbUser, dbCred *string
 	// A missing config row is fine — every column stays nil and we fall back to
 	// the environment.
-	_ = db.QueryRow(`
+	_ = db.QueryRowContext(ctx, `
 		SELECT turn_external_url, turn_external_username, turn_external_credential
 		FROM config WHERE id = 1
 	`).Scan(&dbURL, &dbUser, &dbCred)

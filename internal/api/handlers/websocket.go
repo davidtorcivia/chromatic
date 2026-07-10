@@ -974,6 +974,12 @@ func (h *WebSocketHandler) sendChatHistory(client *websocket.Client, slug string
 
 		messages = append(messages, msg)
 	}
+	if err := rows.Err(); err != nil {
+		// Send nothing rather than a silently truncated transcript — the client
+		// treats chat:history as the complete recent history.
+		logger.Warn("Chat history iteration failed", "room", slug, "error", err)
+		return
+	}
 
 	// Rows came back newest-first so the client receives oldest-first.
 	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {

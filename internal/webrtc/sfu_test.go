@@ -1,6 +1,7 @@
 package webrtc
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -805,10 +806,10 @@ func TestSFU_AbortPublisherOffer_RemovesOnlyMatchingOffer(t *testing.T) {
 	room := sfu.GetRoomTracks(roomSlug)
 
 	current := &VoiceSession{
-		ParticipantID:    participantID,
-		PublisherOfferID: "publish-2",
-		done:             make(chan struct{}),
+		ParticipantID: participantID,
+		done:          make(chan struct{}),
 	}
+	current.SetPublisherOfferID("publish-2")
 	room.mu.Lock()
 	if room.VoiceSessions == nil {
 		room.VoiceSessions = make(map[string]*VoiceSession)
@@ -1433,7 +1434,9 @@ func TestSFU_AddPublisherCandidate_BuffersBeforeSession(t *testing.T) {
 	if room.VoiceSessions == nil {
 		room.VoiceSessions = make(map[string]*VoiceSession)
 	}
-	room.VoiceSessions[participantID] = &VoiceSession{ParticipantID: participantID, PublisherOfferID: "publish-1", done: make(chan struct{})}
+	flushSession := &VoiceSession{ParticipantID: participantID, done: make(chan struct{})}
+	flushSession.SetPublisherOfferID("publish-1")
+	room.VoiceSessions[participantID] = flushSession
 	room.mu.Unlock()
 	pc, err := sfu.CreatePeerConnection()
 	if err != nil {
@@ -1471,13 +1474,14 @@ func TestSFU_AddPublisherCandidate_IgnoresStaleOfferID(t *testing.T) {
 	if room.VoiceSessions == nil {
 		room.VoiceSessions = make(map[string]*VoiceSession)
 	}
-	room.mu.Lock()
-	room.VoiceSessions[participantID] = &VoiceSession{
-		ParticipantID:    participantID,
-		PeerConnection:   pc,
-		PublisherOfferID: "publish-current",
-		done:             make(chan struct{}),
+	staleSession := &VoiceSession{
+		ParticipantID:  participantID,
+		PeerConnection: pc,
+		done:           make(chan struct{}),
 	}
+	staleSession.SetPublisherOfferID("publish-current")
+	room.mu.Lock()
+	room.VoiceSessions[participantID] = staleSession
 	room.mu.Unlock()
 
 	candidate := webrtc.ICECandidateInit{Candidate: "candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host"}
@@ -1862,7 +1866,7 @@ func TestWHIPHandler_TeardownFiresOnce(t *testing.T) {
 
 	var endCalls int32
 	handler := NewWHIPHandler(sfu,
-		func(string) (bool, error) { return true, nil },
+		func(context.Context, string) (bool, error) { return true, nil },
 		func(string) error { return nil },
 		func(string) { atomic.AddInt32(&endCalls, 1) },
 	)

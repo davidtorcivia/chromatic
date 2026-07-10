@@ -3,10 +3,7 @@
     import { activeReviewToolCount, setReviewToolActive, underPressure } from "$lib/perf/loadMonitor";
     import { onMount } from "svelte";
     import { session } from "$lib/stores/session.svelte";
-    import {
-        clientToVideoCoords,
-        getVideoContentRect,
-    } from "$lib/video/coordinates";
+    import { getVideoContentRect } from "$lib/video/coordinates";
     import {
         midpointSlice,
         flattenSlice,
@@ -248,18 +245,23 @@
         // set to none above so the drag doesn't scroll the page.
         const handleVideoPointerDown = (e: PointerEvent) => {
             if (!enabled || e.button !== 0 || isPointing) return;
-            if (!beginLocalStroke(e)) return;
+            // One coalesce+layout pass per event, shared by the local stamp
+            // and the network send paths.
+            const batch = coalescedCoords(e);
+            if (!beginLocalStroke(batch)) return;
             if (e.pointerType === "touch") e.preventDefault();
             showUsageHint = false;
             activePointerId = e.pointerId;
             isPointing = true;
-            sendCursor(e);
+            sendCursor(batch);
         };
 
         const handleGlobalPointerMove = (e: PointerEvent) => {
             if (!isPointing || activePointerId !== e.pointerId) return;
-            extendLocalStroke(e);
-            sendCursor(e);
+            const batch = coalescedCoords(e);
+            if (batch.length === 0) return; // pointer currently outside the video
+            extendLocalStroke(batch);
+            sendCursor(batch);
         };
 
         const handleGlobalPointerUp = (e: PointerEvent) => {
@@ -436,20 +438,24 @@
 
     // Browsers coalesce pointer events: one pointermove can carry many true
     // samples. Capture them all so fast flicks keep their real geometry.
+    // Layout is read once per event, not per sample: a fast flick carries ~8
+    // coalesced samples and this runs on the drawing hot path.
     function coalescedCoords(e: PointerEvent): BatchPoint[] {
-        const events =
-            typeof e.getCoalescedEvents === "function" && e.getCoalescedEvents().length > 0
-                ? e.getCoalescedEvents()
-                : [e];
+        const coalesced = typeof e.getCoalescedEvents === "function" ? e.getCoalescedEvents() : [];
+        const events = coalesced.length > 0 ? coalesced : [e];
+        const elementRect = videoElement.getBoundingClientRect();
+        const contentRect = getVideoContentRect(videoElement, elementRect);
         const out: BatchPoint[] = [];
         for (const ce of events) {
-            const c = clientToVideoCoords(ce.clientX, ce.clientY, videoElement);
+            const nx = (ce.clientX - elementRect.left - contentRect.x) / contentRect.width;
+            const ny = (ce.clientY - elementRect.top - contentRect.y) / contentRect.height;
             // Drop samples outside the video content (letterbox bars, the
-            // screen-share pane in split view). clientToVideoCoords clamps
-            // to 0–1, so sending them pins the stroke along the video edge —
-            // remote viewers see it "squeezed" against the border.
-            if (!c.valid) continue;
-            out.push({ x: c.x, y: c.y });
+            // screen-share pane in split view). Clamping them instead would
+            // pin the stroke along the video edge — remote viewers see it
+            // "squeezed" against the border. (NaN from a zero-size rect also
+            // fails this check and is dropped.)
+            if (!(nx >= 0 && nx <= 1 && ny >= 0 && ny <= 1)) continue;
+            out.push({ x: nx, y: ny });
         }
         return out;
     }
@@ -619,8 +625,7 @@
         return true;
     }
 
-    function beginLocalStroke(e: PointerEvent): boolean {
-        const batch = coalescedCoords(e);
+    function beginLocalStroke(batch: BatchPoint[]): boolean {
         if (batch.length === 0) return false;
         const cursor = localCursor();
         if (!cursor) return false;
@@ -632,8 +637,7 @@
         return true;
     }
 
-    function extendLocalStroke(e: PointerEvent) {
-        const batch = coalescedCoords(e);
+    function extendLocalStroke(batch: BatchPoint[]) {
         if (batch.length === 0) return;
         const cursor = localCursor();
         if (!cursor) return;
@@ -664,8 +668,7 @@
     // {points: [...], active} goes out per ~30Hz tick (first sample of a
     // stroke flushes immediately so remote strokes start without delay).
 
-    function sendCursor(e: PointerEvent) {
-        const batch = coalescedCoords(e);
+    function sendCursor(batch: BatchPoint[]) {
         if (batch.length === 0) return; // pointer currently outside the video
         pendingPoints.push(...batch);
         lastQueuedPos = batch[batch.length - 1];

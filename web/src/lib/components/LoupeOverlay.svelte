@@ -133,6 +133,38 @@ void main() {
         }
     }
 
+    // Context-loss resilience (iOS drops WebGL contexts aggressively under
+    // memory pressure/backgrounding). Without preventDefault the context stays
+    // permanently lost and the lens would render blank forever; with it the
+    // browser restores the context and we rebuild the GPU resources. While
+    // lost, gl is null and draw() falls through to the 2D path, which hides
+    // the lens (the canvas is bound to WebGL, so getContext("2d") is null).
+    function handleContextLost(e: Event) {
+        e.preventDefault();
+        gl = null;
+    }
+
+    function handleContextRestored() {
+        // Every GPU resource died with the old context; rebuild from scratch.
+        glProgram = null;
+        uTex = null;
+        uniforms = {};
+        texIsNearest = false;
+        lastUploadAt = 0;
+        initGL();
+    }
+
+    $effect(() => {
+        const canvas = canvasEl;
+        if (!canvas) return;
+        canvas.addEventListener("webglcontextlost", handleContextLost);
+        canvas.addEventListener("webglcontextrestored", handleContextRestored);
+        return () => {
+            canvas.removeEventListener("webglcontextlost", handleContextLost);
+            canvas.removeEventListener("webglcontextrestored", handleContextRestored);
+        };
+    });
+
     let lastSource: HTMLVideoElement | null = null;
 
     /** Whichever playing video sits under the cursor (share pane wins ties

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -227,7 +228,7 @@ func TestStreamKeyHandler_ValidateKey(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := handler.ValidateKey(tt.token)
+			result, err := handler.ValidateKey(context.Background(), tt.token)
 			if err != nil && tt.expected {
 				t.Errorf("unexpected error: %v", err)
 			}

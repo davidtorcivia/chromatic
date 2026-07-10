@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net/http"
@@ -86,7 +87,9 @@ func NewSetupHandler(db *database.DB, cfg *config.Config) *SetupHandler {
 
 // Status returns the current server-computed setup status.
 func (h *SetupHandler) Status(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, h.buildStatus())
+	ctx, cancel := database.WithTimeout(r.Context())
+	defer cancel()
+	respondJSON(w, h.buildStatus(ctx))
 }
 
 // Complete marks setup complete. It recomputes status first: if any required
@@ -94,46 +97,52 @@ func (h *SetupHandler) Status(w http.ResponseWriter, r *http.Request) {
 // it stamps setup_completed_at (clearing any prior dismissal) and returns the
 // updated status.
 func (h *SetupHandler) Complete(w http.ResponseWriter, r *http.Request) {
-	status := h.buildStatus()
+	ctx, cancel := database.WithTimeout(r.Context())
+	defer cancel()
+
+	status := h.buildStatus(ctx)
 	if !status.ReadyToComplete {
 		w.WriteHeader(http.StatusConflict)
 		respondJSON(w, status)
 		return
 	}
 
-	if _, err := h.db.Exec(`INSERT OR IGNORE INTO config (id) VALUES (1)`); err != nil {
+	if _, err := h.db.ExecContext(ctx, `INSERT OR IGNORE INTO config (id) VALUES (1)`); err != nil {
 		logger.Error("Failed to ensure config exists", "error", err)
 		http.Error(w, "Failed to complete setup", http.StatusInternalServerError)
 		return
 	}
-	if _, err := h.db.Exec(`UPDATE config SET setup_completed_at = CURRENT_TIMESTAMP, setup_dismissed_at = NULL WHERE id = 1`); err != nil {
+	if _, err := h.db.ExecContext(ctx, `UPDATE config SET setup_completed_at = CURRENT_TIMESTAMP, setup_dismissed_at = NULL WHERE id = 1`); err != nil {
 		logger.Error("Failed to mark setup complete", "error", err)
 		http.Error(w, "Failed to complete setup", http.StatusInternalServerError)
 		return
 	}
 
-	respondJSON(w, h.buildStatus())
+	respondJSON(w, h.buildStatus(ctx))
 }
 
 // Dismiss records that the admin dismissed the setup banner without completing
 // it, then returns the updated status.
 func (h *SetupHandler) Dismiss(w http.ResponseWriter, r *http.Request) {
-	if _, err := h.db.Exec(`INSERT OR IGNORE INTO config (id) VALUES (1)`); err != nil {
+	ctx, cancel := database.WithTimeout(r.Context())
+	defer cancel()
+
+	if _, err := h.db.ExecContext(ctx, `INSERT OR IGNORE INTO config (id) VALUES (1)`); err != nil {
 		logger.Error("Failed to ensure config exists", "error", err)
 		http.Error(w, "Failed to dismiss setup", http.StatusInternalServerError)
 		return
 	}
-	if _, err := h.db.Exec(`UPDATE config SET setup_dismissed_at = CURRENT_TIMESTAMP WHERE id = 1`); err != nil {
+	if _, err := h.db.ExecContext(ctx, `UPDATE config SET setup_dismissed_at = CURRENT_TIMESTAMP WHERE id = 1`); err != nil {
 		logger.Error("Failed to dismiss setup", "error", err)
 		http.Error(w, "Failed to dismiss setup", http.StatusInternalServerError)
 		return
 	}
 
-	respondJSON(w, h.buildStatus())
+	respondJSON(w, h.buildStatus(ctx))
 }
 
 // buildStatus computes the full SetupStatusResponse from the live config and DB.
-func (h *SetupHandler) buildStatus() SetupStatusResponse {
+func (h *SetupHandler) buildStatus(ctx context.Context) SetupStatusResponse {
 	cfg := h.cfg
 	facts := SetupFacts{
 		PublicURL:                cfg.PublicURL,
@@ -160,19 +169,19 @@ func (h *SetupHandler) buildStatus() SetupStatusResponse {
 	checks = append(checks, tcCheck)
 
 	// 4. turn-connectivity (required) — also populates last-test facts.
-	connCheck := h.turnConnectivityCheck(&facts)
+	connCheck := h.turnConnectivityCheck(ctx, &facts)
 	checks = append(checks, connCheck)
 
 	// 5. stream-key (required)
-	keyCheck := h.streamKeyCheck(&facts)
+	keyCheck := h.streamKeyCheck(ctx, &facts)
 	checks = append(checks, keyCheck)
 
 	// 6. room (required)
-	roomCheck := h.roomCheck(&facts)
+	roomCheck := h.roomCheck(ctx, &facts)
 	checks = append(checks, roomCheck)
 
 	// 7. branding (optional)
-	brandCheck := h.brandingCheck(&facts)
+	brandCheck := h.brandingCheck(ctx, &facts)
 	checks = append(checks, brandCheck)
 
 	// Progress rollup over required checks only.
@@ -189,7 +198,7 @@ func (h *SetupHandler) buildStatus() SetupStatusResponse {
 	readyToComplete := progress.Required > 0 && progress.Ready == progress.Required
 
 	var completedAt, dismissedAt sql.NullString
-	_ = h.db.QueryRow(`SELECT setup_completed_at, setup_dismissed_at FROM config WHERE id = 1`).Scan(&completedAt, &dismissedAt)
+	_ = h.db.QueryRowContext(ctx, `SELECT setup_completed_at, setup_dismissed_at FROM config WHERE id = 1`).Scan(&completedAt, &dismissedAt)
 
 	resp := SetupStatusResponse{
 		ReadyToComplete: readyToComplete,
@@ -348,12 +357,12 @@ func turnConfigCheck(cfg *config.Config, turn effectiveTURNSettings) SetupCheck 
 
 // turnConnectivityCheck implements the turn-connectivity required check and
 // populates the last-test facts on the report.
-func (h *SetupHandler) turnConnectivityCheck(facts *SetupFacts) SetupCheck {
+func (h *SetupHandler) turnConnectivityCheck(ctx context.Context, facts *SetupFacts) SetupCheck {
 	c := SetupCheck{ID: "turn-connectivity", Title: "TURN reachability", Required: true, Status: SetupCheckNeedsAction}
 
 	var testedAt, lastMsg, lastSig sql.NullString
 	var lastSuccess sql.NullBool
-	_ = h.db.QueryRow(`
+	_ = h.db.QueryRowContext(ctx, `
 		SELECT turn_last_tested_at, turn_last_test_success, turn_last_test_message, turn_last_test_signature
 		FROM config WHERE id = 1
 	`).Scan(&testedAt, &lastSuccess, &lastMsg, &lastSig)
@@ -390,15 +399,15 @@ func (h *SetupHandler) turnConnectivityCheck(facts *SetupFacts) SetupCheck {
 }
 
 // streamKeyCheck implements the stream-key required check.
-func (h *SetupHandler) streamKeyCheck(facts *SetupFacts) SetupCheck {
+func (h *SetupHandler) streamKeyCheck(ctx context.Context, facts *SetupFacts) SetupCheck {
 	c := SetupCheck{ID: "stream-key", Title: "Stream key", Required: true, Status: SetupCheckNeedsAction}
 
 	var count int
-	_ = h.db.QueryRow(`SELECT COUNT(*) FROM stream_keys`).Scan(&count)
+	_ = h.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM stream_keys`).Scan(&count)
 	facts.StreamKeyCount = count
 
 	var firstID sql.NullString
-	_ = h.db.QueryRow(`SELECT id FROM stream_keys ORDER BY created_at DESC LIMIT 1`).Scan(&firstID)
+	_ = h.db.QueryRowContext(ctx, `SELECT id FROM stream_keys ORDER BY created_at DESC LIMIT 1`).Scan(&firstID)
 
 	if count > 0 {
 		c.Status = SetupCheckReady
@@ -416,15 +425,15 @@ func (h *SetupHandler) streamKeyCheck(facts *SetupFacts) SetupCheck {
 }
 
 // roomCheck implements the room required check.
-func (h *SetupHandler) roomCheck(facts *SetupFacts) SetupCheck {
+func (h *SetupHandler) roomCheck(ctx context.Context, facts *SetupFacts) SetupCheck {
 	c := SetupCheck{ID: "room", Title: "First room", Required: true, Status: SetupCheckNeedsAction}
 
 	var count int
-	_ = h.db.QueryRow(`SELECT COUNT(*) FROM rooms`).Scan(&count)
+	_ = h.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rooms`).Scan(&count)
 	facts.RoomCount = count
 
 	var firstSlug sql.NullString
-	_ = h.db.QueryRow(`SELECT slug FROM rooms ORDER BY created_at DESC LIMIT 1`).Scan(&firstSlug)
+	_ = h.db.QueryRowContext(ctx, `SELECT slug FROM rooms ORDER BY created_at DESC LIMIT 1`).Scan(&firstSlug)
 
 	if count > 0 {
 		c.Status = SetupCheckReady
@@ -442,11 +451,11 @@ func (h *SetupHandler) roomCheck(facts *SetupFacts) SetupCheck {
 }
 
 // brandingCheck implements the optional branding check.
-func (h *SetupHandler) brandingCheck(facts *SetupFacts) SetupCheck {
+func (h *SetupHandler) brandingCheck(ctx context.Context, facts *SetupFacts) SetupCheck {
 	c := SetupCheck{ID: "branding", Title: "Default branding", Required: false, Status: SetupCheckOptional, Summary: "Default branding can be set later."}
 
 	var wmText, wmLogoPath sql.NullString
-	_ = h.db.QueryRow(`SELECT default_watermark_text, default_watermark_logo_path FROM config WHERE id = 1`).Scan(&wmText, &wmLogoPath)
+	_ = h.db.QueryRowContext(ctx, `SELECT default_watermark_text, default_watermark_logo_path FROM config WHERE id = 1`).Scan(&wmText, &wmLogoPath)
 
 	if wmText.Valid && wmText.String != "" {
 		s := wmText.String

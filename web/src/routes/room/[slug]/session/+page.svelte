@@ -267,7 +267,7 @@
     // to detect "participant left while the async analyser setup was in
     // flight" so the source node gets disconnected instead of leaking.
     let activeVoicePids = new Set<string>();
-    let vadFrame: ReturnType<typeof requestAnimationFrame> | null = null;
+    let vadTimer: ReturnType<typeof setInterval> | null = null;
     // Buffer voice tracks that arrive before voicePlaybackManager is created
     // (can happen when voice relay tracks are in the initial offer and ontrack
     // fires for them before the main video/audio track triggers handleTrack).
@@ -1395,7 +1395,7 @@
             voiceAnalysers.set(participantId, { analyser, source });
 
             // Start VAD monitoring if not running
-            if (!vadFrame) startVADMonitoring();
+            if (!vadTimer) startVADMonitoring();
         }).catch(err => {
             console.warn('Failed to set up VAD for participant', participantId, err);
         });
@@ -1475,9 +1475,9 @@
         pendingVoiceTracks.delete(participantId);
         voicePlaybackManager?.removeVoiceTrack(participantId);
         // Stop the VAD loop when the last analyser is gone
-        if (voiceAnalysers.size === 0 && vadFrame) {
-            cancelAnimationFrame(vadFrame);
-            vadFrame = null;
+        if (voiceAnalysers.size === 0 && vadTimer) {
+            clearInterval(vadTimer);
+            vadTimer = null;
         }
         // Drop any lingering speaking indicator for the departed participant
         if (speakingParticipants.has(participantId)) {
@@ -1732,10 +1732,19 @@
         let current: MediaStream | null = null;
         let watched: MediaStream | null = null;
         let raf: number | null = null;
+        let vfc: number | null = null;
+        let lastFallbackDraw = 0;
         let mirror = options.mirror ?? false;
         let destroyedCanvas = false;
         const ctx = node.getContext("2d", { alpha: true });
         const trackListeners: MediaStreamTrack[] = [];
+        // Draw on new video frames, not on every display frame: cam capture is
+        // ~24fps while displays run 60–120Hz (ProMotion), so an unconditional
+        // rAF loop redraws identical frames 2–5x — per pill, for the whole
+        // session. rVFC fires only when the source produced a frame; the rAF
+        // fallback (older Firefox) is gated to ~30fps.
+        const hasVFC = typeof (video as any).requestVideoFrameCallback === "function";
+        const FALLBACK_FRAME_MS = 1000 / 30;
 
         const clearCanvas = () => {
             if (!ctx) return;
@@ -1772,17 +1781,29 @@
             scheduleDraw();
         };
 
-        const ensureCanvasSize = () => {
-            const rect = node.getBoundingClientRect();
+        // Backing-store size is cached and maintained by a ResizeObserver;
+        // reading layout (getBoundingClientRect) inside the per-frame draw
+        // would force a synchronous layout on every frame of every cam pill.
+        const applyCanvasSize = (cssWidth: number, cssHeight: number) => {
             const dpr = Math.min(window.devicePixelRatio || 1, 2);
-            const width = Math.max(1, Math.round((rect.width || 64) * dpr));
-            const height = Math.max(1, Math.round((rect.height || 64) * dpr));
+            const width = Math.max(1, Math.round((cssWidth || 64) * dpr));
+            const height = Math.max(1, Math.round((cssHeight || 64) * dpr));
             if (node.width !== width) node.width = width;
             if (node.height !== height) node.height = height;
         };
+        const initialRect = node.getBoundingClientRect();
+        applyCanvasSize(initialRect.width, initialRect.height);
+        const resizeObserver = new ResizeObserver((entries) => {
+            for (const entry of entries) {
+                applyCanvasSize(entry.contentRect.width, entry.contentRect.height);
+            }
+            scheduleDraw();
+        });
+        resizeObserver.observe(node);
 
         const drawFrame = () => {
             raf = null;
+            vfc = null;
             if (destroyedCanvas || !current || !ctx) return;
             scheduleDraw();
             if (
@@ -1793,7 +1814,6 @@
                 return;
             }
 
-            ensureCanvasSize();
             const w = node.width;
             const h = node.height;
             if (!w || !h) return;
@@ -1825,10 +1845,38 @@
             ctx.restore();
         };
 
+        const fallbackLoop = (ts: number) => {
+            raf = null;
+            if (destroyedCanvas || !current) return;
+            if (ts - lastFallbackDraw < FALLBACK_FRAME_MS) {
+                raf = requestAnimationFrame(fallbackLoop);
+                return;
+            }
+            lastFallbackDraw = ts;
+            drawFrame();
+        };
+
         function scheduleDraw() {
-            if (destroyedCanvas || raf !== null || !current) return;
-            raf = requestAnimationFrame(drawFrame);
+            if (destroyedCanvas || !current) return;
+            if (hasVFC) {
+                if (vfc !== null) return;
+                vfc = (video as any).requestVideoFrameCallback(drawFrame);
+            } else {
+                if (raf !== null) return;
+                raf = requestAnimationFrame(fallbackLoop);
+            }
         }
+
+        const cancelDraws = () => {
+            if (raf !== null) {
+                cancelAnimationFrame(raf);
+                raf = null;
+            }
+            if (vfc !== null) {
+                (video as any).cancelVideoFrameCallback?.(vfc);
+                vfc = null;
+            }
+        };
 
         const apply = (next: CanvasStreamOptions) => {
             mirror = next.mirror ?? false;
@@ -1838,10 +1886,7 @@
                 return;
             }
 
-            if (raf !== null) {
-                cancelAnimationFrame(raf);
-                raf = null;
-            }
+            cancelDraws();
             detachTracks();
             if (watched) {
                 watched.removeEventListener("addtrack", onAddTrack);
@@ -1869,7 +1914,8 @@
             update: apply,
             destroy() {
                 destroyedCanvas = true;
-                if (raf !== null) cancelAnimationFrame(raf);
+                cancelDraws();
+                resizeObserver.disconnect();
                 video.removeEventListener("loadeddata", onLoaded);
                 detachTracks();
                 if (watched) watched.removeEventListener("addtrack", onAddTrack);
@@ -1991,17 +2037,13 @@
     }
 
     function startVADMonitoring() {
-        // Reuse a single buffer to avoid allocating on every frame
+        // Reuse a single buffer to avoid allocating on every check
         let vadBuffer: Uint8Array<ArrayBuffer> | null = null;
-        // Throttle to ~15fps (every 4th animation frame) — sufficient for
-        // speaker detection while significantly reducing CPU usage on mobile.
-        let vadFrameCount = 0;
+        // ~15Hz is plenty for speaker detection and isn't display-synchronized,
+        // so an interval expresses it directly — a rAF loop would wake the main
+        // thread on every compositor frame (120Hz on ProMotion) just to skip
+        // 3 out of 4 wakeups.
         const check = () => {
-            vadFrameCount++;
-            if (vadFrameCount % 4 !== 0) {
-                vadFrame = requestAnimationFrame(check);
-                return;
-            }
             let changed = false;
             const newSpeaking = new Set<string>();
             for (const [pid, { analyser }] of voiceAnalysers) {
@@ -2029,17 +2071,16 @@
             if (changed) {
                 speakingParticipants = newSpeaking;
             }
-            vadFrame = requestAnimationFrame(check);
         };
-        vadFrame = requestAnimationFrame(check);
+        vadTimer = setInterval(check, 66);
     }
 
     function cleanupWebRTC() {
         stopStatsPolling();
         stopICEServerRefresh();
-        if (vadFrame) {
-            cancelAnimationFrame(vadFrame);
-            vadFrame = null;
+        if (vadTimer) {
+            clearInterval(vadTimer);
+            vadTimer = null;
         }
         // Disconnect voice analyser source nodes explicitly so they release
         // their MediaStream source and let the browser GC the tracks;
@@ -2554,17 +2595,24 @@
     }
 
     // Display fps and browser-provided WebRTC frame timing for the stats card,
-    // measured only while it's open.
+    // measured only while it's open. Delays smooth into plain locals per frame
+    // and commit to reactive state on a 250ms timer — writing $state at frame
+    // rate would re-render the stats card up to 60x/s for numbers the eye
+    // can't follow anyway.
     $effect(() => {
         const video = videoElement;
         if (!showStats || !video || !("requestVideoFrameCallback" in video)) return;
         let frames = 0;
         let windowStart = performance.now();
         let handle = 0;
+        let captureDelay: number | null = null;
+        let receiveDelay: number | null = null;
+        let processingDelay: number | null = null;
+        let fps: number | null = null;
         const tick = (now: number, metadata: VideoFrameCallbackMetadata) => {
             frames++;
             if (now - windowStart >= 1000) {
-                displayFps = Math.round((frames * 1000) / (now - windowStart));
+                fps = Math.round((frames * 1000) / (now - windowStart));
                 frames = 0;
                 windowStart = now;
             }
@@ -2572,26 +2620,33 @@
             if (typeof metadata.captureTime === "number") {
                 const delay = saneFrameDelay(displayTime - metadata.captureTime);
                 if (delay !== null) {
-                    frameCaptureToDisplayDelay = smoothFrameDelay(frameCaptureToDisplayDelay, delay);
+                    captureDelay = smoothFrameDelay(captureDelay, delay);
                 }
             }
             if (typeof metadata.receiveTime === "number") {
                 const delay = saneFrameDelay(displayTime - metadata.receiveTime);
                 if (delay !== null) {
-                    frameReceiveToDisplayDelay = smoothFrameDelay(frameReceiveToDisplayDelay, delay);
+                    receiveDelay = smoothFrameDelay(receiveDelay, delay);
                 }
             }
             if (typeof metadata.processingDuration === "number") {
-                frameProcessingDelay = smoothFrameDelay(
-                    frameProcessingDelay,
+                processingDelay = smoothFrameDelay(
+                    processingDelay,
                     metadata.processingDuration * 1000,
                 );
             }
             handle = (video as any).requestVideoFrameCallback(tick);
         };
         handle = (video as any).requestVideoFrameCallback(tick);
+        const flush = setInterval(() => {
+            displayFps = fps;
+            frameCaptureToDisplayDelay = captureDelay;
+            frameReceiveToDisplayDelay = receiveDelay;
+            frameProcessingDelay = processingDelay;
+        }, 250);
         return () => {
             (video as any).cancelVideoFrameCallback?.(handle);
+            clearInterval(flush);
             displayFps = null;
             frameCaptureToDisplayDelay = null;
             frameReceiveToDisplayDelay = null;

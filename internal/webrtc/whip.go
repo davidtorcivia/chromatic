@@ -1,6 +1,7 @@
 package webrtc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,13 +21,13 @@ import (
 // WHIPHandler handles WHIP protocol requests from OBS
 type WHIPHandler struct {
 	sfu           *SFU
-	validateKey   func(token string) (bool, error)
+	validateKey   func(ctx context.Context, token string) (bool, error)
 	onStreamStart func(token string) error
 	onStreamEnd   func(token string)
 }
 
 // NewWHIPHandler creates a new WHIP handler
-func NewWHIPHandler(sfu *SFU, validateKey func(string) (bool, error), onStart func(string) error, onEnd func(string)) *WHIPHandler {
+func NewWHIPHandler(sfu *SFU, validateKey func(context.Context, string) (bool, error), onStart func(string) error, onEnd func(string)) *WHIPHandler {
 	return &WHIPHandler{
 		sfu:           sfu,
 		validateKey:   validateKey,
@@ -71,7 +72,7 @@ func keyPrefix(token string) string {
 // handleOffer handles the initial SDP offer from OBS
 func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token string) {
 	// Validate stream key
-	valid, err := h.validateKey(token)
+	valid, err := h.validateKey(r.Context(), token)
 	if err != nil {
 		log.Printf("Error validating stream key: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -142,6 +143,12 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 		"audio",
 		"chromatic-stream",
 	)
+	if err != nil {
+		pc.Close()
+		log.Printf("Failed to create audio track: %v", err)
+		http.Error(w, "Failed to create audio track", http.StatusInternalServerError)
+		return
+	}
 
 	// Create ingest session
 	session := &IngestSession{
@@ -192,6 +199,9 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 		// DIAGNOSTIC: report ingest packets dropped by the forwarder. A nonzero
 		// delta means the fan-out drain stalled and buffer-full drops corrupted
 		// frames for all viewers simultaneously — the signature of sync stutter.
+		// Ends with the forwarder (not just the session): an in-place track
+		// replacement re-fires OnTrack, and the old ticker must not keep running
+		// against the dead forwarder for the rest of the session.
 		go func() {
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
@@ -199,6 +209,8 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 			for {
 				select {
 				case <-session.done:
+					return
+				case <-forwarder.Done():
 					return
 				case <-ticker.C:
 					if d := forwarder.Dropped(); d != last {

@@ -242,20 +242,28 @@
         if (!canvasEl) return;
         const canvas = canvasEl;
 
+        // Coalesce style checks to one per frame: getComputedStyle forces a
+        // style recalc, and a burst of attribute mutations must not multiply it.
+        let styleCheckScheduled = false;
+        const checkCanvasStyle = () => {
+            styleCheckScheduled = false;
+            const style = window.getComputedStyle(canvas);
+            if (
+                style.display === "none" ||
+                style.visibility === "hidden" ||
+                parseFloat(style.opacity) < 0.1
+            ) {
+                handleTampering();
+            }
+        };
+
         observer = new MutationObserver((mutations) => {
             for (const mutation of mutations) {
                 if (mutation.type === "attributes") {
                     const attr = mutation.attributeName;
-                    if (attr === "style" || attr === "class") {
-                        // Check for visibility/opacity tampering
-                        const style = window.getComputedStyle(canvas);
-                        if (
-                            style.display === "none" ||
-                            style.visibility === "hidden" ||
-                            parseFloat(style.opacity) < 0.1
-                        ) {
-                            handleTampering();
-                        }
+                    if ((attr === "style" || attr === "class") && !styleCheckScheduled) {
+                        styleCheckScheduled = true;
+                        requestAnimationFrame(checkCanvasStyle);
                     }
                 } else if (mutation.type === "childList") {
                     // Check if canvas was removed
@@ -266,17 +274,18 @@
             }
         });
 
-        // Watch the canvas and its parent
+        // Watch the parent for canvas removal only (childList, no subtree, no
+        // attributes): the canvas shares .video-container with the loupe and
+        // laser overlays, which write style.transform/opacity every animation
+        // frame — a subtree style observer here would fire per frame and its
+        // getComputedStyle check would force a style recalc each time,
+        // defeating the frame-skipping done everywhere else.
         const parent = canvas.parentElement;
         if (parent) {
-            observer.observe(parent, {
-                childList: true,
-                subtree: true,
-                attributes: true,
-                attributeFilter: ["style", "class"],
-            });
+            observer.observe(parent, { childList: true });
         }
 
+        // Style/class tampering is only meaningful on the canvas itself.
         observer.observe(canvas, {
             attributes: true,
             attributeFilter: ["style", "class"],

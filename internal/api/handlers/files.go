@@ -406,6 +406,12 @@ func (h *FileHandler) ListRoomFiles(w http.ResponseWriter, r *http.Request) {
 		}
 		files = append(files, entry)
 	}
+	// Distinguish end-of-data from a mid-iteration error (e.g. query deadline)
+	// so a timeout isn't served as a silently truncated file list.
+	if err := rows.Err(); err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
 
 	respondJSON(w, map[string]interface{}{"files": files})
 }
@@ -452,9 +458,18 @@ func (h *FileHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Both deletes run in one transaction: losing the messages delete after the
+	// files delete succeeded would leave a permanently broken attachment
+	// reference in the transcript.
 	delCtx, delCancel := database.WithTimeout(r.Context())
-	if _, err := h.db.ExecContext(delCtx, "DELETE FROM files WHERE id = ?", id); err != nil {
-		delCancel()
+	defer delCancel()
+	tx, err := h.db.BeginTx(delCtx, nil)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback() // no-op after Commit
+	if _, err := tx.ExecContext(delCtx, "DELETE FROM files WHERE id = ?", id); err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
@@ -462,9 +477,15 @@ func (h *FileHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 	// them so reloaded transcripts don't render broken attachments. Escape LIKE
 	// metacharacters in the id (defence in depth on top of validFileID) so the
 	// pattern can only ever match this exact file's reference.
-	_, _ = h.db.ExecContext(delCtx, `DELETE FROM messages WHERE room_id = ? AND type = 'file' AND content LIKE ? ESCAPE '\'`,
-		roomID, `%"`+escapeLikeForID(id)+`"%`)
-	delCancel()
+	if _, err := tx.ExecContext(delCtx, `DELETE FROM messages WHERE room_id = ? AND type = 'file' AND content LIKE ? ESCAPE '\'`,
+		roomID, `%"`+escapeLikeForID(id)+`"%`); err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
 
 	logger.Info("File deleted by admin", "file_id", id, "room_id", roomID)
 	w.WriteHeader(http.StatusNoContent)

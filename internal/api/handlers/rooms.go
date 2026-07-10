@@ -360,6 +360,9 @@ func (h *RoomHandler) handleRoomOpen(slug string) {
 			waitingIDs = append(waitingIDs, id)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		logger.Error("Lobby participant iteration failed on room open", "room", slug, "error", err)
+	}
 	rows.Close()
 	waitCancel()
 
@@ -532,6 +535,14 @@ func (h *RoomHandler) List(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rooms = append(rooms, room)
+	}
+	// rows.Next() returns false on both end-of-data and a mid-iteration error
+	// (e.g. the query deadline firing); without this check a timeout would be
+	// served as a silently truncated room list with a 200.
+	if err := rows.Err(); err != nil {
+		logger.Error("Room list iteration failed", "error", err)
+		http.Error(w, "Failed to retrieve rooms", http.StatusInternalServerError)
+		return
 	}
 
 	respondJSON(w, rooms)
@@ -1401,6 +1412,12 @@ func (h *RoomHandler) ListWaiting(w http.ResponseWriter, r *http.Request) {
 			"joinedAt": joinedAt,
 		})
 	}
+	// Distinguish end-of-data from a mid-iteration error so a timeout isn't
+	// served as a silently truncated waiting list.
+	if err := rows.Err(); err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
 
 	respondJSON(w, participants)
 }
@@ -1541,6 +1558,12 @@ func (h *RoomHandler) AdmitAll(w http.ResponseWriter, r *http.Request) {
 		if err := rows.Scan(&id); err == nil {
 			waitingIDs = append(waitingIDs, id)
 		}
+	}
+	// A mid-iteration error means participants were admitted in the DB but not
+	// captured here — they'd miss their SSE admit notification. Surface it.
+	if err := rows.Err(); err != nil {
+		logger.Error("Admit-all RETURNING iteration failed; some admitted participants may not be notified",
+			"room", slug, "error", err)
 	}
 	rows.Close()
 	admitCancel()
@@ -1857,6 +1880,11 @@ func (h *RoomHandler) assignRoomColor(roomID, participantID string) string {
 		if rows.Scan(&c) == nil {
 			used[c] = true
 		}
+	}
+	if err := rows.Err(); err != nil {
+		// Partial color census — fall back to hash assignment rather than
+		// confidently picking a color that may already be in use.
+		return assignColor(participantID)
 	}
 
 	for _, c := range cursorColors {

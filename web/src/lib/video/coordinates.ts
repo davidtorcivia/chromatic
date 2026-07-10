@@ -9,10 +9,14 @@ export interface VideoRect {
 
 /**
  * Get the actual video content rectangle within a video element
- * that uses object-fit: contain (which may have letterboxing)
+ * that uses object-fit: contain (which may have letterboxing).
+ *
+ * Pass elementRect when the caller already read the element's bounding rect —
+ * getBoundingClientRect is a layout read, and hot paths (per pointer sample)
+ * must not pay it twice.
  */
-export function getVideoContentRect(video: HTMLVideoElement): VideoRect {
-    const elementRect = video.getBoundingClientRect();
+export function getVideoContentRect(video: HTMLVideoElement, elementRect?: DOMRect): VideoRect {
+    elementRect ??= video.getBoundingClientRect();
     const elementWidth = elementRect.width;
     const elementHeight = elementRect.height;
 
@@ -55,7 +59,7 @@ export function getVideoContentPageRect(video: HTMLVideoElement): DOMRect | null
     if (!video.videoWidth || !video.videoHeight) return null;
     const box = video.getBoundingClientRect();
     if (!box.width || !box.height) return null;
-    const r = getVideoContentRect(video);
+    const r = getVideoContentRect(video, box);
     return new DOMRect(box.left + r.x, box.top + r.y, r.width, r.height);
 }
 
@@ -68,7 +72,7 @@ export function clientToVideoCoords(
     video: HTMLVideoElement
 ): { x: number; y: number; valid: boolean } {
     const elementRect = video.getBoundingClientRect();
-    const videoRect = getVideoContentRect(video);
+    const videoRect = getVideoContentRect(video, elementRect);
 
     // Convert client coords to element-relative
     const elementX = clientX - elementRect.left;
