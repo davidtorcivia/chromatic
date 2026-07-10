@@ -16,8 +16,6 @@ const (
 	defaultDatabasePath     = "/data/chromatic.db"
 	defaultUploadPath       = "/data/files"
 	defaultLogoPath         = "/data/logos"
-	defaultOBSReconnect     = "5m"
-	defaultClientPing       = "60s"
 	defaultChromaticImage   = "ghcr.io/davidtorcivia/chromatic:latest"
 	defaultPublicURLProd    = "https://stream.yourdomain.com"
 	defaultPublicURLDev     = "http://localhost:3000"
@@ -140,8 +138,6 @@ func runSetup() int {
 		turnExternalPass:    externalTurnPass,
 		turnCloudflareKeyID: turnCloudflareKeyID,
 		turnCloudflareToken: turnCloudflareAPIToken,
-		obsReconnectTimeout: defaultOBSReconnect,
-		clientPingInterval:  defaultClientPing,
 	})
 
 	if err := os.MkdirAll(filepath.Dir(envPath), 0755); err != nil {
@@ -180,8 +176,6 @@ type envFileParams struct {
 	turnExternalPass    string
 	turnCloudflareKeyID string
 	turnCloudflareToken string
-	obsReconnectTimeout string
-	clientPingInterval  string
 }
 
 func buildEnvFile(p envFileParams) string {
@@ -240,12 +234,6 @@ func buildEnvFile(p envFileParams) string {
 	writeLine(fmt.Sprintf("TURN_EXTERNAL_URL=%s", firstCSVValue(p.turnExternalURLs)))
 	writeLine(fmt.Sprintf("TURN_EXTERNAL_USER=%s", p.turnExternalUser))
 	writeLine(fmt.Sprintf("TURN_EXTERNAL_PASS=%s", p.turnExternalPass))
-	writeLine("")
-	writeLine("# =============================================================================")
-	writeLine("# TIMEOUTS")
-	writeLine("# =============================================================================")
-	writeLine(fmt.Sprintf("OBS_RECONNECT_TIMEOUT=%s", p.obsReconnectTimeout))
-	writeLine(fmt.Sprintf("CLIENT_PING_INTERVAL=%s", p.clientPingInterval))
 	return b.String()
 }
 

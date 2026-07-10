@@ -3,7 +3,6 @@ package config
 import (
 	"os"
 	"testing"
-	"time"
 )
 
 // TestLoad tests configuration loading from environment
@@ -248,57 +247,6 @@ func TestGetEnvInt(t *testing.T) {
 			result := getEnvInt("TEST_INT", tt.default_)
 			if result != tt.expected {
 				t.Errorf("expected %d, got %d", tt.expected, result)
-			}
-		})
-	}
-}
-
-// TestGetEnvDuration tests the getEnvDuration helper
-func TestGetEnvDuration(t *testing.T) {
-	tests := []struct {
-		name     string
-		envValue string
-		default_ time.Duration
-		expected time.Duration
-	}{
-		{
-			name:     "valid duration",
-			envValue: "5m",
-			default_: time.Minute,
-			expected: 5 * time.Minute,
-		},
-		{
-			name:     "valid duration seconds",
-			envValue: "30s",
-			default_: time.Minute,
-			expected: 30 * time.Second,
-		},
-		{
-			name:     "invalid duration",
-			envValue: "not-a-duration",
-			default_: time.Minute,
-			expected: time.Minute,
-		},
-		{
-			name:     "empty value",
-			envValue: "",
-			default_: time.Minute,
-			expected: time.Minute,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			os.Setenv("TEST_DURATION", tt.envValue)
-			defer os.Unsetenv("TEST_DURATION")
-
-			if tt.envValue == "" {
-				os.Unsetenv("TEST_DURATION")
-			}
-
-			result := getEnvDuration("TEST_DURATION", tt.default_)
-			if result != tt.expected {
-				t.Errorf("expected %v, got %v", tt.expected, result)
 			}
 		})
 	}

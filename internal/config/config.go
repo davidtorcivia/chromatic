@@ -6,7 +6,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 )
 
 const (
@@ -58,10 +57,6 @@ type Config struct {
 	TurnCloudflareCredentialTTL  int
 	TurnCloudflareCredentialSkew int
 
-	// Timeouts
-	OBSReconnectTimeout time.Duration
-	ClientPingInterval  time.Duration
-
 	// ICELoopbackOnly restricts ICE gathering to loopback addresses and
 	// disables mDNS. Test-only (set by test helpers, never loaded from the
 	// environment): it keeps the ad-hoc `go test` binaries from listening on
@@ -96,8 +91,6 @@ func Load() (*Config, error) {
 		),
 		TurnCloudflareCredentialTTL:  getEnvInt("TURN_CLOUDFLARE_CREDENTIAL_TTL", 3600),
 		TurnCloudflareCredentialSkew: getEnvInt("TURN_CLOUDFLARE_CREDENTIAL_SKEW", 60),
-		OBSReconnectTimeout:          getEnvDuration("OBS_RECONNECT_TIMEOUT", 5*time.Minute),
-		ClientPingInterval:           getEnvDuration("CLIENT_PING_INTERVAL", 60*time.Second),
 	}
 
 	// Support legacy TURN_EXTERNAL_URL when TURN_EXTERNAL_URLS is not set.
@@ -206,16 +199,6 @@ func getEnvInt(key string, defaultValue int) int {
 	if value := os.Getenv(key); value != "" {
 		if i, err := strconv.Atoi(value); err == nil {
 			return i
-		}
-	}
-	return defaultValue
-}
-
-// getEnvDuration gets a duration environment variable with a default value
-func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
-	if value := os.Getenv(key); value != "" {
-		if d, err := time.ParseDuration(value); err == nil {
-			return d
 		}
 	}
 	return defaultValue
