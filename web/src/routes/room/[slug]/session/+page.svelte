@@ -15,7 +15,9 @@
         storeCameraDeviceId,
     } from "$lib/webrtc/manager";
     import { loadAudioModeState, getJoinWithCamera, type AudioMode, type DenoiserEngine } from "$lib/audio/audio-mode";
+    import { createVADMonitor } from "$lib/audio/vad";
     import { deriveStreamOverlayState } from "$lib/video/stream-overlay";
+    import { bindStream, bindCanvasStream } from "$lib/video/streamBinding";
     import { VoicePlaybackManager } from "$lib/audio/voice-playback";
     import { playShareRequestChime, playWaitingRoomChime, playJoinChime, playLeaveChime, playChatReceiveChime, getUiSoundsEnabled, setUiSoundsEnabled } from "$lib/audio/chimes";
     import LaserPointerOverlay from "$lib/components/LaserPointerOverlay.svelte";
@@ -267,7 +269,12 @@
     // to detect "participant left while the async analyser setup was in
     // flight" so the source node gets disconnected instead of leaking.
     let activeVoicePids = new Set<string>();
-    let vadTimer: ReturnType<typeof setInterval> | null = null;
+    const vadMonitor = createVADMonitor({
+        getAnalysers: () => voiceAnalysers,
+        onChange: (speaking) => {
+            speakingParticipants = speaking;
+        },
+    });
     // Buffer voice tracks that arrive before voicePlaybackManager is created
     // (can happen when voice relay tracks are in the initial offer and ontrack
     // fires for them before the main video/audio track triggers handleTrack).
@@ -1395,7 +1402,7 @@
             voiceAnalysers.set(participantId, { analyser, source });
 
             // Start VAD monitoring if not running
-            if (!vadTimer) startVADMonitoring();
+            vadMonitor.start();
         }).catch(err => {
             console.warn('Failed to set up VAD for participant', participantId, err);
         });
@@ -1475,9 +1482,8 @@
         pendingVoiceTracks.delete(participantId);
         voicePlaybackManager?.removeVoiceTrack(participantId);
         // Stop the VAD loop when the last analyser is gone
-        if (voiceAnalysers.size === 0 && vadTimer) {
-            clearInterval(vadTimer);
-            vadTimer = null;
+        if (voiceAnalysers.size === 0) {
+            vadMonitor.stop();
         }
         // Drop any lingering speaking indicator for the departed participant
         if (speakingParticipants.has(participantId)) {
@@ -1654,280 +1660,6 @@
         await refreshAudioDevices();
     }
 
-    // Svelte action: attach a MediaStream to a <video> and keep it in sync.
-    function bindStream(node: HTMLVideoElement, stream: MediaStream | null) {
-        // Firefox can leave a freshly-attached getUserMedia stream painting a
-        // black frame: a lone synchronous play() that rejects is never retried —
-        // so the tile sits black over its #000 background even though the track
-        // is live. Retry playback on the element's readiness events, on a track
-        // flipping mute→unmute, AND when the device switch swaps a new track INTO
-        // the same MediaStream (identity unchanged, so `update` never fires — we
-        // catch it via the stream's 'addtrack' and re-kick + rebind).
-        let current: MediaStream | null = null;
-        let watched: MediaStream | null = null;
-        const tryPlay = () => void node.play().catch(() => {});
-        const onLoaded = () => tryPlay();
-        const onUnmute = () => tryPlay();
-        const trackListeners: MediaStreamTrack[] = [];
-        const detachTracks = () => {
-            for (const t of trackListeners) t.removeEventListener("unmute", onUnmute);
-            trackListeners.length = 0;
-        };
-        const attachTracks = (s: MediaStream) => {
-            for (const t of s.getVideoTracks()) {
-                t.addEventListener("unmute", onUnmute);
-                trackListeners.push(t);
-            }
-        };
-        const onAddTrack = () => {
-            if (!watched) return;
-            detachTracks();
-            attachTracks(watched);
-            tryPlay();
-        };
-        const apply = (s: MediaStream | null) => {
-            if (current === s) return;
-            current = s;
-            detachTracks();
-            if (watched) {
-                watched.removeEventListener("addtrack", onAddTrack);
-                watched = null;
-            }
-            node.srcObject = s;
-            if (s) {
-                watched = s;
-                s.addEventListener("addtrack", onAddTrack);
-                attachTracks(s);
-                tryPlay();
-            }
-        };
-        node.addEventListener("loadeddata", onLoaded);
-        apply(stream);
-        return {
-            update: apply,
-            destroy() {
-                node.removeEventListener("loadeddata", onLoaded);
-                detachTracks();
-                if (watched) watched.removeEventListener("addtrack", onAddTrack);
-                watched = null;
-                node.srcObject = null;
-                current = null;
-            },
-        };
-    }
-
-    type CanvasStreamOptions = {
-        stream: MediaStream | null;
-        mirror?: boolean;
-    };
-
-    // Floating webcam pills render through canvas instead of a visible <video>.
-    // That avoids Windows/browser video-overlay paths that can ignore CSS clips.
-    function bindCanvasStream(node: HTMLCanvasElement, options: CanvasStreamOptions) {
-        const video = document.createElement("video");
-        video.muted = true;
-        video.autoplay = true;
-        video.playsInline = true;
-
-        let current: MediaStream | null = null;
-        let watched: MediaStream | null = null;
-        let raf: number | null = null;
-        let vfc: number | null = null;
-        let lastFallbackDraw = 0;
-        let mirror = options.mirror ?? false;
-        let destroyedCanvas = false;
-        const ctx = node.getContext("2d", { alpha: true });
-        const trackListeners: MediaStreamTrack[] = [];
-        // Draw on new video frames, not on every display frame: cam capture is
-        // ~24fps while displays run 60–120Hz (ProMotion), so an unconditional
-        // rAF loop redraws identical frames 2–5x — per pill, for the whole
-        // session. rVFC fires only when the source produced a frame; the rAF
-        // fallback (older Firefox) is gated to ~30fps.
-        const hasVFC = typeof (video as any).requestVideoFrameCallback === "function";
-        const FALLBACK_FRAME_MS = 1000 / 30;
-
-        const clearCanvas = () => {
-            if (!ctx) return;
-            ctx.clearRect(0, 0, node.width, node.height);
-        };
-
-        const tryPlay = () => void video.play().catch(() => {});
-        const onLoaded = () => {
-            tryPlay();
-            scheduleDraw();
-        };
-        const onUnmute = () => {
-            tryPlay();
-            scheduleDraw();
-        };
-
-        const detachTracks = () => {
-            for (const t of trackListeners) t.removeEventListener("unmute", onUnmute);
-            trackListeners.length = 0;
-        };
-
-        const attachTracks = (s: MediaStream) => {
-            for (const t of s.getVideoTracks()) {
-                t.addEventListener("unmute", onUnmute);
-                trackListeners.push(t);
-            }
-        };
-
-        const onAddTrack = () => {
-            if (!watched) return;
-            detachTracks();
-            attachTracks(watched);
-            tryPlay();
-            scheduleDraw();
-        };
-
-        // Backing-store size is cached and maintained by a ResizeObserver;
-        // reading layout (getBoundingClientRect) inside the per-frame draw
-        // would force a synchronous layout on every frame of every cam pill.
-        const applyCanvasSize = (cssWidth: number, cssHeight: number) => {
-            const dpr = Math.min(window.devicePixelRatio || 1, 2);
-            const width = Math.max(1, Math.round((cssWidth || 64) * dpr));
-            const height = Math.max(1, Math.round((cssHeight || 64) * dpr));
-            if (node.width !== width) node.width = width;
-            if (node.height !== height) node.height = height;
-        };
-        const initialRect = node.getBoundingClientRect();
-        applyCanvasSize(initialRect.width, initialRect.height);
-        const resizeObserver = new ResizeObserver((entries) => {
-            for (const entry of entries) {
-                applyCanvasSize(entry.contentRect.width, entry.contentRect.height);
-            }
-            scheduleDraw();
-        });
-        resizeObserver.observe(node);
-
-        const drawFrame = () => {
-            raf = null;
-            vfc = null;
-            if (destroyedCanvas || !current || !ctx) return;
-            scheduleDraw();
-            if (
-                video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
-                !video.videoWidth ||
-                !video.videoHeight
-            ) {
-                return;
-            }
-
-            const w = node.width;
-            const h = node.height;
-            if (!w || !h) return;
-
-            const canvasAspect = w / h;
-            const videoAspect = video.videoWidth / video.videoHeight;
-            let sx = 0;
-            let sy = 0;
-            let sw = video.videoWidth;
-            let sh = video.videoHeight;
-            if (videoAspect > canvasAspect) {
-                sw = video.videoHeight * canvasAspect;
-                sx = (video.videoWidth - sw) / 2;
-            } else {
-                sh = video.videoWidth / canvasAspect;
-                sy = (video.videoHeight - sh) / 2;
-            }
-
-            ctx.clearRect(0, 0, w, h);
-            ctx.save();
-            ctx.beginPath();
-            ctx.arc(w / 2, h / 2, Math.min(w, h) / 2, 0, Math.PI * 2);
-            ctx.clip();
-            if (mirror) {
-                ctx.translate(w, 0);
-                ctx.scale(-1, 1);
-            }
-            ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
-            ctx.restore();
-        };
-
-        const fallbackLoop = (ts: number) => {
-            raf = null;
-            if (destroyedCanvas || !current) return;
-            if (ts - lastFallbackDraw < FALLBACK_FRAME_MS) {
-                raf = requestAnimationFrame(fallbackLoop);
-                return;
-            }
-            lastFallbackDraw = ts;
-            drawFrame();
-        };
-
-        function scheduleDraw() {
-            if (destroyedCanvas || !current) return;
-            if (hasVFC) {
-                if (vfc !== null) return;
-                vfc = (video as any).requestVideoFrameCallback(drawFrame);
-            } else {
-                if (raf !== null) return;
-                raf = requestAnimationFrame(fallbackLoop);
-            }
-        }
-
-        const cancelDraws = () => {
-            if (raf !== null) {
-                cancelAnimationFrame(raf);
-                raf = null;
-            }
-            if (vfc !== null) {
-                (video as any).cancelVideoFrameCallback?.(vfc);
-                vfc = null;
-            }
-        };
-
-        const apply = (next: CanvasStreamOptions) => {
-            mirror = next.mirror ?? false;
-            const nextStream = next.stream;
-            if (current === nextStream) {
-                scheduleDraw();
-                return;
-            }
-
-            cancelDraws();
-            detachTracks();
-            if (watched) {
-                watched.removeEventListener("addtrack", onAddTrack);
-                watched = null;
-            }
-
-            current = nextStream;
-            video.srcObject = nextStream;
-            if (!nextStream) {
-                clearCanvas();
-                return;
-            }
-
-            watched = nextStream;
-            nextStream.addEventListener("addtrack", onAddTrack);
-            attachTracks(nextStream);
-            tryPlay();
-            scheduleDraw();
-        };
-
-        video.addEventListener("loadeddata", onLoaded);
-        apply(options);
-
-        return {
-            update: apply,
-            destroy() {
-                destroyedCanvas = true;
-                cancelDraws();
-                resizeObserver.disconnect();
-                video.removeEventListener("loadeddata", onLoaded);
-                detachTracks();
-                if (watched) watched.removeEventListener("addtrack", onAddTrack);
-                video.pause();
-                video.srcObject = null;
-                current = null;
-                watched = null;
-                clearCanvas();
-            },
-        };
-    }
-
     function toggleScreenShare() {
         if (screenShareActive) {
             // Stop sharing
@@ -2036,52 +1768,10 @@
         session.send("admin:screenshare-revoke", { participantId });
     }
 
-    function startVADMonitoring() {
-        // Reuse a single buffer to avoid allocating on every check
-        let vadBuffer: Uint8Array<ArrayBuffer> | null = null;
-        // ~15Hz is plenty for speaker detection and isn't display-synchronized,
-        // so an interval expresses it directly — a rAF loop would wake the main
-        // thread on every compositor frame (120Hz on ProMotion) just to skip
-        // 3 out of 4 wakeups.
-        const check = () => {
-            let changed = false;
-            const newSpeaking = new Set<string>();
-            for (const [pid, { analyser }] of voiceAnalysers) {
-                // Reuse or resize the buffer as needed
-                if (!vadBuffer || vadBuffer.length !== analyser.frequencyBinCount) {
-                    vadBuffer = new Uint8Array(analyser.frequencyBinCount) as Uint8Array<ArrayBuffer>;
-                }
-                analyser.getByteFrequencyData(vadBuffer);
-                let sum = 0;
-                for (let i = 0; i < vadBuffer.length; i++) sum += vadBuffer[i];
-                const avg = sum / vadBuffer.length;
-                const db = 20 * Math.log10(avg / 255);
-                if (db > -50) {
-                    newSpeaking.add(pid);
-                }
-            }
-            // Only trigger reactivity if the set actually changed
-            if (newSpeaking.size !== speakingParticipants.size) {
-                changed = true;
-            } else {
-                for (const pid of newSpeaking) {
-                    if (!speakingParticipants.has(pid)) { changed = true; break; }
-                }
-            }
-            if (changed) {
-                speakingParticipants = newSpeaking;
-            }
-        };
-        vadTimer = setInterval(check, 66);
-    }
-
     function cleanupWebRTC() {
         stopStatsPolling();
         stopICEServerRefresh();
-        if (vadTimer) {
-            clearInterval(vadTimer);
-            vadTimer = null;
-        }
+        vadMonitor.stop();
         // Disconnect voice analyser source nodes explicitly so they release
         // their MediaStream source and let the browser GC the tracks;
         // otherwise the graph stays wired until the shared AudioContext closes.
