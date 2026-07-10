@@ -60,6 +60,13 @@ type Config struct {
 	// Timeouts
 	OBSReconnectTimeout time.Duration
 	ClientPingInterval  time.Duration
+
+	// ICELoopbackOnly restricts ICE gathering to loopback addresses and
+	// disables mDNS. Test-only (set by test helpers, never loaded from the
+	// environment): it keeps the ad-hoc `go test` binaries from listening on
+	// real interfaces, which would otherwise trigger an OS firewall prompt
+	// for every freshly built test executable on Windows/macOS.
+	ICELoopbackOnly bool
 }
 
 // Load loads configuration from environment variables

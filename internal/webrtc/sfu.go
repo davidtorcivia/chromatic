@@ -14,6 +14,7 @@ import (
 	"chromatic/internal/config"
 	"chromatic/internal/metrics"
 
+	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/intervalpli"
 	"github.com/pion/interceptor/pkg/stats"
@@ -436,6 +437,14 @@ func NewSFU(cfg *config.Config) (*SFU, error) {
 		}
 		return true
 	})
+	if cfg.ICELoopbackOnly {
+		// Test mode: gather only loopback candidates and skip mDNS so the
+		// test binary never listens on a real interface (see the field doc
+		// in config.Config — this is what stops the per-build OS firewall
+		// prompt during `go test`).
+		se.SetIPFilter(func(ip net.IP) bool { return ip.IsLoopback() })
+		se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+	}
 
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(m),

@@ -42,7 +42,7 @@ func newStreamStartTestEnv(t *testing.T, roomStatus string) (*streamStartTestEnv
 	hub := websocket.NewHub()
 	go hub.Run()
 
-	sfu, err := webrtc.NewSFU(&config.Config{})
+	sfu, err := webrtc.NewSFU(&config.Config{ICELoopbackOnly: true})
 	if err != nil {
 		t.Fatalf("failed to create SFU: %v", err)
 	}
@@ -119,7 +119,7 @@ func (env *streamStartTestEnv) dial() *gorillaws.Conn {
 
 func TestWebSocketHandler_InitiateSubscriptionCleansUpWhenOfferNotQueued(t *testing.T) {
 	hub := websocket.NewHub()
-	sfu, err := webrtc.NewSFU(&config.Config{})
+	sfu, err := webrtc.NewSFU(&config.Config{ICELoopbackOnly: true})
 	if err != nil {
 		t.Fatalf("failed to create SFU: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestWebSocketHandler_InitiateSubscriptionCleansUpWhenOfferNotQueued(t *test
 
 func TestWebSocketHandler_ResubscribeSendsIceServersBeforeOffer(t *testing.T) {
 	hub := websocket.NewHub()
-	sfu, err := webrtc.NewSFU(&config.Config{})
+	sfu, err := webrtc.NewSFU(&config.Config{ICELoopbackOnly: true})
 	if err != nil {
 		t.Fatalf("failed to create SFU: %v", err)
 	}

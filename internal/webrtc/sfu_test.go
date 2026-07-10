@@ -30,6 +30,8 @@ func createTestConfig() *config.Config {
 		TurnRealm:       "",
 		TurnSecret:      "",
 		TurnExternalURL: "",
+		// Loopback-only ICE: no OS firewall prompt for the test binary.
+		ICELoopbackOnly: true,
 	}
 }
 

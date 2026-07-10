@@ -42,7 +42,7 @@ func newRejoinTestEnv(t *testing.T) (*rejoinTestEnv, func()) {
 	hub := websocket.NewHub()
 	go hub.Run()
 
-	sfu, err := webrtc.NewSFU(&config.Config{})
+	sfu, err := webrtc.NewSFU(&config.Config{ICELoopbackOnly: true})
 	if err != nil {
 		t.Fatalf("failed to create SFU: %v", err)
 	}
