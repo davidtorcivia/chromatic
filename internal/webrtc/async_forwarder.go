@@ -143,7 +143,6 @@ func (f *asyncForwarder) drain() {
 		f.mu.Lock()
 		if used != nil {
 			f.recycleLocked(used)
-			used = nil
 		}
 		for f.count == 0 && !f.closed {
 			f.cond.Wait()

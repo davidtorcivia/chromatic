@@ -244,7 +244,7 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	defer dst.Close()
 
 	if _, err := io.Copy(dst, file); err != nil {
-		os.Remove(storedPath)
+		_ = os.Remove(storedPath)
 		http.Error(w, "Failed to save file", http.StatusInternalServerError)
 		return
 	}
@@ -258,7 +258,7 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	insertCancel()
 
 	if err != nil {
-		os.Remove(storedPath)
+		_ = os.Remove(storedPath)
 		http.Error(w, "Failed to save file metadata", http.StatusInternalServerError)
 		return
 	}
@@ -725,7 +725,7 @@ func generateThumbnail(srcPath, dstPath string) error {
 
 	// Encode as JPEG
 	if err := jpeg.Encode(dstFile, dstImage, &jpeg.Options{Quality: thumbnailQuality}); err != nil {
-		os.Remove(dstPath)
+		_ = os.Remove(dstPath)
 		return fmt.Errorf("failed to encode thumbnail: %w", err)
 	}
 

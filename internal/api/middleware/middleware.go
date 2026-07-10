@@ -1,3 +1,5 @@
+// Package middleware provides the HTTP middleware chain: admin auth, rate
+// limiting, CORS, security headers, and admin audit logging.
 package middleware
 
 import (

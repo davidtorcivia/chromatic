@@ -1,3 +1,5 @@
+// Package handlers contains the HTTP and WebSocket request handlers: rooms,
+// auth, files, stream keys, config, setup, and the realtime session protocol.
 package handlers
 
 import (
@@ -137,18 +139,16 @@ type RoomHandler struct {
 		RoomClientCount(roomSlug string) int
 		CloseRoom(roomSlug string)
 	}
-	onRoomLive          func(roomSlug string) // Called when room goes live
-	tokenManager        *TokenManager         // For generating signed WebSocket tokens
-	waitingManager      *WaitingManager       // For waiting room SSE notifications
-	adminToken          string                // For validating admin joins (constant-time compared)
-	validateSession     SessionValidator      // Admin session cookie validation (join-as-host)
-	maxParticipants     int                   // Cap on non-ended participants per room
-	uploadPath          string                // Root of per-room upload dirs (for delete-with-files)
-	obsReconnectTimeout time.Duration
-	productionMode      bool
-	joinMu              sync.Mutex
-	timerMu             sync.Mutex
-	streamEndTimers     map[string]*time.Timer
+	onRoomLive      func(roomSlug string) // Called when room goes live
+	tokenManager    *TokenManager         // For generating signed WebSocket tokens
+	waitingManager  *WaitingManager       // For waiting room SSE notifications
+	adminToken      string                // For validating admin joins (constant-time compared)
+	validateSession SessionValidator      // Admin session cookie validation (join-as-host)
+	maxParticipants int                   // Cap on non-ended participants per room
+	uploadPath      string                // Root of per-room upload dirs (for delete-with-files)
+	productionMode  bool
+	joinMu          sync.Mutex
+	timerMu         sync.Mutex
 	// openTimers fire when a scheduled room reaches scheduled_at so lobby
 	// participants are auto-admitted without any polling. One timer per room,
 	// armed lazily when the first lobby participant joins.
@@ -162,16 +162,14 @@ func NewRoomHandler(db *database.DB, cfg *config.Config, tokenSecret []byte) *Ro
 		maxParticipants = 20
 	}
 	return &RoomHandler{
-		db:                  db,
-		tokenManager:        NewTokenManager(tokenSecret),
-		waitingManager:      NewWaitingManager(),
-		adminToken:          cfg.AdminToken,
-		maxParticipants:     maxParticipants,
-		uploadPath:          cfg.UploadPath,
-		obsReconnectTimeout: cfg.OBSReconnectTimeout,
-		productionMode:      cfg.ProductionMode,
-		streamEndTimers:     make(map[string]*time.Timer),
-		openTimers:          make(map[string]*time.Timer),
+		db:              db,
+		tokenManager:    NewTokenManager(tokenSecret),
+		waitingManager:  NewWaitingManager(),
+		adminToken:      cfg.AdminToken,
+		maxParticipants: maxParticipants,
+		uploadPath:      cfg.UploadPath,
+		productionMode:  cfg.ProductionMode,
+		openTimers:      make(map[string]*time.Timer),
 	}
 }
 
@@ -227,7 +225,6 @@ func (h *RoomHandler) SetHub(hub interface {
 
 func (h *RoomHandler) closeRoomRuntime(slug string, notify bool) {
 	h.cancelOpenTimer(slug)
-	h.cancelStreamEndTimer(slug)
 
 	if h.hub != nil && notify {
 		_ = h.hub.BroadcastJSON(slug, "room:ended", map[string]interface{}{}, "")
@@ -243,52 +240,6 @@ func (h *RoomHandler) closeRoomRuntime(slug string, notify bool) {
 // SetOnRoomLive sets the callback for when a room goes live
 func (h *RoomHandler) SetOnRoomLive(callback func(roomSlug string)) {
 	h.onRoomLive = callback
-}
-
-func (h *RoomHandler) cancelStreamEndTimer(roomSlug string) {
-	h.timerMu.Lock()
-	defer h.timerMu.Unlock()
-
-	if timer, ok := h.streamEndTimers[roomSlug]; ok {
-		timer.Stop()
-		delete(h.streamEndTimers, roomSlug)
-	}
-}
-
-func (h *RoomHandler) scheduleStreamEnd(roomSlug string) {
-	if h.obsReconnectTimeout <= 0 {
-		return
-	}
-
-	h.timerMu.Lock()
-	if timer, ok := h.streamEndTimers[roomSlug]; ok {
-		timer.Stop()
-	}
-
-	h.streamEndTimers[roomSlug] = time.AfterFunc(h.obsReconnectTimeout, func() {
-		now := time.Now()
-		ctx, cancel := database.WithTimeout(context.Background())
-		result, err := h.db.ExecContext(ctx, `
-			UPDATE rooms SET status = 'ended', ended_at = ?
-			WHERE slug = ? AND status = 'live'
-		`, now, roomSlug)
-		cancel()
-		if err != nil {
-			logger.Error("Failed to end room after reconnect timeout", "room", roomSlug, "error", err)
-			return
-		}
-
-		affected, _ := result.RowsAffected()
-		if affected > 0 {
-			h.closeRoomRuntime(roomSlug, true)
-		}
-
-		h.timerMu.Lock()
-		delete(h.streamEndTimers, roomSlug)
-		h.timerMu.Unlock()
-	})
-
-	h.timerMu.Unlock()
 }
 
 // ensureOpenTimer arms (at most one) timer per room that fires at
@@ -363,7 +314,7 @@ func (h *RoomHandler) handleRoomOpen(slug string) {
 	if err := rows.Err(); err != nil {
 		logger.Error("Lobby participant iteration failed on room open", "room", slug, "error", err)
 	}
-	rows.Close()
+	rows.Close() //nolint:sqlclosecheck // deliberate mid-function close: the cursor must release its connection before the UPDATE below
 	waitCancel()
 
 	if len(waitingIDs) == 0 {
@@ -400,7 +351,13 @@ func (h *RoomHandler) handleRoomOpen(slug string) {
 			admittedIDs = append(admittedIDs, id)
 		}
 	}
-	admitRows.Close()
+	// A mid-iteration error means participants were admitted in the DB but
+	// not captured — they'd miss their SSE admit notification. Surface it.
+	if err := admitRows.Err(); err != nil {
+		logger.Error("Auto-admit RETURNING iteration failed; some admitted participants may not be notified",
+			"room", slug, "error", err)
+	}
+	admitRows.Close() //nolint:sqlclosecheck // deliberate mid-function close before the notification fan-out below
 	admitCancel()
 	metrics.Get().WaitingParticipants.Add(-int64(len(admittedIDs)))
 	h.waitingManager.NotifyAllAdmitted(admittedIDs)
@@ -1565,7 +1522,7 @@ func (h *RoomHandler) AdmitAll(w http.ResponseWriter, r *http.Request) {
 		logger.Error("Admit-all RETURNING iteration failed; some admitted participants may not be notified",
 			"room", slug, "error", err)
 	}
-	rows.Close()
+	rows.Close() //nolint:sqlclosecheck // deliberate mid-function close before the notification fan-out below
 	admitCancel()
 
 	// Track admitted participants
@@ -1702,9 +1659,6 @@ func (h *RoomHandler) OnStreamStart(streamKeyToken string) error {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 	tx = nil // Prevent deferred rollback
-
-	// Cancel any pending stream end timer
-	h.cancelStreamEndTimer(roomSlug)
 
 	// Going live opens a scheduled room early: mark opened_at and run the
 	// lobby auto-admission flow. Only relevant while scheduled_at is still in

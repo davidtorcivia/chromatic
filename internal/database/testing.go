@@ -19,20 +19,20 @@ func NewTestDB(t *testing.T) (*DB, func()) {
 	dbPath := filepath.Join(tmpDir, "test.db")
 	db, err := New(dbPath)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("failed to create database: %v", err)
 	}
 
 	// Run migrations to create tables
 	if err := db.Migrate(); err != nil {
-		db.Close()
-		os.RemoveAll(tmpDir)
+		_ = db.Close()
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("failed to run migrations: %v", err)
 	}
 
 	cleanup := func() {
-		db.Close()
-		os.RemoveAll(tmpDir)
+		_ = db.Close()
+		_ = os.RemoveAll(tmpDir)
 	}
 
 	return db, cleanup

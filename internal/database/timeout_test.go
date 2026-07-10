@@ -55,7 +55,7 @@ func TestWithTimeout_RespectsParentDeadline(t *testing.T) {
 // TestWithTimeout_NilParentIsSafe ensures a nil parent doesn't panic (some
 // background call sites pass context.Background(); this guards accidental nil).
 func TestWithTimeout_NilParentIsSafe(t *testing.T) {
-	ctx, cancel := WithTimeout(nil)
+	ctx, cancel := WithTimeout(nil) //nolint:staticcheck // deliberately nil: this test exists to prove nil is safe
 	defer cancel()
 	if ctx == nil {
 		t.Fatal("WithTimeout(nil) returned nil context")

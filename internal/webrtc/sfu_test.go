@@ -175,7 +175,7 @@ func TestSFU_GetSetRemoveIngest(t *testing.T) {
 	// Should find it now
 	got := sfu.GetIngest(token)
 	if got == nil {
-		t.Error("ingest should be found after setting")
+		t.Fatal("ingest should be found after setting")
 	}
 	if got.StreamKeyToken != token {
 		t.Errorf("expected token %s, got %s", token, got.StreamKeyToken)
@@ -203,7 +203,7 @@ func TestSFU_GetRoomTracks(t *testing.T) {
 	// Get or create room
 	room1 := sfu.GetRoomTracks(roomSlug)
 	if room1 == nil {
-		t.Error("GetRoomTracks should create room if not exists")
+		t.Fatal("GetRoomTracks should create room if not exists")
 	}
 	if room1.RoomSlug != roomSlug {
 		t.Errorf("expected room slug %s, got %s", roomSlug, room1.RoomSlug)

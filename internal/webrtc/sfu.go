@@ -1,3 +1,6 @@
+// Package webrtc implements Chromatic's SFU: WHIP ingest from OBS, viewer
+// subscriptions, and the voice/screen-share/webcam relay fan-out, built on
+// pion. Program-audio purity and end-to-end latency are the design axioms.
 package webrtc
 
 import (
@@ -1260,11 +1263,11 @@ func (s *SFU) RequestKeyframe(roomSlug string) {
 	}
 }
 
-func (room *RoomTracks) markKeyframeRequestLocked(now time.Time) bool {
-	if !room.lastKeyframeRequest.IsZero() && now.Sub(room.lastKeyframeRequest) < keyframeRequestMinInterval {
+func (rt *RoomTracks) markKeyframeRequestLocked(now time.Time) bool {
+	if !rt.lastKeyframeRequest.IsZero() && now.Sub(rt.lastKeyframeRequest) < keyframeRequestMinInterval {
 		return false
 	}
-	room.lastKeyframeRequest = now
+	rt.lastKeyframeRequest = now
 	return true
 }
 
@@ -1310,14 +1313,14 @@ func (s *SFU) RequestScreenShareKeyframe(roomSlug string) {
 // the dedicated publisher PC stored in VoiceSessions; the subscriber fallback
 // supports older in-place publishing paths.
 // Caller must hold room.mu for reading or writing.
-func (room *RoomTracks) screenShareKeyframePeerConnectionLocked(sharerID string) *webrtc.PeerConnection {
+func (rt *RoomTracks) screenShareKeyframePeerConnectionLocked(sharerID string) *webrtc.PeerConnection {
 	if sharerID == "" {
 		return nil
 	}
-	if vs := room.VoiceSessions[sharerID]; vs != nil && vs.PeerConnection != nil {
+	if vs := rt.VoiceSessions[sharerID]; vs != nil && vs.PeerConnection != nil {
 		return vs.PeerConnection
 	}
-	if sub := room.Subscribers[sharerID]; sub != nil {
+	if sub := rt.Subscribers[sharerID]; sub != nil {
 		return sub.PeerConnection
 	}
 	return nil

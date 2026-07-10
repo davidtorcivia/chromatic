@@ -1,3 +1,4 @@
+// Package logger is the shared structured logger (slog) with level control.
 package logger
 
 import (

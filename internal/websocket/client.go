@@ -45,9 +45,9 @@ func (c *Client) ReadPumpWithDisconnect(handler func(*Client, Message), onDiscon
 	}()
 
 	c.Conn.SetReadLimit(maxSignalingMessageSize)
-	c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+	_ = c.Conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.Conn.SetPongHandler(func(string) error {
-		c.Conn.SetReadDeadline(time.Now().Add(pongWait))
+		_ = c.Conn.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
 
@@ -101,7 +101,7 @@ func (c *Client) WritePump() {
 				c.writeCloseFrame()
 				return
 			}
-			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+			_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
 				return
 			}
@@ -111,7 +111,7 @@ func (c *Client) WritePump() {
 				c.writeCloseFrame()
 				return
 			}
-			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+			_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
@@ -131,7 +131,7 @@ func (c *Client) isDone() bool {
 func (c *Client) writeCloseFrame() {
 	// Send channel is intentionally never closed to avoid send-on-closed-channel
 	// panics in concurrent producers.
-	c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 	_ = c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
 }
 

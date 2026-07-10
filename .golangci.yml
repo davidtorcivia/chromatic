@@ -1,0 +1,49 @@
+version: "2"
+
+# Curated for this codebase's actual failure modes (see CLAUDE.md):
+# rowserrcheck/sqlclosecheck/bodyclose guard the DB-and-HTTP discipline the
+# core follows but peripheral handlers have historically drifted from.
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose
+    - rowserrcheck
+    - sqlclosecheck
+  settings:
+    errcheck:
+      exclude-functions:
+        # Best-effort writes to clients that may already be gone (JSON
+        # responses, SSE frames) and digest writes that cannot fail.
+        - (*encoding/json.Encoder).Encode
+        - (net/http.ResponseWriter).Write
+        - fmt.Fprintf
+        - fmt.Fprintln
+    staticcheck:
+      checks:
+        - all
+        # Error strings here legitimately start with proper nouns
+        # ("Cloudflare TURN API error", "B-frames detected").
+        - -ST1005
+        # Explicit pkt.Header.X selectors are intentional clarity in RTP code.
+        - -QF1008
+  exclusions:
+    rules:
+      # Close/Rollback teardown is best-effort by design: every site that can
+      # act on a close failure already uses the full `if err :=` form, and
+      # the remainder (deferred closes, PC teardown, tx rollback-after-commit)
+      # has no action to take.
+      - linters: [errcheck]
+        text: 'Error return value of `.*\.(Close|Rollback)` is not checked'
+      # Hub/client sends are fire-and-forget: the error just means the peer
+      # is gone, and the disconnect path handles that.
+      - linters: [errcheck]
+        text: '(BroadcastJSON|BroadcastToAdminsJSON|BroadcastJSONDropIfFull|SendToJSON|SendJSON)'
+      # Tests intentionally ignore errors when arranging fixtures, and the
+      # UPDATE...RETURNING tests close rows mid-function on purpose (the
+      # cursor must release its connection before the next assertion).
+      - path: _test\.go
+        linters:
+          - errcheck
+          - bodyclose
+          - sqlclosecheck
+          - rowserrcheck

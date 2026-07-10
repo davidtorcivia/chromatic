@@ -1,3 +1,5 @@
+// Package models defines the database-backed domain types shared by the
+// HTTP handlers.
 package models
 
 import (

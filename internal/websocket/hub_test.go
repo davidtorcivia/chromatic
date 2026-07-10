@@ -20,19 +20,6 @@ func init() {
 	_ = metrics.Get()
 }
 
-// mockConn implements a minimal interface for testing without real WebSocket
-type mockConn struct {
-	closed bool
-	mu     sync.Mutex
-}
-
-func (m *mockConn) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.closed = true
-	return nil
-}
-
 func newTestClient(id, name, roomSlug string, hub *Hub) *Client {
 	return &Client{
 		ID:       id,
@@ -540,7 +527,7 @@ func TestHub_GetClient(t *testing.T) {
 
 	found := hub.GetClient("test-room", "client-1")
 	if found == nil {
-		t.Error("expected to find client")
+		t.Fatal("expected to find client")
 	}
 	if found.Name != "Alice" {
 		t.Errorf("expected name 'Alice', got '%s'", found.Name)

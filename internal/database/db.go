@@ -1,3 +1,5 @@
+// Package database wraps the SQLite connection (WAL mode, bounded pool,
+// query deadlines) and runs the embedded migrations.
 package database
 
 import (

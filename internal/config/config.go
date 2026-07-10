@@ -1,3 +1,4 @@
+// Package config loads and validates Chromatic's environment configuration.
 package config
 
 import (

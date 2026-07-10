@@ -10,14 +10,6 @@ import (
 	pionwebrtc "github.com/pion/webrtc/v4"
 )
 
-// screenShareSim extends browserSim with the ability to start a screen share:
-// it adds a sendonly VP8 video track, performs the client-initiated
-// renegotiation (signal:offer -> signal:voice-answer) and pumps synthetic RTP.
-type screenShareSim struct {
-	*browserSim
-	id string
-}
-
 // TestScreenShareRelay_EndToEnd verifies the full screen share path:
 // sharer adds a video track via client renegotiation -> server OnTrack ->
 // relay track fan-out -> viewer receives the screen share track AND RTP

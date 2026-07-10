@@ -1,3 +1,5 @@
+// Package websocket implements the per-room signaling hub: client
+// registration, read/write pumps, and broadcast fan-out with backpressure.
 package websocket
 
 import (

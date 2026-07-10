@@ -776,7 +776,12 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 				canShare[id] = allowed
 			}
 		}
-		rows.Close()
+		if err := rows.Err(); err != nil {
+			// Partial approvals map: affected participants fall back to
+			// needing re-approval, which is the safe direction.
+			logger.Warn("Screen-share approvals iteration failed", "room", slug, "error", err)
+		}
+		rows.Close() //nolint:sqlclosecheck // deliberate mid-function close: sendRoomState runs more queries on the same pool
 	}
 	shareCancel()
 
@@ -909,6 +914,12 @@ func (h *WebSocketHandler) sendWaitingState(client *websocket.Client, slug strin
 			"name":          sanitizeText(name),
 			"joinedAt":      joinedAt.UTC(),
 		})
+	}
+	if err := rows.Err(); err != nil {
+		// Send nothing rather than a truncated roster — the admin UI treats
+		// waiting:list as the complete set.
+		logger.Warn("Waiting roster iteration failed", "room", slug, "error", err)
+		return
 	}
 
 	if waitingRoomEnabled {

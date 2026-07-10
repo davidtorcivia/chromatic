@@ -1,3 +1,5 @@
+// Package api assembles the HTTP router: public endpoints, the WHIP ingest
+// route, and the admin mux behind auth/audit middleware.
 package api
 
 import (

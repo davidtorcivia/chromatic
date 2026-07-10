@@ -1,3 +1,5 @@
+// Package metrics exposes the Prometheus counters and gauges Chromatic
+// reports (rooms, participants, ingest state, forwarder drops).
 package metrics
 
 import (
