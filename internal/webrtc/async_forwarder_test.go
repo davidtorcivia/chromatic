@@ -89,7 +89,10 @@ func TestAsyncForwarder_SlowConsumerDoesNotBlockProducer(t *testing.T) {
 		case <-block:
 			// a delivery happened; reset the idle timer
 			if !idle.Stop() {
-				select { case <-idle.C: default: }
+				select {
+				case <-idle.C:
+				default:
+				}
 			}
 			idle.Reset(120 * time.Millisecond)
 		case <-idle.C:

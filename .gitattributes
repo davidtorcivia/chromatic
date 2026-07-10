@@ -1,0 +1,9 @@
+# Go tooling (gofmt, go vet) assumes LF; CRLF working copies make
+# `gofmt -l` flag every file and bury real formatting signal.
+*.go text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+*.sql text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

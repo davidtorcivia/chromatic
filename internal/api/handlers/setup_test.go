@@ -270,9 +270,9 @@ func TestSetupHandler_BrandingOptionalDoesNotBlockCompletion(t *testing.T) {
 
 func TestPublicURLCheck_SchemeValidation(t *testing.T) {
 	cases := []struct {
-		url   string
-		want  SetupCheckStatus
-		note  string
+		url  string
+		want SetupCheckStatus
+		note string
 	}{
 		{"http://localhost:3000", SetupCheckReady, "local http is ready"},
 		{"http://127.0.0.1:3000", SetupCheckReady, "loopback http is ready"},

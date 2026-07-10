@@ -738,7 +738,7 @@ func TestParseTURNURL_AcceptsTransportUDP(t *testing.T) {
 	}
 	if host != "turn.example.com:3478" {
 		t.Fatalf("expected host turn.example.com:3478, got %s", host)
-}
+	}
 }
 
 func init() {

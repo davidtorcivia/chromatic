@@ -760,4 +760,3 @@ func TestClient_ReadPumpRecoversFromHandlerPanic(t *testing.T) {
 		t.Fatal("read pump did not exit cleanly after recovered panic")
 	}
 }
-
