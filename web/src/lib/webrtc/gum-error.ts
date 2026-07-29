@@ -19,10 +19,15 @@ function gumErrorMessage(err: unknown): string {
 }
 
 // Firefox raises these as a bare DOMException whose `name` carries no useful
-// information, so the message text is the only discriminator. Both mean the
-// device could not be STARTED (not that it was blocked): the source is already
-// allocated — commonly by another Chromatic tab, since one camera cannot be
-// opened twice with differing constraints.
+// information, so the message text is the only discriminator. They mean the
+// device could not be STARTED, which is NOT the same as the site being denied:
+// the site permission reads as granted and every capture still fails.
+//
+// Confirmed causes, in the order worth checking: the OS withholding camera
+// access from the browser application (this is what it turned out to be in
+// practice — Windows' "let desktop apps access your camera"), a sandboxed
+// browser package missing the device interface (snap/flatpak on Linux), or the
+// source already being allocated by another app or tab.
 function isSourceBusy(err: unknown): boolean {
     return /failed to allocate videosource|concurrent mic process limit|starting video failed|starting audio failed/i.test(
         gumErrorMessage(err)
@@ -32,7 +37,7 @@ function isSourceBusy(err: unknown): boolean {
 export function describeGumError(err: unknown, kind: CaptureKind): string {
     const lower = kind.toLowerCase();
     if (isSourceBusy(err)) {
-        return `${kind} could not be started — it is already in use. Close any other Chromatic tab or window, and any other app using the ${lower} (OBS, Zoom, Photo Booth), then retry. If it persists, fully quit and reopen the browser.`;
+        return `${kind} could not be started. This is an OS or app-level block, not a site one — allowing this site is not enough. On Windows check Settings › Privacy & security › ${kind} › "Let desktop apps access your ${lower}"; on macOS System Settings › Privacy & Security › ${kind} and confirm your browser is listed and on. Otherwise another app or Chromatic tab already has the ${lower} open.`;
     }
     switch (gumErrorName(err)) {
         case 'NotAllowedError':

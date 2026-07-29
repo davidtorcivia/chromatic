@@ -10,13 +10,16 @@ const domException = (name: string, message: string) => {
 };
 
 describe('describeGumError', () => {
-    it('reads Firefox "Failed to allocate videosource" as a busy device, not a block', () => {
-        // BUG regression: this surfaced as "Camera blocked — allow access",
-        // sending users into permission settings that were already correct.
+    it('points Firefox\'s "Failed to allocate videosource" at the OS-level block', () => {
+        // BUG regression: this surfaced as "Camera blocked — allow access in
+        // your browser", sending users into SITE permission settings that were
+        // already correct. The real cause (confirmed in the field) was Windows
+        // withholding camera access from the browser application.
         const msg = describeGumError(domException('DOMException', 'Failed to allocate videosource'), 'Camera');
-        expect(msg).toMatch(/already in use/i);
-        expect(msg).toMatch(/other Chromatic tab/i);
-        expect(msg).not.toMatch(/blocked/i);
+        expect(msg).toMatch(/Windows/);
+        expect(msg).toMatch(/macOS/);
+        expect(msg).toMatch(/not a site one/i);
+        expect(msg).toMatch(/another app or Chromatic tab/i);
     });
 
     it('does not treat an allocation failure as a permission error', () => {
