@@ -16,6 +16,7 @@
         getStoredCameraDeviceId,
         storeCameraDeviceId,
     } from "$lib/webrtc/manager";
+    import { describeGumError, gumErrorName } from "$lib/webrtc/gum-error";
     import { getJoinWithCamera, setJoinWithCamera } from "$lib/audio/audio-mode";
 
     let micStream = $state<MediaStream | null>(null);
@@ -27,26 +28,7 @@
     let micDenied = $state(false);
     let micErrorMsg = $state("Microphone blocked — allow access in your browser.");
     let camDenied = $state(false);
-
-    // Map a getUserMedia failure to a specific, actionable message. The generic
-    // "blocked — allow access" is wrong (and misleading) for the non-permission
-    // cases: a busy device, a vanished device, or no input at all.
-    function describeGumError(err: unknown, kind: "Microphone" | "Camera"): string {
-        const name = (err as { name?: string })?.name ?? "";
-        switch (name) {
-            case "NotAllowedError":
-            case "SecurityError":
-                return `${kind} blocked — allow access in your browser (and macOS System Settings › Privacy › ${kind}).`;
-            case "NotReadableError":
-            case "AbortError":
-                return `${kind} is in use by another app or tab — close it (e.g. OBS or another window) and retry.`;
-            case "NotFoundError":
-            case "OverconstrainedError":
-                return `No available ${kind.toLowerCase()} — the saved device may be gone. Retrying with the default…`;
-            default:
-                return `${kind} unavailable${name ? ` (${name})` : ""}. Check the browser and OS permissions.`;
-        }
-    }
+    let camErrorMsg = $state("Camera unavailable. Check the browser and OS permissions.");
     let micLevel = $state(0); // 0..1 smoothed
     let audioInputs = $state<MediaDeviceInfo[]>([]);
     let videoInputs = $state<MediaDeviceInfo[]>([]);
@@ -116,7 +98,7 @@
             await refreshDevices();
         } catch (err) {
             console.error("Mic enable failed:", err);
-            const name = (err as { name?: string })?.name ?? "";
+            const name = gumErrorName(err);
             // A saved mic that has since vanished (very common with hot-plugged
             // capture/Blackmagic audio) fails NotFound/Overconstrained. Drop the
             // stored device and retry once with the OS default before giving up.
@@ -171,7 +153,7 @@
         camOn = false;
     }
 
-    async function enableCam(deviceId?: string | null) {
+    async function enableCam(deviceId?: string | null, allowDefaultRetry = true) {
         if (camPending) return;
         camPending = true;
         camDenied = false;
@@ -197,8 +179,25 @@
             if (activeCamId) storeCameraDeviceId(activeCamId);
             setJoinWithCamera(true);
             await refreshDevices();
-        } catch {
+        } catch (err) {
+            console.error("Camera enable failed:", err);
+            const name = gumErrorName(err);
+            // Same hot-plug reality as the mic: a remembered camera that has
+            // since vanished fails NotFound/Overconstrained. Forget it and retry
+            // once with the default before telling the user anything is wrong.
+            if (
+                allowDefaultRetry &&
+                (name === "NotFoundError" || name === "OverconstrainedError") &&
+                (deviceId ?? activeCamId)
+            ) {
+                storeCameraDeviceId(null);
+                activeCamId = null;
+                camPending = false;
+                await enableCam(null, false);
+                return;
+            }
             camDenied = true;
+            camErrorMsg = describeGumError(err, "Camera");
             setJoinWithCamera(false);
         } finally {
             if (!destroyed) camPending = false;
@@ -304,7 +303,7 @@
                 <!-- svelte-ignore a11y_media_has_caption -->
                 <video bind:this={videoEl} class="cam-preview-video" muted autoplay playsinline></video>
             {:else if camDenied}
-                <span class="device-hint error">Camera blocked — allow access in your browser.</span>
+                <span class="device-hint error">{camErrorMsg}</span>
             {:else}
                 <span class="device-hint">Join with your camera on for a face-to-face feel.</span>
             {/if}

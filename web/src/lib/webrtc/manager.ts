@@ -9,6 +9,7 @@ import {
     opusPreferencesFor
 } from '$lib/audio/audio-mode';
 import { isDenoiserImplemented } from '$lib/audio/denoiser';
+import { isPermissionError as isCameraPermissionError } from './gum-error';
 import { applyOpusPreferences, tuneSubscriberAnswerOpus } from './sdp';
 
 const DEBUG = import.meta.env.DEV;
@@ -81,11 +82,6 @@ function camConstraints(deviceId?: string | null, exact = false): MediaTrackCons
 }
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-function isCameraPermissionError(err: unknown): boolean {
-    const name = (err as { name?: string })?.name ?? '';
-    return name === 'NotAllowedError' || name === 'SecurityError';
-}
 
 export interface MicConstraintOptions {
     deviceId?: string | null;
@@ -201,6 +197,10 @@ export class WebRTCManager {
     // concurrent capture — that double-acquire is exactly the Firefox "device in
     // use" failure (and leaks a stream whose track is never stopped).
     private cameraOpenPromise: Promise<MediaStream | null> | null = null;
+    // Last camera capture rejection, kept so the UI can say WHY the camera
+    // failed (busy device / gone device / actually blocked) instead of always
+    // blaming permissions. Cleared on a successful capture.
+    private lastCameraError: unknown = null;
     private isMicMuted: boolean = true;
     private iceRestartPending: boolean = false;
     private iceRestartOfferCounter = 0;
@@ -1756,6 +1756,12 @@ export class WebRTCManager {
         this.sendSignal('webcam:visibility', { visible });
     }
 
+    // Why the last camera capture failed, for the UI's error copy. Null when the
+    // camera has never failed (or has since succeeded).
+    getLastCameraError(): unknown {
+        return this.lastCameraError;
+    }
+
     getCurrentCameraDeviceId(): string | null {
         const track = this.cameraStream?.getVideoTracks()[0];
         try {
@@ -1818,19 +1824,47 @@ export class WebRTCManager {
         pushAttempt({ video: true, audio: false });
 
         let lastError: unknown = null;
+        // Every rung's failure is recorded and logged as one line if the whole
+        // ladder fails: "which constraint set failed, and with what" is the only
+        // thing that distinguishes a real block from a busy/absent device, and
+        // it is otherwise invisible to anyone debugging from a user's console.
+        const failures: string[] = [];
         for (let i = 0; i < attempts.length; i += 1) {
             try {
-                return await navigator.mediaDevices.getUserMedia(attempts[i]);
+                const stream = await navigator.mediaDevices.getUserMedia(attempts[i]);
+                this.lastCameraError = null;
+                return stream;
             } catch (err) {
                 lastError = err;
+                failures.push(`${JSON.stringify(attempts[i].video)} -> ${(err as { name?: string })?.name ?? 'Error'}: ${(err as { message?: string })?.message ?? ''}`);
                 if (preferred) storeCameraDeviceId(null);
-                if (isCameraPermissionError(err)) throw err;
+                if (isCameraPermissionError(err)) {
+                    console.error('Camera capture blocked:', failures.join(' | '));
+                    throw err;
+                }
                 // Camera drivers on Windows/Firefox often need a short beat
                 // after a failed allocation before the next constraint set.
                 await sleep(i === 0 ? 300 : 150);
             }
         }
 
+        // One last unconstrained try after a longer beat. Firefox does not
+        // release a video source synchronously on track.stop(), so a capture
+        // opened immediately after another was torn down (green room preview →
+        // session auto-start, same tick) fails to allocate on every rung above
+        // purely on timing. This does NOT help cross-tab contention — a camera
+        // held by another tab stays held.
+        await sleep(800);
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+            this.lastCameraError = null;
+            return stream;
+        } catch (err) {
+            lastError = err;
+            failures.push(`retry {video:true} -> ${(err as { name?: string })?.name ?? 'Error'}: ${(err as { message?: string })?.message ?? ''}`);
+        }
+
+        console.error('Camera capture failed after all attempts:', failures.join(' | '));
         throw lastError ?? new Error('Camera capture failed');
     }
 
@@ -1878,6 +1912,7 @@ export class WebRTCManager {
                 return this.cameraStream;
             } catch (err) {
                 console.error('Failed to open camera preview:', err);
+                this.lastCameraError = err;
                 return null;
             } finally {
                 this.cameraOpenPromise = null;
@@ -1928,6 +1963,7 @@ export class WebRTCManager {
             return true;
         } catch (err) {
             console.error('Failed to enable camera:', err);
+            this.lastCameraError = err;
             // Leave nothing half-live: drop the sender AND the capture so the
             // returned false matches a clean "off" state in both the manager and
             // the UI (no broadcasting-with-Cam-Off desync, no device left lit).

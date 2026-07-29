@@ -14,6 +14,7 @@
         storeMicDeviceId,
         storeCameraDeviceId,
     } from "$lib/webrtc/manager";
+    import { describeGumError } from "$lib/webrtc/gum-error";
     import { loadAudioModeState, getJoinWithCamera, type AudioMode, type DenoiserEngine } from "$lib/audio/audio-mode";
     import { createVADMonitor } from "$lib/audio/vad";
     import { deriveStreamOverlayState } from "$lib/video/stream-overlay";
@@ -1572,6 +1573,7 @@
             } else {
                 // Capture failed/denied — keep the modal up to show the reason.
                 camCaptureDenied = true;
+                camErrorMsg = describeGumError(manager.getLastCameraError(), "Camera");
                 selfCamStream = manager.getCameraStream();
             }
         } finally {
@@ -1638,14 +1640,18 @@
     // Open the manager-owned preview capture and bind it to the self-view. The
     // manager reuses an already-live capture, so this never double-acquires the
     // device (which fails on Firefox).
+    // Omit deviceId to use the current selection; pass null to force the OS
+    // default (the retry path, where the remembered id is the one that failed).
     async function startCameraPreview(deviceId?: string | null) {
         if (!webrtcManager) return;
         const manager = webrtcManager;
         camCaptureDenied = false;
-        const stream = await manager.openCameraPreview(deviceId ?? activeCameraId);
+        if (deviceId === null) activeCameraId = null;
+        const stream = await manager.openCameraPreview(deviceId === undefined ? activeCameraId : deviceId);
         if (destroyed || webrtcManager !== manager) return;
         if (!stream) {
             camCaptureDenied = true;
+            camErrorMsg = describeGumError(manager.getLastCameraError(), "Camera");
             return;
         }
         // The modal may have been dismissed during the await — if we're not
@@ -2487,6 +2493,11 @@
     // Enable (broadcast) or Dismiss. This is the camera "selector".
     let showCameraModal = $state(false);
     let camCaptureDenied = $state(false);
+    // The actual reason capture failed. "Blocked — allow access" is wrong (and
+    // sends the user hunting through browser settings that are already correct)
+    // when the real fault is a busy device, a vanished device, or a stale
+    // per-tab block.
+    let camErrorMsg = $state("Camera unavailable. Check the browser and OS permissions.");
 
     // Join/leave chimes for everyone: watch the roster for deltas rather
     // than a specific message type (joins arrive via roster broadcasts).
@@ -3272,7 +3283,11 @@
                                 playsinline
                             ></video>
                         {:else if camCaptureDenied}
-                            <span class="cam-modal-empty">Camera blocked — allow access in your browser.</span>
+                            <span class="cam-modal-empty error">{camErrorMsg}</span>
+                            <!-- Retry from the OS default: the failing attempt already
+                                 cleared the stored device, and activeCameraId still holds
+                                 the id that just failed. -->
+                            <button class="cam-modal-retry" onclick={() => startCameraPreview(null)}>Retry</button>
                         {:else}
                             <span class="cam-modal-empty">Starting preview…</span>
                         {/if}
@@ -4966,8 +4981,10 @@
         background: #000;
         border: 1px solid rgba(255, 255, 255, 0.08);
         display: flex;
+        flex-direction: column;
         align-items: center;
         justify-content: center;
+        gap: var(--space-sm);
         text-align: center;
         padding: var(--space-md);
     }
@@ -4980,6 +4997,23 @@
     .cam-modal-empty {
         font-size: 0.8125rem;
         color: var(--color-text-subtle);
+        line-height: 1.45;
+        max-width: 34ch;
+    }
+    .cam-modal-empty.error {
+        color: var(--color-text);
+    }
+    .cam-modal-retry {
+        padding: 4px 12px;
+        border-radius: var(--radius-sm);
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--color-text);
+        font-size: 0.8125rem;
+        cursor: pointer;
+    }
+    .cam-modal-retry:hover {
+        background: rgba(255, 255, 255, 0.12);
     }
     /* Shared device dropdown (mic / speaker / camera): collapses to the selected
        device with a caret; the native list opens on click and scrolls for many
