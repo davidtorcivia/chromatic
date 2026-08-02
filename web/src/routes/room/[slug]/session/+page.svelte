@@ -164,6 +164,11 @@
     let uiSounds = $state(getUiSoundsEnabled());
     let reduceTransparency = $state(false);
     let streamError = $state<string | null>(null);
+    // The browser refused our stereo-tuned answer on a renegotiation, so the
+    // program mix is decoding mono until the next one re-applies it. Surfaced
+    // rather than repaired: rebuilding the subscription to fix it would cost
+    // the stream, and a live review can't afford that.
+    let programAudioDegraded = $state(false);
     let needsPlayClick = $state(false); // Autoplay fallback
     let streamPaused = $state(false); // Stream temporarily disconnected
     // True once the video element fires 'playing' — the only reliable signal
@@ -192,9 +197,19 @@
     // Full re-subscription fallback: when ICE restart can't repair the media
     // path (dead TURN allocation, server-side subscriber gone), ask the server
     // for a brand-new subscriber instead of stranding the viewer.
+    //
+    // The budget is a sliding time window, not a counter. It used to be a
+    // counter reset by the 'playing' event, which cannot bound a flapping loop:
+    // every cycle rendered a frame before dying, so the count returned to zero
+    // each time and the cap was never reached. On 2026-08-02 that let a viewer
+    // rebuild its subscription every ~22s for 27 minutes, showing "connecting"
+    // half the time instead of ever surfacing an error. Timestamps age out on
+    // their own, so a genuinely recovered session still gets a full budget
+    // later while a loop trips the cap in about a minute.
     const RESUBSCRIBE_MAX_ATTEMPTS = 3;
+    const RESUBSCRIBE_WINDOW_MS = 120000;
     const CONNECTING_WATCHDOG_MS = 15000;
-    let resubscribeAttempts = $state(0);
+    let resubscribeTimes: number[] = [];
     let connectingWatchdog: ReturnType<typeof setTimeout> | null = null;
     let subscriptionRetryTimer: ReturnType<typeof setTimeout> | null = null;
     // Controls auto-hide (ITEM 3)
@@ -788,8 +803,8 @@
             // Subscriber setup can fail transiently (e.g. TURN hiccup while
             // building the server-side peer connection) — retry with backoff
             // before telling the user to refresh.
-            if (data?.code === 'subscription-failed' && resubscribeAttempts < RESUBSCRIBE_MAX_ATTEMPTS) {
-                const delay = 2000 * (resubscribeAttempts + 1);
+            if (data?.code === 'subscription-failed' && recentResubscribeCount() < RESUBSCRIBE_MAX_ATTEMPTS) {
+                const delay = 2000 * (recentResubscribeCount() + 1);
                 clearSubscriptionRetryTimer();
                 subscriptionRetryTimer = setTimeout(() => {
                     subscriptionRetryTimer = null;
@@ -923,6 +938,13 @@
             },
             onNegotiationWedged: () => {
                 requestResubscribe('local renegotiation wedged');
+            },
+            onProgramAudioDegraded: (degraded) => {
+                // Deliberately does not rebuild the subscription: keeping a
+                // working stream up beats a ~11s gap to recover a codec
+                // parameter. The next renegotiation re-applies stereo on its
+                // own; until then the viewer is told rather than left guessing.
+                programAudioDegraded = degraded;
             },
             onScreenShareEnded: () => {
                 screenShareActive = false;
@@ -1108,8 +1130,10 @@
         clearMediaStallTimer();
         clearKeyframeNudge();
         clearSubscriptionRetryTimer();
-        // Media is flowing again — future failures get a fresh retry budget.
-        resubscribeAttempts = 0;
+        // Deliberately does NOT clear the resubscribe budget. Frames rendering
+        // is exactly what a flapping loop produces between teardowns, so
+        // treating it as "recovered" is what let one run unbounded for 27
+        // minutes. The window ages entries out instead.
         captureVideoAspect();
     }
 
@@ -1150,14 +1174,23 @@
     // failed, keyframe nudges exhausted, or the viewer sat on "connecting"
     // past the watchdog. Bounded so a genuinely unreachable network ends in
     // a clear error instead of an infinite silent loop.
+    // Resubscribes still inside the sliding window, pruning expired entries.
+    function recentResubscribeCount(): number {
+        const now = Date.now();
+        resubscribeTimes = resubscribeTimes.filter((t) => now - t < RESUBSCRIBE_WINDOW_MS);
+        return resubscribeTimes.length;
+    }
+
     function requestResubscribe(reason: string): boolean {
-        if (resubscribeAttempts >= RESUBSCRIBE_MAX_ATTEMPTS) {
+        const now = Date.now();
+        resubscribeTimes = resubscribeTimes.filter((t) => now - t < RESUBSCRIBE_WINDOW_MS);
+        if (resubscribeTimes.length >= RESUBSCRIBE_MAX_ATTEMPTS) {
             streamError = "We couldn't reach the stream after several attempts.";
             return false;
         }
-        resubscribeAttempts++;
+        resubscribeTimes.push(now);
         resubscribeEvents++;
-        console.warn(`Requesting fresh subscription (${reason}, attempt ${resubscribeAttempts}/${RESUBSCRIBE_MAX_ATTEMPTS})`);
+        console.warn(`Requesting fresh subscription (${reason}, ${resubscribeTimes.length}/${RESUBSCRIBE_MAX_ATTEMPTS} in the last ${RESUBSCRIBE_WINDOW_MS / 1000}s)`);
         clearSubscriptionRetryTimer();
         // Reset the keyframe-nudge cycle: without this the stale attempt
         // counter immediately re-escalates on its next tick and the client
@@ -2100,8 +2133,9 @@
         webrtcManager?.requestResync();
         // Explicit user action: don't just ask for a keyframe, rebuild the
         // subscription with a fresh retry budget. This is what "Reload
-        // stream" should mean when the transport is wedged.
-        resubscribeAttempts = 0;
+        // stream" should mean when the transport is wedged. A person choosing
+        // to retry is the one case where clearing the window is right.
+        resubscribeTimes = [];
         requestResubscribe('user reload');
     }
 
@@ -3177,6 +3211,17 @@
                     <div class="screenshare-approval-actions">
                         <button class="screenshare-approval-btn approve" onclick={startApprovedShare}>Start sharing</button>
                         <button class="screenshare-approval-btn deny" onclick={dismissApprovedShare}>Cancel</button>
+                    </div>
+                </div>
+            {/if}
+
+            {#if programAudioDegraded}
+                <!-- Reuses the mic-prompt shell so the banner stack stays one
+                     visual language; only the edge colour differs. -->
+                <div class="mic-prompt program-audio-notice" role="status" aria-live="polite" transition:fly={{ y: 8, duration: prefersReducedMotion ? 0 : 200 }}>
+                    <div class="mic-prompt-copy">
+                        <p class="mic-prompt-title">Program audio is playing in mono</p>
+                        <p class="mic-prompt-text">Your browser refused the stereo setting on the last update. The stream is otherwise fine and stereo returns on its own — reload the stream if you need it back now.</p>
                     </div>
                 </div>
             {/if}
@@ -4293,6 +4338,11 @@
     }
     .mic-prompt.error {
         border-color: rgba(239, 90, 90, 0.5);
+    }
+    /* Degradation, not failure: the stream is still playing, so this reads
+       warmer than .error without shouting. */
+    .program-audio-notice {
+        border-color: rgba(224, 168, 74, 0.45);
     }
     .mic-prompt-copy {
         display: flex;

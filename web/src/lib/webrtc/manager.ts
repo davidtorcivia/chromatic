@@ -10,7 +10,7 @@ import {
 } from '$lib/audio/audio-mode';
 import { isDenoiserImplemented } from '$lib/audio/denoiser';
 import { isPermissionError as isCameraPermissionError } from './gum-error';
-import { applyOpusPreferences, tuneSubscriberAnswerOpus } from './sdp';
+import { applyOpusPreferences, findProgramAudioMid, tuneSubscriberAnswerOpus } from './sdp';
 
 const DEBUG = import.meta.env.DEV;
 const debugLog = (...args: unknown[]) => {
@@ -153,6 +153,22 @@ export interface WebRTCManagerOptions {
     /** Local renegotiation failed repeatedly — the page should rebuild the
      *  subscription (local tracks re-attach on the fresh offer). */
     onNegotiationWedged?: () => void;
+    /** The browser refused our stereo-tuned answer, so program audio is
+     *  decoding mono until a later renegotiation re-applies it (true), or that
+     *  has now happened (false). Stability wins over rebuilding the connection
+     *  to fix it, so the page surfaces this instead of reconnecting. */
+    onProgramAudioDegraded?: (degraded: boolean) => void;
+}
+
+// Compact, log-safe rendering of a thrown value. DOMException.name is the part
+// that identifies a munge rejection (InvalidModificationError) versus a state
+// error (InvalidStateError), so it must survive into the server log.
+function describeError(err: unknown): string {
+    const e = err as { name?: string; message?: string } | null;
+    if (e && (e.name || e.message)) {
+        return `${e.name ?? 'Error'}: ${e.message ?? ''}`.trim();
+    }
+    return String(err);
 }
 
 export interface WebRTCStats {
@@ -172,6 +188,12 @@ export class WebRTCManager {
     private pc: RTCPeerConnection | null = null;
     private subscriberOfferId: string | null = null;
     private subscriberCandidateOfferId: string | null = null;
+    // Set when the browser rejected our stereo-tuned answer and we fell back to
+    // its own (mono) answer to keep the connection alive. Cleared by the next
+    // renegotiation that applies the munge cleanly.
+    private programStereoDegraded = false;
+    // Rate-limits the program-mid-unknown breadcrumb to once per connection.
+    private programMidWarned = false;
     private options: WebRTCManagerOptions;
     // localStream holds the stream whose audio track is SENT — the processed
     // output of the mic cleanup chain when available, the raw capture
@@ -342,13 +364,20 @@ export class WebRTCManager {
                 // before committing the local answer — the browser's default
                 // answer follows RFC 7587 (mono) and would downmix the program
                 // stream. Receive-side params only; no DTX/bitrate cap. The same
-                // tuned SDP is what we signal, so both peers agree.
+                // tuned SDP is what we signal, so both peers agree. Scoped to
+                // the program m-line so voice m-lines (mono) keep the browser's
+                // own fmtp.
                 const tunedAnswer: RTCSessionDescriptionInit = {
                     type: answer.type,
-                    sdp: tuneSubscriberAnswerOpus(answer.sdp ?? '')
+                    sdp: tuneSubscriberAnswerOpus(answer.sdp ?? '', this.programAudioMid(sdp))
                 };
                 await pc.setLocalDescription(tunedAnswer);
                 debugLog('Created and set local description (answer)');
+                // A fresh subscription re-applies the munge from scratch, so any
+                // mono fallback from the previous PC is over. Without this the
+                // "playing in mono" notice would stick for the rest of the
+                // session even though stereo came back.
+                this.markProgramStereoRestored();
 
                 const payload: { sdp: string | undefined; offerId?: string } = { sdp: tunedAnswer.sdp };
                 if (offerId) {
@@ -398,6 +427,9 @@ export class WebRTCManager {
         }
         this.subscriberOfferId = null;
         this.subscriberCandidateOfferId = null;
+        // The replacement PC negotiates its own answer from scratch, so a mono
+        // fallback recorded against the old one no longer describes reality.
+        this.markProgramStereoRestored();
         this.videoJitterBufferSamples.clear();
     }
 
@@ -425,6 +457,11 @@ export class WebRTCManager {
             iceServers: this.options.iceServers
         });
         this.pc = pc;
+        // Belongs here, not only in resetPeerConnection: handleOffer builds a
+        // PC directly when there is none to tear down, so resetting only there
+        // would let the flag outlive the connection it describes and suppress
+        // the warning for every later subscription.
+        this.programMidWarned = false;
 
         // Handle incoming tracks
         this.pc.ontrack = (event) => {
@@ -1576,41 +1613,137 @@ export class WebRTCManager {
             this.options.onRenegotiation?.();
             const previousCandidateOfferId = this.subscriberCandidateOfferId;
 
+            const pc = this.pc;
+            const stateBefore = pc.signalingState;
+
             try {
-                if (this.pc.signalingState === 'have-local-offer') {
+                if (pc.signalingState === 'have-local-offer') {
                     debugLog('Rolling back local subscriber offer before server renegotiation');
-                    await this.pc.setLocalDescription({ type: 'rollback' });
+                    await pc.setLocalDescription({ type: 'rollback' });
                     this.clearIceRestartAttempt();
                 }
 
                 this.subscriberCandidateOfferId = offerId ?? null;
-                await this.pc.setRemoteDescription({ type: 'offer', sdp });
-                const answer = await this.pc.createAnswer();
+                await pc.setRemoteDescription({ type: 'offer', sdp });
+                const answer = await pc.createAnswer();
+
                 // Same stereo-decode munge as the initial answer: server
                 // renegotiation (e.g. a new program/voice track) must not let
                 // the browser fall back to a mono Opus answer.
-                const tunedAnswer: RTCSessionDescriptionInit = {
-                    type: answer.type,
-                    sdp: tuneSubscriberAnswerOpus(answer.sdp ?? '')
-                };
-                await this.pc.setLocalDescription(tunedAnswer);
+                //
+                // If the browser refuses the tuned SDP we must still answer.
+                // The SFU cannot roll back its own offer (pion v4 rejects
+                // SetLocalDescription(rollback) from HaveLocalOffer — see
+                // sfu.go HandleIceRestart/HandleSubscriberOffer), so a
+                // subscriber that goes quiet here leaves the server pinned in
+                // have-local-offer, where every later track-add is dropped by
+                // the stable-state guard and that viewer silently goes deaf to
+                // everyone who joins afterwards. Answering untuned keeps the
+                // session alive and the state machine moving; program audio
+                // rides mono until the next renegotiation re-applies the munge,
+                // and the UI says so rather than pretending it's clean.
+                let answerSdp: string | undefined;
+                try {
+                    const tunedAnswer: RTCSessionDescriptionInit = {
+                        type: answer.type,
+                        sdp: tuneSubscriberAnswerOpus(answer.sdp ?? '', this.programAudioMid(sdp))
+                    };
+                    await pc.setLocalDescription(tunedAnswer);
+                    answerSdp = tunedAnswer.sdp;
+                    this.markProgramStereoRestored();
+                } catch (mungeErr) {
+                    // Let the browser author and apply its own answer — that
+                    // form cannot be rejected as a modification.
+                    await pc.setLocalDescription();
+                    answerSdp = pc.localDescription?.sdp;
+                    this.programStereoDegraded = true;
+                    this.renegotiationDebug(
+                        'munge-rejected',
+                        `${describeError(mungeErr)} before=${stateBefore} after=${pc.signalingState}`
+                    );
+                    this.options.onProgramAudioDegraded?.(true);
+                }
 
-                const payload: { sdp: string | undefined; offerId?: string } = { sdp: tunedAnswer.sdp };
+                const payload: { sdp: string | undefined; offerId?: string } = { sdp: answerSdp };
                 if (offerId) {
                     payload.offerId = offerId;
                 }
 
                 if (!this.sendSignal('signal:renegotiate-answer', payload)) {
-                    this.failSubscriberNegotiation('Failed to send renegotiation answer; resetting subscriber connection');
+                    // The websocket is gone, so there is no answer to deliver
+                    // and no way to ask for a replacement. Reconnect logic owns
+                    // recovery from here.
+                    this.renegotiationDebug('answer-undeliverable', `state=${pc.signalingState}`);
                     return;
                 }
 
                 debugLog('Sent renegotiation answer');
             } catch (err) {
                 this.subscriberCandidateOfferId = previousCandidateOfferId;
-                this.failSubscriberNegotiation('Failed to handle renegotiation; resetting subscriber connection', err);
+                this.renegotiationDebug(
+                    'failed',
+                    `${describeError(err)} before=${stateBefore} after=${pc.signalingState} conn=${pc.connectionState}`
+                );
+                // A renegotiation that cannot be applied does not invalidate the
+                // media already flowing. Destroying the connection here is what
+                // turned one wedged offer into a room-wide reconnect cascade on
+                // 2026-08-02: every rebuild re-published voice, which forced a
+                // renegotiation on everyone else, which wedged the next viewer.
+                // Only tear down a connection that is genuinely dead; otherwise
+                // keep the stream up and let the next renegotiation resolve it.
+                // Identity guard: an await above may have yielded long enough
+                // for a fresh offer to replace this PC, and tearing down then
+                // would kill the healthy replacement instead.
+                if (this.pc !== pc) {
+                    debugLog('Renegotiation failed on a superseded peer connection; ignoring');
+                    return;
+                }
+                if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+                    this.failSubscriberNegotiation('Renegotiation failed on a dead connection; resetting subscriber', err);
+                    return;
+                }
+                console.warn('Renegotiation could not be applied; keeping the existing connection', err);
             }
         });
+    }
+
+    // Breadcrumb reporting for subscriber renegotiation, mirrored to the server
+    // log for the same reason as shareDebug: these failures only reproduce on a
+    // participant's own machine mid-session, and the 2026-08-02 cascade had to
+    // be diagnosed by inference because the browser-side exception never left
+    // the client. Now the exception names itself in `docker logs chromatic`.
+    // Locates the program-audio m-line in a server offer. A null result silently
+    // reverts the munge to whole-SDP scope, which is the pre-fix behavior that
+    // synthesized fmtp lines onto voice m-lines — so it must be visible in the
+    // server log rather than looking identical to the fixed path.
+    private programAudioMid(offerSdp: string): string | null {
+        const mid = findProgramAudioMid(offerSdp);
+        // Reported once per peer connection: if the offer shape ever changes
+        // this is true of every renegotiation, and one line per voice track
+        // would drown the log it exists to make readable.
+        if (mid === null && !this.programMidWarned) {
+            this.programMidWarned = true;
+            this.renegotiationDebug('program-mid-unknown', 'tuning every Opus m-line');
+        }
+        return mid;
+    }
+
+    // Called wherever a tuned answer is applied successfully. Idempotent: only
+    // reports when there was an outstanding degradation to clear.
+    private markProgramStereoRestored(): void {
+        if (!this.programStereoDegraded) return;
+        this.programStereoDegraded = false;
+        this.renegotiationDebug('stereo-restored');
+        this.options.onProgramAudioDegraded?.(false);
+    }
+
+    private renegotiationDebug(event: string, detail = ''): void {
+        debugLog(`[reneg] ${event}`, detail);
+        try {
+            this.sendSignal('client:debug', { event: `reneg:${event}`, detail });
+        } catch {
+            // never let diagnostics break renegotiation
+        }
     }
 
     // Start screen sharing — captures display and adds video track to peer connection

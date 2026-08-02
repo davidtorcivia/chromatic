@@ -103,6 +103,44 @@ const SUBSCRIBER_ANSWER_OPUS_PARAMS: Record<string, string> = {
     'sprop-stereo': '1'
 };
 
+// The msid stream name the SFU gives the OBS program-audio relay track (see
+// whip.go — NewTrackLocalStaticRTP(..., "audio", "chromatic-stream")). Voice,
+// webcam and screen-share relays use per-participant names, so this is what
+// distinguishes the one m-line that carries program audio.
+const PROGRAM_STREAM_ID = 'chromatic-stream';
+
+// Split an SDP into its session-level preamble and per-m-line sections.
+function splitMediaSections(lines: string[]): { preamble: string[]; sections: string[][] } {
+    const preamble: string[] = [];
+    const sections: string[][] = [];
+    for (const line of lines) {
+        if (line.startsWith('m=')) {
+            sections.push([line]);
+        } else if (sections.length === 0) {
+            preamble.push(line);
+        } else {
+            sections[sections.length - 1].push(line);
+        }
+    }
+    return { preamble, sections };
+}
+
+// findProgramAudioMid locates the mid of the m-line carrying OBS program audio
+// in a server OFFER, by looking for the relay's msid stream name. Returns null
+// when the offer has no such m-line (older server, or an offer that carries no
+// program audio yet) — callers then fall back to tuning every Opus m-line.
+export function findProgramAudioMid(offerSdp: string): string | null {
+    if (!offerSdp) return null;
+    const { sections } = splitMediaSections(offerSdp.split(/\r\n|\n/));
+    for (const section of sections) {
+        if (!section[0].startsWith('m=audio')) continue;
+        if (!section.some((l) => l.startsWith('a=msid:') && l.includes(PROGRAM_STREAM_ID))) continue;
+        const midLine = section.find((l) => l.startsWith('a=mid:'));
+        if (midLine) return midLine.slice('a=mid:'.length).trim();
+    }
+    return null;
+}
+
 // tuneSubscriberAnswerOpus ensures the subscriber's ANSWER advertises full-
 // stereo Opus decode for the program stream. Applied to the browser's own
 // createAnswer() SDP before setLocalDescription, on both the initial server
@@ -110,7 +148,18 @@ const SUBSCRIBER_ANSWER_OPUS_PARAMS: Record<string, string> = {
 // params above into the Opus fmtp — never adds sender caps, DTX, or a bitrate
 // ceiling, and never touches m-lines, payload ordering, or rtpmap. Returns the
 // SDP unchanged when no Opus codec is present.
-export function tuneSubscriberAnswerOpus(sdp: string): string {
+//
+// `programMid` scopes the edit to the single m-line carrying program audio.
+// This matters because every audio m-line shares one Opus payload type: without
+// scoping we also stamped stereo=1;sprop-stereo=1 onto every *voice* m-line
+// (which are mono) and synthesized a=fmtp lines onto m-lines that had none.
+// Renegotiation offers are exactly where new voice m-lines appear, and adding
+// lines the browser's own createAnswer did not produce is the kind of munge
+// Chrome rejects outright — which used to destroy the whole subscription.
+// Omitting `programMid` keeps the original whole-SDP behavior, so a failure to
+// identify the program m-line degrades to "tune everything" rather than
+// silently dropping the program stream to mono.
+export function tuneSubscriberAnswerOpus(sdp: string, programMid?: string | null): string {
     if (!sdp) return sdp;
 
     // Match line endings of the source (WebRTC uses CRLF; tests may use LF).
@@ -125,23 +174,31 @@ export function tuneSubscriberAnswerOpus(sdp: string): string {
     }
     if (opusPts.size === 0) return sdp;
 
-    const out: string[] = [];
-    const haveFmtp = new Set<string>();
+    const { preamble, sections } = splitMediaSections(lines);
+    // Only scope when the requested mid is actually present; a stale mid must
+    // not result in an answer with no stereo advertised anywhere.
+    const scoped =
+        programMid != null &&
+        sections.some((s) => s.some((l) => l.trim() === `a=mid:${programMid}`));
 
-    for (const line of lines) {
-        const m = /^a=fmtp:(\d+)\s+(.*)$/.exec(line);
-        if (m && opusPts.has(m[1])) {
-            haveFmtp.add(m[1]);
-            out.push(`a=fmtp:${m[1]} ${mergeFmtpParams(m[2], SUBSCRIBER_ANSWER_OPUS_PARAMS)}`);
-        } else {
-            out.push(line);
+    const tuneSection = (section: string[]): string[] => {
+        const out: string[] = [];
+        const haveFmtp = new Set<string>();
+        for (const line of section) {
+            const m = /^a=fmtp:(\d+)\s+(.*)$/.exec(line);
+            if (m && opusPts.has(m[1])) {
+                haveFmtp.add(m[1]);
+                out.push(`a=fmtp:${m[1]} ${mergeFmtpParams(m[2], SUBSCRIBER_ANSWER_OPUS_PARAMS)}`);
+            } else {
+                out.push(line);
+            }
         }
-    }
 
-    // Some answers omit the fmtp line; add one right after the rtpmap for any
-    // Opus PT that lacked it so the stereo decode params still take effect.
-    const missing = [...opusPts].filter((pt) => !haveFmtp.has(pt));
-    if (missing.length > 0) {
+        // Some answers omit the fmtp line; add one right after the rtpmap for
+        // any Opus PT that lacked it so the stereo decode params still apply.
+        const missing = [...opusPts].filter((pt) => !haveFmtp.has(pt));
+        if (missing.length === 0) return out;
+
         const fmtpValue = mergeFmtpParams('', SUBSCRIBER_ANSWER_OPUS_PARAMS);
         const withFmtp: string[] = [];
         for (const line of out) {
@@ -151,8 +208,13 @@ export function tuneSubscriberAnswerOpus(sdp: string): string {
                 withFmtp.push(`a=fmtp:${m[1]} ${fmtpValue}`);
             }
         }
-        return withFmtp.join(eol);
-    }
+        return withFmtp;
+    };
 
-    return out.join(eol);
+    const tuned = sections.map((section) => {
+        if (scoped && !section.some((l) => l.trim() === `a=mid:${programMid}`)) return section;
+        return tuneSection(section);
+    });
+
+    return [...preamble, ...tuned.flat()].join(eol);
 }

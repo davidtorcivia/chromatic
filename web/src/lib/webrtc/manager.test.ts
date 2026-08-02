@@ -74,6 +74,15 @@ class FakeShareSender {
     }
 }
 
+// Diagnostics ride the same sendSignal channel as signaling but are not part
+// of the signaling contract, so exact-match assertions filter them out. Tests
+// that care about a breadcrumb assert on it directly.
+function signalsOnly(
+    sent: Array<{ type: string; payload: unknown }>
+): Array<{ type: string; payload: unknown }> {
+    return sent.filter((m) => m.type !== 'client:debug');
+}
+
 class FakeSubscriberPeerConnection {
     ontrack: ((event: RTCTrackEvent) => void) | null = null;
     onicecandidate: ((event: { candidate: RTCIceCandidateInit | null }) => void) | null = null;
@@ -90,6 +99,10 @@ class FakeSubscriberPeerConnection {
     rejectRemoteOffers = false;
     answerSDP: string | null = null;
     lastLocalSDP: string | undefined;
+    // Simulates Chrome refusing a munged answer with InvalidModificationError
+    // while still accepting the implicit setLocalDescription() form.
+    rejectMungedAnswers = false;
+    localDescription: RTCSessionDescriptionInit | null = null;
 
     async createOffer(options?: RTCOfferOptions): Promise<RTCSessionDescriptionInit> {
         return { type: 'offer', sdp: options?.iceRestart ? 'ice-restart-offer' : 'offer' };
@@ -115,8 +128,25 @@ class FakeSubscriberPeerConnection {
     }
 
     async setLocalDescription(description?: RTCSessionDescriptionInit): Promise<void> {
-        if (!description) return;
+        // Implicit form: the browser authors the description itself, so it can
+        // never be rejected as a modification.
+        if (!description) {
+            const implicit: RTCSessionDescriptionInit = {
+                type: this.signalingState === 'have-remote-offer' ? 'answer' : 'offer',
+                sdp: this.answerSDP ?? 'subscriber-answer'
+            };
+            this.lastLocalSDP = implicit.sdp;
+            this.localDescription = implicit;
+            this.signalingState = implicit.type === 'answer' ? 'stable' : 'have-local-offer';
+            return;
+        }
+        if (this.rejectMungedAnswers && description.type === 'answer') {
+            const err = new Error('The SDP does not match the previously generated SDP');
+            err.name = 'InvalidModificationError';
+            throw err;
+        }
         if (description.sdp !== undefined) this.lastLocalSDP = description.sdp;
+        this.localDescription = description;
         if (description.type === 'offer') {
             this.signalingState = 'have-local-offer';
             this.onicecandidate?.({
@@ -798,7 +828,7 @@ describe('WebRTCManager ICE restart recovery', () => {
         await manager.handleRenegotiation('renegotiation-offer', 'speaker-1', 'renegotiate-456');
 
         expect(managerInternals.pc?.signalingState).toBe('stable');
-        expect(sent).toEqual([
+        expect(signalsOnly(sent)).toEqual([
             { type: 'signal:ice-restart', payload: { sdp: 'ice-restart-offer', offerId: 'ice-restart-1' } },
             {
                 type: 'signal:candidate',
@@ -837,7 +867,9 @@ describe('WebRTCManager subscriber signaling', () => {
 
         await manager.handleOffer('subscriber-offer', 'offer-123');
 
-        expect(sent).toEqual([{ type: 'signal:answer', payload: { sdp: 'subscriber-answer', offerId: 'offer-123' } }]);
+        expect(signalsOnly(sent)).toEqual([
+            { type: 'signal:answer', payload: { sdp: 'subscriber-answer', offerId: 'offer-123' } }
+        ]);
     });
 
     it('resubscribes when a fresh subscriber offer cannot be applied', async () => {
@@ -980,7 +1012,12 @@ describe('WebRTCManager subscriber signaling', () => {
         ]);
     });
 
-    it('resubscribes when a server renegotiation offer cannot be applied', async () => {
+    // A renegotiation that cannot be applied does not invalidate media that is
+    // already flowing. Tearing the connection down here is what turned one
+    // wedged offer into a room-wide reconnect cascade on 2026-08-02, because
+    // every rebuild re-published voice and forced a renegotiation on everyone
+    // else. The live connection must survive.
+    it('keeps the existing connection when a renegotiation offer cannot be applied', async () => {
         vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
 
         const onNegotiationWedged = vi.fn();
@@ -994,6 +1031,31 @@ describe('WebRTCManager subscriber signaling', () => {
         await manager.handleOffer('subscriber-offer', 'offer-123');
         const managerInternals = manager as unknown as { pc: FakeSubscriberPeerConnection | null };
         const pc = managerInternals.pc;
+        pc!.connectionState = 'connected';
+        pc!.rejectRemoteOffers = true;
+
+        await manager.handleRenegotiation('bad-renegotiation-offer', 'speaker-1', 'renegotiate-456');
+
+        expect(pc?.closed).toBe(false);
+        expect(managerInternals.pc).toBe(pc);
+        expect(onNegotiationWedged).not.toHaveBeenCalled();
+    });
+
+    it('still tears down when renegotiation fails on an already-dead connection', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const onNegotiationWedged = vi.fn();
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: () => {},
+            onNegotiationWedged
+        });
+
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+        const managerInternals = manager as unknown as { pc: FakeSubscriberPeerConnection | null };
+        const pc = managerInternals.pc;
+        pc!.connectionState = 'failed';
         pc!.rejectRemoteOffers = true;
 
         await manager.handleRenegotiation('bad-renegotiation-offer', 'speaker-1', 'renegotiate-456');
@@ -1001,6 +1063,121 @@ describe('WebRTCManager subscriber signaling', () => {
         expect(pc?.closed).toBe(true);
         expect(managerInternals.pc).toBeNull();
         expect(onNegotiationWedged).toHaveBeenCalledTimes(1);
+    });
+
+    // The SFU cannot roll back its own offer (pion v4 rejects rollback from
+    // HaveLocalOffer), so a subscriber that declines to answer leaves the
+    // server pinned in have-local-offer and silently deaf to later joiners.
+    // A rejected munge must therefore still produce an answer.
+    it('answers untuned when the browser rejects the stereo-tuned answer', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const sent: { type: string; payload: unknown }[] = [];
+        const onProgramAudioDegraded = vi.fn();
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: (type, payload) => {
+                sent.push({ type, payload });
+                return true;
+            },
+            onProgramAudioDegraded
+        });
+
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+        const managerInternals = manager as unknown as { pc: FakeSubscriberPeerConnection | null };
+        const pc = managerInternals.pc;
+        pc!.connectionState = 'connected';
+        pc!.rejectMungedAnswers = true;
+        sent.length = 0;
+
+        await manager.handleRenegotiation('renegotiation-offer', 'speaker-1', 'renegotiate-456');
+
+        // The connection survives and the server gets its answer.
+        expect(pc?.closed).toBe(false);
+        expect(sent.some((m) => m.type === 'signal:renegotiate-answer')).toBe(true);
+        // The degradation is reported, not hidden.
+        expect(onProgramAudioDegraded).toHaveBeenCalledWith(true);
+        expect(sent.some((m) => m.type === 'client:debug')).toBe(true);
+    });
+
+    // signalsOnly() filters client:debug out of the exact-match assertions, so
+    // a breadcrumb that started firing per-renegotiation would otherwise be
+    // invisible. This is the test that guards the dedupe.
+    it('warns once per connection when the program m-line cannot be identified', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const sent: Array<{ type: string; payload: unknown }> = [];
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: (type, payload) => {
+                sent.push({ type, payload });
+                return true;
+            }
+        });
+
+        // These fixture offers carry no chromatic-stream msid, so the mid is
+        // never identifiable and the warning path runs on every call.
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+        (manager as unknown as { pc: FakeSubscriberPeerConnection | null }).pc!.connectionState = 'connected';
+        await manager.handleRenegotiation('renegotiation-offer', 'speaker-1', 'reneg-1');
+        await manager.handleRenegotiation('renegotiation-offer', 'speaker-2', 'reneg-2');
+
+        const warnings = sent.filter(
+            (m) => m.type === 'client:debug' && (m.payload as { event?: string }).event === 'reneg:program-mid-unknown'
+        );
+        expect(warnings).toHaveLength(1);
+    });
+
+    // The banner must come back down, or it tells the viewer their audio is
+    // mono long after stereo returned.
+    it('clears the mono notice once a renegotiation applies the tuned answer', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const onProgramAudioDegraded = vi.fn();
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: () => true,
+            onProgramAudioDegraded
+        });
+
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+        const managerInternals = manager as unknown as { pc: FakeSubscriberPeerConnection | null };
+        const pc = managerInternals.pc;
+        pc!.connectionState = 'connected';
+
+        pc!.rejectMungedAnswers = true;
+        await manager.handleRenegotiation('renegotiation-offer', 'speaker-1', 'reneg-1');
+        expect(onProgramAudioDegraded).toHaveBeenLastCalledWith(true);
+
+        pc!.rejectMungedAnswers = false;
+        await manager.handleRenegotiation('renegotiation-offer', 'speaker-2', 'reneg-2');
+        expect(onProgramAudioDegraded).toHaveBeenLastCalledWith(false);
+    });
+
+    it('clears the mono notice when a fresh subscription replaces the connection', async () => {
+        vi.stubGlobal('RTCPeerConnection', FakeSubscriberPeerConnection);
+
+        const onProgramAudioDegraded = vi.fn();
+        const manager = new WebRTCManager({
+            iceServers: [],
+            onTrack: () => {},
+            sendSignal: () => true,
+            onProgramAudioDegraded
+        });
+
+        await manager.handleOffer('subscriber-offer', 'offer-123');
+        const managerInternals = manager as unknown as { pc: FakeSubscriberPeerConnection | null };
+        managerInternals.pc!.connectionState = 'connected';
+        managerInternals.pc!.rejectMungedAnswers = true;
+        await manager.handleRenegotiation('renegotiation-offer', 'speaker-1', 'reneg-1');
+        expect(onProgramAudioDegraded).toHaveBeenLastCalledWith(true);
+
+        // A fresh subscription renegotiates from scratch.
+        await manager.handleOffer('subscriber-offer-2', 'offer-456');
+        expect(onProgramAudioDegraded).toHaveBeenLastCalledWith(false);
     });
 
     it('sets low-latency jitter buffer targets on inbound receivers when supported', () => {
@@ -1100,7 +1277,7 @@ describe('WebRTCManager subscriber signaling', () => {
         expect(pc!.lastLocalSDP).toContain('sprop-stereo=1');
         expect(pc!.lastLocalSDP).not.toContain('maxaveragebitrate');
         // ...and the SAME tuned SDP is what we signal to the server.
-        expect(sent).toEqual([
+        expect(signalsOnly(sent)).toEqual([
             { type: 'signal:answer', payload: { sdp: pc!.lastLocalSDP, offerId: 'offer-123' } }
         ]);
     });
@@ -1125,7 +1302,7 @@ describe('WebRTCManager subscriber signaling', () => {
 
         expect(pc!.lastLocalSDP).toContain('stereo=1');
         expect(pc!.lastLocalSDP).toContain('sprop-stereo=1');
-        expect(sent).toEqual([
+        expect(signalsOnly(sent)).toEqual([
             { type: 'signal:renegotiate-answer', payload: { sdp: pc!.lastLocalSDP, offerId: 'renegotiate-456' } }
         ]);
     });
