@@ -195,6 +195,9 @@ func NewRouter(cfg *config.Config, db *database.DB, sfu *webrtc.SFU, hub *websoc
 
 	// File endpoints (session auth) - rate limited: 10 per minute
 	mux.Handle("POST /api/rooms/{slug}/files", middleware.FileUploadRateLimiter(cfg.TrustedProxies)(http.HandlerFunc(fileHandler.Upload)))
+	// Frame grabs get their own route so origin='frame-grab' is decided by the
+	// endpoint rather than by a client-supplied field.
+	mux.Handle("POST /api/rooms/{slug}/grab", middleware.FileUploadRateLimiter(cfg.TrustedProxies)(http.HandlerFunc(fileHandler.GrabFrame)))
 	mux.HandleFunc("GET /api/files/{id}", fileHandler.Download)
 	mux.HandleFunc("GET /api/files/{id}/thumbnail", fileHandler.Thumbnail)
 	// Public watermark logo (viewers need access)

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -159,8 +161,20 @@ func (h *FileHandler) authorizeParticipant(r *http.Request, roomSlug string) (st
 	return payload.ParticipantID, nil
 }
 
-// Upload handles file uploads
+// Upload handles ordinary file uploads (references, decks, audio notes).
 func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
+	h.storeUpload(w, r, fileOriginUpload)
+}
+
+// GrabFrame handles frame captures from the session player. It is a separate
+// route from Upload purely so origin='frame-grab' is decided by which endpoint
+// the request arrived on: keying watermark behaviour off a client-supplied
+// field would let a client opt its own capture out of the stamp.
+func (h *FileHandler) GrabFrame(w http.ResponseWriter, r *http.Request) {
+	h.storeUpload(w, r, fileOriginFrameGrab)
+}
+
+func (h *FileHandler) storeUpload(w http.ResponseWriter, r *http.Request, origin string) {
 	slug := r.PathValue("slug")
 
 	uploaderID, err := h.authorizeParticipant(r, slug)
@@ -169,15 +183,16 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get room ID
-	var roomID string
+	// Room id plus the watermark config, which decides whether a frame grab is
+	// stamped on the way in.
 	roomCtx, roomCancel := database.WithTimeout(r.Context())
-	err = h.db.QueryRowContext(roomCtx, "SELECT id FROM rooms WHERE slug = ?", slug).Scan(&roomID)
+	room, err := h.roomWatermark(roomCtx, slug)
 	roomCancel()
 	if err != nil {
 		http.Error(w, "Room not found", http.StatusNotFound)
 		return
 	}
+	roomID := room.ID
 
 	// Parse multipart form
 	r.Body = http.MaxBytesReader(w, r.Body, maxFileSize+1024)
@@ -212,6 +227,12 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "File type not allowed", http.StatusBadRequest)
 		return
 	}
+	// The grab route only ever receives the player's JPEG capture. Narrowing it
+	// keeps the stamped path to a single decoder.
+	if origin == fileOriginFrameGrab && mimeType != "image/jpeg" {
+		http.Error(w, "Frame grabs must be JPEG", http.StatusBadRequest)
+		return
+	}
 	if err := validateImageDimensions(file, mimeType, maxImagePixels); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -241,48 +262,80 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to save file", http.StatusInternalServerError)
 		return
 	}
-	defer dst.Close()
 
-	if _, err := io.Copy(dst, file); err != nil {
+	if _, copyErr := io.Copy(dst, file); copyErr != nil {
+		_ = dst.Close()
 		_ = os.Remove(storedPath)
 		http.Error(w, "Failed to save file", http.StatusInternalServerError)
 		return
 	}
-
-	// Insert into database
-	insertCtx, insertCancel := database.WithTimeout(r.Context())
-	_, err = h.db.ExecContext(insertCtx, `
-		INSERT INTO files (id, room_id, uploader_id, original_name, stored_path, mime_type, size_bytes)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, fileID, roomID, uploaderID, originalName, storedPath, mimeType, header.Size)
-	insertCancel()
-
-	if err != nil {
+	if err := dst.Close(); err != nil {
 		_ = os.Remove(storedPath)
-		http.Error(w, "Failed to save file metadata", http.StatusInternalServerError)
+		http.Error(w, "Failed to save file", http.StatusInternalServerError)
 		return
 	}
+	storedSize := header.Size
 
-	// Generate thumbnail for images
+	// Thumbnails are generated from the clean frame, before any stamp. Identity
+	// text tiled onto a 200px preview is unreadable mush, and thumbnails are
+	// deliberately left unmarked (a 200px still is not a meaningful leak
+	// surface for a 4K frame, and per-requester marking would mean regenerating
+	// on every request).
 	var thumbnailPath string
 	if strings.HasPrefix(mimeType, "image/") && mimeType != "image/gif" {
 		thumbnailPath = filepath.Join(h.cfg.UploadPath, roomID, "thumbnails", fileID+".jpg")
 		if err := generateThumbnail(storedPath, thumbnailPath); err != nil {
 			logger.Warn("Failed to generate thumbnail", "file_id", fileID, "error", err)
 			// Don't fail the upload, just skip thumbnail
-		} else {
-			// Update database with thumbnail path
-			thCtx, thCancel := database.WithTimeout(r.Context())
-			_, _ = h.db.ExecContext(thCtx, "UPDATE files SET thumbnail_path = ? WHERE id = ?", thumbnailPath, fileID)
-			thCancel()
+			thumbnailPath = ""
 		}
+	}
+
+	// Provenance stamp: who captured this frame. Serve-time marking records who
+	// downloaded it, but only the upload stamp survives a copy made outside
+	// Chromatic. Fails the upload rather than storing a clean frame: a grab in a
+	// watermarked room that silently skipped its stamp is the hole this closes.
+	if origin == fileOriginFrameGrab && room.marksFrames() {
+		name, _ := h.participantName(r.Context(), uploaderID)
+		size, stampErr := stampStoredFrame(storedPath, frameStampSpec{
+			Lines:   captureStampLines(name, uploaderID, time.Now().UTC()),
+			Opacity: room.Opacity,
+			Scale:   room.Scale,
+		})
+		if stampErr != nil {
+			logger.Error("Failed to stamp grabbed frame", "file_id", fileID, "error", stampErr)
+			_ = os.Remove(storedPath)
+			if thumbnailPath != "" {
+				_ = os.Remove(thumbnailPath)
+			}
+			http.Error(w, "Failed to save file", http.StatusInternalServerError)
+			return
+		}
+		storedSize = size
+	}
+
+	// Insert into database
+	insertCtx, insertCancel := database.WithTimeout(r.Context())
+	_, err = h.db.ExecContext(insertCtx, `
+		INSERT INTO files (id, room_id, uploader_id, original_name, stored_path, thumbnail_path, mime_type, size_bytes, origin)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, fileID, roomID, uploaderID, originalName, storedPath, nullableString(thumbnailPath), mimeType, storedSize, origin)
+	insertCancel()
+
+	if err != nil {
+		_ = os.Remove(storedPath)
+		if thumbnailPath != "" {
+			_ = os.Remove(thumbnailPath)
+		}
+		http.Error(w, "Failed to save file metadata", http.StatusInternalServerError)
+		return
 	}
 
 	response := map[string]interface{}{
 		"id":           fileID,
 		"originalName": originalName,
 		"mimeType":     mimeType,
-		"sizeBytes":    header.Size,
+		"sizeBytes":    storedSize,
 		"url":          fmt.Sprintf("/api/files/%s", fileID),
 	}
 
@@ -301,14 +354,17 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 func (h *FileHandler) Download(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	var storedPath, mimeType, originalName, roomSlug string
+	var storedPath, mimeType, originalName, roomSlug, origin string
+	var room roomWatermarkConfig
 	dlCtx, dlCancel := database.WithTimeout(r.Context())
 	err := h.db.QueryRowContext(dlCtx, `
-		SELECT f.stored_path, f.mime_type, f.original_name, r.slug
+		SELECT f.stored_path, f.mime_type, f.original_name, f.origin, r.slug,
+		       COALESCE(r.watermark_mode, 'none'), COALESCE(r.watermark_opacity, 0.3),
+		       COALESCE(r.watermark_scale, 1.0)
 		FROM files f
 		JOIN rooms r ON r.id = f.room_id
 		WHERE f.id = ?
-	`, id).Scan(&storedPath, &mimeType, &originalName, &roomSlug)
+	`, id).Scan(&storedPath, &mimeType, &originalName, &origin, &roomSlug, &room.Mode, &room.Opacity, &room.Scale)
 	dlCancel()
 
 	if err != nil {
@@ -316,9 +372,17 @@ func (h *FileHandler) Download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := h.authorizeParticipant(r, roomSlug); err != nil && !h.hasAdminSession(r) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
+	// Keep the requester id: a marked serve is stamped for whoever is
+	// downloading, not for whoever grabbed the frame. Marking only at upload
+	// misattributes — Alice grabs, Bob downloads, Bob leaks, the frame says
+	// Alice.
+	requesterID, authErr := h.authorizeParticipant(r, roomSlug)
+	if authErr != nil {
+		if !h.hasAdminSession(r) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		requesterID = ""
 	}
 
 	// Containment check: the stored path comes from the database and must
@@ -347,7 +411,55 @@ func (h *FileHandler) Download(w http.ResponseWriter, r *http.Request) {
 		"filename": sanitizeFilename(originalName),
 	}))
 
+	if origin == fileOriginFrameGrab && room.marksFrames() {
+		h.serveMarkedFrame(w, r, id, storedPath, room, requesterID)
+		return
+	}
+
 	http.ServeFile(w, r, storedPath)
+}
+
+// serveMarkedFrame stamps a grabbed frame for the requester and writes it
+// directly. ServeFile is not usable here: the body differs per requester and
+// per second, so range requests, ETag and Last-Modified would all describe a
+// representation that does not exist.
+func (h *FileHandler) serveMarkedFrame(
+	w http.ResponseWriter, r *http.Request,
+	fileID, storedPath string, room roomWatermarkConfig, requesterID string,
+) {
+	src, err := os.ReadFile(storedPath)
+	if err != nil {
+		logger.Error("Failed to read frame for marking", "file_id", fileID, "error", err)
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	name := "Admin"
+	if requesterID != "" {
+		name, _ = h.participantName(r.Context(), requesterID)
+	}
+
+	marked, err := stampJPEG(src, frameStampSpec{
+		Lines:   downloadStampLines(name, requesterID, time.Now().UTC()),
+		Opacity: room.Opacity,
+		Scale:   room.Scale,
+	})
+	if err != nil {
+		// Fail closed. Serving the clean frame because marking broke would hand
+		// out exactly the unmarked full-resolution still this path exists to
+		// prevent.
+		logger.Error("Failed to mark frame for download", "file_id", fileID, "error", err)
+		http.Error(w, "Failed to prepare file", http.StatusInternalServerError)
+		return
+	}
+
+	// A shared cache handing Bob a copy marked for Alice would undo the whole
+	// thing.
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Content-Length", strconv.Itoa(len(marked)))
+	if _, err := w.Write(marked); err != nil {
+		logger.Debug("Marked frame write failed", "file_id", fileID, "error", err)
+	}
 }
 
 // ListRoomFiles returns every file uploaded to a room, newest first.
@@ -542,6 +654,110 @@ func (h *FileHandler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.ServeFile(w, r, storedPath)
+}
+
+// File origins. Set by which route the upload arrived on, never by a client
+// field, so watermark behaviour cannot be opted out of by the uploader.
+const (
+	fileOriginUpload    = "upload"
+	fileOriginFrameGrab = "frame-grab"
+)
+
+// roomWatermarkConfig is the subset of room watermark settings the file
+// pipeline needs.
+type roomWatermarkConfig struct {
+	ID      string
+	Mode    string
+	Opacity float64
+	Scale   float64
+}
+
+// marksFrames reports whether grabbed frames in this room get stamped. Rooms
+// with watermarking switched off keep clean grabs: the stamp follows the room's
+// watermark setting rather than introducing a second, hidden policy.
+func (c roomWatermarkConfig) marksFrames() bool {
+	return c.Mode != "" && c.Mode != "none"
+}
+
+func (h *FileHandler) roomWatermark(ctx context.Context, slug string) (roomWatermarkConfig, error) {
+	var c roomWatermarkConfig
+	err := h.db.QueryRowContext(ctx, `
+		SELECT id, COALESCE(watermark_mode, 'none'), COALESCE(watermark_opacity, 0.3),
+		       COALESCE(watermark_scale, 1.0)
+		FROM rooms WHERE slug = ?
+	`, slug).Scan(&c.ID, &c.Mode, &c.Opacity, &c.Scale)
+	return c, err
+}
+
+// participantName resolves a display name from the database rather than from
+// the join token: mark content is server-owned, and a participant can be gone
+// by the time an old grab is downloaded.
+func (h *FileHandler) participantName(ctx context.Context, participantID string) (string, bool) {
+	if participantID == "" {
+		return "Unknown", false
+	}
+	var name string
+	nameCtx, cancel := database.WithTimeout(ctx)
+	err := h.db.QueryRowContext(nameCtx, "SELECT name FROM participants WHERE id = ?", participantID).Scan(&name)
+	cancel()
+	if err != nil || name == "" {
+		return "Unknown", false
+	}
+	return name, true
+}
+
+// shortParticipantID is what ties a leaked frame back to an audit row. The
+// participant id is 32 hex chars; the first 8 are plenty to disambiguate within
+// a room and short enough to stay legible in a tiled mark.
+func shortParticipantID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
+func captureStampLines(name, participantID string, t time.Time) []string {
+	return []string{
+		fmt.Sprintf("captured by %s (%s)", name, shortParticipantID(participantID)),
+		t.Format("2006-01-02 15:04:05 UTC"),
+	}
+}
+
+func downloadStampLines(name, participantID string, t time.Time) []string {
+	who := name
+	if participantID != "" {
+		who = fmt.Sprintf("%s (%s)", name, shortParticipantID(participantID))
+	}
+	return []string{
+		fmt.Sprintf("downloaded by %s", who),
+		t.Format("2006-01-02 15:04:05 UTC"),
+	}
+}
+
+// stampStoredFrame rewrites the stored JPEG with the stamp burned in and
+// returns the new size on disk.
+func stampStoredFrame(path string, spec frameStampSpec) (int64, error) {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	marked, err := stampJPEG(src, spec)
+	if err != nil {
+		return 0, err
+	}
+	if err := os.WriteFile(path, marked, 0o600); err != nil {
+		return 0, err
+	}
+	return int64(len(marked)), nil
+}
+
+// nullableString keeps an unset path as SQL NULL instead of an empty string,
+// which is what the thumbnail readers expect.
+func nullableString(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 func generateFileID() (string, error) {
