@@ -111,11 +111,15 @@ var ErrStalePublisherOffer = errors.New("stale publisher offer")
 var ErrClientOfferDeferred = errors.New("client offer deferred until in-flight server offer settles")
 
 // iceGatherTimeout bounds how long we wait for ICE gathering to complete before
-// returning the SDP with whatever candidates we already have. Host/srflx
-// candidates gather quickly and are usually sufficient; relay candidates can
-// trickle later. Without this cap a hung STUN/TURN server freezes the
-// handshake indefinitely (and a WHIP response could blow past client/server
-// write timeouts).
+// returning the SDP with whatever candidates we already have. Without this cap
+// a hung STUN server freezes the handshake indefinitely (and a WHIP response
+// could blow past client/server write timeouts).
+//
+// Since server-side PCs gather STUN-only (see serverICEServers), completion is
+// ~0.02s and this is a pure safety net rather than something we expect to hit.
+// It used to fire on every voice PC because TURN gathering takes a flat 5s;
+// if TURN is ever restored here, this must be raised past that or the SDP goes
+// out truncated.
 const iceGatherTimeout = 3 * time.Second
 
 // waitForICEGather blocks until ICE gathering completes or the timeout fires.
@@ -508,6 +512,37 @@ func NewSFU(cfg *config.Config) (*SFU, error) {
 	return sfu, nil
 }
 
+// serverICEServers is the ICE configuration for the SFU's OWN peer connections
+// (subscriber, voice/publisher, WHIP ingest) — STUN only, deliberately without
+// TURN.
+//
+// Measured against the live Cloudflare TURN config on 2026-08-02: gathering
+// with TURN takes a flat 5.0s to reach `complete`, while STUN alone finishes in
+// ~0.02s with a full host+srflx set. Since iceGatherTimeout is 3s, every single
+// voice PC in that session (182 of them) hit the timeout and shipped a
+// TRUNCATED candidate list — the relay candidates the wait was paying for
+// mostly never made it into the SDP at all. The ones that did then decayed:
+// the same session logged 179 "Fail to refresh permissions" errors, roughly one
+// per allocation per refresh interval, because server-side allocations stop
+// being maintained.
+//
+// So this removes three seconds from every negotiation, makes the candidate set
+// complete instead of truncated, and drops a class of recurring error, at the
+// cost of relay candidates that were largely theoretical. NAT traversal still
+// works: clients keep the full STUN+TURN set from GetICEServers, and a
+// symmetric-NAT client reaches this server via its own relay against our
+// host/srflx candidates. This host is not itself behind a symmetric NAT —
+// srflx pairs are observed succeeding in production.
+//
+// If a participant ever proves unreachable in a way that needs a server-side
+// relay, restore TURN here and raise iceGatherTimeout past 5s together; adding
+// it back alone would reintroduce the truncation, which is the worst of both.
+func (s *SFU) serverICEServers() []webrtc.ICEServer {
+	return []webrtc.ICEServer{
+		{URLs: []string{"stun:stun.l.google.com:19302"}},
+	}
+}
+
 // GetICEServers returns the ICE server configuration for clients
 func (s *SFU) GetICEServers() []webrtc.ICEServer {
 	servers := []webrtc.ICEServer{
@@ -596,7 +631,7 @@ func splitAndSanitizeTURNURLs(raw string) []string {
 // CreatePeerConnection creates a new peer connection with standard configuration
 func (s *SFU) CreatePeerConnection() (*webrtc.PeerConnection, error) {
 	config := webrtc.Configuration{
-		ICEServers: s.GetICEServers(),
+		ICEServers: s.serverICEServers(),
 	}
 
 	// Serialize creation so the stats-interceptor factory callback (which

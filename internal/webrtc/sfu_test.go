@@ -35,6 +35,52 @@ func createTestConfig() *config.Config {
 	}
 }
 
+// The SFU's own peer connections must gather STUN-only. Adding TURN here costs
+// 3s per negotiation and ships a truncated candidate set, because ICE gathering
+// with Cloudflare TURN takes a flat ~5s while iceGatherTimeout is 3s — measured
+// against the live config on 2026-08-02, when it fired on all 182 voice PCs.
+// Clients are unaffected: GetICEServers still hands them the full TURN set.
+func TestSFU_ServerPeerConnectionsDoNotGatherTURN(t *testing.T) {
+	cfg := createTestConfig()
+	cfg.TurnRealm = "turn.example.com"
+	cfg.TurnSecret = "shared-secret"
+	cfg.TurnMode = config.TurnModeSelfHosted
+
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	// Precondition: with this config the client-facing set really does include
+	// TURN, so the assertion below is meaningful rather than vacuous.
+	sawClientTURN := false
+	for _, server := range sfu.GetICEServers() {
+		for _, url := range server.URLs {
+			if strings.HasPrefix(url, "turn:") || strings.HasPrefix(url, "turns:") {
+				sawClientTURN = true
+			}
+		}
+	}
+	if !sawClientTURN {
+		t.Fatal("precondition: expected client ICE servers to include TURN")
+	}
+
+	for _, server := range sfu.serverICEServers() {
+		for _, url := range server.URLs {
+			if strings.HasPrefix(url, "turn:") || strings.HasPrefix(url, "turns:") {
+				t.Errorf("server-side ICE config must not include TURN, got %q", url)
+			}
+		}
+	}
+
+	// If TURN is ever restored server-side, the gather timeout has to clear the
+	// ~5s TURN gathering time or the SDP goes out truncated.
+	if iceGatherTimeout >= 5*time.Second {
+		t.Log("iceGatherTimeout now exceeds TURN gathering time; server-side TURN could be reconsidered")
+	}
+}
+
 func TestNewSFU(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)
