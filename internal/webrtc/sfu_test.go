@@ -1312,6 +1312,49 @@ func TestSFU_SetSubscriberAnswer_IgnoresStaleOfferID(t *testing.T) {
 	}
 }
 
+// An answer that arrives with no offerID and no pending offer must be ignored,
+// not pushed into pion. On 2026-08-02 this surfaced as an ERROR-level
+// "invalid proposed signaling state transition: stable->SetRemote(answer)"
+// — the negotiation was simply already over, but it read like a fault.
+func TestSFU_SetSubscriberAnswer_IgnoresAnswerWhenNotAwaitingOne(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	room := sfu.GetRoomTracks(roomSlug)
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create peer connection: %v", err)
+	}
+	defer pc.Close()
+
+	// A brand-new PC is Stable: it has no local offer outstanding, so there is
+	// nothing for an answer to complete.
+	if state := pc.SignalingState(); state != webrtc.SignalingStateStable {
+		t.Fatalf("precondition: expected stable PC, got %s", state)
+	}
+
+	sub := &Subscriber{
+		ID:             "sub-1",
+		PeerConnection: pc,
+		done:           make(chan struct{}),
+	}
+	room.AddSubscriber(sub)
+
+	// No offerID, so the offer-matching check above is skipped entirely — the
+	// signaling-state guard is the only thing standing between this and pion.
+	if err := sfu.SetSubscriberAnswer(roomSlug, "sub-1", webrtc.SessionDescription{
+		Type: webrtc.SDPTypeAnswer,
+		SDP:  "answer for a negotiation that already finished",
+	}, ""); err != nil {
+		t.Fatalf("expected a late answer to be ignored, got error: %v", err)
+	}
+}
+
 func TestSFU_AddSubscriberICECandidate_RoomNotFound(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)
@@ -1996,7 +2039,7 @@ func TestSFU_AddSubscriberICECandidate_BudgetResetsPerNegotiation(t *testing.T) 
 
 	// Exhaust the budget. remoteDescSet is false, so candidates are buffered
 	// and never touch the PeerConnection.
-	for i := 0; i < MaxICECandidates; i++ {
+	for i := 0; i < maxSubscriberICECandidates; i++ {
 		if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate, ""); err != nil {
 			t.Fatalf("candidate %d unexpectedly rejected: %v", i, err)
 		}
@@ -2012,13 +2055,67 @@ func TestSFU_AddSubscriberICECandidate_BudgetResetsPerNegotiation(t *testing.T) 
 	}
 
 	// ...and the fresh budget is still bounded.
-	for i := 0; i < MaxICECandidates-1; i++ {
+	for i := 0; i < maxSubscriberICECandidates-1; i++ {
 		if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate, ""); err != nil {
 			t.Fatalf("candidate %d of fresh budget unexpectedly rejected: %v", i, err)
 		}
 	}
 	if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate, ""); err == nil {
 		t.Fatal("expected candidate over the fresh budget to be rejected")
+	}
+}
+
+// The budget must also refill on its own. Without the sliding window, a
+// subscriber that exhausted its allowance and then got no further negotiation
+// would reject candidates forever — which is how a repair attempt loses its
+// tail (2026-08-02: 16 candidates discarded during an ICE restart).
+func TestSFU_AddSubscriberICECandidate_WindowRefills(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	room := sfu.GetRoomTracks(roomSlug)
+
+	sub := &Subscriber{ID: "sub-1", done: make(chan struct{})}
+	room.AddSubscriber(sub)
+
+	candidate := webrtc.ICECandidateInit{Candidate: "candidate:1 1 udp 2122260223 192.0.2.1 54321 typ host"}
+
+	for i := 0; i < maxSubscriberICECandidates; i++ {
+		if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate, ""); err != nil {
+			t.Fatalf("candidate %d unexpectedly rejected: %v", i, err)
+		}
+	}
+	if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate, ""); err == nil {
+		t.Fatal("expected candidate over budget to be rejected")
+	}
+
+	// Age the window out without touching the counter, simulating the passage
+	// of subscriberCandidateWindow with no intervening negotiation.
+	sub.remoteCandidateMu.Lock()
+	sub.iceWindowStart = time.Now().Add(-subscriberCandidateWindow - time.Second)
+	sub.remoteCandidateMu.Unlock()
+
+	if err := sfu.AddSubscriberICECandidate(roomSlug, "sub-1", candidate, ""); err != nil {
+		t.Fatalf("candidate after window expiry unexpectedly rejected: %v", err)
+	}
+}
+
+// The subscriber allowance must comfortably exceed a single browser regather.
+// One Firefox ICE restart produced >50 candidates in ~2s on 2026-08-02; a cap
+// anywhere near that rejects legitimate repair traffic.
+func TestSubscriberICECandidateBudget_FitsARealRegather(t *testing.T) {
+	if maxSubscriberICECandidates < 150 {
+		t.Errorf("maxSubscriberICECandidates = %d, too small for a real ICE restart burst",
+			maxSubscriberICECandidates)
+	}
+	if maxSubscriberICECandidates > 1000 {
+		t.Errorf("maxSubscriberICECandidates = %d, too large to bound flooding",
+			maxSubscriberICECandidates)
 	}
 }
 

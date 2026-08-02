@@ -186,7 +186,6 @@ interface JitterBufferSample {
 
 export class WebRTCManager {
     private pc: RTCPeerConnection | null = null;
-    private subscriberOfferId: string | null = null;
     private subscriberCandidateOfferId: string | null = null;
     // Set when the browser rejected our stereo-tuned answer and we fell back to
     // its own (mono) answer to keep the connection alive. Cleared by the next
@@ -347,7 +346,6 @@ export class WebRTCManager {
                 this.createPeerConnection();
             }
 
-            this.subscriberOfferId = offerId ?? null;
             this.subscriberCandidateOfferId = offerId ?? null;
             const pc = this.pc!;
 
@@ -425,7 +423,6 @@ export class WebRTCManager {
             }
             this.pc = null;
         }
-        this.subscriberOfferId = null;
         this.subscriberCandidateOfferId = null;
         // The replacement PC negotiates its own answer from scratch, so a mono
         // fallback recorded against the old one no longer describes reality.

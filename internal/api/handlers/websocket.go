@@ -263,6 +263,7 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 		Done:           make(chan struct{}),
 		IsAdmin:        isAdmin,
 		AdminSessionID: adminSessionID,
+		Browser:        websocket.SummarizeUserAgent(r.UserAgent()),
 	}
 	client.SetAudioEnabled(false)
 	client.SetVideoEnabled(true)
@@ -666,8 +667,12 @@ func (h *WebSocketHandler) handleClientDebug(client *websocket.Client, payload j
 	if len(data.Detail) > 256 {
 		data.Detail = data.Detail[:256]
 	}
+	// Browser is included because these breadcrumbs exist to diagnose
+	// engine-specific WebRTC failures; without it the reader is back to asking
+	// a human which browser the participant was using.
 	logger.Info("Client debug", "event", data.Event, "detail", data.Detail,
-		"participant_id", client.ID, "name", client.Name, "room", client.RoomSlug)
+		"participant_id", client.ID, "name", client.Name, "room", client.RoomSlug,
+		"browser", client.Browser)
 }
 
 // handleResubscribe forces a fresh subscriber for a client whose media path

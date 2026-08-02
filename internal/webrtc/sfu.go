@@ -72,6 +72,24 @@ const MaxICECandidates = 50
 // bounds the flooding attack rate without permanently rejecting candidates.
 const whipCandidateWindow = time.Minute
 
+// Subscriber trickle-ICE budget. Same sliding-window shape as the WHIP ingest
+// above, but a much larger allowance, because a single browser ICE restart can
+// legitimately produce a very large burst: on 2026-08-02 one Firefox restart
+// trickled more than 50 candidates in about two seconds and the tail was
+// rejected with "too many ICE candidates" — 16 candidates thrown away on a
+// connection that was trying to repair itself.
+//
+// The count is high enough for several full regathers (host + srflx across
+// IPv4/IPv6, plus the sizeable relay set Cloudflare TURN hands out) while still
+// bounding a flood to a fixed rate rather than an unbounded one. The
+// per-negotiation reset (resetICECandidateBudget) is kept on top of this: it
+// makes the common case start from zero, and the window is the backstop for
+// bursts that straddle negotiations.
+const (
+	maxSubscriberICECandidates = 250
+	subscriberCandidateWindow  = time.Minute
+)
+
 const keyframeRequestMinInterval = 250 * time.Millisecond
 
 var ErrStaleSubscriberAnswer = errors.New("stale subscriber answer")
@@ -231,10 +249,12 @@ type Subscriber struct {
 	pendingRemoteCandidates []*webrtc.ICECandidateInit
 	remoteDescSet           bool
 	remoteCandidateMu       sync.Mutex
-	// Rate limit client-to-server ICE candidates (matches ingest limit).
-	// Scoped per negotiation: reset via resetICECandidateBudget whenever a
-	// new SDP negotiation begins.
+	// Rate limit client-to-server ICE candidates. Sliding window (see
+	// maxSubscriberICECandidates) plus a per-negotiation reset via
+	// resetICECandidateBudget, so neither a long session nor a single large
+	// ICE-restart burst can exhaust the allowance permanently.
 	iceCandidateCount int
+	iceWindowStart    time.Time
 	// Pending renegotiation state. Tracks that could not be offered right away
 	// (another offer/answer exchange in flight, or signaling lock contention)
 	// are never dropped: they are either attached with needsRenegotiation set,
@@ -290,6 +310,7 @@ func pcHasTrack(pc *webrtc.PeerConnection, track webrtc.TrackLocal) bool {
 func (sub *Subscriber) resetICECandidateBudget() {
 	sub.remoteCandidateMu.Lock()
 	sub.iceCandidateCount = 0
+	sub.iceWindowStart = time.Now()
 	sub.remoteCandidateMu.Unlock()
 }
 
@@ -1761,6 +1782,18 @@ func (s *SFU) SetSubscriberAnswer(roomSlug, subscriberID string, answer webrtc.S
 		}
 	}
 
+	// An answer only applies to a PC that is still waiting for one. Without
+	// this, an answer arriving after the PC already settled (a duplicate, or a
+	// client that omits offerID and therefore skips the check above) reaches
+	// pion as stable->SetRemote(answer) and surfaces as an ERROR-level
+	// InvalidModificationError — alarming in the log, but nothing is actually
+	// wrong: the negotiation it belonged to is simply over. HandleRenegotiationAnswer
+	// has carried this same guard; the initial-answer path was missing it.
+	if state := sub.PeerConnection.SignalingState(); state != webrtc.SignalingStateHaveLocalOffer {
+		log.Printf("Ignoring stale subscriber answer for %s (state: %s)", subscriberID, state)
+		return nil
+	}
+
 	if err := sub.PeerConnection.SetRemoteDescription(answer); err != nil {
 		return fmt.Errorf("failed to set remote description: %w", err)
 	}
@@ -1922,13 +1955,20 @@ func (s *SFU) AddSubscriberICECandidate(roomSlug, subscriberID string, candidate
 		return fmt.Errorf("%w: got %s, want %s", ErrStaleSubscriberCandidate, candidateID, currentID)
 	}
 
-	// Enforce ICE candidate limit to prevent flooding attacks
+	// Enforce ICE candidate limit to prevent flooding attacks. Sliding window:
+	// a legitimate regather (ICE restart, network transition) refills rather
+	// than being permanently penalised by earlier negotiations.
+	now := time.Now()
 	sub.remoteCandidateMu.Lock()
-	sub.iceCandidateCount++
-	if sub.iceCandidateCount > MaxICECandidates {
+	if sub.iceWindowStart.IsZero() || now.Sub(sub.iceWindowStart) >= subscriberCandidateWindow {
+		sub.iceWindowStart = now
+		sub.iceCandidateCount = 0
+	}
+	if sub.iceCandidateCount >= maxSubscriberICECandidates {
 		sub.remoteCandidateMu.Unlock()
 		return fmt.Errorf("too many ICE candidates from subscriber %s", subscriberID)
 	}
+	sub.iceCandidateCount++
 	if !sub.remoteDescSet {
 		// Buffer until remote description is set
 		sub.pendingRemoteCandidates = append(sub.pendingRemoteCandidates, &candidate)

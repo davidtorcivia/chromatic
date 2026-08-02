@@ -83,6 +83,13 @@ type Client struct {
 	// so that mid-session logout revokes them. Empty for non-admin clients.
 	AdminSessionID string
 
+	// Browser is a compact rendering of the User-Agent captured at upgrade.
+	// WebRTC bugs are routinely browser-specific — the 2026-08-02 renegotiation
+	// cascade came down to Chrome rejecting an SDP that Firefox accepted, and
+	// establishing that took asking a human who had been in the room. Recording
+	// it on join makes the next one answerable from the log alone.
+	Browser string
+
 	// Rate limiting for chat messages (30 per minute)
 	chatRateLimiter *RateLimiter
 	// Rate limiting for cursor updates (40 per second)
@@ -250,7 +257,11 @@ func (h *Hub) registerClient(client *Client) {
 	}
 
 	room.Clients[client.ID] = client
-	log.Printf("Client %s (%s) joined room %s", client.ID, client.Name, client.RoomSlug)
+	browser := client.Browser
+	if browser == "" {
+		browser = "unknown"
+	}
+	log.Printf("Client %s (%s) joined room %s [%s]", client.ID, client.Name, client.RoomSlug, browser)
 }
 
 func (h *Hub) unregisterClient(client *Client) {

@@ -203,11 +203,18 @@
     // every cycle rendered a frame before dying, so the count returned to zero
     // each time and the cap was never reached. On 2026-08-02 that let a viewer
     // rebuild its subscription every ~22s for 27 minutes, showing "connecting"
-    // half the time instead of ever surfacing an error. Timestamps age out on
-    // their own, so a genuinely recovered session still gets a full budget
-    // later while a loop trips the cap in about a minute.
-    const RESUBSCRIBE_MAX_ATTEMPTS = 3;
-    const RESUBSCRIBE_WINDOW_MS = 120000;
+    // half the time instead of ever surfacing an error.
+    //
+    // Sized against that measured loop (~2.7 resubscribes/min) rather than as
+    // tightly as possible: it trips in a little over two minutes, while a
+    // connection that drops a few times and genuinely recovers keeps its budget
+    // because entries age out. Giving up is itself an outage — the terminal
+    // state here is a modal with a Refresh button, so the bar for reaching it
+    // should be "this is clearly looping", not "this was briefly unhappy".
+    // The connecting-watchdog re-arms every CONNECTING_WATCHDOG_MS, so this
+    // budget is also ~90s of continuous retrying before the user sees an error.
+    const RESUBSCRIBE_MAX_ATTEMPTS = 6;
+    const RESUBSCRIBE_WINDOW_MS = 300000;
     const CONNECTING_WATCHDOG_MS = 15000;
     let resubscribeTimes: number[] = [];
     let connectingWatchdog: ReturnType<typeof setTimeout> | null = null;
