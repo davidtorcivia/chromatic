@@ -324,6 +324,56 @@ func TestDownload_OrdinaryUploadNeverMarked(t *testing.T) {
 	}
 }
 
+// The thumbnail endpoint falls back to the stored file when no thumbnail
+// exists. For a grabbed frame that fallback would serve the whole picture from
+// a route named "thumbnail", so it must downscale instead.
+func TestThumbnail_FrameGrabFallbackNeverServesFullFrame(t *testing.T) {
+	fileHandler, roomHandler, db, cleanup := setupFileTest(t)
+	defer cleanup()
+
+	roomID := createTestRoom(t, roomHandler, db, "grab-thumb")
+	enableRoomWatermark(t, db, roomID)
+	createTestParticipant(t, db, roomID, "grabber-5")
+	token := createJoinToken(t, "grabber-5", "grab-thumb")
+
+	fileID := uploadedFileID(t, postFrameGrab(t, fileHandler, "grab-thumb", token,
+		createTestFrameJPEG(t, 1280, 720)))
+
+	// Simulate thumbnail generation having failed at upload time.
+	var thumbPath *string
+	if err := db.QueryRow("SELECT thumbnail_path FROM files WHERE id = ?", fileID).Scan(&thumbPath); err != nil {
+		t.Fatalf("read thumbnail path: %v", err)
+	}
+	if thumbPath != nil {
+		if err := os.Remove(*thumbPath); err != nil {
+			t.Fatalf("remove thumbnail: %v", err)
+		}
+	}
+	if _, err := db.Exec("UPDATE files SET thumbnail_path = NULL WHERE id = ?", fileID); err != nil {
+		t.Fatalf("clear thumbnail path: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/api/files/"+fileID+"/thumbnail", nil)
+	req.SetPathValue("id", fileID)
+	req.Header.Set("X-Join-Token", token)
+	rr := httptest.NewRecorder()
+	fileHandler.Thumbnail(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("thumbnail: %d %s", rr.Code, rr.Body.String())
+	}
+	img, err := jpeg.Decode(bytes.NewReader(rr.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("decode fallback thumbnail: %v", err)
+	}
+	if img.Bounds().Dx() > 200 || img.Bounds().Dy() > 200 {
+		t.Errorf("fallback served %v; the full frame is reachable from the thumbnail route", img.Bounds().Size())
+	}
+	if cc := rr.Header().Get("Cache-Control"); cc != "private, no-store" {
+		t.Errorf("Cache-Control = %q, want %q", cc, "private, no-store")
+	}
+}
+
 // Fixed input plus fixed spec produces stable output, and the stamp never
 // changes the frame's dimensions.
 func TestStampImage_DeterministicAndSizePreserving(t *testing.T) {

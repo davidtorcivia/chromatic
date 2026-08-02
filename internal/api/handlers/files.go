@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -607,15 +608,19 @@ func (h *FileHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 func (h *FileHandler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	var storedPath, mimeType, roomSlug string
+	var storedPath, mimeType, roomSlug, origin string
 	var thumbnailPath *string
+	var room roomWatermarkConfig
 	thCtx, thCancel := database.WithTimeout(r.Context())
 	err := h.db.QueryRowContext(thCtx, `
-		SELECT f.stored_path, f.mime_type, f.thumbnail_path, r.slug
+		SELECT f.stored_path, f.mime_type, f.thumbnail_path, f.origin, r.slug,
+		       COALESCE(r.watermark_mode, 'none'), COALESCE(r.watermark_opacity, 0.3),
+		       COALESCE(r.watermark_scale, 1.0)
 		FROM files f
 		JOIN rooms r ON r.id = f.room_id
 		WHERE f.id = ?
-	`, id).Scan(&storedPath, &mimeType, &thumbnailPath, &roomSlug)
+	`, id).Scan(&storedPath, &mimeType, &thumbnailPath, &origin, &roomSlug,
+		&room.Mode, &room.Opacity, &room.Scale)
 	thCancel()
 
 	if err != nil {
@@ -653,6 +658,27 @@ func (h *FileHandler) Thumbnail(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
+
+	// Never let the fallback hand out a full-resolution grabbed frame. If
+	// thumbnail generation failed at upload, or the file was removed from disk,
+	// this branch would otherwise serve the whole picture from an endpoint named
+	// "thumbnail" — the exact hole this path exists to close, one route over.
+	if origin == fileOriginFrameGrab && room.marksFrames() {
+		data, err := encodeThumbnail(storedPath)
+		if err != nil {
+			logger.Warn("Failed to build fallback thumbnail", "file_id", id, "error", err)
+			http.Error(w, "File not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Header().Set("Cache-Control", "private, no-store")
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		if _, err := w.Write(data); err != nil {
+			logger.Debug("Fallback thumbnail write failed", "file_id", id, "error", err)
+		}
+		return
+	}
+
 	http.ServeFile(w, r, storedPath)
 }
 
@@ -885,17 +911,39 @@ func detectPathContentType(path string) (string, error) {
 
 // generateThumbnail creates a resized thumbnail from an image file
 func generateThumbnail(srcPath, dstPath string) error {
+	data, err := encodeThumbnail(srcPath)
+	if err != nil {
+		return err
+	}
+
+	// Ensure directory exists
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
+		return fmt.Errorf("failed to create thumbnail directory: %w", err)
+	}
+
+	if err := os.WriteFile(dstPath, data, 0o600); err != nil {
+		return fmt.Errorf("failed to write thumbnail: %w", err)
+	}
+
+	logger.Debug("Generated thumbnail", "path", dstPath, "bytes", len(data))
+	return nil
+}
+
+// encodeThumbnail decodes an image and returns a JPEG-encoded thumbnail. Kept
+// separate from generateThumbnail so the serve path can build one in memory
+// without leaving a file behind.
+func encodeThumbnail(srcPath string) ([]byte, error) {
 	// Open source file
 	srcFile, err := os.Open(srcPath)
 	if err != nil {
-		return fmt.Errorf("failed to open source: %w", err)
+		return nil, fmt.Errorf("failed to open source: %w", err)
 	}
 	defer srcFile.Close()
 
 	// Decode image
 	srcImage, format, err := image.Decode(srcFile)
 	if err != nil {
-		return fmt.Errorf("failed to decode image: %w", err)
+		return nil, fmt.Errorf("failed to decode image: %w", err)
 	}
 
 	logger.Debug("Generating thumbnail", "format", format, "source", srcPath)
@@ -927,26 +975,13 @@ func generateThumbnail(srcPath, dstPath string) error {
 	// Use high-quality resampling
 	draw.CatmullRom.Scale(dstImage, dstImage.Bounds(), srcImage, bounds, draw.Over, nil)
 
-	// Ensure directory exists
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
-		return fmt.Errorf("failed to create thumbnail directory: %w", err)
+	var out bytes.Buffer
+	if err := jpeg.Encode(&out, dstImage, &jpeg.Options{Quality: thumbnailQuality}); err != nil {
+		return nil, fmt.Errorf("failed to encode thumbnail: %w", err)
 	}
 
-	// Create destination file
-	dstFile, err := os.Create(dstPath)
-	if err != nil {
-		return fmt.Errorf("failed to create thumbnail file: %w", err)
-	}
-	defer dstFile.Close()
-
-	// Encode as JPEG
-	if err := jpeg.Encode(dstFile, dstImage, &jpeg.Options{Quality: thumbnailQuality}); err != nil {
-		_ = os.Remove(dstPath)
-		return fmt.Errorf("failed to encode thumbnail: %w", err)
-	}
-
-	logger.Debug("Generated thumbnail", "path", dstPath, "width", newWidth, "height", newHeight)
-	return nil
+	logger.Debug("Encoded thumbnail", "source", srcPath, "width", newWidth, "height", newHeight)
+	return out.Bytes(), nil
 }
 
 // Register image decoders (required for image.Decode to work)
