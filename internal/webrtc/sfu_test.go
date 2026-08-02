@@ -81,6 +81,97 @@ func TestSFU_ServerPeerConnectionsDoNotGatherTURN(t *testing.T) {
 	}
 }
 
+// Publisher candidates gathered before the answer is delivered must be held,
+// not dropped: the client cannot attach a candidate until it has applied the
+// answer. Before trickle existed in this direction, anything the bounded
+// pre-answer gather wait missed was lost outright.
+func TestVoiceSession_BuffersPublisherCandidatesUntilTrickleEnabled(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "test-room"
+	room := sfu.GetRoomTracks(roomSlug)
+
+	session := &VoiceSession{ParticipantID: "p1", done: make(chan struct{})}
+	session.SetPublisherOfferID("publish-1")
+	room.mu.Lock()
+	if room.VoiceSessions == nil {
+		room.VoiceSessions = make(map[string]*VoiceSession)
+	}
+	room.VoiceSessions["p1"] = session
+	room.mu.Unlock()
+
+	// Gathered before the answer went out.
+	first := webrtc.ICECandidateInit{Candidate: "candidate:1 1 udp 2122260223 192.0.2.1 1111 typ host"}
+	second := webrtc.ICECandidateInit{Candidate: "candidate:2 1 udp 2122260223 192.0.2.2 2222 typ host"}
+	session.queuePublisherCandidate(&first, "publish-1")
+	session.queuePublisherCandidate(&second, "publish-1")
+
+	type delivered struct {
+		candidate string
+		offerID   string
+	}
+	var got []delivered
+	sfu.EnablePublisherTrickleICE(roomSlug, "p1", func(init *webrtc.ICECandidateInit, offerID string) {
+		got = append(got, delivered{init.Candidate, offerID})
+	})
+
+	if len(got) != 2 {
+		t.Fatalf("expected both buffered candidates to flush, got %d", len(got))
+	}
+	if got[0].candidate != first.Candidate || got[1].candidate != second.Candidate {
+		t.Errorf("candidates flushed out of order: %+v", got)
+	}
+	for _, d := range got {
+		if d.offerID != "publish-1" {
+			t.Errorf("candidate lost its offer generation: %+v", d)
+		}
+	}
+
+	// Once enabled, later candidates go straight out rather than accumulating.
+	third := webrtc.ICECandidateInit{Candidate: "candidate:3 1 udp 2122260223 192.0.2.3 3333 typ host"}
+	session.queuePublisherCandidate(&third, "publish-1")
+	if len(got) != 3 || got[2].candidate != third.Candidate {
+		t.Errorf("expected live forwarding after trickle enabled, got %+v", got)
+	}
+
+	session.candidateMu.Lock()
+	leftover := len(session.pendingCandidates)
+	session.candidateMu.Unlock()
+	if leftover != 0 {
+		t.Errorf("expected no buffered candidates after flush, got %d", leftover)
+	}
+}
+
+// A candidate must carry the offer generation current at the time it was
+// gathered, so the client can discard candidates from a superseded publisher.
+func TestVoiceSession_PublisherCandidateCarriesCurrentOfferID(t *testing.T) {
+	session := &VoiceSession{ParticipantID: "p1", done: make(chan struct{})}
+	session.SetPublisherOfferID("publish-1")
+
+	var seen []string
+	session.candidateMu.Lock()
+	session.OnICECandidate = func(_ *webrtc.ICECandidateInit, offerID string) {
+		seen = append(seen, offerID)
+	}
+	session.candidateMu.Unlock()
+
+	c := webrtc.ICECandidateInit{Candidate: "candidate:1 1 udp 2122260223 192.0.2.1 1111 typ host"}
+	session.queuePublisherCandidate(&c, session.PublisherOfferID())
+
+	// Renegotiation moves the generation forward.
+	session.SetPublisherOfferID("publish-2")
+	session.queuePublisherCandidate(&c, session.PublisherOfferID())
+
+	if len(seen) != 2 || seen[0] != "publish-1" || seen[1] != "publish-2" {
+		t.Errorf("expected candidates stamped publish-1 then publish-2, got %v", seen)
+	}
+}
+
 func TestNewSFU(t *testing.T) {
 	cfg := createTestConfig()
 	sfu, err := NewSFU(cfg)

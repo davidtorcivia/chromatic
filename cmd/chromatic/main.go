@@ -30,8 +30,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Initialize structured logger
-	logger.Initialize(cfg.ProductionMode)
+	// Initialize structured logger. The file sink lives on the data volume so
+	// session history outlives container recreation.
+	logger.InitializeWithFile(cfg.ProductionMode, cfg.LogPath)
 
 	logger.Info("Starting Chromatic server",
 		"port", cfg.Port,

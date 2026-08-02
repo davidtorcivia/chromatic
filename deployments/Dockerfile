@@ -30,8 +30,10 @@ RUN addgroup -g 1001 chromatic && \
 COPY --from=backend /build/chromatic .
 COPY --from=frontend /build/build ./static
 
-# Create data directories and set ownership
-RUN mkdir -p /data/files /data/logos && \
+# Create data directories and set ownership. /data/logs must exist and be owned
+# by the runtime user or the non-root process silently falls back to stdout-only
+# logging — which is exactly the durability gap the log file exists to close.
+RUN mkdir -p /data/files /data/logos /data/logs && \
     chown -R chromatic:chromatic /app /data
 
 # Switch to non-root user

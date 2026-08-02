@@ -14,10 +14,22 @@ services:
     # caddy/bridge-network setup in upstream's compose is intentionally NOT used
     # here because it would collide with that shared proxy on ports 80/443.
     network_mode: host
+    # Docker's json-file log dies with the container: `docker compose up -d`
+    # recreates it on every deploy and takes the whole history along. These
+    # bounds stop it growing without limit between deploys; LOG_PATH below is
+    # what actually makes session history survive one.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     environment:
       - DATABASE_PATH=/data/chromatic.db
       - UPLOAD_PATH=/data/files
       - LOGO_PATH=/data/logos
+      # On the persistent volume, so an incident stays investigable after the
+      # redeploy that fixes it.
+      - LOG_PATH=/data/logs/chromatic.log
       - ADMIN_TOKEN=${ADMIN_TOKEN}
       - PUBLIC_URL=${PUBLIC_URL}
       - TURN_MODE=${TURN_MODE:-external}

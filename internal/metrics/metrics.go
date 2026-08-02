@@ -29,6 +29,27 @@ type Metrics struct {
 	TotalErrors         atomic.Int64
 	TotalWebRTCErrors   atomic.Int64
 
+	// Renegotiation health. These exist because the 2026-08-02 outage was
+	// invisible to monitoring: a room-wide reconnect loop ran for 27 minutes
+	// while every gauge above looked normal (participants were connected —
+	// repeatedly). Each of these counts an event that is survivable once and
+	// pathological in a run, so the signal is the RATE, not the total.
+	//
+	// TotalRenegotiationsWedged: a subscriber could not apply a server
+	// renegotiation offer. Recoverable now, but a sustained rate means
+	// something is systematically rejecting our SDP.
+	TotalRenegotiationsWedged atomic.Int64
+	// TotalProgramAudioMonoFallbacks: the browser refused the stereo-tuned
+	// answer and we answered untuned to keep the connection. Program audio is
+	// mono until the next renegotiation, so any nonzero value is worth knowing.
+	TotalProgramAudioMonoFallbacks atomic.Int64
+	// TotalSubscriberResubscribes: a client asked for a brand-new subscriber.
+	// A few are normal over a long session; a steady stream is the loop.
+	TotalSubscriberResubscribes atomic.Int64
+	// TotalStaleAnswersIgnored: an answer arrived for a negotiation that had
+	// already settled. Benign individually; a spike means offer/answer races.
+	TotalStaleAnswersIgnored atomic.Int64
+
 	// Uptime tracking
 	startTime time.Time
 }
@@ -82,6 +103,20 @@ func Handler() http.HandlerFunc {
 		writeCounter("chromatic_join_requests_total", "Total number of room join requests", m.TotalJoinRequests.Load())
 		writeCounter("chromatic_errors_total", "Total number of errors", m.TotalErrors.Load())
 		writeCounter("chromatic_webrtc_errors_total", "Total number of WebRTC errors", m.TotalWebRTCErrors.Load())
+
+		// Renegotiation health — alert on rate of change, not absolute value.
+		writeCounter("chromatic_renegotiations_wedged_total",
+			"Subscriber renegotiation offers the client could not apply",
+			m.TotalRenegotiationsWedged.Load())
+		writeCounter("chromatic_program_audio_mono_fallbacks_total",
+			"Times a browser refused the stereo-tuned answer and program audio fell back to mono",
+			m.TotalProgramAudioMonoFallbacks.Load())
+		writeCounter("chromatic_subscriber_resubscribes_total",
+			"Client-requested rebuilds of a subscriber connection",
+			m.TotalSubscriberResubscribes.Load())
+		writeCounter("chromatic_stale_answers_ignored_total",
+			"Answers discarded because their negotiation had already settled",
+			m.TotalStaleAnswersIgnored.Load())
 
 		// Uptime
 		uptime := time.Since(m.startTime).Seconds()

@@ -47,9 +47,19 @@ Premium product — latency, program-audio purity, and polish are the axioms.
 
 - `go build ./...`, `golangci-lint run ./...` (config in `.golangci.yml`),
   `gofmt` (LF endings enforced via .gitattributes).
-- `go test ./...` — the SQLite-backed packages (`handlers`, `database`) need
-  cgo; on a no-gcc box they fail with the go-sqlite3 stub error and CI is the
-  signal for them. webrtc/websocket/api/middleware tests run anywhere.
+- `go test ./...` — run the whole thing. The SQLite-backed packages (`handlers`,
+  `database`) need cgo, so check `which gcc` first: if a C compiler is present
+  they run locally (handlers takes ~40s) and there is no reason to skip them.
+  Only on a genuinely no-gcc box do they fail with the go-sqlite3 stub error and
+  fall to CI. webrtc/websocket/api/middleware tests run anywhere.
 - Tests create SFUs with `ICELoopbackOnly: true` (loopback-only ICE) so test
   binaries never trigger OS firewall prompts. Keep it that way.
 - Frontend: `cd web && npx svelte-check && npx vitest run && npm run build`.
+  If `npm run build` dies in `build:worklets` on an unresolved
+  `@jitsi/rnnoise-wasm`, node_modules is stale — `npm install` fixes it without
+  touching package-lock.
+- E2E (`e2e/`, Playwright) talks to a running deployment and obeys its origin
+  check, so `TEST_BASE_URL` must match an entry in that instance's
+  `ALLOWED_ORIGINS` — against a production-mode deployment `localhost` gets a
+  403 on join and you must use the public URL. Note that doing so creates and
+  deletes rooms on the real instance; delete any `test-*` rooms it leaves.

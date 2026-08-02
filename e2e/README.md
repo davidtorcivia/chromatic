@@ -54,6 +54,33 @@ Example:
 TEST_BASE_URL=http://localhost:3000 ADMIN_TOKEN=my-secret npm test
 ```
 
+### `TEST_BASE_URL` must be an allowed origin
+
+The join endpoint enforces the server's `ALLOWED_ORIGINS`, so the URL you test
+through has to be one the target instance accepts. Against a development server
+`http://localhost:3000` is fine. Against a **production-mode deployment** it is
+not: the browser sends `Origin: http://localhost:<port>`, the origin check
+rejects it, and `POST /api/rooms/<slug>/join` returns **403** even though the
+room was created successfully — which surfaces as the join test timing out
+waiting for the session page. Use the deployment's real public URL instead:
+
+```bash
+TEST_BASE_URL=https://stream.example.com ADMIN_TOKEN=... npm test
+```
+
+Do not add a loopback exemption to the origin check to work around this. That
+check is CSRF protection on a live deployment, and weakening it so a test suite
+can be pointed at localhost is not a good trade.
+
+### These tests mutate the instance they run against
+
+The suite creates rooms (`test-<timestamp>-<rand>`) through the real admin API
+and does not always clean them up. Running against a production deployment
+therefore leaves real rooms behind, and destructive specs act on real data.
+Prefer a scratch instance; if you do run against production, delete the
+leftover `test-*` rooms afterwards and check you haven't disturbed a live
+session first.
+
 ## Test Structure
 
 ```

@@ -438,6 +438,24 @@
         });
 
         // Handle ICE candidates from server
+        // The SFU's own candidates for the PUBLISHER peer connection. Kept
+        // separate from signal:candidate (which belongs to the subscriber PC) —
+        // they are different connections and crossing them would attach a
+        // candidate to the wrong transport.
+        session.onMessage("publish:candidate", async (payload: unknown) => {
+            const data = payload as { candidate: string; sdpMid?: string; sdpMLineIndex?: number; offerId?: string };
+            if (!webrtcManager) return;
+            try {
+                await webrtcManager.handlePublisherCandidate({
+                    candidate: data.candidate,
+                    sdpMid: data.sdpMid ?? null,
+                    sdpMLineIndex: data.sdpMLineIndex ?? null
+                }, data.offerId);
+            } catch (err) {
+                console.error('Failed to add publisher ICE candidate:', err);
+            }
+        });
+
         session.onMessage("signal:candidate", async (payload: unknown) => {
             const data = payload as { candidate: string; sdpMid?: string; sdpMLineIndex?: number; offerId?: string };
             if (webrtcManager) {

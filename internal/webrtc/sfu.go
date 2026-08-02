@@ -1825,6 +1825,7 @@ func (s *SFU) SetSubscriberAnswer(roomSlug, subscriberID string, answer webrtc.S
 	// wrong: the negotiation it belonged to is simply over. HandleRenegotiationAnswer
 	// has carried this same guard; the initial-answer path was missing it.
 	if state := sub.PeerConnection.SignalingState(); state != webrtc.SignalingStateHaveLocalOffer {
+		metrics.Get().TotalStaleAnswersIgnored.Add(1)
 		log.Printf("Ignoring stale subscriber answer for %s (state: %s)", subscriberID, state)
 		return nil
 	}
@@ -2198,6 +2199,69 @@ type VoiceSession struct {
 	// writing them to the local track — so admin:mute is effective even if a
 	// malicious client ignores the client-side mute request.
 	Muted atomic.Bool
+
+	// Trickle ICE toward the client. This direction did not exist: the
+	// publisher answer had to carry every candidate, which is why it waits on
+	// gathering, and anything gathered after that deadline was dropped on the
+	// floor. Candidates are buffered here until the answer has actually been
+	// delivered (ordering: a candidate that arrives first has nothing to attach
+	// to), then forwarded live.
+	candidateMu       sync.Mutex
+	pendingCandidates []publisherCandidate
+	OnICECandidate    func(*webrtc.ICECandidateInit, string)
+}
+
+// publisherCandidate pairs a candidate with the offer generation it belongs to,
+// so the client can discard candidates from a superseded publisher.
+type publisherCandidate struct {
+	Candidate webrtc.ICECandidateInit
+	OfferID   string
+}
+
+// queuePublisherCandidate forwards a candidate to the client if trickle is
+// already enabled, and buffers it otherwise.
+func (vs *VoiceSession) queuePublisherCandidate(init *webrtc.ICECandidateInit, offerID string) {
+	vs.candidateMu.Lock()
+	cb := vs.OnICECandidate
+	if cb == nil {
+		vs.pendingCandidates = append(vs.pendingCandidates, publisherCandidate{Candidate: *init, OfferID: offerID})
+		vs.candidateMu.Unlock()
+		return
+	}
+	vs.candidateMu.Unlock()
+	cb(init, offerID)
+}
+
+// EnablePublisherTrickleICE starts forwarding the SFU's publisher-side ICE
+// candidates to the client and flushes any gathered so far.
+//
+// Must be called AFTER the publish answer has been sent, for the same reason as
+// the subscriber equivalent: the client cannot attach a candidate until it has
+// applied the answer, so a candidate that overtakes it is wasted.
+func (s *SFU) EnablePublisherTrickleICE(roomSlug, participantID string, onICECandidate func(*webrtc.ICECandidateInit, string)) {
+	room := s.GetRoomTracksForSlug(roomSlug)
+	if room == nil {
+		return
+	}
+
+	room.mu.RLock()
+	session, ok := room.VoiceSessions[participantID]
+	room.mu.RUnlock()
+	if !ok || session == nil {
+		return
+	}
+
+	session.candidateMu.Lock()
+	session.OnICECandidate = onICECandidate
+	pending := session.pendingCandidates
+	session.pendingCandidates = nil
+	session.candidateMu.Unlock()
+
+	// Deliver outside the lock: the callback writes to the websocket.
+	for _, c := range pending {
+		candidate := c.Candidate
+		onICECandidate(&candidate, c.OfferID)
+	}
 }
 
 // PublisherOfferID returns the ID of the most recent publisher offer, or ""
@@ -2380,6 +2444,28 @@ func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP, offerID string
 		return "", fmt.Errorf("failed to create peer connection: %w", err)
 	}
 
+	// Build the session up front so the ICE-candidate callback below has
+	// somewhere to buffer into. It is not published to the room until the very
+	// end; until then nothing else can observe it.
+	newSession := &VoiceSession{
+		ParticipantID:  participantID,
+		PeerConnection: pc,
+		done:           make(chan struct{}),
+	}
+	newSession.SetPublisherOfferID(offerID)
+
+	// Wired before SetLocalDescription, which is what starts gathering — a
+	// callback attached afterwards would miss the candidates that arrive first.
+	// These buffer until the handler enables trickle, which it does only after
+	// the answer has been delivered.
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c == nil {
+			return
+		}
+		init := c.ToJSON()
+		newSession.queuePublisherCandidate(&init, newSession.PublisherOfferID())
+	})
+
 	// Forward every published track (mic audio AND screen-share video) —
 	// the caller routes by kind.
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
@@ -2424,15 +2510,9 @@ func (s *SFU) HandleVoiceOffer(roomSlug, participantID, offerSDP, offerID string
 	// Wait for ICE gathering (bounded — see iceGatherTimeout).
 	waitForICEGather(pc)
 
-	// Store the voice session. If the participant already had one (rejoin),
+	// Publish the voice session. If the participant already had one (rejoin),
 	// close the old PC first so its terminal-state callback can't later tear
 	// down the replacement.
-	newSession := &VoiceSession{
-		ParticipantID:  participantID,
-		PeerConnection: pc,
-		done:           make(chan struct{}),
-	}
-	newSession.SetPublisherOfferID(offerID)
 	room := s.GetRoomTracks(roomSlug)
 	room.mu.Lock()
 	if room.VoiceSessions == nil {
@@ -3124,6 +3204,7 @@ func (s *SFU) HandleRenegotiationAnswer(roomSlug, subscriberID, sdpAnswer, offer
 	// the offer was rolled back to accept a client-initiated offer), there is
 	// nothing to apply this answer to.
 	if sub.PeerConnection.SignalingState() != webrtc.SignalingStateHaveLocalOffer {
+		metrics.Get().TotalStaleAnswersIgnored.Add(1)
 		log.Printf("Ignoring stale renegotiation answer for subscriber %s (state: %s)", subscriberID, sub.PeerConnection.SignalingState())
 		return nil
 	}

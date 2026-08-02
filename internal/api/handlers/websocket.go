@@ -624,6 +624,22 @@ func (h *WebSocketHandler) handlePublishOffer(client *websocket.Client, payload 
 		}
 		return
 	}
+	// Only now that the answer is on the wire can the client attach candidates.
+	// Enabling trickle here flushes whatever gathering produced in the meantime
+	// and forwards the rest live, so a candidate that misses the bounded
+	// pre-answer wait still reaches the client instead of being lost.
+	h.sfu.EnablePublisherTrickleICE(roomSlug, client.ID, func(init *pionwebrtc.ICECandidateInit, offerID string) {
+		payload := map[string]interface{}{
+			"candidate":     init.Candidate,
+			"sdpMid":        init.SDPMid,
+			"sdpMLineIndex": init.SDPMLineIndex,
+		}
+		if offerID != "" {
+			payload["offerId"] = offerID
+		}
+		client.SendJSON("publish:candidate", payload)
+	})
+
 	logger.Debug("Publisher negotiated", "participant_id", client.ID, "room", roomSlug)
 }
 
@@ -667,6 +683,17 @@ func (h *WebSocketHandler) handleClientDebug(client *websocket.Client, payload j
 	if len(data.Detail) > 256 {
 		data.Detail = data.Detail[:256]
 	}
+	// Promote the two renegotiation breadcrumbs that indicate real degradation
+	// to counters. The log line stays for the detail (exception name, signaling
+	// state); the counter is what makes a recurrence visible on a dashboard
+	// instead of requiring someone to go reading logs after the fact.
+	switch data.Event {
+	case "reneg:failed":
+		metrics.Get().TotalRenegotiationsWedged.Add(1)
+	case "reneg:munge-rejected":
+		metrics.Get().TotalProgramAudioMonoFallbacks.Add(1)
+	}
+
 	// Browser is included because these breadcrumbs exist to diagnose
 	// engine-specific WebRTC failures; without it the reader is back to asking
 	// a human which browser the participant was using.
@@ -682,6 +709,7 @@ func (h *WebSocketHandler) handleClientDebug(client *websocket.Client, payload j
 // client's WS session are untouched — only the media transport is rebuilt.
 func (h *WebSocketHandler) handleResubscribe(client *websocket.Client) {
 	roomSlug := client.RoomSlug
+	metrics.Get().TotalSubscriberResubscribes.Add(1)
 	logger.Info("Client requested fresh subscription", "participant_id", client.ID, "room", roomSlug)
 
 	// A resubscribe usually follows a dead ICE path or expired TURN allocation.

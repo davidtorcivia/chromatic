@@ -242,6 +242,11 @@ export class WebRTCManager {
     private publisherOfferId: string | null = null;
     private publisherCandidateOfferId: string | null = null;
     private pendingPublisherCandidates: RTCIceCandidateInit[] = [];
+    // Inbound counterpart: the SFU's own candidates for the publisher PC, held
+    // until its answer is applied (addIceCandidate before setRemoteDescription
+    // throws). Distinct from pendingPublisherCandidates above, which is OUR
+    // candidates waiting to go out.
+    private pendingRemotePublisherCandidates: RTCIceCandidateInit[] = [];
     private publisherNeedsRenegotiation: boolean = false;
     private closed: boolean = false;
     // Watchdog: rebuilds the publisher if an offer goes unanswered
@@ -1402,6 +1407,7 @@ export class WebRTCManager {
                 this.publisherOfferId = null;
                 this.publisherCandidateOfferId = null;
                 this.pendingPublisherCandidates = [];
+                this.pendingRemotePublisherCandidates = [];
                 this.publisherNeedsRenegotiation = false;
                 if (this.publisherPc === pc) {
                     this.clearPublisherDisconnectWatchdog();
@@ -1438,6 +1444,42 @@ export class WebRTCManager {
         this.sendSignal('webcam:start', { trackId, mid });
     }
 
+    // Apply an ICE candidate the SFU gathered for the publisher PC.
+    //
+    // The publisher used to be vanilla-ICE in this direction: the SFU had no way
+    // to send candidates, so every one it had to offer needed to be inside the
+    // answer, which is why the answer waits on gathering at all. Anything
+    // gathered after that deadline was simply lost. Trickle makes those late
+    // candidates deliverable, so a slow-gathering path degrades into a slightly
+    // later connection instead of a missing one.
+    async handlePublisherCandidate(candidate: RTCIceCandidateInit, offerId?: string): Promise<void> {
+        return this.enqueueSignaling(async () => {
+            // Generation guard: a candidate from a superseded publisher must
+            // never be applied to its replacement. publisherCandidateOfferId is
+            // set when we send an offer and cleared on rebuild/close, so it
+            // identifies the negotiation this PC belongs to.
+            if (offerId && this.publisherCandidateOfferId && offerId !== this.publisherCandidateOfferId) {
+                debugLog('Ignoring publisher candidate from a superseded negotiation', offerId);
+                return;
+            }
+            const pc = this.publisherPc;
+            if (!pc) return;
+
+            // Before the answer lands there is no remote description to attach
+            // a candidate to. Buffer rather than drop.
+            if (!pc.remoteDescription) {
+                this.pendingRemotePublisherCandidates.push(candidate);
+                return;
+            }
+            try {
+                await pc.addIceCandidate(candidate);
+            } catch (err) {
+                // A rejected candidate costs one path, not the connection.
+                console.warn('Failed to add publisher ICE candidate', err);
+            }
+        });
+    }
+
     // Apply the server's answer to the publisher offer.
     async handlePublishAnswer(sdp: string, offerId?: string): Promise<void> {
         return this.enqueueSignaling(async () => {
@@ -1454,6 +1496,17 @@ export class WebRTCManager {
             await pc.setRemoteDescription({ type: 'answer', sdp });
             this.clearPublishAnswerWatchdog();
             this.publisherOfferId = null;
+            // The PC can take candidates now — drain anything that arrived
+            // ahead of the answer.
+            const buffered = this.pendingRemotePublisherCandidates;
+            this.pendingRemotePublisherCandidates = [];
+            for (const candidate of buffered) {
+                try {
+                    await pc.addIceCandidate(candidate);
+                } catch (err) {
+                    console.warn('Failed to add buffered publisher ICE candidate', err);
+                }
+            }
             if (this.screenShareSender) {
                 await this.tuneShareSender(this.screenShareSender);
             }
@@ -1482,6 +1535,7 @@ export class WebRTCManager {
         this.publisherOfferId = null;
         this.publisherCandidateOfferId = null;
         this.pendingPublisherCandidates = [];
+        this.pendingRemotePublisherCandidates = [];
         this.publisherNeedsRenegotiation = false;
         this.audioSender = null;
         this.screenShareSender = null;
@@ -2281,6 +2335,7 @@ export class WebRTCManager {
             this.publisherOfferId = null;
             this.publisherCandidateOfferId = null;
             this.pendingPublisherCandidates = [];
+            this.pendingRemotePublisherCandidates = [];
             this.publisherNeedsRenegotiation = false;
         }
     }

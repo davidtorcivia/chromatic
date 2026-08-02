@@ -32,6 +32,11 @@ type Config struct {
 	// Storage
 	UploadPath string
 	LogoPath   string
+	// LogPath, when set, mirrors every log line to a rotating file. Point it at
+	// a persistent volume: container stdout dies with the container, so without
+	// this a redeploy erases the history any incident investigation depends on.
+	// Empty disables file logging (stdout only).
+	LogPath string
 
 	// Authentication
 	AdminToken string
@@ -73,6 +78,7 @@ func Load() (*Config, error) {
 		DatabasePath:           getEnv("DATABASE_PATH", "/data/chromatic.db"),
 		UploadPath:             getEnv("UPLOAD_PATH", "/data/files"),
 		LogoPath:               getEnv("LOGO_PATH", "/data/logos"),
+		LogPath:                getEnv("LOG_PATH", "/data/logs/chromatic.log"),
 		AdminToken:             getEnvRequired("ADMIN_TOKEN"),
 		AllowedOrigins:         getEnvList("ALLOWED_ORIGINS", nil),
 		TrustedProxies:         getEnvList("TRUSTED_PROXIES", nil),
