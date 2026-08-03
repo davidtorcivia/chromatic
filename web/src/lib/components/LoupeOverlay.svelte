@@ -100,6 +100,57 @@ void main() {
     let uTex: WebGLTexture | null = null;
     let uniforms: Record<string, WebGLUniformLocation | null> = {};
     let texIsNearest = false;
+    let hasTexture = false;
+    let bitmapInFlight = false;
+
+    // Uploading the video element straight into WebGL makes the engine do its
+    // own YUV->RGB conversion during texImage2D, and that conversion is
+    // measurably wrong: 39/255 on Safari with a VP8 screen share, 4/255 on
+    // Chromium H.264 (measured 2026-08-02 against a live WebRTC stream on
+    // Chromium, real Firefox and real Safari). An ImageBitmap through the
+    // identical pipeline — same shader, same format, same readback — is
+    // pixel-exact on every engine. gl.pixelStorei(UNPACK_COLORSPACE_CONVERSION,
+    // NONE) does not help; the number does not move at all.
+    //
+    // The loupe is a colour-inspection instrument, so this is the difference
+    // between a working tool and one that quietly lies about the footage.
+    //
+    // createImageBitmap is async and GPU-side (see frameSource.ts), which suits
+    // a texture already throttled to CONTENT_MS: content freshness lags by one
+    // refresh, pointer tracking does not.
+    //
+    // Applied on every engine even though Gecko measured exact from the video
+    // element, so there is one colour path rather than a per-engine branch. If
+    // the bitmap ever costs too much on Gecko at 4K — the engine that does
+    // video->canvas work on the main thread — that measurement is the licence
+    // to skip it there specifically.
+    function uploadFrame(video: HTMLVideoElement): void {
+        // Nothing on screen yet: upload synchronously so the lens is never
+        // blank, and let the accurate refresh replace it a beat later.
+        if (!hasTexture) uploadSource(video);
+        if (bitmapInFlight || typeof createImageBitmap !== "function") return;
+        bitmapInFlight = true;
+        createImageBitmap(video)
+            .then((bitmap) => {
+                if (gl && uTex) uploadSource(bitmap);
+                bitmap.close();
+            })
+            .catch(() => {
+                // Engine refused the bitmap. The lens keeps working on the
+                // direct upload, just with that engine's colour conversion.
+                uploadSource(video);
+            })
+            .finally(() => {
+                bitmapInFlight = false;
+            });
+    }
+
+    function uploadSource(source: HTMLVideoElement | ImageBitmap): void {
+        if (!gl || !uTex) return;
+        gl.bindTexture(gl.TEXTURE_2D, uTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+        hasTexture = true;
+    }
 
     function initGL(): void {
         glTried = true;
@@ -151,6 +202,7 @@ void main() {
         uniforms = {};
         texIsNearest = false;
         lastUploadAt = 0;
+        hasTexture = false; // the texture died with the context
         initGL();
     }
 
@@ -289,6 +341,10 @@ void main() {
         if (video !== lastSource) {
             lastSource = video;
             lastUploadAt = 0; // new source: refresh the texture immediately
+            // The old frame belongs to a different surface; take the synchronous
+            // upload again rather than magnifying the previous stream until the
+            // next bitmap resolves.
+            hasTexture = false;
         }
 
         canvasEl.style.transform = `translate(${px - LENS_SIZE / 2}px, ${py - LENS_SIZE / 2}px)`;
@@ -318,7 +374,7 @@ void main() {
             // Yield under load: content freshness halves, tracking doesn't
             if (now - lastUploadAt >= degradedInterval("loupe", CONTENT_MS)) {
                 lastUploadAt = now;
-                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+                uploadFrame(video);
             }
             // True pixels once a source pixel maps to ≥1 lens pixel
             const wantNearest = size / (srcHalf * 2) >= 1;
