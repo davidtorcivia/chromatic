@@ -404,6 +404,27 @@ export async function uploadFile(
     onProgress?: (percent: number) => void,
     signal?: AbortSignal
 ): Promise<UploadedFile> {
+    return postFile(`${API_BASE}/api/rooms/${roomSlug}/files`, file, onProgress, signal);
+}
+
+// Frame grabs go to their own endpoint. The server records origin='frame-grab'
+// from the route, not from anything we send, and watermarks the frame per
+// requester on download.
+export async function uploadGrabbedFrame(
+    roomSlug: string,
+    file: File,
+    onProgress?: (percent: number) => void,
+    signal?: AbortSignal
+): Promise<UploadedFile> {
+    return postFile(`${API_BASE}/api/rooms/${roomSlug}/grab`, file, onProgress, signal);
+}
+
+function postFile(
+    url: string,
+    file: File,
+    onProgress?: (percent: number) => void,
+    signal?: AbortSignal
+): Promise<UploadedFile> {
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         const formData = new FormData();
@@ -451,7 +472,7 @@ export async function uploadFile(
             reject(new Error('Upload cancelled'));
         });
 
-        xhr.open('POST', `${API_BASE}/api/rooms/${roomSlug}/files`);
+        xhr.open('POST', url);
         xhr.withCredentials = true;
         xhr.send(formData);
     });

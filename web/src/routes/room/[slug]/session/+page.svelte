@@ -5,7 +5,7 @@
     import { goto } from "$app/navigation";
     import { page } from "$app/stores";
     import { session } from "$lib/stores/session.svelte";
-    import { rooms, uploadFile } from "$lib/api/client";
+    import { rooms, uploadGrabbedFrame } from "$lib/api/client";
     import { chatStore, type ChatMessage } from "$lib/stores/chat.svelte";
     import { unlockAudio, getAudioContext, closeAudioContext } from "$lib/audio/context";
     import {
@@ -2286,7 +2286,7 @@
                 .map((n) => n.toString().padStart(2, "0"))
                 .join("");
             const file = new File([blob], `frame-${slug}-${stamp}.jpg`, { type: "image/jpeg" });
-            const uploaded = await uploadFile(
+            const uploaded = await uploadGrabbedFrame(
                 slug,
                 file,
                 undefined,
