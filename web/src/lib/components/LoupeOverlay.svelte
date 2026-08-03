@@ -118,6 +118,12 @@ void main() {
     // createImageBitmap is async and GPU-side (see frameSource.ts), which suits
     // a texture already throttled to CONTENT_MS: content freshness lags by one
     // refresh, pointer tracking does not.
+    //
+    // Applied on every engine even though Gecko measured exact from the video
+    // element, so there is one colour path rather than a per-engine branch. If
+    // the bitmap ever costs too much on Gecko at 4K — the engine that does
+    // video->canvas work on the main thread — that measurement is the licence
+    // to skip it there specifically.
     function uploadFrame(video: HTMLVideoElement): void {
         // Nothing on screen yet: upload synchronously so the lens is never
         // blank, and let the accurate refresh replace it a beat later.
