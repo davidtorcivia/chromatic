@@ -1,7 +1,9 @@
 # Stream-embedded watermarking
 
-Status: **Phase 0 implemented (server-side frame-grab marking); Phases 1-5
-pending.** Implementation plan in
+Status: **Phases 0-1 implemented** (server-side frame-grab marking; the mark
+engine). **The compositor gate is measured and passes on desktop** — see
+"Validation gate results" below; iOS is deferred. Phases 2-5 pending.
+Implementation plan in
 [`WATERMARKING_PLAN.md`](./WATERMARKING_PLAN.md). **Phase numbers in this document
 refer to the plan's Phase 0–5**; the section headers below name the plan phase
 they correspond to. Supersedes the current DOM overlay
@@ -117,12 +119,10 @@ untaken rather than failing — but that is itself informative: the compositor
 must not depend on WebGL being available, because the existing glass renderer
 already has a silent no-WebGL fallback path.
 
-Harness limitation to close before implementation: this tested **file-backed**
-video. A WebRTC `MediaStream`-backed element may take a different
-hardware-decode/zero-copy path. **Re-run against a live stream, and on real
-Safari (macOS and iOS), before Phase 1 is called done.** Safari is entirely
-unvalidated here — Playwright's WebKit could not launch on this box (missing
-system libs) and Linux WebKit is weak evidence for Safari regardless.
+That limitation is now closed: see "Validation gate results" below. Canvas 2D
+`drawImage` measures pixel-exact against a live WebRTC stream on real Safari and
+real Firefox too, and the WebGL gap turns out to be the video-element upload
+rather than WebGL itself (`docs/COLOR_PARITY.md`).
 
 ### If Safari fails, that is a product decision, not a fallback
 
@@ -214,6 +214,61 @@ and the mark is in the pixels regardless. Validate that iOS Safari permits
 `drawImage` from a hidden, `playsinline` MediaStream-backed video — historically
 iOS has restricted video→canvas, and if it refuses, iOS falls back to §5
 enforcement or is blocked from marked rooms by policy.
+
+---
+
+## 3b. Validation gate results
+
+Measured 2026-08-02 on Chromium, real Firefox (Windows) and real Safari 26.5.2
+(macOS). Harness in `tests/gate/colorparity/`, full colour numbers in
+`docs/COLOR_PARITY.md`. Every measurement uses a live WebRTC track with the
+codec pinned to what the SFU negotiates.
+
+**Colour parity — passes.** Canvas 2D `drawImage` is 0/255 against the native
+`<video>` on every engine, both codecs. This is branch **(a)** above for macOS
+Safari: marked rooms need not go Chromium/Firefox-only on colour grounds. WebGL
+is 1-39/255 off (worst on Safari with VP8), and
+`UNPACK_COLORSPACE_CONVERSION_WEBGL` does not change that — but an `ImageBitmap`
+through the same pipeline is exact, which is a fix rather than a fallback.
+
+**Program audio on a detached element — passes, and constrains the design.**
+`play()` resolves, `currentTime` advances, and sample counts match an attached
+element within 0.5% on all three engines. Stereo survives with the production
+Opus fmtp (`stereo=1;sprop-stereo=1`, 2 channels, 48 kHz) and zero concealment.
+The redesign this gate existed to catch — splitting audio onto its own element
+or an `AudioContext` graph — is not needed.
+
+The constraint: **"detached" must mean never-inserted, not removed.** The HTML
+spec pauses a media element when it is *removed* from a document, and that is
+observable — an element attached and then removed froze its `currentTime` while
+the receiver kept playing out. So `createElement` and never append. If a later
+refactor appends that element, `remove()` will silently kill program audio.
+
+Not established: `muted`/`volume` on Firefox and Safari, where
+`totalAudioEnergy` did not move with them (most likely sampled before the
+element's volume rather than the controls failing — this test cannot tell those
+apart). Nor audibility at the DAC, nor A/V sync drift. Those need a human
+listening or a loopback audio device.
+
+**rVFC on a detached element — passes.** `requestVideoFrameCallback` fires on a
+never-inserted element at the same rate as attached on Chromium and Firefox, and
+`receiveTime`, `processingDuration`, `presentationTime`, `expectedDisplayTime`,
+`width`, `height` and `mediaTime` all populate. Detaching changes nothing about
+the metadata. Safari delivers the same metadata on a detached element.
+
+One field to know about: **`captureTime` is absent on every engine**, attached
+and detached alike. It rides on the `abs-capture-time` RTP header extension,
+which this SFU does not relay, so the stats readout should not promise it. That
+is a pre-existing property, not a consequence of detaching.
+
+**Firefox 4K blit cost — not settled.** Headless runs render in software, so the
+numbers (Chromium 25 ms median at 3840x2160 -> 1920x1080; Firefox 12 ms but only
+reaching 2364x1330) are worst-case, not what a reviewer's GPU does. This needs a
+headed session on real hardware before Phase 2 ships.
+
+**iOS — deferred by owner.** Both iOS questions remain open: whether it permits
+`drawImage` from a hidden `playsinline` MediaStream video, and whether it
+suspends a detached element's audio.
 
 ---
 

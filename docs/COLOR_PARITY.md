@@ -77,5 +77,5 @@ The scopes are fine: `frameSource.ts` hands them an `ImageBitmap` which
 - `safaridriver` and Firefox's BiDi endpoint both refuse a second session while
   a previous browser process survives. Kill leftovers before re-running.
 
-Harness and raw numbers: `/tmp/keep-colortest/` (`live.html`, `runlive.mjs`,
-`safari.mjs`, `firefox-bidi.mjs`, `RESULTS-live.md`).
+Harness: `tests/gate/colorparity/`, which also carries the detached-element
+audio and rVFC pages behind the same gate. Its README lists the traps.
