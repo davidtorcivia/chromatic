@@ -292,7 +292,15 @@ type Subscriber struct {
 	pendingClientOffer          string
 	pendingClientOfferID        string
 	pendingClientOfferIsRestart bool
-	OnDeferredClientOffer       func(isRestart bool, offerID, answerSDP string)
+	// pendingClientOfferAttempts bounds replay retries. The replay used to
+	// clear the queued offer before applying it, so any failure inside
+	// SetRemoteDescription dropped the client's offer permanently — no answer,
+	// no retry, and for an ICE restart that means a viewer whose connection was
+	// already failing never gets repaired. Keeping the offer queued lets the
+	// next settling point try again; the counter is what stops a permanently
+	// unapplicable offer from retrying forever.
+	pendingClientOfferAttempts int
+	OnDeferredClientOffer      func(isRestart bool, offerID, answerSDP string)
 }
 
 // pcHasTrack reports whether the peer connection already has a sender bound
@@ -2051,6 +2059,7 @@ func (s *SFU) HandleIceRestart(roomSlug, subscriberID, sdpOffer, offerID string)
 		sub.pendingClientOffer = sdpOffer
 		sub.pendingClientOfferID = offerID
 		sub.pendingClientOfferIsRestart = true
+		sub.pendingClientOfferAttempts = 0
 		return "", ErrClientOfferDeferred
 	}
 
@@ -2120,6 +2129,7 @@ func (s *SFU) HandleSubscriberOffer(roomSlug, subscriberID, sdpOffer string) (st
 		sub.pendingClientOffer = sdpOffer
 		sub.pendingClientOfferID = ""
 		sub.pendingClientOfferIsRestart = false
+		sub.pendingClientOfferAttempts = 0
 		return "", false, ErrClientOfferDeferred
 	}
 
@@ -3241,6 +3251,19 @@ func (s *SFU) HandleRenegotiationAnswer(roomSlug, subscriberID, sdpAnswer, offer
 	return nil
 }
 
+// maxDeferredClientOfferAttempts bounds replay retries so an offer that can
+// never be applied does not retry at every settling point forever.
+const maxDeferredClientOfferAttempts = 3
+
+// clearPendingClientOffer drops the queued client offer. Caller must hold
+// SignalingMu.
+func (sub *Subscriber) clearPendingClientOffer() {
+	sub.pendingClientOffer = ""
+	sub.pendingClientOfferID = ""
+	sub.pendingClientOfferIsRestart = false
+	sub.pendingClientOfferAttempts = 0
+}
+
 // replayDeferredClientOffer applies a client voice offer or ICE restart that was
 // queued while a server-initiated offer was in flight, now that the PC is Stable
 // again. Caller must hold sub.SignalingMu.
@@ -3261,14 +3284,29 @@ func (s *SFU) replayDeferredClientOfferLocked(sub *Subscriber, subscriberID stri
 	if sub.PeerConnection.SignalingState() != webrtc.SignalingStateStable {
 		return
 	}
-	// Clear the pending state before replay so a failure doesn't loop.
-	sub.pendingClientOffer = ""
-	sub.pendingClientOfferID = ""
-	sub.pendingClientOfferIsRestart = false
+	// The queued offer stays queued until the replay actually succeeds. Pion can
+	// fail SetRemoteDescription transiently here — "attempting to gather
+	// candidates during gathering state" is the one seen in CI — and clearing
+	// first meant that failure silently discarded the client's offer for good.
+	// An ICE restart is a repair request from a connection that is already in
+	// trouble, so dropping it is the worst possible moment to drop anything.
+	sub.pendingClientOfferAttempts++
+	attempt := sub.pendingClientOfferAttempts
+
+	giveUp := func(stage string, err error) {
+		if attempt >= maxDeferredClientOfferAttempts {
+			log.Printf("Giving up on deferred client offer for %s after %d attempts (%s): %v",
+				subscriberID, attempt, stage, err)
+			sub.clearPendingClientOffer()
+			return
+		}
+		log.Printf("Failed to %s deferred client offer for %s (attempt %d/%d), leaving it queued: %v",
+			stage, subscriberID, attempt, maxDeferredClientOfferAttempts, err)
+	}
 
 	offer := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: deferredSDP}
 	if err := sub.PeerConnection.SetRemoteDescription(offer); err != nil {
-		log.Printf("Failed to apply deferred client offer for %s: %v", subscriberID, err)
+		giveUp("apply", err)
 		return
 	}
 	sub.setCandidateID(deferredOfferID)
@@ -3276,13 +3314,14 @@ func (s *SFU) replayDeferredClientOfferLocked(sub *Subscriber, subscriberID stri
 
 	answer, err := sub.PeerConnection.CreateAnswer(nil)
 	if err != nil {
-		log.Printf("Failed to create deferred client offer answer for %s: %v", subscriberID, err)
+		giveUp("create answer for", err)
 		return
 	}
 	if err := sub.PeerConnection.SetLocalDescription(answer); err != nil {
-		log.Printf("Failed to set deferred client offer answer for %s: %v", subscriberID, err)
+		giveUp("set answer for", err)
 		return
 	}
+	sub.clearPendingClientOffer()
 	log.Printf("Replayed deferred client offer for subscriber %s (restart=%v)", subscriberID, isRestart)
 	// Deliver outside the signaling lock to avoid re-entrancy into SendJSON paths.
 	go cb(isRestart, deferredOfferID, answer.SDP)

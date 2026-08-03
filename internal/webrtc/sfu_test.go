@@ -2293,3 +2293,72 @@ func TestSFU_CreateSubscriberConnection_OffersProgramAudioAsStereoOpus(t *testin
 
 	assertProgramStereoFmtp(t, opusFmtpFromSDP(offerSDP), "subscriber offer")
 }
+
+// A deferred client offer used to be cleared before the replay was attempted,
+// so any failure inside SetRemoteDescription discarded it permanently: no
+// answer, no retry. For an ICE restart that is a repair request from a
+// connection already in trouble, so it is the worst thing to drop silently.
+func TestSFU_DeferredClientOffer_SurvivesAFailedReplay(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "deferred-retry-room"
+	room := sfu.GetRoomTracks(roomSlug)
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("create pc: %v", err)
+	}
+	defer pc.Close()
+	sub := &Subscriber{ID: "sub-1", PeerConnection: pc, done: make(chan struct{})}
+	room.AddSubscriber(sub)
+
+	replayed := make(chan struct{}, 1)
+	sub.OnDeferredClientOffer = func(bool, string, string) {
+		select {
+		case replayed <- struct{}{}:
+		default:
+		}
+	}
+
+	// An offer that SetRemoteDescription will always reject.
+	sub.SignalingMu.Lock()
+	sub.pendingClientOffer = "definitely not sdp"
+	sub.pendingClientOfferID = "restart-9"
+	sub.pendingClientOfferIsRestart = true
+	sub.pendingClientOfferAttempts = 0
+	sub.SignalingMu.Unlock()
+
+	for attempt := 1; attempt < maxDeferredClientOfferAttempts; attempt++ {
+		sub.SignalingMu.Lock()
+		sfu.replayDeferredClientOfferLocked(sub, "sub-1")
+		pending, count := sub.pendingClientOffer, sub.pendingClientOfferAttempts
+		sub.SignalingMu.Unlock()
+
+		if pending == "" {
+			t.Fatalf("attempt %d dropped the queued offer; it must survive to be retried", attempt)
+		}
+		if count != attempt {
+			t.Fatalf("attempt %d recorded %d attempts", attempt, count)
+		}
+	}
+
+	// The bound is what stops an unapplicable offer retrying at every settling
+	// point forever.
+	sub.SignalingMu.Lock()
+	sfu.replayDeferredClientOfferLocked(sub, "sub-1")
+	pending := sub.pendingClientOffer
+	sub.SignalingMu.Unlock()
+	if pending != "" {
+		t.Errorf("offer still queued after %d attempts; it would retry forever", maxDeferredClientOfferAttempts)
+	}
+
+	select {
+	case <-replayed:
+		t.Error("a failed replay must not deliver an answer to the client")
+	default:
+	}
+}
