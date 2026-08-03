@@ -1,0 +1,214 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rVFC + blit cost on a detached element</title>
+<style>html,body{margin:0;background:#111;color:#ddd;font:13px system-ui}</style>
+<pre id="log"></pre>
+<canvas id="dst"></canvas>
+<script>
+// Two gate items in one harness.
+//
+// 1. rVFC on a DETACHED element. The compositor's whole render loop is
+//    requestVideoFrameCallback on an element with no parent node, and the stats
+//    readout reads captureTime/receiveTime/processingDuration off the same
+//    callback. If rVFC does not fire when the element is not in the document,
+//    Phase 2's design does not work at all.
+// 2. The Firefox 4K blit cost. frameSource.ts:9 records that Gecko does
+//    video->canvas drawImage on the main thread, and the compositor does that
+//    per displayed frame.
+const out = [];
+const log = (s) => { out.push(s); document.getElementById('log').textContent = out.join('\n'); };
+
+window.ready = false;
+window.result = {};
+
+const SRC_W = Number(new URLSearchParams(location.search).get('w') || 3840);
+const SRC_H = Math.round(SRC_W * 9 / 16);
+const DST_W = 1920, DST_H = 1080;
+
+function stats(xs) {
+    if (!xs.length) return null;
+    const s = [...xs].sort((a, b) => a - b);
+    const sum = s.reduce((a, b) => a + b, 0);
+    return {
+        n: s.length,
+        mean: +(sum / s.length).toFixed(3),
+        median: +s[Math.floor(s.length / 2)].toFixed(3),
+        p95: +s[Math.floor(s.length * 0.95)].toFixed(3),
+        max: +s[s.length - 1].toFixed(3)
+    };
+}
+
+async function run() {
+    const src = document.createElement('canvas');
+    src.width = SRC_W;
+    src.height = SRC_H;
+    const sctx = src.getContext('2d');
+    let tick = 0;
+    const paint = () => {
+        // Real detail, not flat colour: a flat frame encodes to almost nothing
+        // and would understate both bitrate and decode cost.
+        const g = sctx.createLinearGradient(0, 0, SRC_W, SRC_H);
+        g.addColorStop(0, `hsl(${tick % 360},70%,45%)`);
+        g.addColorStop(1, `hsl(${(tick * 3 + 120) % 360},70%,25%)`);
+        sctx.fillStyle = g;
+        sctx.fillRect(0, 0, SRC_W, SRC_H);
+        sctx.fillStyle = '#fff';
+        for (let i = 0; i < 60; i++) {
+            sctx.fillRect(((i * 137 + tick * 7) % SRC_W), ((i * 91 + tick * 3) % SRC_H), 40, 40);
+        }
+        tick++;
+    };
+    paint();
+    const stream = src.captureStream(30);
+    const timer = setInterval(paint, 33);
+
+    const pc1 = new RTCPeerConnection();
+    const pc2 = new RTCPeerConnection();
+    pc1.onicecandidate = (e) => e.candidate && pc2.addIceCandidate(e.candidate);
+    pc2.onicecandidate = (e) => e.candidate && pc1.addIceCandidate(e.candidate);
+    const remote = new Promise((res) => { pc2.ontrack = (e) => res(e.streams[0] || new MediaStream([e.track])); });
+
+    const tx = pc1.addTransceiver(stream.getVideoTracks()[0], { direction: 'sendonly' });
+    // Keep the encoder at full resolution: the default is adaptive and would
+    // quietly hand back 960x540, which would make a 4K cost claim false.
+    try {
+        const params = tx.sender.getParameters();
+        params.encodings = params.encodings && params.encodings.length ? params.encodings : [{}];
+        params.encodings[0].scaleResolutionDownBy = 1;
+        params.encodings[0].maxBitrate = 40_000_000;
+        params.degradationPreference = 'maintain-resolution';
+        await tx.sender.setParameters(params);
+    } catch (e) {
+        window.result.setParametersError = String(e);
+    }
+
+    const offer = await pc1.createOffer();
+    await pc1.setLocalDescription(offer);
+    await pc2.setRemoteDescription(offer);
+    const answer = await pc2.createAnswer();
+    await pc2.setLocalDescription(answer);
+    await pc1.setRemoteDescription(answer);
+
+    const remoteStream = await Promise.race([
+        remote,
+        new Promise((_, rej) => setTimeout(() => rej(new Error('ontrack never fired')), 15000))
+    ]);
+
+    // DETACHED: created, never inserted.
+    const v = document.createElement('video');
+    v.playsInline = true;
+    v.autoplay = true;
+    v.muted = true;
+    v.srcObject = remoteStream;
+    window.result.isConnected = v.isConnected;
+    await v.play().catch((e) => { window.result.playError = String(e); });
+
+    window.result.hasRVFC = typeof v.requestVideoFrameCallback === 'function';
+    if (!window.result.hasRVFC) {
+        window.result.note = 'no requestVideoFrameCallback in this engine; compositor would need the rAF fallback';
+    }
+
+    // Let the encoder reach full resolution before measuring anything.
+    const deadline = Date.now() + 25000;
+    while (Date.now() < deadline) {
+        if (v.videoWidth >= SRC_W * 0.9 && v.currentTime > 2) break;
+        await new Promise((r) => setTimeout(r, 250));
+    }
+    window.result.sourceSize = [SRC_W, SRC_H];
+    window.result.decodedSize = [v.videoWidth, v.videoHeight];
+    window.result.reachedFullRes = v.videoWidth >= SRC_W * 0.9;
+
+    const dst = document.getElementById('dst');
+    dst.width = DST_W;
+    dst.height = DST_H;
+    const dctx = dst.getContext('2d');
+
+    // Measure one phase: count rVFC callbacks, record which metadata fields are
+    // populated, and time the drawImage the compositor would do per frame.
+    const measure = (label, el, ms) => new Promise((resolve) => {
+        const blits = [];
+        const gaps = [];
+        let frames = 0;
+        let lastNow = 0;
+        let metaSample = null;
+        let stop = false;
+        const useRVFC = typeof el.requestVideoFrameCallback === 'function';
+
+        const onFrame = (now, meta) => {
+            if (stop) return;
+            frames++;
+            if (lastNow) gaps.push(now - lastNow);
+            lastNow = now;
+            if (!metaSample && meta) metaSample = { ...meta };
+            const t0 = performance.now();
+            dctx.drawImage(el, 0, 0, DST_W, DST_H);
+            blits.push(performance.now() - t0);
+            if (useRVFC) el.requestVideoFrameCallback(onFrame);
+            else requestAnimationFrame((n) => onFrame(n, null));
+        };
+        if (useRVFC) el.requestVideoFrameCallback(onFrame);
+        else requestAnimationFrame((n) => onFrame(n, null));
+
+        setTimeout(() => {
+            stop = true;
+            const meta = metaSample || {};
+            resolve({
+                phase: label,
+                drivenBy: useRVFC ? 'requestVideoFrameCallback' : 'requestAnimationFrame',
+                frames,
+                fps: +(frames / (ms / 1000)).toFixed(1),
+                blitMs: stats(blits),
+                frameGapMs: stats(gaps),
+                // The stats readout depends on these three specifically.
+                metadataPresent: {
+                    captureTime: meta.captureTime !== undefined,
+                    receiveTime: meta.receiveTime !== undefined,
+                    processingDuration: meta.processingDuration !== undefined,
+                    presentationTime: meta.presentationTime !== undefined,
+                    expectedDisplayTime: meta.expectedDisplayTime !== undefined,
+                    width: meta.width !== undefined,
+                    height: meta.height !== undefined,
+                    mediaTime: meta.mediaTime !== undefined
+                },
+                metadataSample: meta
+            });
+        }, ms);
+    });
+
+    // Phase 5's attestation excuses a frozen frame counter when the page reports
+    // itself hidden. If an engine stops rVFC while still reporting "visible",
+    // that excuse never fires and an honest client gets gated.
+    window.result.visibility = {
+        visibilityState: document.visibilityState,
+        hidden: document.hidden,
+        hasFocus: document.hasFocus()
+    };
+
+    const detached = await measure('detached-never-inserted', v, 6000);
+    window.result.detached = detached;
+    log(JSON.stringify({ phase: detached.phase, fps: detached.fps, blit: detached.blitMs }));
+
+    // Attach and repeat: the comparison is what turns this into a measurement.
+    document.body.appendChild(v);
+    v.style.width = '320px';
+    await v.play().catch(() => {});
+    const attached = await measure('attached-in-dom', v, 6000);
+    window.result.attached = attached;
+    log(JSON.stringify({ phase: attached.phase, fps: attached.fps, blit: attached.blitMs }));
+
+    clearInterval(timer);
+    window.result.summary = {
+        rvfcFiresWhileDetached: detached.frames > 0 && detached.drivenBy === 'requestVideoFrameCallback',
+        detachedFps: detached.fps,
+        attachedFps: attached.fps,
+        blitMedianDetached: detached.blitMs && detached.blitMs.median,
+        blitP95Detached: detached.blitMs && detached.blitMs.p95,
+        decodedSize: window.result.decodedSize,
+        reachedFullRes: window.result.reachedFullRes
+    };
+    window.ready = true;
+}
+
+setTimeout(() => { if (!window.ready) { window.result.timedOut = true; window.ready = true; } }, 90000);
+run().catch((e) => { window.result.fatal = String(e); window.ready = true; });
+</script>

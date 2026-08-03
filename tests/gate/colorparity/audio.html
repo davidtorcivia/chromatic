@@ -1,0 +1,253 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>detached element program audio</title>
+<style>html,body{margin:0;padding:0;background:#111;color:#ddd;font:13px system-ui}</style>
+<pre id="log"></pre>
+<script>
+// Gate item: the program <video> is also the program audio sink, and the
+// compositor moves that element to a DETACHED node. bindCanvasStream is not
+// precedent because webcam pills set muted = true, so the detached audio path
+// is untested here.
+//
+// What this measures, precisely: whether a detached element pulls and plays out
+// the audio track the same way an attached one does, whether stereo survives,
+// and whether the element's audio controls still apply. It does NOT measure the
+// DAC: nothing here proves the sound reaches a speaker, which needs a human or a
+// loopback audio device.
+const out = [];
+const log = (s) => { out.push(s); document.getElementById('log').textContent = out.join('\n'); };
+
+window.ready = false;
+window.result = { checks: [] };
+
+const LEFT_HZ = 440;
+const RIGHT_HZ = 1320;
+
+// Match the SFU's program-audio capability (opus.go: stereo=1;sprop-stereo=1,
+// no bitrate cap) so this exercises the negotiated shape production uses, not
+// the browser's mono default.
+function forceStereoOpus(sdp) {
+    return sdp.replace(/a=fmtp:(\d+) ([^\r\n]*minptime[^\r\n]*)/g, (m, pt, params) => {
+        let p = params;
+        if (!/stereo=/.test(p)) p += ';stereo=1';
+        if (!/sprop-stereo=/.test(p)) p += ';sprop-stereo=1';
+        return `a=fmtp:${pt} ${p}`;
+    });
+}
+
+async function audioStats(pc) {
+    const stats = await pc.getStats();
+    let r = null;
+    stats.forEach((s) => {
+        if (s.type === 'inbound-rtp' && s.kind === 'audio') {
+            r = {
+                samples: s.totalSamplesReceived || 0,
+                energy: s.totalAudioEnergy || 0,
+                duration: s.totalSamplesDuration || 0,
+                concealed: s.concealedSamples || 0,
+                codec: s.codecId ? (stats.get(s.codecId) || {}) : {}
+            };
+        }
+    });
+    return r;
+}
+
+// Peak bin of an analyser, in Hz.
+function peakHz(analyser, buf) {
+    analyser.getFloatFrequencyData(buf);
+    let bestIdx = 0;
+    for (let i = 1; i < buf.length; i++) if (buf[i] > buf[bestIdx]) bestIdx = i;
+    return {
+        hz: Math.round((bestIdx * analyser.context.sampleRate) / analyser.fftSize),
+        db: Math.round(buf[bestIdx])
+    };
+}
+
+async function run() {
+    const ctx = new AudioContext();
+    // Firefox blocks Web Audio under its autoplay policy separately from media
+    // elements, and resume() then never settles. Racing it keeps a blocked
+    // context from hanging the whole run.
+    await Promise.race([
+        ctx.resume().catch(() => {}),
+        new Promise((r) => setTimeout(r, 3000))
+    ]);
+    window.result.audioContextState = ctx.state;
+    window.result.sourceSampleRate = ctx.sampleRate;
+
+    // Distinct tone per channel: a downmix or a channel swap is then obvious
+    // rather than a judgement call.
+    const oscL = ctx.createOscillator();
+    const oscR = ctx.createOscillator();
+    oscL.frequency.value = LEFT_HZ;
+    oscR.frequency.value = RIGHT_HZ;
+    const merger = ctx.createChannelMerger(2);
+    oscL.connect(merger, 0, 0);
+    oscR.connect(merger, 0, 1);
+    const dest = ctx.createMediaStreamDestination();
+    merger.connect(dest);
+    oscL.start();
+    oscR.start();
+
+    const pc1 = new RTCPeerConnection();
+    const pc2 = new RTCPeerConnection();
+    pc1.onicecandidate = (e) => e.candidate && pc2.addIceCandidate(e.candidate);
+    pc2.onicecandidate = (e) => e.candidate && pc1.addIceCandidate(e.candidate);
+    const remote = new Promise((res) => { pc2.ontrack = (e) => res(e.streams[0] || new MediaStream([e.track])); });
+
+    pc1.addTrack(dest.stream.getAudioTracks()[0], dest.stream);
+    const offer = await pc1.createOffer();
+    offer.sdp = forceStereoOpus(offer.sdp);
+    await pc1.setLocalDescription(offer);
+    await pc2.setRemoteDescription(offer);
+    const answer = await pc2.createAnswer();
+    answer.sdp = forceStereoOpus(answer.sdp);
+    await pc2.setLocalDescription(answer);
+    await pc1.setRemoteDescription(answer);
+    window.result.negotiatedStereo = /stereo=1/.test(pc2.localDescription.sdp);
+
+    const stream = await Promise.race([
+        remote,
+        new Promise((_, rej) => setTimeout(() => rej(new Error('ontrack never fired')), 15000))
+    ]);
+
+    // DETACHED: created, never inserted. Not display:none — a hidden but present
+    // element still offers PiP and the native context menu an affordance.
+    const el = document.createElement('video');
+    el.playsInline = true;
+    el.autoplay = true;
+    el.srcObject = stream;
+    window.result.isConnected = el.isConnected;
+
+    let playError = null;
+    await el.play().catch((e) => { playError = String(e); });
+    window.result.playError = playError;
+
+    // inbound-rtp does not exist until the connection is up and packets flow;
+    // sampling before that reads null and looks like silence.
+    const statsDeadline = Date.now() + 20000;
+    let first = null;
+    while (Date.now() < statsDeadline) {
+        first = await audioStats(pc2);
+        if (first && first.samples > 0) break;
+        await new Promise((r) => setTimeout(r, 250));
+    }
+    window.result.iceState = pc2.iceConnectionState;
+    if (!first) {
+        window.result.statsUnavailable = true;
+        window.result.ready = true;
+    }
+
+    const sample = async (label, ms) => {
+        const before = (await audioStats(pc2)) || { samples: 0, energy: 0, duration: 0, concealed: 0 };
+        await new Promise((r) => setTimeout(r, ms));
+        const after = (await audioStats(pc2)) || before;
+        const row = {
+            phase: label,
+            samplesDelta: after.samples - before.samples,
+            energyDelta: +(after.energy - before.energy).toFixed(6),
+            durationDelta: +(after.duration - before.duration).toFixed(3),
+            concealedDelta: after.concealed - before.concealed,
+            currentTime: +el.currentTime.toFixed(3)
+        };
+        window.result.checks.push(row);
+        log(JSON.stringify(row));
+        return row;
+    };
+
+    // Order matters: the HTML spec pauses a media element when it is REMOVED
+    // from a document, so any phase after a remove() measures a paused element.
+    // The compositor creates the element detached and never inserts it, so every
+    // detached phase below runs on a never-inserted element and the attach comes
+    // last.
+    const detached = await sample('detached-never-inserted', 4000);
+
+    el.muted = true;
+    const muted = await sample('detached-muted', 3000);
+    el.muted = false;
+
+    el.volume = 0.5;
+    const halfVolume = await sample('detached-volume-0.5', 3000);
+    el.volume = 1;
+
+    const restored = await sample('detached-volume-restored', 3000);
+
+    // Attach last. Inserting is safe; it is removal that pauses.
+    document.body.appendChild(el);
+    el.style.width = '160px';
+    const attached = await sample('attached-in-dom', 4000);
+    window.result.currentTimeAdvancedWhileDetached = detached.currentTime > 0.5;
+
+    const perSecond = (row, secs) => +(row.energyDelta / secs).toFixed(4);
+    window.result.summary = {
+        playedWhileNeverInserted: detached.samplesDelta > 0 && detached.currentTime > 0.5,
+        attachedPlaysOut: attached.samplesDelta > 0,
+        // Playout should not depend on being in the document.
+        samplesParityWithAttached: attached.samplesDelta > 0
+            ? +(Math.abs(detached.samplesDelta / 4 - attached.samplesDelta / 4) / (attached.samplesDelta / 4)).toFixed(4)
+            : null,
+        energyPerSecond: {
+            baseline: perSecond(detached, 4),
+            muted: perSecond(muted, 3),
+            halfVolume: perSecond(halfVolume, 3),
+            restored: perSecond(restored, 3),
+            attached: perSecond(attached, 4)
+        },
+        concealedTotal: detached.concealedDelta + muted.concealedDelta
+            + halfVolume.concealedDelta + restored.concealedDelta + attached.concealedDelta
+    };
+
+    // Stereo integrity of the received track. This reads the STREAM, not the
+    // element's output: createMediaElementSource is unreliable for srcObject
+    // elements, so element-output capture is not available. Program audio
+    // purity is about the track staying stereo end to end, which is what this
+    // covers.
+    try {
+        const src = ctx.createMediaStreamSource(stream);
+        const splitter = ctx.createChannelSplitter(2);
+        src.connect(splitter);
+        const mk = () => { const a = ctx.createAnalyser(); a.fftSize = 8192; return a; };
+        const aL = mk(), aR = mk();
+        splitter.connect(aL, 0);
+        splitter.connect(aR, 1);
+        await new Promise((r) => setTimeout(r, 1200));
+        const bufL = new Float32Array(aL.frequencyBinCount);
+        const bufR = new Float32Array(aR.frequencyBinCount);
+        window.result.stereo = {
+            left: peakHz(aL, bufL),
+            right: peakHz(aR, bufR),
+            expectLeft: LEFT_HZ,
+            expectRight: RIGHT_HZ,
+            contextSampleRate: ctx.sampleRate
+        };
+    } catch (e) {
+        window.result.stereoErr = String(e);
+    }
+
+    // setSinkId on a detached element (Chromium; the UI hides the control
+    // elsewhere). Only the default device is used: enumerateDevices needs a
+    // permission grant for real device ids and this is about routing, not
+    // picking a speaker.
+    try {
+        if (typeof el.setSinkId === 'function') {
+            await el.setSinkId('');
+            window.result.setSinkId = 'resolved on detached element';
+        } else {
+            window.result.setSinkId = 'unsupported';
+        }
+    } catch (e) {
+        window.result.setSinkId = 'REJECTED: ' + e;
+    }
+
+    const codec = ((await audioStats(pc2)) || {}).codec || {};
+    window.result.codec = codec.mimeType ? `${codec.mimeType} ${codec.sdpFmtpLine || ''}`.trim() : 'unknown';
+    window.result.codecChannels = codec.channels ?? null;
+    window.result.codecClockRate = codec.clockRate ?? null;
+
+    log(JSON.stringify(window.result.summary, null, 1));
+    window.ready = true;
+}
+
+setTimeout(() => { if (!window.ready) { window.result.timedOut = true; window.ready = true; } }, 60000);
+run().catch((e) => { window.result.fatal = String(e); window.ready = true; });
+</script>

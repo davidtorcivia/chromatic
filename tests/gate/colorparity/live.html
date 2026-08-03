@@ -1,0 +1,294 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>live colour parity</title>
+<style>
+  html,body{margin:0;padding:0;background:#000}
+  .row{display:block;width:640px;height:360px;margin:0;padding:0}
+  video,canvas{display:block;width:640px;height:360px;margin:0;padding:0}
+</style>
+<video id="v" class="row" muted playsinline autoplay></video>
+<canvas id="gl" class="row" width="640" height="360"></canvas>
+<canvas id="c2" class="row" width="640" height="360"></canvas>
+<canvas id="glnc" class="row" width="640" height="360"></canvas>
+<canvas id="bm" class="row" width="640" height="360"></canvas>
+<canvas id="glbm" class="row" width="640" height="360"></canvas>
+<canvas id="glcv" class="row" width="640" height="360"></canvas>
+<script>
+// Colour parity against a LIVE WebRTC MediaStream, not a file. The gate item is
+// that a MediaStream-backed <video> may take a different hardware-decode path
+// than a file-backed one, so the source here is a real remote track: a canvas
+// capture pushed through a local RTCPeerConnection pair. pc2.ontrack hands back
+// a genuine remote MediaStreamTrack with the production codec forced onto it.
+const v = document.getElementById('v');
+const glc = document.getElementById('gl');
+const c2 = document.getElementById('c2');
+const glnc = document.getElementById('glnc');
+const bm = document.getElementById('bm');
+const glbm = document.getElementById('glbm');
+const glcv = document.getElementById('glcv');
+const params = new URLSearchParams(location.search);
+const WANT = (params.get('codec') || 'H264').toLowerCase();
+const XS = [80, 240, 400, 560];
+const SAMPLE_Y = 180;
+
+// Saturated primaries plus yellow: colour-conversion error shows up on a
+// saturated channel, which is where the file-backed harness measured WebGL at
+// 5/255.
+const BARS = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
+
+window.ready = false;
+window.glErr = null;
+window.info = { stages: [] };
+
+// Stage markers plus a watchdog: a hang (rather than a throw) inside the
+// negotiation is otherwise indistinguishable from a slow connection, and the
+// runner only sees "never became ready".
+const stage = (name) => window.info.stages.push(`${name}@${Math.round(performance.now())}ms`);
+setTimeout(() => {
+    if (!window.ready) {
+        window.info.timedOut = true;
+        window.ready = true;
+    }
+}, 40000);
+
+// Safari throttles requestAnimationFrame to nothing in an occluded window, and
+// a WebDriver-driven Safari is occluded, so an rAF wait hangs forever there.
+// A timer wait gives the compositor the same chance to paint without depending
+// on the window being frontmost.
+const settleFrames = () => new Promise((r) => setTimeout(r, 250));
+
+function drawSource(ctx, tick) {
+  for (let i = 0; i < BARS.length; i++) {
+    ctx.fillStyle = `rgb(${BARS[i].join(',')})`;
+    ctx.fillRect(i * 160, 0, 160, 360);
+  }
+  // A changing pixel outside every sample region, so the encoder keeps pushing
+  // frames instead of stalling on a static canvas.
+  ctx.fillStyle = tick % 2 ? '#fff' : '#000';
+  ctx.fillRect(636, 356, 4, 4);
+}
+
+function sh(gl, ty, src) {
+  const s = gl.createShader(ty);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+const VERT = `#version 300 es
+in vec2 a;out vec2 t;
+void main(){ t = vec2(a.x*0.5+0.5, 0.5-a.y*0.5); gl_Position=vec4(a,0.,1.);}`;
+// Pure passthrough: no colour math whatsoever.
+const FRAG = `#version 300 es
+precision highp float;uniform sampler2D u;in vec2 t;out vec4 o;
+void main(){ o = texture(u,t); }`;
+
+function preferCodec(transceiver) {
+    const caps = RTCRtpSender.getCapabilities('video');
+    if (!caps || !transceiver.setCodecPreferences) return 'unsupported';
+    let wanted = caps.codecs.filter((c) => c.mimeType.toLowerCase() === 'video/' + WANT);
+    if (WANT === 'h264') {
+        // Match what the SFU registers for program video: packetization-mode=1,
+        // Constrained Baseline. Testing a profile production never negotiates
+        // would prove nothing.
+        const cb = wanted.filter((c) => /profile-level-id=42[0e]01f/i.test(c.sdpFmtpLine || ''));
+        if (cb.length) wanted = cb;
+    }
+    if (!wanted.length) return 'unavailable';
+    transceiver.setCodecPreferences(wanted);
+    return wanted[0].sdpFmtpLine ? `${wanted[0].mimeType} ${wanted[0].sdpFmtpLine}` : wanted[0].mimeType;
+}
+
+async function negotiatedCodec(pc) {
+    try {
+        const stats = await pc.getStats();
+        let mime = null;
+        stats.forEach((r) => {
+            if (r.type === 'inbound-rtp' && r.kind === 'video' && r.codecId) {
+                const codec = stats.get(r.codecId);
+                if (codec) mime = codec.sdpFmtpLine ? `${codec.mimeType} ${codec.sdpFmtpLine}` : codec.mimeType;
+            }
+        });
+        return mime;
+    } catch (e) {
+        return 'stats failed: ' + e;
+    }
+}
+
+async function run() {
+    stage('start');
+    const src = document.createElement('canvas');
+    src.width = 640;
+    src.height = 360;
+    const sctx = src.getContext('2d');
+    let tick = 0;
+    drawSource(sctx, tick);
+    if (!src.captureStream) throw new Error('canvas.captureStream unsupported');
+    const stream = src.captureStream(30);
+    stage('captureStream');
+    const timer = setInterval(() => drawSource(sctx, ++tick), 100);
+
+    stage('sourceReady');
+    const pc1 = new RTCPeerConnection();
+    const pc2 = new RTCPeerConnection();
+    pc1.onicecandidate = (e) => e.candidate && pc2.addIceCandidate(e.candidate);
+    pc2.onicecandidate = (e) => e.candidate && pc1.addIceCandidate(e.candidate);
+
+    const remote = new Promise((resolve) => {
+        pc2.ontrack = (e) => resolve(e.streams[0] || new MediaStream([e.track]));
+    });
+
+    const tx = pc1.addTransceiver(stream.getVideoTracks()[0], { direction: 'sendonly' });
+    window.info.requested = preferCodec(tx);
+    stage('codecPreferred');
+
+    const offer = await pc1.createOffer();
+    await pc1.setLocalDescription(offer);
+    await pc2.setRemoteDescription(offer);
+    const answer = await pc2.createAnswer();
+    await pc2.setLocalDescription(answer);
+    await pc1.setRemoteDescription(answer);
+    stage('negotiated');
+
+    const remoteStream = await Promise.race([remote, new Promise((_, rej) => setTimeout(() => rej(new Error('ontrack never fired')), 15000))]);
+    stage('ontrack');
+    v.srcObject = remoteStream;
+    await v.play().catch((e) => { window.info.playError = String(e); });
+    stage('play');
+
+    // Let the connection come up and the encoder settle: the first intra frame
+    // of a fresh stream is where compression error is worst, and a bad sample
+    // there would read as a colour difference.
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+        if (v.readyState >= 2 && v.videoWidth > 0 && v.currentTime > 1.5) break;
+        await new Promise((r) => setTimeout(r, 100));
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+    clearInterval(timer);
+    stage('settled');
+
+    window.info.iceState = pc2.iceConnectionState;
+    window.info.connState = pc2.connectionState;
+    window.info.codec = await negotiatedCodec(pc2);
+    window.info.videoSize = [v.videoWidth, v.videoHeight];
+    window.info.readyState = v.readyState;
+    window.info.currentTime = v.currentTime;
+
+    // Give the compositor a couple of frames to actually paint the video.
+    await settleFrames();
+
+    const drawGL = (target, disableColorConversion, source) => {
+        const gl = target.getContext('webgl2', { antialias: false, premultipliedAlpha: false });
+        if (!gl) throw new Error('no webgl2');
+        if (disableColorConversion) {
+            // The default is BROWSER_DEFAULT_WEBGL, which lets the engine apply
+            // its own colour conversion while uploading the video frame. That
+            // conversion is the suspected source of the WebGL-vs-<video> delta.
+            gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+        }
+        if ('drawingBufferColorSpace' in gl) gl.drawingBufferColorSpace = 'srgb';
+        if ('unpackColorSpace' in gl) gl.unpackColorSpace = 'srgb';
+        const p = gl.createProgram();
+        gl.attachShader(p, sh(gl, gl.VERTEX_SHADER, VERT));
+        gl.attachShader(p, sh(gl, gl.FRAGMENT_SHADER, FRAG));
+        gl.linkProgram(p);
+        gl.useProgram(p);
+        const buf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+        const loc = gl.getAttribLocation(p, 'a');
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source || v);
+        gl.viewport(0, 0, 640, 360);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        gl.finish();
+        const px = new Uint8Array(640 * 360 * 4);
+        gl.readPixels(0, 0, 640, 360, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        return XS.map((x) => {
+            const y = 360 - SAMPLE_Y;
+            const i = ((y * 640) + x) * 4;
+            return [px[i], px[i + 1], px[i + 2]];
+        });
+    };
+
+    try {
+        window.glRead = drawGL(glc, false);
+    } catch (e) {
+        window.glErr = String(e);
+    }
+    try {
+        window.glncRead = drawGL(glnc, true);
+    } catch (e) {
+        window.glncErr = String(e);
+    }
+
+    // What frameSource hands the scopes: createImageBitmap, whose
+    // colorSpaceConversion defaults to letting the engine convert. A waveform
+    // reading converted pixels is a wrong instrument.
+    let sharedBitmap = null;
+    try {
+        const bitmap = await createImageBitmap(v);
+        sharedBitmap = bitmap;
+        const bctx = bm.getContext('2d');
+        bctx.drawImage(bitmap, 0, 0, 640, 360);
+        const bd = bctx.getImageData(0, 0, 640, 360).data;
+        window.bmRead = XS.map((x) => {
+            const i = ((SAMPLE_Y * 640) + x) * 4;
+            return [bd[i], bd[i + 1], bd[i + 2]];
+        });
+    } catch (e) {
+        window.bmErr = String(e);
+    }
+
+    // Same WebGL upload, but sourced from an ImageBitmap instead of the video
+    // element. If the engine's colour error lives in the video-element upload
+    // path specifically, this is a one-line fix for the loupe.
+    try {
+        if (!sharedBitmap) throw new Error('no bitmap');
+        window.glbmRead = drawGL(glbm, false, sharedBitmap);
+    } catch (e) {
+        window.glbmErr = String(e);
+    }
+
+    // Synchronous alternative to the ImageBitmap: draw the video into a 2D
+    // canvas (measured pixel-exact) and upload that. Avoids the async hop a
+    // per-frame createImageBitmap would add to the loupe's render loop.
+    try {
+        const scratch = document.createElement('canvas');
+        scratch.width = 640;
+        scratch.height = 360;
+        scratch.getContext('2d').drawImage(v, 0, 0, 640, 360);
+        window.glcvRead = drawGL(glcv, false, scratch);
+    } catch (e) {
+        window.glcvErr = String(e);
+    }
+
+    const ctx = c2.getContext('2d');
+    ctx.drawImage(v, 0, 0, 640, 360);
+    try {
+        const d = ctx.getImageData(0, 0, 640, 360).data;
+        window.c2Read = XS.map((x) => {
+            const i = ((SAMPLE_Y * 640) + x) * 4;
+            return [d[i], d[i + 1], d[i + 2]];
+        });
+    } catch (e) {
+        window.c2Err = String(e);
+    }
+
+    await settleFrames();
+    window.ready = true;
+}
+
+run().catch((e) => {
+    window.info.fatal = String(e);
+    window.ready = true;
+});
+</script>

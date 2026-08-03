@@ -261,8 +261,24 @@ here. `new Audio()` is a detached element that plays fine in every engine,
 which is encouraging but does not cover `setSinkId` on a detached node, or iOS
 Safari's autoplay/suspend behavior.
 
-Verify in all three engines **before Phase 2 design is locked**, alongside the
-colour check:
+**Measured 2026-08-02 — this gate passes.** Results in `WATERMARKING.md` §3b,
+harness in `tests/gate/colorparity/`. `play()` resolves on a never-inserted
+element, `currentTime` advances, sample counts match an attached element within
+0.5%, and stereo survives with the production Opus fmtp on all three engines.
+The fallback below is not needed.
+
+One finding changes the wording from preference to requirement: the HTML spec
+pauses a media element when it is **removed** from a document, so the element
+must be created detached and never appended. Appending it later makes it
+un-detachable without pausing program audio.
+
+Still unverified: `muted`/`volume` on Firefox and Safari (their
+`totalAudioEnergy` does not move with either, most likely because it is sampled
+before the element's volume), audibility at the DAC, and A/V sync drift. Those
+need a human or a loopback audio device.
+
+Originally to verify in all three engines **before Phase 2 design is locked**,
+alongside the colour check:
 
 - Stereo program audio plays from a detached element, bit-clean, no resample.
 - `muted` toggling and volume behave identically.
@@ -443,16 +459,17 @@ real rooms — delete any `test-*` rooms left behind.
 ## Sequencing and gates
 
 ```
-Phase 0  grab hole (server-side, per-requester)   ← independent, ships now
+Phase 0  grab hole (server-side, per-requester)   ← DONE
    │
-   ├─ Phase 1  mark engine (JS + Go, shared vectors)
+   ├─ Phase 1  mark engine (JS + Go, shared vectors)   ← DONE
    │      │
    │      ▼
    │   [GATE] on a live stream, all three engines:
-   │      │     · colour parity (Canvas 2D vs <video>)
-   │      │     · program audio on a detached element  ← can force a redesign
-   │      │     · iOS drawImage from a hidden MediaStream video
-   │      │   fail → pick (a)/(b)/(c) from spec §3 before any more code
+   │      │     · colour parity (Canvas 2D vs <video>)   ← PASSES, 0/255
+   │      │     · program audio on a detached element    ← PASSES
+   │      │     · rVFC + metadata on a detached element  ← PASSES
+   │      │     · Firefox 4K blit cost      ← OPEN, needs a headed GPU session
+   │      │     · iOS drawImage from a hidden MediaStream video  ← DEFERRED
    │      ▼
    │   Phase 2  compositor (flagged off)
    │      ▼
