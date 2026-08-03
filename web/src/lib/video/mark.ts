@@ -1,0 +1,270 @@
+/**
+ * The mark engine: one definition, rendered by several consumers.
+ *
+ * The display compositor, the loupe, the Go frame-grab path and the admin
+ * preview must all produce the same mark from the same inputs, or forensic
+ * attribution falls apart the moment two of them disagree. `internal/watermark`
+ * mirrors the geometry here, and both sides assert `testdata/mark_vectors.json`
+ * so they cannot drift apart silently.
+ *
+ * The determinism contract is *geometry*: tile pitch, rotation, drift and
+ * opacity modulation. It is deliberately not glyph rasterization, which will
+ * never match between a browser and gofont. Forensics locates the mark by
+ * geometry and reads it by eye.
+ */
+
+/** Tile box in CSS pixels at scale 1. Fixed, never measured from text: text
+ *  metrics vary by platform and font fallback, so a measured pitch would be
+ *  irreproducible in Go and would silently break the shared vectors. */
+export const TILE_BASE_WIDTH = 360;
+export const TILE_BASE_HEIGHT = 168;
+
+/** Diagonal, so a crop along either axis cannot land between rows. */
+export const ROTATION_RADIANS = (-30 * Math.PI) / 180;
+
+/** Drift period. Long enough not to distract during a review, short enough
+ *  that temporal averaging over a shot never sees a constant layer. */
+export const DRIFT_PERIOD_MS = 45_000;
+
+/** Room config bounds, mirrored from the admin UI. */
+const MIN_SCALE = 0.25;
+const MAX_SCALE = 3;
+
+/** Backing-store scale ceiling, matching the compositor's min(dpr, 2). */
+const MAX_DPR = 2;
+
+const BASE_FONT_PX = 15;
+const LINE_SPACING = 1.3;
+const TOKEN_FONT_RATIO = 0.78;
+
+export interface MarkSpec {
+    token: string; // server-signed, opaque; rendered verbatim
+    lines: string[]; // name, participant short-ID, room, UTC clock,
+    // server-expanded watermarkText template. NOTE: no
+    // email — models.Participant has none.
+    seed: string; // session ID — drives drift deterministically
+    opacity: number; // room config
+    scale: number; // room config
+}
+
+export interface DriftOffset {
+    dx: number;
+    dy: number;
+}
+
+/** 32-bit FNV-1a over the seed's UTF-8 bytes. Exactly reproducible in Go:
+ *  encode rather than walking UTF-16 code units, or a non-ASCII seed diverges
+ *  while every ASCII one passes. */
+export function seedHash(seed: string): number {
+    const bytes = new TextEncoder().encode(seed);
+    let hash = 0x811c9dc5;
+    for (const byte of bytes) {
+        hash ^= byte;
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash >>> 0;
+}
+
+function clamp(value: number, lo: number, hi: number): number {
+    if (!(value > lo)) return lo; // also catches NaN
+    return value > hi ? hi : value;
+}
+
+/** Tile box in device pixels. Integer, and a function of scale and dpr only. */
+export function tileSize(spec: MarkSpec, dpr: number): { width: number; height: number } {
+    const s = clamp(spec.scale, MIN_SCALE, MAX_SCALE) * clamp(dpr, 0.5, MAX_DPR);
+    return {
+        width: Math.round(TILE_BASE_WIDTH * s),
+        height: Math.round(TILE_BASE_HEIGHT * s)
+    };
+}
+
+/**
+ * Drift offset at server time t, in tile pitches: |dx|, |dy| reach 1, so the
+ * mark travels a full tile and never sits at a fixed pixel. Deterministic from
+ * the seed, so the position at a given timestamp is reproducible during
+ * forensic analysis of a leaked recording.
+ *
+ * MUST be server time, not Date.now(): a few seconds of client clock skew
+ * against a 45s period puts the forensic position in the wrong place. The mark
+ * token carries a server timestamp; the client keeps the offset and feeds
+ * corrected time in here.
+ */
+export function driftOffset(seed: string, serverTMs: number): DriftOffset {
+    const hash = seedHash(seed);
+    const phaseX = ((hash & 0xffff) / 0x10000) * 2 * Math.PI;
+    const phaseY = (((hash >>> 16) & 0xffff) / 0x10000) * 2 * Math.PI;
+    // Reduce against the full path length before the sine. Server time is epoch
+    // milliseconds, and sin() of ~1e8 radians is where two runtimes' argument
+    // reduction stops agreeing; fmod is exact, so both sides feed sin the same
+    // small angle. 3:2 Lissajous, so the path only closes after three periods
+    // and consecutive periods do not retrace the same pixels.
+    const turns = (modPositive(serverTMs, DRIFT_PERIOD_MS * 3) / DRIFT_PERIOD_MS) * 2 * Math.PI;
+    return {
+        dx: Math.sin(turns + phaseX),
+        dy: Math.sin((turns * 2) / 3 + phaseY)
+    };
+}
+
+/** Non-negative remainder, so a negative timestamp still lands on the path. */
+function modPositive(value: number, modulus: number): number {
+    return ((value % modulus) + modulus) % modulus;
+}
+
+/**
+ * Opacity multiplier at server time t, in [0.8, 1]. Slight modulation on a
+ * different period from the drift, so the mark's contribution is never
+ * constant frame to frame.
+ */
+export function opacityScale(seed: string, serverTMs: number): number {
+    const hash = seedHash(seed);
+    const phase = (((hash >>> 8) & 0xffff) / 0x10000) * 2 * Math.PI;
+    const period = DRIFT_PERIOD_MS * 0.5;
+    const turns = (modPositive(serverTMs, period) / period) * 2 * Math.PI;
+    return 0.9 + 0.1 * Math.sin(turns + phase);
+}
+
+/** Lines actually drawn into a tile: the caller's lines, then the token. */
+function tileLines(spec: MarkSpec): string[] {
+    const lines = spec.lines.filter((line) => line !== "");
+    return spec.token ? [...lines, spec.token] : lines;
+}
+
+function tileCacheKey(spec: MarkSpec, dpr: number): string {
+    // Opacity is applied at paint time, so it is not part of the key: a fading
+    // mark must not re-rasterize the tile every frame.
+    return [clamp(spec.scale, MIN_SCALE, MAX_SCALE), dpr, ...tileLines(spec)].join("\u0000");
+}
+
+/**
+ * More than one entry, because more than one surface is marked at a time: the
+ * program video and the screen share carry different specs, and the loupe
+ * paints at a different source scale again. A single slot would miss on every
+ * alternating paint and re-rasterize per frame, which is the per-frame cost the
+ * pattern design exists to avoid.
+ */
+const TILE_CACHE_LIMIT = 6;
+const tileCache = new Map<string, HTMLCanvasElement>();
+
+/**
+ * Rasterize ONE tile at the given device scale. Cheap; called on text change
+ * (clock ticks ~1Hz) or DPR change, never per frame.
+ */
+export function renderTile(spec: MarkSpec, dpr: number): HTMLCanvasElement {
+    const key = tileCacheKey(spec, dpr);
+    const hit = tileCache.get(key);
+    if (hit) {
+        // Refresh recency so the surfaces in active use survive eviction.
+        tileCache.delete(key);
+        tileCache.set(key, hit);
+        return hit;
+    }
+
+    const { width, height } = tileSize(spec, dpr);
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+
+    const ctx = canvas.getContext("2d");
+    // Do not cache a tile we could not draw into: a blank tile would be painted
+    // silently for the life of the page, and a mark that is not there is worse
+    // than a slow one.
+    if (!ctx) return canvas;
+
+    const deviceScale = clamp(spec.scale, MIN_SCALE, MAX_SCALE) * clamp(dpr, 0.5, MAX_DPR);
+    const fontPx = BASE_FONT_PX * deviceScale;
+    const lineHeight = fontPx * LINE_SPACING;
+    const padX = width * 0.06;
+    const padY = height * 0.1;
+    const maxTextWidth = width - padX * 2;
+
+    ctx.textBaseline = "alphabetic";
+    ctx.lineJoin = "round";
+
+    const lines = tileLines(spec);
+    lines.forEach((line, i) => {
+        const isToken = spec.token !== "" && i === lines.length - 1;
+        const size = isToken ? fontPx * TOKEN_FONT_RATIO : fontPx;
+        ctx.font = `${size}px system-ui, sans-serif`;
+        // measureText is used only to ellipsize into the fixed box. It must
+        // never feed the tile pitch, which is what the shared vectors lock.
+        const text = ellipsize(ctx, line, maxTextWidth);
+        const y = padY + lineHeight * i + size;
+        // A light stroke under a dark fill modulates luminance both ways, so no
+        // single-direction levels or gamma move removes the mark.
+        ctx.lineWidth = Math.max(1, size / 8);
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
+        ctx.strokeText(text, padX, y);
+        ctx.fillStyle = "rgba(0, 0, 0, 0.9)";
+        ctx.fillText(text, padX, y);
+    });
+
+    tileCache.set(key, canvas);
+    if (tileCache.size > TILE_CACHE_LIMIT) {
+        const oldest = tileCache.keys().next();
+        if (!oldest.done) tileCache.delete(oldest.value);
+    }
+    return canvas;
+}
+
+function ellipsize(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string {
+    if (ctx.measureText(text).width <= maxWidth) return text;
+    let lo = 0;
+    let hi = text.length;
+    while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (ctx.measureText(text.slice(0, mid) + "…").width <= maxWidth) lo = mid;
+        else hi = mid - 1;
+    }
+    return text.slice(0, lo) + "…";
+}
+
+/**
+ * Paint the mark over `ctx` covering `rect`, at `sourceScale` (1 = native,
+ * <1 = display-res composite, >1 = loupe magnification).
+ *
+ * One `fillRect` through a cached pattern. Rotation, scale and drift live on
+ * the pattern's transform and the context transform stays at identity:
+ * rotating the context and then filling means filling a rotated region, which
+ * leaves uncovered corners and tempts a bounding-box enlargement that wastes
+ * fill area.
+ */
+export function paintMark(
+    ctx: CanvasRenderingContext2D,
+    spec: MarkSpec,
+    rect: DOMRect,
+    sourceScale: number,
+    tMs: number
+): void {
+    if (rect.width <= 0 || rect.height <= 0) return;
+    if (tileLines(spec).length === 0) return;
+
+    const dpr = clamp(globalThis.devicePixelRatio || 1, 0.5, MAX_DPR);
+    const pattern = ctx.createPattern(renderTile(spec, dpr), "repeat");
+    if (!pattern) return;
+
+    // Tile size in the context's user units at this source scale.
+    const unit = tileSize(spec, 1);
+    const unitW = unit.width * sourceScale;
+    const unitH = unit.height * sourceScale;
+    const drift = driftOffset(spec.seed, tMs);
+
+    // Tile device px -> user units.
+    const k = sourceScale / dpr;
+    const matrix = new DOMMatrix()
+        .translateSelf(rect.x + drift.dx * unitW, rect.y + drift.dy * unitH)
+        .rotateSelf((ROTATION_RADIANS * 180) / Math.PI)
+        .scaleSelf(k, k);
+    pattern.setTransform(matrix);
+
+    ctx.save();
+    ctx.globalAlpha = clamp(spec.opacity, 0, 1) * opacityScale(spec.seed, tMs);
+    ctx.fillStyle = pattern;
+    ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
+    ctx.restore();
+}
+
+/** Drop every cached tile. Call when the surface's DPR changes underneath us. */
+export function resetTileCache(): void {
+    tileCache.clear();
+}
