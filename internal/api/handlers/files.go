@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -298,16 +299,21 @@ func (h *FileHandler) storeUpload(w http.ResponseWriter, r *http.Request, origin
 	// watermarked room that silently skipped its stamp is the hole this closes.
 	if origin == fileOriginFrameGrab && room.marksFrames() {
 		name, _ := h.participantName(r.Context(), uploaderID)
-		size, stampErr := stampStoredFrame(storedPath, frameStampSpec{
+		size, stampErr := stampStoredFrame(r.Context(), storedPath, frameStampSpec{
 			Lines:   captureStampLines(name, uploaderID, time.Now().UTC()),
 			Opacity: room.Opacity,
 			Scale:   room.Scale,
+			Phase:   captureStampPhase,
 		})
 		if stampErr != nil {
 			logger.Error("Failed to stamp grabbed frame", "file_id", fileID, "error", stampErr)
 			_ = os.Remove(storedPath)
 			if thumbnailPath != "" {
 				_ = os.Remove(thumbnailPath)
+			}
+			if isContextErr(stampErr) {
+				http.Error(w, "Server busy", http.StatusServiceUnavailable)
+				return
 			}
 			http.Error(w, "Failed to save file", http.StatusInternalServerError)
 			return
@@ -440,12 +446,18 @@ func (h *FileHandler) serveMarkedFrame(
 		name, _ = h.participantName(r.Context(), requesterID)
 	}
 
-	marked, err := stampJPEG(src, frameStampSpec{
+	marked, err := stampUnderLimit(r.Context(), src, frameStampSpec{
 		Lines:   downloadStampLines(name, requesterID, time.Now().UTC()),
 		Opacity: room.Opacity,
 		Scale:   room.Scale,
+		// Half a tile off the capture layer so the two do not overprint.
+		Phase: downloadStampPhase,
 	})
 	if err != nil {
+		if isContextErr(err) {
+			http.Error(w, "Server busy", http.StatusServiceUnavailable)
+			return
+		}
 		// Fail closed. Serving the clean frame because marking broke would hand
 		// out exactly the unmarked full-resolution still this path exists to
 		// prevent.
@@ -689,6 +701,14 @@ const (
 	fileOriginFrameGrab = "frame-grab"
 )
 
+// Tile-grid phases for the two stamp layers a served frame carries. Same
+// rotation and pitch at the same phase means the download text lands on the
+// capture text and neither can be read.
+const (
+	captureStampPhase  = 0.0
+	downloadStampPhase = 0.5
+)
+
 // roomWatermarkConfig is the subset of room watermark settings the file
 // pipeline needs.
 type roomWatermarkConfig struct {
@@ -742,17 +762,31 @@ func shortParticipantID(id string) string {
 	return id
 }
 
+// stampNameRunes bounds the display name so the short-ID at the end of the line
+// always survives. The tile box is fixed, so an over-long line is ellipsized
+// from the right — and the id is the part that ties a leaked frame to an audit
+// row, so it is the one part that must not be what gets cut.
+const stampNameRunes = 22
+
+func stampName(name string) string {
+	runes := []rune(name)
+	if len(runes) <= stampNameRunes {
+		return name
+	}
+	return string(runes[:stampNameRunes-1]) + "…"
+}
+
 func captureStampLines(name, participantID string, t time.Time) []string {
 	return []string{
-		fmt.Sprintf("captured by %s (%s)", name, shortParticipantID(participantID)),
+		fmt.Sprintf("captured by %s (%s)", stampName(name), shortParticipantID(participantID)),
 		t.Format("2006-01-02 15:04:05 UTC"),
 	}
 }
 
 func downloadStampLines(name, participantID string, t time.Time) []string {
-	who := name
+	who := stampName(name)
 	if participantID != "" {
-		who = fmt.Sprintf("%s (%s)", name, shortParticipantID(participantID))
+		who = fmt.Sprintf("%s (%s)", stampName(name), shortParticipantID(participantID))
 	}
 	return []string{
 		fmt.Sprintf("downloaded by %s", who),
@@ -760,14 +794,57 @@ func downloadStampLines(name, participantID string, t time.Time) []string {
 	}
 }
 
+// Stamping costs ~365ms for a 4K frame (BenchmarkStampJPEG4K) and runs per
+// download on an endpoint with no per-file rate limit. This process also hosts
+// the SFU fan-out, and starving that is the one thing CLAUDE.md says must never
+// happen — so bound how many stamps run at once instead of letting a burst of
+// downloads take every core.
+var stampSlots = make(chan struct{}, maxStampConcurrency())
+
+func maxStampConcurrency() int {
+	if n := runtime.GOMAXPROCS(0) / 4; n > 1 {
+		return n
+	}
+	return 1
+}
+
+// acquireStampSlot waits for capacity or gives up when the request does.
+func acquireStampSlot(ctx context.Context) error {
+	select {
+	case stampSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func releaseStampSlot() { <-stampSlots }
+
+// isContextErr reports whether the failure was the request going away or the
+// concurrency bound refusing it, rather than the image pipeline breaking.
+func isContextErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// stampUnderLimit runs one stamp inside the concurrency bound. The slot is
+// released with defer so a panic in the image pipeline cannot permanently
+// shrink capacity.
+func stampUnderLimit(ctx context.Context, src []byte, spec frameStampSpec) ([]byte, error) {
+	if err := acquireStampSlot(ctx); err != nil {
+		return nil, err
+	}
+	defer releaseStampSlot()
+	return stampJPEG(src, spec)
+}
+
 // stampStoredFrame rewrites the stored JPEG with the stamp burned in and
 // returns the new size on disk.
-func stampStoredFrame(path string, spec frameStampSpec) (int64, error) {
+func stampStoredFrame(ctx context.Context, path string, spec frameStampSpec) (int64, error) {
 	src, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
 	}
-	marked, err := stampJPEG(src, spec)
+	marked, err := stampUnderLimit(ctx, src, spec)
 	if err != nil {
 		return 0, err
 	}

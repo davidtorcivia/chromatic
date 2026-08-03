@@ -33,6 +33,9 @@ const (
 	stampFontHeightFraction = 0.018
 	stampMinFontPx          = 9.0
 	stampLineSpacing        = 1.35
+	// Tile text column, in ems. Fixed so every pass shares one grid; lines
+	// longer than this are ellipsized rather than widening the tile.
+	stampTextWidthEms = 26.0
 	// Re-encode quality; matches the client's grab quality so the round trip
 	// does not add a visible generation loss.
 	stampJPEGQuality = 92
@@ -43,6 +46,13 @@ type frameStampSpec struct {
 	Lines   []string
 	Opacity float64 // room watermark opacity (0-1)
 	Scale   float64 // room watermark scale multiplier
+	// Phase offsets this layer's tile grid by a fraction of a tile. A served
+	// frame carries two passes — the capture stamp burned in at upload and the
+	// download stamp composited on top — and both use the same rotation and
+	// pitch. At the same phase they land on each other and neither is legible,
+	// which destroys exactly the attribution the stamp exists for. Half a tile
+	// interleaves them.
+	Phase float64
 }
 
 // stampJPEG decodes a JPEG, composites the tiled stamp over it and re-encodes.
@@ -101,9 +111,10 @@ func stampImage(img image.Image, spec frameStampSpec) (image.Image, error) {
 	cols := int(math.Ceil(radius/tileW)) + 1
 	rows := int(math.Ceil(radius/tileH)) + 1
 
-	for row := -rows; row <= rows; row++ {
-		for col := -cols; col <= cols; col++ {
-			ox, oy := float64(col)*tileW, float64(row)*tileH
+	for row := -rows - 1; row <= rows+1; row++ {
+		for col := -cols - 1; col <= cols+1; col++ {
+			ox := (float64(col) + spec.Phase) * tileW
+			oy := (float64(row) + spec.Phase) * tileH
 			m := f64.Aff3{
 				cos, -sin, cos*ox - sin*oy + cx,
 				sin, cos, sin*ox + cos*oy + cy,
@@ -137,18 +148,15 @@ func renderStampTile(lines []string, fontPx, opacity float64) (*image.RGBA, erro
 	defer face.Close()
 
 	lineHeight := fontPx * stampLineSpacing
-	textWidth := 0.0
-	for _, line := range lines {
-		w := float64(font.MeasureString(face, line)) / 64
-		if w > textWidth {
-			textWidth = w
-		}
-	}
 
-	// Padding sets the gap between tiles; roughly one line of breathing room in
-	// each direction keeps the frame readable at the default opacity.
+	// The tile box is fixed from the font size, never from the measured text.
+	// Two passes land on one frame (capture at upload, download at serve); if
+	// each sized its own grid to its own longest line the two grids would drift
+	// against each other and collide unpredictably. A fixed box plus a phase
+	// offset makes them interleave everywhere.
 	padX := fontPx * 2.5
 	padY := fontPx * 1.75
+	textWidth := fontPx * stampTextWidthEms
 	tileW := int(math.Ceil(textWidth + padX*2))
 	tileH := int(math.Ceil(lineHeight*float64(len(lines)) + padY*2))
 	tile := image.NewRGBA(image.Rect(0, 0, tileW, tileH))
@@ -162,6 +170,7 @@ func renderStampTile(lines []string, fontPx, opacity float64) (*image.RGBA, erro
 
 	drawer := font.Drawer{Dst: tile, Face: face}
 	for i, line := range lines {
+		line = ellipsize(face, line, textWidth)
 		baseline := padY + lineHeight*float64(i) + fontPx
 		for _, pass := range []struct {
 			src    image.Image
@@ -180,6 +189,23 @@ func renderStampTile(lines []string, fontPx, opacity float64) (*image.RGBA, erro
 	}
 
 	return tile, nil
+}
+
+// ellipsize trims a line to fit the fixed tile box. Measuring is fine here —
+// it only decides where to cut the text, never the tile pitch.
+func ellipsize(face font.Face, text string, maxWidth float64) string {
+	width := func(s string) float64 { return float64(font.MeasureString(face, s)) / 64 }
+	if width(text) <= maxWidth {
+		return text
+	}
+	runes := []rune(text)
+	for len(runes) > 0 {
+		runes = runes[:len(runes)-1]
+		if width(string(runes)+"…") <= maxWidth {
+			return string(runes) + "…"
+		}
+	}
+	return ""
 }
 
 func nonEmptyLines(lines []string) []string {

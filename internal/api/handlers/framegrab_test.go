@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -425,5 +426,115 @@ func TestStampImage_NoLinesLeavesSizeIntact(t *testing.T) {
 	}
 	if img.Bounds().Dx() != 200 || img.Bounds().Dy() != 120 {
 		t.Errorf("size = %v, want 200x120", img.Bounds().Size())
+	}
+}
+
+// A served frame carries two stamp layers: the capture stamp burned in at
+// upload and the download stamp composited at serve. They share a rotation and
+// a tile pitch, so at the same grid phase they land on each other and neither
+// is readable — which destroys exactly the attribution the stamp exists for.
+// This asserts the two layers ink mostly different pixels.
+func TestStampLayersDoNotOverprint(t *testing.T) {
+	base := image.NewRGBA(image.Rect(0, 0, 1280, 720))
+	draw.Draw(base, base.Bounds(), &image.Uniform{C: color.RGBA{R: 128, G: 128, B: 128, A: 255}}, image.Point{}, draw.Src)
+
+	spec := func(lines []string, phase float64) frameStampSpec {
+		return frameStampSpec{Lines: lines, Opacity: 0.35, Scale: 1, Phase: phase}
+	}
+	captured, err := stampImage(base, spec(
+		captureStampLines("Dana Reyes", "9f3c1a72b4d5e6f7", time.Unix(1_770_000_000, 0).UTC()),
+		captureStampPhase))
+	if err != nil {
+		t.Fatalf("capture stamp: %v", err)
+	}
+	downloaded, err := stampImage(base, spec(
+		downloadStampLines("Sam Okafor", "1122334455667788", time.Unix(1_770_000_600, 0).UTC()),
+		downloadStampPhase))
+	if err != nil {
+		t.Fatalf("download stamp: %v", err)
+	}
+
+	inked := func(img image.Image, x, y int) bool {
+		r, g, b, _ := img.At(x, y).RGBA()
+		return abs8(int(r>>8)-128) > 2 || abs8(int(g>>8)-128) > 2 || abs8(int(b>>8)-128) > 2
+	}
+
+	var countA, countB, both int
+	for y := base.Bounds().Min.Y; y < base.Bounds().Max.Y; y++ {
+		for x := base.Bounds().Min.X; x < base.Bounds().Max.X; x++ {
+			a, b := inked(captured, x, y), inked(downloaded, x, y)
+			if a {
+				countA++
+			}
+			if b {
+				countB++
+			}
+			if a && b {
+				both++
+			}
+		}
+	}
+	if countA == 0 || countB == 0 {
+		t.Fatalf("a stamp layer drew nothing: capture=%d download=%d", countA, countB)
+	}
+
+	smaller := countA
+	if countB < smaller {
+		smaller = countB
+	}
+	overlap := float64(both) / float64(smaller)
+	// Identical grids at the same phase overlap almost completely. Interleaved
+	// layers still cross where the diagonals meet, so this is a ceiling on
+	// collision, not a demand for zero.
+	if overlap > 0.4 {
+		t.Errorf("stamp layers overlap %.0f%% of the smaller layer; they overprint and neither reads", overlap*100)
+	}
+}
+
+func abs8(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// The short-ID ties a leaked frame back to an audit row, so a long display name
+// must not be what pushes it off the end of the line.
+func TestStampLinesKeepShortIDForLongNames(t *testing.T) {
+	long := "Bartholomew Fitzgerald-Montgomery III"
+	id := "9f3c1a72b4d5e6f7"
+	for _, line := range append(
+		captureStampLines(long, id, time.Unix(1_770_000_000, 0).UTC()),
+		downloadStampLines(long, id, time.Unix(1_770_000_000, 0).UTC())...,
+	) {
+		if strings.Contains(line, "captured by") || strings.Contains(line, "downloaded by") {
+			if !strings.Contains(line, "(9f3c1a72)") {
+				t.Errorf("line %q lost the participant short-ID", line)
+			}
+			if len([]rune(line)) > 60 {
+				t.Errorf("line %q is %d runes; too long for the fixed tile box", line, len([]rune(line)))
+			}
+		}
+	}
+}
+
+// Serve-time marking is one decode + composite + encode per download, on an
+// authenticated endpoint with no per-file rate limit. Keep the cost visible.
+func BenchmarkStampJPEG4K(b *testing.B) {
+	img := image.NewRGBA(image.Rect(0, 0, 3840, 2160))
+	draw.Draw(img, img.Bounds(), &image.Uniform{C: color.RGBA{R: 90, G: 110, B: 130, A: 255}}, image.Point{}, draw.Src)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 92}); err != nil {
+		b.Fatal(err)
+	}
+	spec := frameStampSpec{
+		Lines:   downloadStampLines("Sam Okafor", "1122334455667788", time.Unix(1_770_000_000, 0).UTC()),
+		Opacity: 0.35, Scale: 1, Phase: downloadStampPhase,
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := stampJPEG(buf.Bytes(), spec); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
