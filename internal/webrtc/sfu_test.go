@@ -1370,13 +1370,178 @@ func TestSFU_VoiceMuteGate_StableAcrossSessionReplacement(t *testing.T) {
 		t.Fatal("SetVoiceMuted should also mirror onto VoiceSession.Muted")
 	}
 
-	// Cleanup must remove the flag so a rejoiner starts unmuted.
+	// Tearing down the voice PeerConnection must NOT clear the gate: the mute is
+	// attached to the participant's presence in the room, not to one PC. It used
+	// to be dropped here, so a muted participant could come back unmuted just by
+	// bouncing their mic — the exact bypass the server-side gate exists to close.
 	sfu.RemoveVoiceSession(roomSlug, participantID)
+	room.mu.RLock()
+	survived := room.voiceMuteFlags[participantID]
+	room.mu.RUnlock()
+	if survived != relayFlag {
+		t.Fatal("voice mute flag must survive a voice-session teardown (mic bounce would clear an admin mute)")
+	}
+
+	// A confirmed departure is what clears it, so a genuine rejoin starts unmuted.
+	room.RemoveSubscriber(participantID)
 	room.mu.RLock()
 	_, stillThere := room.voiceMuteFlags[participantID]
 	room.mu.RUnlock()
 	if stillThere {
-		t.Fatal("voice mute flag should be cleared when the voice session is removed")
+		t.Fatal("voice mute flag should be cleared when the participant leaves the room")
+	}
+}
+
+// The duplicate-a=msid regression (2026-08-11, room glg-hk-color).
+//
+// removeVoiceSessionIfSame used to delete VoiceLocalTracks, which made
+// CreateVoiceRelayTrack's reuse path unreachable: a mic bounce built a second
+// TrackLocalStaticRTP with the same msid while subscribers still held a sender
+// bound to the first. Chrome and Safari reject an offer carrying two identical
+// a=msid lines, answer nothing, and strand the SFU in HaveLocalOffer forever —
+// deaf viewers. Firefox accepts it, which is why one participant could hear
+// everyone while nobody else could hear each other.
+func TestSFU_VoiceRelayTrackSurvivesVoiceSessionTeardown(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	roomSlug := "relay-reuse-room"
+	participantID := "speaker-1"
+	room := sfu.GetRoomTracks(roomSlug)
+
+	relay, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+		"voice-"+participantID,
+		"voice-stream-"+participantID,
+	)
+	if err != nil {
+		t.Fatalf("failed to create relay track: %v", err)
+	}
+
+	room.mu.Lock()
+	room.VoiceLocalTracks = map[string]*webrtc.TrackLocalStaticRTP{participantID: relay}
+	room.VoiceSessions = map[string]*VoiceSession{
+		participantID: {ParticipantID: participantID, done: make(chan struct{})},
+	}
+	room.mu.Unlock()
+
+	// The voice PeerConnection dies (mic bounce, ICE failure, publisher replaced).
+	sfu.RemoveVoiceSession(roomSlug, participantID)
+
+	room.mu.RLock()
+	got, stillThere := room.VoiceLocalTracks[participantID]
+	room.mu.RUnlock()
+	if !stillThere {
+		t.Fatal("voice relay track was dropped on voice-session teardown; the rejoin will mint a duplicate msid")
+	}
+	if got != relay {
+		t.Fatal("voice relay track was replaced rather than kept; CreateVoiceRelayTrack must rebind this exact object")
+	}
+
+	// Leaving the room is what actually retires it.
+	room.RemoveSubscriber(participantID)
+	room.mu.RLock()
+	_, afterLeave := room.VoiceLocalTracks[participantID]
+	room.mu.RUnlock()
+	if afterLeave {
+		t.Fatal("voice relay track should be retired when the participant leaves")
+	}
+}
+
+// A departing participant's voice relay must be handed back as a dead track so
+// RemoveSubscriber detaches it from everyone else. Without this, the remaining
+// subscribers kept a sender bound to a dead track: silent for the rest of the
+// session, and a duplicate msid the moment that participant rejoined.
+func TestRoomTracks_RemoveSubscriberReturnsVoiceTrackAsDead(t *testing.T) {
+	relay, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+		"voice-leaver",
+		"voice-stream-leaver",
+	)
+	if err != nil {
+		t.Fatalf("failed to create relay track: %v", err)
+	}
+
+	room := &RoomTracks{
+		RoomSlug:         "test-room",
+		Subscribers:      make(map[string]*Subscriber),
+		VoiceLocalTracks: map[string]*webrtc.TrackLocalStaticRTP{"leaver": relay},
+	}
+	room.AddSubscriber(&Subscriber{ID: "leaver", done: make(chan struct{})})
+
+	room.mu.Lock()
+	_, deadTracks := room.removeSubscriberLocked("leaver")
+	room.mu.Unlock()
+
+	found := false
+	for _, dead := range deadTracks {
+		if dead == relay {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("departing participant's voice relay was not returned as a dead track, so its sender stays bound on every other subscriber")
+	}
+}
+
+// removeStaleRelaySenders is the structural guard: whatever else goes wrong, an
+// offer must never carry two m-lines with the same msid.
+func TestRemoveStaleRelaySenders_LeavesOneMsidPerRelay(t *testing.T) {
+	cfg := createTestConfig()
+	sfu, err := NewSFU(cfg)
+	if err != nil {
+		t.Fatalf("failed to create SFU: %v", err)
+	}
+	defer sfu.Shutdown()
+
+	pc, err := sfu.CreatePeerConnection()
+	if err != nil {
+		t.Fatalf("failed to create peer connection: %v", err)
+	}
+	defer pc.Close()
+
+	newRelay := func() *webrtc.TrackLocalStaticRTP {
+		track, trackErr := webrtc.NewTrackLocalStaticRTP(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
+			"voice-p1",
+			"voice-stream-p1",
+		)
+		if trackErr != nil {
+			t.Fatalf("failed to create relay track: %v", trackErr)
+		}
+		return track
+	}
+
+	// The old relay is already attached; the participant's mic bounces and a
+	// rebuilt relay arrives carrying the identical msid.
+	stale := newRelay()
+	if _, err := pc.AddTrack(stale); err != nil {
+		t.Fatalf("failed to add stale track: %v", err)
+	}
+	fresh := newRelay()
+
+	if !removeStaleRelaySenders(pc, fresh) {
+		t.Fatal("removeStaleRelaySenders did not detach the sender carrying the duplicate msid")
+	}
+	if _, err := pc.AddTrack(fresh); err != nil {
+		t.Fatalf("failed to add fresh track: %v", err)
+	}
+
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("failed to create offer: %v", err)
+	}
+	if n := strings.Count(offer.SDP, "a=msid:voice-stream-p1 voice-p1"); n != 1 {
+		t.Fatalf("offer carries %d a=msid lines for the relay, want exactly 1 — Chrome and Safari reject duplicates outright:\n%s", n, offer.SDP)
+	}
+
+	// Re-adding the very same object must be a no-op, not a self-detach.
+	if removeStaleRelaySenders(pc, fresh) {
+		t.Fatal("removeStaleRelaySenders detached the live sender when handed its own track")
 	}
 }
 

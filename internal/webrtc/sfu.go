@@ -301,7 +301,19 @@ type Subscriber struct {
 	// unapplicable offer from retrying forever.
 	pendingClientOfferAttempts int
 	OnDeferredClientOffer      func(isRestart bool, offerID, answerSDP string)
+	// unansweredOffer fires when a renegotiation offer we sent has gone
+	// unanswered for too long. A client that cannot apply an offer answers
+	// nothing, and pion v4 cannot roll back a local offer, so the PC stays in
+	// HaveLocalOffer forever and every later track add is silently deferred —
+	// the viewer goes deaf to the room with nothing in the log but an ABSENT
+	// "renegotiation answer" line. Guarded by SignalingMu.
+	unansweredOffer *time.Timer
 }
+
+// unansweredOfferWarnAfter is how long a renegotiation offer may go unanswered
+// before we call it out. Comfortably longer than a healthy offer/answer round
+// trip (tens of ms, even over TURN).
+const unansweredOfferWarnAfter = 10 * time.Second
 
 // pcHasTrack reports whether the peer connection already has a sender bound
 // to this exact track (prevents double-attach when an add is retried/queued).
@@ -312,6 +324,69 @@ func pcHasTrack(pc *webrtc.PeerConnection, track webrtc.TrackLocal) bool {
 		}
 	}
 	return false
+}
+
+// watchOfferAnswered arms a one-shot check that reports a renegotiation offer
+// still sitting unanswered — the state that turns a transient SDP error into a
+// permanently deaf viewer, and that is otherwise invisible because it shows up
+// in the log only as a MISSING "renegotiation answer" line. Clear-before-set;
+// the check no-ops once the subscriber is gone.
+// Caller must hold sub.SignalingMu.
+func (sub *Subscriber) watchOfferAnswered(offerID string) {
+	if sub.unansweredOffer != nil {
+		sub.unansweredOffer.Stop()
+	}
+	sub.unansweredOffer = time.AfterFunc(unansweredOfferWarnAfter, func() {
+		select {
+		case <-sub.done:
+			return
+		default:
+		}
+		sub.SignalingMu.Lock()
+		state := sub.PeerConnection.SignalingState()
+		stuck := sub.RenegotiationOfferID == offerID && state != webrtc.SignalingStateStable
+		sub.SignalingMu.Unlock()
+		if stuck {
+			log.Printf("Subscriber %s has not answered renegotiation offer %s after %s (state %s) — it cannot apply our SDP and is deaf to every track added since",
+				sub.ID, offerID, unansweredOfferWarnAfter, state)
+		}
+	})
+}
+
+// removeStaleRelaySenders detaches any sender bound to a DIFFERENT track object
+// that carries the same msid as the track about to be added, reporting whether
+// it removed anything.
+//
+// Relay tracks are named after their source participant (voice-<pid>,
+// webcam-<pid>), so a rebuilt relay for a rejoining source is a new object with
+// an identical msid. Offering both puts two matching a=msid lines in one SDP:
+// Chrome fails SetRemoteDescription with "Duplicate a=msid lines detected" and
+// Safari with the same SyntaxError, so neither answers. The SFU is then stuck in
+// HaveLocalOffer for that subscriber forever — pion v4 cannot roll back a local
+// offer — and the stable-state guard in tryAddTrackAndRenegotiate silently drops
+// every subsequent track add, leaving that viewer deaf to everyone who speaks or
+// joins afterwards. Firefox accepts the duplicate, which is why this presented
+// as "one person could hear everyone, and nobody else could hear each other".
+//
+// Callers must hold sub.SignalingMu.
+func removeStaleRelaySenders(pc *webrtc.PeerConnection, track webrtc.TrackLocal) bool {
+	removed := false
+	for _, sender := range pc.GetSenders() {
+		existing := sender.Track()
+		if existing == nil || existing == track {
+			continue
+		}
+		if existing.ID() != track.ID() || existing.StreamID() != track.StreamID() {
+			continue
+		}
+		if err := pc.RemoveTrack(sender); err != nil {
+			log.Printf("Failed to detach stale relay sender %s: %v", existing.ID(), err)
+			continue
+		}
+		log.Printf("Detached stale relay sender %s before re-adding the rebuilt track", existing.ID())
+		removed = true
+	}
+	return removed
 }
 
 // resetICECandidateBudget resets the per-negotiation ICE candidate counter.
@@ -1063,7 +1138,17 @@ func (rt *RoomTracks) removeSubscriberLocked(id string) (pcs []*webrtc.PeerConne
 	}
 	delete(rt.voiceMuteFlags, id)
 	delete(rt.VoiceRemoteTracks, id)
-	delete(rt.VoiceLocalTracks, id)
+	// Hand the voice relay to the caller for detaching, exactly like the webcam
+	// and screen-share tracks below. Deleting the map entry alone left every
+	// other subscriber holding a sender bound to a dead track: silent for the
+	// rest of the session, and a duplicate msid the moment that participant
+	// rejoined under the same ID.
+	if voiceLocal, ok := rt.VoiceLocalTracks[id]; ok {
+		delete(rt.VoiceLocalTracks, id)
+		if voiceLocal != nil {
+			deadTracks = append(deadTracks, voiceLocal)
+		}
+	}
 	if ch, ok := rt.voiceRelayDone[id]; ok {
 		close(ch)
 		delete(rt.voiceRelayDone, id)
@@ -2591,8 +2676,24 @@ func (s *SFU) removeVoiceSessionIfSame(roomSlug, participantID string, expected 
 	delete(room.VoiceSessions, participantID)
 	delete(room.PendingPublisherICE, participantID)
 	delete(room.VoiceRemoteTracks, participantID)
-	delete(room.VoiceLocalTracks, participantID)
-	delete(room.voiceMuteFlags, participantID)
+	// VoiceLocalTracks and voiceMuteFlags deliberately survive: they are keyed to
+	// the participant's membership in the room, not to one voice PeerConnection.
+	//
+	// Dropping the relay track here is what made CreateVoiceRelayTrack's reuse
+	// path unreachable — every mic blip built a NEW TrackLocalStaticRTP with the
+	// same msid (voice-<pid>) while every subscriber still held a sender bound to
+	// the old one. The resulting offer carried two identical a=msid lines, which
+	// Chrome and Safari reject outright; those clients then send no answer and the
+	// SFU stays pinned in HaveLocalOffer, where the stable-state guard drops every
+	// later track add. That is a viewer who is permanently deaf to the room, and
+	// it is only cleared by a full subscriber rebuild. Keeping the entry lets a
+	// rejoining publisher rebind the existing track: no new msid, no renegotiation
+	// at all. RemoveSubscriber (a confirmed leave) is what actually drops it, and
+	// it detaches the senders at the same time.
+	//
+	// Keeping the mute flag also closes a bypass: an admin-muted participant used
+	// to come back unmuted simply by bouncing their voice PeerConnection.
+	//
 	// Stop the relay goroutine for this participant, if any.
 	if ch, ok := room.voiceRelayDone[participantID]; ok {
 		close(ch)
@@ -2758,7 +2859,10 @@ func (s *SFU) CreateVoiceRelayTrack(roomSlug, participantID string, remoteTrack 
 	}
 	// Stop any previous relay goroutine for this participant before
 	// replacing it (e.g. mic restarted or speaker rejoined) so it can't leak
-	// and there's no duplicate writer to the shared local track.
+	// and there's no duplicate writer to the shared local track. The outgoing
+	// relay may still be parked in Read for up to its one-second deadline, but
+	// it re-checks this channel before writing, so it cannot interleave a stale
+	// packet into the replacement's stream on the now-shared local track.
 	if prev, ok := room.voiceRelayDone[participantID]; ok {
 		close(prev)
 	}
@@ -2811,6 +2915,20 @@ func relayTrackLoop(remoteTrack *webrtc.TrackRemote, localTrack *webrtc.TrackLoc
 		// admin:mute contract honest.
 		if muted != nil && muted.Load() {
 			continue
+		}
+		// Re-check cancellation between the read and the write. A rejoining
+		// publisher rebinds the EXISTING local track, so a relay that was parked
+		// in Read when it was cancelled would otherwise land its last packet in
+		// the middle of its replacement's stream — two sources' sequence numbers
+		// and timestamps under one SSRC. The top-of-loop check can't catch that:
+		// cancellation typically arrives while this goroutine is blocked in Read.
+		// Selecting on a closed channel allocates nothing, so this stays clean
+		// against the per-packet allocation rule.
+		select {
+		case <-done:
+			log.Printf("%s relay stopped for %s", label, participantID)
+			return
+		default:
 		}
 		if err := pkt.Unmarshal(buf[:n]); err != nil {
 			continue
@@ -2972,6 +3090,8 @@ func (s *SFU) tryAddTrackAndRenegotiate(sub *Subscriber, localTrack *webrtc.Trac
 	// Attach the shared relay track now — AddTrack is legal in any signaling
 	// state and pion fans out writes to all PCs that have added this track.
 	if !pcHasTrack(sub.PeerConnection, localTrack) {
+		// Never offer two m-lines with the same msid (see removeStaleRelaySenders).
+		removeStaleRelaySenders(sub.PeerConnection, localTrack)
 		if _, err := sub.PeerConnection.AddTrack(localTrack); err != nil {
 			return "", "", false, false, fmt.Errorf("failed to add track: %w", err)
 		}
@@ -3000,6 +3120,7 @@ func (s *SFU) tryAddTrackAndRenegotiate(sub *Subscriber, localTrack *webrtc.Trac
 
 	sub.RenegotiationOfferID = s.nextSignalingOfferID()
 	sub.setCandidateID(sub.RenegotiationOfferID)
+	sub.watchOfferAnswered(sub.RenegotiationOfferID)
 
 	// ICE candidates are trickled via the subscriber's OnICECandidate callback
 	return offer.SDP, sub.RenegotiationOfferID, false, false, nil
@@ -3028,6 +3149,7 @@ func (s *SFU) flushPendingRenegotiationLocked(sub *Subscriber) {
 		if pcHasTrack(sub.PeerConnection, t) {
 			continue
 		}
+		removeStaleRelaySenders(sub.PeerConnection, t)
 		if _, err := sub.PeerConnection.AddTrack(t); err != nil {
 			log.Printf("Failed to attach queued track for subscriber %s: %v", sub.ID, err)
 			continue
@@ -3058,6 +3180,7 @@ func (s *SFU) flushPendingRenegotiationLocked(sub *Subscriber) {
 	}
 	sub.RenegotiationOfferID = s.nextSignalingOfferID()
 	sub.setCandidateID(sub.RenegotiationOfferID)
+	sub.watchOfferAnswered(sub.RenegotiationOfferID)
 	sub.needsRenegotiation = false
 	log.Printf("Flushed pending renegotiation for subscriber %s", sub.ID)
 	// Deliver outside the signaling-critical path.
@@ -3149,6 +3272,7 @@ func (s *SFU) RenegotiateSubscriber(roomSlug, subscriberID string) (string, stri
 
 	sub.RenegotiationOfferID = s.nextSignalingOfferID()
 	sub.setCandidateID(sub.RenegotiationOfferID)
+	sub.watchOfferAnswered(sub.RenegotiationOfferID)
 
 	// ICE candidates are trickled via the subscriber's OnICECandidate callback
 	log.Printf("Renegotiation offer created for subscriber %s", subscriberID)
