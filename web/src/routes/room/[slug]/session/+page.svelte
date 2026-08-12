@@ -18,6 +18,7 @@
     import { loadAudioModeState, getJoinWithCamera, type AudioMode, type DenoiserEngine } from "$lib/audio/audio-mode";
     import { createVADMonitor } from "$lib/audio/vad";
     import { deriveStreamOverlayState } from "$lib/video/stream-overlay";
+    import { decideKeyframeNudge } from "$lib/video/keyframe-nudge";
     import { bindStream, bindCanvasStream } from "$lib/video/streamBinding";
     import { VoicePlaybackManager } from "$lib/audio/voice-playback";
     import { playShareRequestChime, playWaitingRoomChime, playJoinChime, playLeaveChime, playChatReceiveChime, getUiSoundsEnabled, setUiSoundsEnabled } from "$lib/audio/chimes";
@@ -1145,6 +1146,11 @@
                     needsPlayClick = true;
                 }
             });
+        // A new stream is a new cycle. A fresh server offer (websocket
+        // reconnect) rebinds without going through requestResubscribe, so a
+        // cycle left over from the previous peer connection would otherwise
+        // carry its spent attempts onto this one.
+        clearKeyframeNudge();
         scheduleKeyframeNudge();
     }
 
@@ -1234,6 +1240,9 @@
         // The server replies to resubscribe with fresh ICE servers immediately
         // before the replacement offer, preserving websocket message order.
         session.send("signal:resubscribe", {});
+        // Re-arm the escalation clearConnectingWatchdog above just dropped;
+        // the overlay is already 'connecting', so the effect will not.
+        armConnectingWatchdog();
         return true;
     }
 
@@ -1241,17 +1250,24 @@
     // live but no frames render within the window (lost offer, failed ICE
     // with no state transition, refresh during a TURN outage), escalate to a
     // full re-subscription instead of sitting there forever.
+    //
+    // connectingWatchdog is a plain handle, not $state, so the effect below
+    // re-arms only when overlayState changes — which it does not after a
+    // resubscribe that was already showing 'connecting'.
+    function armConnectingWatchdog() {
+        if (connectingWatchdog) return;
+        connectingWatchdog = setTimeout(function tick() {
+            connectingWatchdog = null;
+            if (overlayState !== 'connecting') return;
+            if (requestResubscribe('stuck on connecting')) {
+                connectingWatchdog = setTimeout(tick, CONNECTING_WATCHDOG_MS);
+            }
+        }, CONNECTING_WATCHDOG_MS);
+    }
+
     $effect(() => {
         if (overlayState === 'connecting') {
-            if (!connectingWatchdog) {
-                connectingWatchdog = setTimeout(function tick() {
-                    connectingWatchdog = null;
-                    if (overlayState !== 'connecting') return;
-                    if (requestResubscribe('stuck on connecting')) {
-                        connectingWatchdog = setTimeout(tick, CONNECTING_WATCHDOG_MS);
-                    }
-                }, CONNECTING_WATCHDOG_MS);
-            }
+            armConnectingWatchdog();
         } else if (connectingWatchdog) {
             clearConnectingWatchdog();
         }
@@ -1266,8 +1282,22 @@
         playNudgeAttempts = 0;
         const tick = () => {
             playNudgeTimer = null;
-            if (isVideoPlaying || !webrtcManager) return;
-            if (playNudgeAttempts >= PLAY_NUDGE_MAX_ATTEMPTS) {
+            if (!webrtcManager) return;
+            const action = decideKeyframeNudge({
+                isVideoPlaying,
+                connectionState: webrtcManager.getConnectionState(),
+                attempts: playNudgeAttempts,
+                maxAttempts: PLAY_NUDGE_MAX_ATTEMPTS
+            });
+            if (action === 'stop') return;
+            if (action === 'wait') {
+                // Transport still coming up: a PLI cannot produce a frame yet,
+                // so hold the attempt budget and re-poll. The connecting
+                // watchdog owns a transport that never arrives.
+                playNudgeTimer = setTimeout(tick, PLAY_NUDGE_INTERVAL_MS);
+                return;
+            }
+            if (action === 'escalate') {
                 // Keyframes alone aren't fixing it — the transport itself is
                 // likely dead. Escalate to a full re-subscription.
                 requestResubscribe('keyframe nudges exhausted');
