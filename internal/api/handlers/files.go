@@ -10,7 +10,7 @@ import (
 	"image"
 	_ "image/gif"
 	"image/jpeg"
-	"image/png"
+	_ "image/png"
 	"io"
 	"mime"
 	"net/http"
@@ -1062,9 +1062,6 @@ func encodeThumbnail(srcPath string) ([]byte, error) {
 }
 
 // Register image decoders (required for image.Decode to work)
-func init() {
-	// JPEG decoder is automatically registered via import
-	// PNG decoder is automatically registered via import
-	_ = png.Decode // Trigger registration
-	_ = jpeg.Decode
-}
+// Decoders self-register via the blank imports above (image/gif, webp, and
+// golang.org/x/image/webp); png/jpeg are imported for direct use.
+var _ = image.DecodeConfig

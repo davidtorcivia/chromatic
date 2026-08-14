@@ -366,8 +366,7 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 					"participantId": c.ID,
 				}, "")
 				for _, subID := range affected {
-					subIDCopy := subID
-					safeGo("renegotiateSubscriber", func() { h.renegotiateSubscriber(c.RoomSlug, subIDCopy) })
+					safeGo("renegotiateSubscriber", func() { h.renegotiateSubscriber(c.RoomSlug, subID) })
 				}
 				logger.Info("Webcam stopped (owner disconnected)", "owner", c.ID, "room", c.RoomSlug)
 			}
@@ -1744,8 +1743,7 @@ func (h *WebSocketHandler) handleAdminDisableCam(client *websocket.Client, paylo
 		"disabled":      disabled,
 	}, "")
 	for _, subID := range affected {
-		subIDCopy := subID
-		safeGo("renegotiateSubscriber", func() { h.renegotiateSubscriber(client.RoomSlug, subIDCopy) })
+		safeGo("renegotiateSubscriber", func() { h.renegotiateSubscriber(client.RoomSlug, subID) })
 	}
 	logger.Info("Admin camera toggle", "by", client.ID, "target", data.ParticipantID, "disabled", disabled, "room", client.RoomSlug)
 }

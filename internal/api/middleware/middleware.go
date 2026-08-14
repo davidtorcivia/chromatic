@@ -33,6 +33,16 @@ func RequireAuth(cfg AuthConfig) func(http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// An empty configured admin token must fail every request:
+			// constant-time comparison treats two empty strings as equal, so
+			// a "Bearer " header with nothing after it would otherwise
+			// authenticate. Config rejects an empty ADMIN_TOKEN, but this is
+			// a trust boundary and does not depend on that.
+			if len(adminTokenBytes) == 0 {
+				http.Error(w, "Server misconfigured", http.StatusInternalServerError)
+				return
+			}
+
 			// First, try to authenticate via session cookie (preferred, secure)
 			if cfg.SessionCookie != "" && cfg.ValidateSession != nil {
 				cookie, err := r.Cookie(cfg.SessionCookie)
@@ -53,8 +63,8 @@ func RequireAuth(cfg AuthConfig) func(http.Handler) http.Handler {
 
 			// Extract bearer token
 			token := strings.TrimPrefix(auth, "Bearer ")
-			if token == auth {
-				// No "Bearer " prefix found
+			if token == auth || token == "" {
+				// No "Bearer " prefix, or nothing after it
 				http.Error(w, "Invalid authorization format", http.StatusUnauthorized)
 				return
 			}

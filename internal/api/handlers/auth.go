@@ -81,8 +81,10 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate admin token with constant-time comparison
-	if subtle.ConstantTimeCompare([]byte(req.Token), []byte(h.adminToken)) != 1 {
+	// Validate admin token with constant-time comparison. Reject an empty
+	// configured token: two empty strings compare equal, so without the
+	// length check an empty ADMIN_TOKEN would authenticate an empty token.
+	if len(h.adminToken) == 0 || subtle.ConstantTimeCompare([]byte(req.Token), []byte(h.adminToken)) != 1 {
 		http.Error(w, "Invalid token", http.StatusUnauthorized)
 		return
 	}

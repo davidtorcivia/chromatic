@@ -1740,7 +1740,6 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 	// Same for any cams already on: nudge each owner so the joiner's cam tiles
 	// fill in immediately instead of sitting black until the next keyframe.
 	for _, pid := range activeWebcamPIDs {
-		pid := pid
 		go s.RequestWebcamKeyframe(roomSlug, pid)
 	}
 

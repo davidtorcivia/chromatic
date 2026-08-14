@@ -317,60 +317,6 @@ func TestGetEnvList(t *testing.T) {
 	}
 }
 
-// TestTrimSpace tests the trimSpace helper
-func TestTrimSpace(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{"  hello  ", "hello"},
-		{"hello", "hello"},
-		{"  ", ""},
-		{"", ""},
-		{"\t\nhello\r\n", "hello"},
-		{"hello world", "hello world"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			result := trimSpace(tt.input)
-			if result != tt.expected {
-				t.Errorf("trimSpace(%q) = %q, expected %q", tt.input, result, tt.expected)
-			}
-		})
-	}
-}
-
-// TestSplitString tests the splitString helper
-func TestSplitString(t *testing.T) {
-	tests := []struct {
-		input    string
-		sep      string
-		expected []string
-	}{
-		{"a,b,c", ",", []string{"a", "b", "c"}},
-		{"a", ",", []string{"a"}},
-		{"", ",", []string{""}},
-		{"a::b::c", "::", []string{"a", "b", "c"}},
-		{"a,b,c", "", []string{"a,b,c"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			result := splitString(tt.input, tt.sep)
-			if len(result) != len(tt.expected) {
-				t.Errorf("expected length %d, got %d", len(tt.expected), len(result))
-				return
-			}
-			for i := range result {
-				if result[i] != tt.expected[i] {
-					t.Errorf("at index %d: expected %q, got %q", i, tt.expected[i], result[i])
-				}
-			}
-		})
-	}
-}
-
 // TestListenAddr tests the ListenAddr method
 func TestListenAddr(t *testing.T) {
 	cfg := &Config{Port: 8080}

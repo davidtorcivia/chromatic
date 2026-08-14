@@ -174,7 +174,7 @@ func (c *Config) ListenAddr() string {
 }
 
 func normalizeTurnMode(mode string) string {
-	normalized := strings.ToLower(trimSpace(mode))
+	normalized := strings.ToLower(strings.TrimSpace(mode))
 	switch normalized {
 	case "", TurnModeHybrid:
 		return TurnModeHybrid
@@ -236,52 +236,10 @@ func getEnvList(key string, defaultValue []string) []string {
 // splitAndTrim splits a string and trims whitespace from each element
 func splitAndTrim(s, sep string) []string {
 	var result []string
-	for _, part := range splitString(s, sep) {
-		trimmed := trimSpace(part)
-		if trimmed != "" {
+	for _, part := range strings.Split(s, sep) {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
 			result = append(result, trimmed)
 		}
 	}
 	return result
-}
-
-// splitString splits a string by separator (simple implementation to avoid strings import)
-func splitString(s, sep string) []string {
-	if len(sep) == 0 {
-		return []string{s}
-	}
-	var result []string
-	for {
-		i := indexOf(s, sep)
-		if i < 0 {
-			result = append(result, s)
-			break
-		}
-		result = append(result, s[:i])
-		s = s[i+len(sep):]
-	}
-	return result
-}
-
-// indexOf returns the index of sep in s, or -1 if not found
-func indexOf(s, sep string) int {
-	for i := 0; i <= len(s)-len(sep); i++ {
-		if s[i:i+len(sep)] == sep {
-			return i
-		}
-	}
-	return -1
-}
-
-// trimSpace removes leading and trailing whitespace
-func trimSpace(s string) string {
-	start := 0
-	for start < len(s) && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
-		start++
-	}
-	end := len(s)
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r') {
-		end--
-	}
-	return s[start:end]
 }

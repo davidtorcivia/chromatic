@@ -37,6 +37,7 @@ handlers.out
 
 # Local tooling
 .claude/
+.pi/
 
 # Temporary files
 tmp/
