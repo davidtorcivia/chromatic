@@ -216,6 +216,10 @@
         }
         return () => {
             if (registered) setReviewToolActive("laser", false);
+            // The <video> outlives this component (it unmounts on any
+            // autoplay gate); never leave it with touch-action:none.
+            videoElement.style.cursor = "";
+            videoElement.style.touchAction = "";
         };
     });
 
