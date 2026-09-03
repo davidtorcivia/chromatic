@@ -101,7 +101,7 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 
 	// Validate SDP - check for B-frames configuration
 	if err := validateSDP(sdpOffer); err != nil {
-		log.Printf("SDP validation failed for %s: %v", token, err)
+		log.Printf("SDP validation failed for %s: %v", keyPrefix(token), err)
 		http.Error(w, fmt.Sprintf("Invalid stream configuration: %v", err), http.StatusUnprocessableEntity)
 		return
 	}
@@ -264,10 +264,12 @@ func (h *WHIPHandler) handleOffer(w http.ResponseWriter, r *http.Request, token 
 				metrics.Get().ActiveWHIPIngests.Add(-1)
 			}
 			h.sfu.removeIngestIfSame(token, session)
-			// Only notify stream end if the stream actually started;
-			// otherwise viewers would see a spurious "stream ended" for a
-			// session that never connected.
-			if session.everConnected.Load() && h.onStreamEnd != nil {
+			// Only notify stream end if the stream actually started (otherwise
+			// viewers see a spurious "stream ended" for a session that never
+			// connected) and this session was not already replaced by an OBS
+			// reconnect (the replacement is about to broadcast stream start).
+			wasLive := session.everConnected.Load() || session.replacedLive.Load()
+			if wasLive && h.onStreamEnd != nil && !h.sfu.ingestSuperseded(token, session) {
 				h.onStreamEnd(token)
 			}
 		})

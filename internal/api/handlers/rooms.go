@@ -298,7 +298,7 @@ func (h *RoomHandler) handleRoomOpen(slug string) {
 	}
 
 	waitCtx, waitCancel := database.WithTimeout(context.Background())
-	rows, err := h.db.QueryContext(waitCtx, `SELECT id FROM participants WHERE room_id = ? AND is_admitted = FALSE`, roomID)
+	rows, err := h.db.QueryContext(waitCtx, `SELECT id FROM participants WHERE room_id = ? AND is_admitted = FALSE AND kicked_at IS NULL`, roomID)
 	if err != nil {
 		waitCancel()
 		logger.Error("Failed to list lobby participants on room open", "room", slug, "error", err)
@@ -336,7 +336,7 @@ func (h *RoomHandler) handleRoomOpen(slug string) {
 	// RETURNING guarantees the notification list is exactly who we admitted.
 	admitCtx, admitCancel := database.WithTimeout(context.Background())
 	admitRows, qErr := h.db.QueryContext(admitCtx, `
-		UPDATE participants SET is_admitted = TRUE WHERE room_id = ? AND is_admitted = FALSE
+		UPDATE participants SET is_admitted = TRUE WHERE room_id = ? AND is_admitted = FALSE AND kicked_at IS NULL
 		RETURNING id
 	`, roomID)
 	if qErr != nil {
@@ -383,10 +383,12 @@ func (h *RoomHandler) maybeRunMissedOpen(slug string) {
 		FROM rooms WHERE slug = ?
 	`, slug).Scan(&roomID, &waitingRoom, &scheduledAt, &openedAt, &roomStatus)
 	cancel()
-	if err != nil || roomStatus == "ended" || scheduledAt == nil {
+	if err != nil || roomStatus == "ended" {
 		return
 	}
-	if openedAt == nil && time.Now().Before(*scheduledAt) {
+	// A nil scheduled_at is an open room; fall through so lobby rows left
+	// behind by a schedule being cleared still get admitted.
+	if scheduledAt != nil && openedAt == nil && time.Now().Before(*scheduledAt) {
 		// Not open yet — make sure the open timer survives restarts.
 		h.ensureOpenTimer(slug, *scheduledAt)
 		return
@@ -750,7 +752,10 @@ func (h *RoomHandler) Update(w http.ResponseWriter, r *http.Request) {
 		args = append(args, name)
 	}
 
+	var newSchedule *time.Time
+	rescheduled := false
 	if raw, ok := updates["scheduledAt"]; ok {
+		rescheduled = true
 		if string(raw) == "null" {
 			setClauses = append(setClauses, "scheduled_at = NULL")
 		} else {
@@ -761,6 +766,7 @@ func (h *RoomHandler) Update(w http.ResponseWriter, r *http.Request) {
 			}
 			setClauses = append(setClauses, "scheduled_at = ?")
 			args = append(args, scheduledAt)
+			newSchedule = &scheduledAt
 		}
 	}
 
@@ -967,6 +973,21 @@ func (h *RoomHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if affected == 0 {
 		http.Error(w, "Room not found", http.StatusNotFound)
 		return
+	}
+
+	// The lobby open timer is keyed by slug and armed for the old
+	// scheduled_at; without a reset it fires at the stale time. Re-arm for
+	// the new time (a past time fires immediately; an empty lobby makes the
+	// open flow a no-op, so arming unconditionally is safe).
+	if rescheduled {
+		h.cancelOpenTimer(slug)
+		if newSchedule != nil {
+			h.ensureOpenTimer(slug, *newSchedule)
+		} else {
+			// Schedule cleared: the room is open now, so release anyone
+			// already waiting in the countdown lobby.
+			h.handleRoomOpen(slug)
+		}
 	}
 
 	// Return updated room
@@ -1313,7 +1334,7 @@ func buildJoinResponse(participantID, token string, isAdmitted bool, color, name
 func (h *RoomHandler) countWaiting(roomID string) int {
 	var n int
 	ctx, cancel := database.WithTimeout(context.Background())
-	err := h.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM participants WHERE room_id = ? AND is_admitted = FALSE`, roomID).Scan(&n)
+	err := h.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM participants WHERE room_id = ? AND is_admitted = FALSE AND kicked_at IS NULL`, roomID).Scan(&n)
 	cancel()
 	if err != nil {
 		return 0
@@ -1345,7 +1366,7 @@ func (h *RoomHandler) ListWaiting(w http.ResponseWriter, r *http.Request) {
 		SELECT p.id, p.name, p.joined_at
 		FROM participants p
 		JOIN rooms r ON r.id = p.room_id
-		WHERE r.slug = ? AND p.is_admitted = FALSE
+		WHERE r.slug = ? AND p.is_admitted = FALSE AND p.kicked_at IS NULL
 		ORDER BY p.joined_at
 	`, slug)
 	if err != nil {
@@ -1388,7 +1409,7 @@ func (h *RoomHandler) AdmitWaitingParticipant(slug, participantID string) (bool,
 	ctx, cancel := database.WithTimeout(context.Background())
 	result, err := h.db.ExecContext(ctx, `
 		UPDATE participants SET is_admitted = TRUE
-		WHERE id = ? AND is_admitted = FALSE
+		WHERE id = ? AND is_admitted = FALSE AND kicked_at IS NULL
 		  AND room_id = (SELECT id FROM rooms WHERE slug = ?)
 	`, participantID, slug)
 	cancel()
@@ -1426,7 +1447,7 @@ func (h *RoomHandler) DenyWaitingParticipant(slug, participantID string) (bool, 
 	ctx, cancel := database.WithTimeout(context.Background())
 	result, err := h.db.ExecContext(ctx, `
 		DELETE FROM participants
-		WHERE id = ? AND is_admitted = FALSE
+		WHERE id = ? AND is_admitted = FALSE AND kicked_at IS NULL
 		  AND room_id = (SELECT id FROM rooms WHERE slug = ?)
 	`, participantID, slug)
 	cancel()
@@ -1501,7 +1522,7 @@ func (h *RoomHandler) AdmitAll(w http.ResponseWriter, r *http.Request) {
 	admitCtx, admitCancel := database.WithTimeout(r.Context())
 	rows, err := h.db.QueryContext(admitCtx, `
 		UPDATE participants SET is_admitted = TRUE
-		WHERE room_id = (SELECT id FROM rooms WHERE slug = ?) AND is_admitted = FALSE
+		WHERE room_id = (SELECT id FROM rooms WHERE slug = ?) AND is_admitted = FALSE AND kicked_at IS NULL
 		RETURNING id
 	`, slug)
 	if err != nil {

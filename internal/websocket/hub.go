@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"chromatic/internal/metrics"
@@ -70,7 +71,10 @@ type Client struct {
 	Send      chan []byte
 	Done      chan struct{} // Closed when client disconnects; gates SendJSON
 	closeOnce sync.Once     // Ensures Send channel is closed only once
-	IsAdmin   bool
+	// isAdmin is revoked by the read pump (requireAdmin on a dead session)
+	// while broadcast filters read it from other goroutines; atomic so the
+	// revocation is a well-defined write, not a race.
+	isAdmin atomic.Bool
 
 	// Media state is written by the read pump (media:toggle) and read by
 	// other goroutines (e.g. room-state snapshots), so it is guarded by a mutex.
@@ -92,6 +96,9 @@ type Client struct {
 
 	// Rate limiting for chat messages (30 per minute)
 	chatRateLimiter *RateLimiter
+	// Rate limiting for signaling that builds or replaces a PeerConnection
+	// (resubscribe, publisher offers, ICE restarts): each is real SFU work.
+	signalRateLimiter *RateLimiter
 	// Rate limiting for cursor updates (40 per second)
 	cursorRateLimiter *RateLimiter
 }
@@ -165,6 +172,12 @@ func (r *RateLimiter) Allow() bool {
 	return true
 }
 
+// IsAdmin reports whether the client currently holds admin powers.
+func (c *Client) IsAdmin() bool { return c.isAdmin.Load() }
+
+// SetAdmin grants or revokes admin powers for the connection.
+func (c *Client) SetAdmin(v bool) { c.isAdmin.Store(v) }
+
 // InitChatRateLimiter initializes the chat message rate limiter
 // 30 messages per minute per client
 func (c *Client) InitChatRateLimiter() {
@@ -178,6 +191,18 @@ func (c *Client) AllowChatMessage() bool {
 		c.InitChatRateLimiter()
 	}
 	return c.chatRateLimiter.Allow()
+}
+
+// AllowSignal gates the expensive signaling commands. 30/min is far above
+// any legitimate client (the browser's own resubscribe window allows a
+// handful per minute, and a publisher renegotiates a few times per
+// mic/share toggle) but stops a stuck or hostile client from making the
+// SFU rebuild peer connections in a loop.
+func (c *Client) AllowSignal() bool {
+	if c.signalRateLimiter == nil {
+		c.signalRateLimiter = NewRateLimiter(30, time.Minute)
+	}
+	return c.signalRateLimiter.Allow()
 }
 
 // InitCursorRateLimiter initializes the cursor update rate limiter.
@@ -465,7 +490,7 @@ func (h *Hub) BroadcastToAdminsJSON(roomSlug, msgType string, payload interface{
 	}
 
 	h.broadcastFiltered(roomSlug, msgBytes, false, func(c *Client) bool {
-		return c.IsAdmin
+		return c.IsAdmin()
 	})
 	return nil
 }

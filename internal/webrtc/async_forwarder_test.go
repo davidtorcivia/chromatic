@@ -304,3 +304,39 @@ func TestAsyncForwarder_CloseStopsDrain(t *testing.T) {
 		t.Errorf("writes after close should be dropped; got %d writes, want 1", final)
 	}
 }
+
+// TestStripHeaderExtensions_ReusesCapacity locks the allocation-free contract
+// of the relay loop: after stripping, re-unmarshalling an extension-bearing
+// packet into the same header must not grow a fresh Extensions slice.
+func TestStripHeaderExtensions_ReusesCapacity(t *testing.T) {
+	src := rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: 96, SequenceNumber: 1, SSRC: 7, Extension: true, ExtensionProfile: 0xBEDE}, Payload: []byte{1, 2, 3}}
+	if err := src.Header.SetExtension(1, []byte{0xAA, 0xBB}); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Header.SetExtension(3, []byte{0xCC}); err != nil {
+		t.Fatal(err)
+	}
+	wire, err := src.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var p rtp.Packet
+	if err := p.Unmarshal(wire); err != nil {
+		t.Fatal(err)
+	}
+	stripHeaderExtensions(&p.Header)
+	if p.Header.Extension || len(p.Header.Extensions) != 0 {
+		t.Fatalf("extensions not stripped: %+v", p.Header)
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		if err := p.Unmarshal(wire); err != nil {
+			t.Fatal(err)
+		}
+		stripHeaderExtensions(&p.Header)
+	})
+	if allocs != 0 {
+		t.Fatalf("unmarshal+strip cycle allocates %.1f/op; Extensions capacity is being discarded", allocs)
+	}
+}

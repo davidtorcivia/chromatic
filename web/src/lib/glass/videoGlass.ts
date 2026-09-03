@@ -54,6 +54,7 @@ interface GroupOptions {
 const MAX_RECTS = 10;
 const FBO_WIDTH = 1024;
 const RAMP_MS = 300;
+const TRANSITION_WATCH_MS = 600;
 // A few consecutive failures (driver quirks, bad video states) and the
 // renderer retires permanently, restoring the CSS material — flapping
 // styles every frame on a deterministic error would be worse than either.
@@ -316,6 +317,40 @@ export function videoGlassGroup(node: HTMLElement, options: GroupOptions) {
 		}
 	}
 
+	// Layout reads (getBoundingClientRect forces a synchronous layout) are
+	// cached, not taken every frame: re-read only when something that can
+	// move a surface happened — a size change, a class/style/child mutation
+	// under the bar, a running CSS transition/animation, a video resize, or
+	// the item set changing. The GPU draw is already gated on rect changes,
+	// so this only removes the layout flushes.
+	let layoutDirty = true;
+	let transitionsUntil = 0;
+	let rectCount = 0;
+	let content: DOMRect | null = null;
+	let nodeRect: DOMRect = node.getBoundingClientRect();
+	let observedVideo: HTMLVideoElement | null = null;
+	const markDirty = () => {
+		layoutDirty = true;
+	};
+	// Transitions move surfaces continuously; keep reading for their
+	// plausible duration (longest bar transition is 420ms) instead of
+	// tracking start/end pairs that can be lost when a node is removed.
+	const onMotion = () => {
+		transitionsUntil = performance.now() + TRANSITION_WATCH_MS;
+	};
+	const ro = new ResizeObserver(markDirty);
+	ro.observe(node);
+	const layoutMo = new MutationObserver(markDirty);
+	layoutMo.observe(node, {
+		subtree: true,
+		childList: true,
+		attributes: true,
+		attributeFilter: ["class", "style"],
+	});
+	node.addEventListener("transitionrun", onMotion, true);
+	node.addEventListener("animationstart", onMotion, true);
+	window.addEventListener("resize", markDirty);
+
 	function frameBody() {
 		// Gecko: even the cheap skip-path bookkeeping (rect reads, item
 		// diffing) is worth halving on the slowest compositor.
@@ -340,9 +375,15 @@ export function videoGlassGroup(node: HTMLElement, options: GroupOptions) {
 		const items = usable ? opts.items().slice(0, MAX_RECTS) : [];
 		const w = node.clientWidth;
 		const h = node.clientHeight;
-		const content = usable ? getVideoContentPageRect(video!) : null;
+		if (video && video !== observedVideo) {
+			if (observedVideo) ro.unobserve(observedVideo);
+			ro.observe(video);
+			observedVideo = video;
+			layoutDirty = true;
+		}
 
-		if (!usable || !items.length || !w || !h || !content) {
+		if (!usable || !items.length || !w || !h) {
+			content = null;
 			wasRendering = false;
 			releaseAll();
 			if (overlayVisible()) schedule(); // keep polling while visible
@@ -365,27 +406,42 @@ export function videoGlassGroup(node: HTMLElement, options: GroupOptions) {
 			if (!items.includes(el)) {
 				styleItem(el, false);
 				styled.delete(el);
+				ro.unobserve(el);
+				layoutDirty = true;
 			}
 		}
 		for (const el of items) {
 			if (!styled.has(el)) {
 				styleItem(el, true);
 				styled.add(el);
+				ro.observe(el);
+				layoutDirty = true;
 			}
 		}
 
-		const nodeRect = node.getBoundingClientRect();
-		let count = 0;
-		for (const el of items) {
-			const r = el.getBoundingClientRect();
-			if (!r.width || !r.height) continue;
-			rectsArr[count * 4] = r.left - nodeRect.left;
-			rectsArr[count * 4 + 1] = r.top - nodeRect.top;
-			rectsArr[count * 4 + 2] = r.width;
-			rectsArr[count * 4 + 3] = r.height;
-			radiiArr[count] = cornerRadius(el, r.width, r.height);
-			count++;
+		if (layoutDirty || performance.now() < transitionsUntil || !content) {
+			layoutDirty = false;
+			content = getVideoContentPageRect(video!);
+			if (!content) {
+				wasRendering = false;
+				releaseAll();
+				if (overlayVisible()) schedule();
+				return;
+			}
+			nodeRect = node.getBoundingClientRect();
+			rectCount = 0;
+			for (const el of items) {
+				const r = el.getBoundingClientRect();
+				if (!r.width || !r.height) continue;
+				rectsArr[rectCount * 4] = r.left - nodeRect.left;
+				rectsArr[rectCount * 4 + 1] = r.top - nodeRect.top;
+				rectsArr[rectCount * 4 + 2] = r.width;
+				rectsArr[rectCount * 4 + 3] = r.height;
+				radiiArr[rectCount] = cornerRadius(el, r.width, r.height);
+				rectCount++;
+			}
 		}
+		const count = rectCount;
 
 		// Scene texture: prefer the shared downsampled bitmap (the video
 		// is drawn ONCE at ~1024px for all renderers, then each uploads
@@ -527,6 +583,11 @@ export function videoGlassGroup(node: HTMLElement, options: GroupOptions) {
 	return {
 		destroy() {
 			mo.disconnect();
+			layoutMo.disconnect();
+			ro.disconnect();
+			node.removeEventListener("transitionrun", onMotion, true);
+			node.removeEventListener("animationstart", onMotion, true);
+			window.removeEventListener("resize", markDirty);
 			document.removeEventListener("visibilitychange", onVisibility);
 			if (raf) cancelAnimationFrame(raf);
 			releaseAll();

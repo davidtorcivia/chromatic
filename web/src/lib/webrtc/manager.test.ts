@@ -527,6 +527,32 @@ describe('WebRTCManager media capture lifetime', () => {
         expect(manager.getCurrentMicDeviceId()).toBeNull();
     });
 
+    it('keeps the working mic when replaceTrack rejects during a device switch', async () => {
+        // Regression: the failure path used to stop the PREVIOUS capture — the
+        // one still feeding the sender — and leave state pointing at the new,
+        // unattached one, so the mic went silent with the UI reading "on".
+        const first = fakeMediaStream('audio');
+        const second = fakeMediaStream('audio');
+        vi.stubGlobal('RTCPeerConnection', FakePublisherPeerConnection);
+        vi.spyOn(navigator.mediaDevices, 'getUserMedia')
+            .mockResolvedValueOnce(first.stream)
+            .mockResolvedValueOnce(second.stream);
+
+        const manager = newManager(() => {});
+        await manager.setDenoiserEngine('off'); // no cleanup chain: raw capture feeds the sender
+        await expect(manager.requestMicrophone()).resolves.toBe(true);
+
+        const replaceTrack = vi.fn().mockRejectedValue(new Error('InvalidModificationError'));
+        (manager as unknown as { audioSender: unknown }).audioSender = { replaceTrack };
+
+        await expect(manager.setMicDevice('other-mic')).resolves.toBe(false);
+
+        expect(replaceTrack).toHaveBeenCalledWith(second.track);
+        expect(first.track.stop).not.toHaveBeenCalled();
+        expect(second.track.stop).toHaveBeenCalledTimes(1);
+        expect((manager as unknown as { localStream: MediaStream | null }).localStream).toBe(first.stream);
+    });
+
     it('stops a screen-share capture that resolves after the manager is closed', async () => {
         const capture = deferred<MediaStream>();
         const { stream, track } = fakeMediaStream('video');

@@ -155,6 +155,12 @@ type IngestSession struct {
 	// Used to avoid spurious stream-end notifications and negative metrics
 	// for sessions that never connected.
 	everConnected atomic.Bool
+	// replacedLive is set by SetIngest when this session supersedes one that
+	// had connected. The old session's teardown skips its stream-end
+	// broadcast (see ingestSuperseded), so if this one never connects it must
+	// deliver that broadcast itself or viewers sit on a frozen frame with no
+	// "waiting for reconnection" message.
+	replacedLive atomic.Bool
 	// teardown is set by the WHIP handler and runs the session teardown
 	// (metric decrement, ingest removal, stream-end notification) exactly
 	// once across Failed/Closed state callbacks and DELETE requests.
@@ -554,6 +560,9 @@ func NewSFU(cfg *config.Config) (*SFU, error) {
 		// in config.Config — this is what stops the per-build OS firewall
 		// prompt during `go test`).
 		se.SetIPFilter(func(ip net.IP) bool { return ip.IsLoopback() })
+		// pion/ice skips the loopback interface entirely unless asked; the IP
+		// filter alone left the agent with zero host candidates from ice v4.4.
+		se.SetIncludeLoopbackCandidate(true)
 		se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 	}
 
@@ -766,6 +775,12 @@ func (s *SFU) SetIngest(streamKeyToken string, session *IngestSession) {
 
 	if replaced && prev != nil {
 		log.Printf("Replacing existing ingest for key %s... (OBS reconnect)", streamKeyToken[:min(8, len(streamKeyToken))])
+		// Carry the obligation through a chain of never-connected
+		// replacements too, or a reconnect loop that never succeeds ends
+		// with no session broadcasting stream-end at all.
+		if prev.everConnected.Load() || prev.replacedLive.Load() {
+			session.replacedLive.Store(true)
+		}
 		prev.closeOnce.Do(func() { close(prev.done) })
 		if prev.PeerConnection != nil {
 			_ = prev.PeerConnection.Close()
@@ -800,6 +815,18 @@ func (s *SFU) TakeIngest(streamKeyToken string) *IngestSession {
 // from a replaced ingest from killing the new one.
 func (s *SFU) removeIngestIfSame(streamKeyToken string, expected *IngestSession) {
 	s.removeIngestIf(streamKeyToken, expected)
+}
+
+// ingestSuperseded reports whether a different session now owns the token,
+// i.e. OBS reconnected and SetIngest replaced this one. The old session's
+// teardown uses it to skip the stream-end broadcast: viewers would otherwise
+// see "Stream disconnected" flash moments before the new session goes live.
+// An absent entry is not superseded (explicit DELETE / genuine failure).
+func (s *SFU) ingestSuperseded(streamKeyToken string, session *IngestSession) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.ingests[streamKeyToken]
+	return ok && current != session
 }
 
 func (s *SFU) removeIngestIf(streamKeyToken string, expected *IngestSession) {
@@ -1370,7 +1397,7 @@ func (s *SFU) BindIngestToRoom(streamKeyToken, roomSlug string) ([]string, error
 		}
 	}
 
-	log.Printf("Bound ingest %s... to room %s", streamKeyToken[:8], roomSlug)
+	log.Printf("Bound ingest %s... to room %s", streamKeyToken[:min(8, len(streamKeyToken))], roomSlug)
 	return needsRenegotiation, nil
 }
 
@@ -1537,6 +1564,18 @@ func (s *SFU) HasSubscriber(roomSlug, subscriberID string) bool {
 	defer room.mu.RUnlock()
 	_, ok := room.Subscribers[subscriberID]
 	return ok
+}
+
+// removeSubscriberAndRenegotiate drops sub (identity-checked) and pushes a
+// fresh offer to every remaining subscriber whose sender for sub's relay
+// tracks was just removed. The confirmed-leave path in the handlers already
+// does this; the abrupt paths (PC failed on its own, renegotiation aborted)
+// used to drop the affected list, leaving the others with a torn-out m-line
+// until something unrelated renegotiated them.
+func (s *SFU) removeSubscriberAndRenegotiate(room *RoomTracks, roomSlug, subscriberID string, sub *Subscriber) {
+	for _, id := range room.removeSubscriberIfSame(subscriberID, sub) {
+		go s.FlushPendingRenegotiation(roomSlug, id)
+	}
 }
 
 // RemoveSubscriberIfSame removes a subscriber only if the current room entry
@@ -1754,7 +1793,7 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 			logSelectedICEPair("subscriber", subscriberID, pc)
 		case webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed:
-			room.removeSubscriberIfSame(subscriberID, sub)
+			s.removeSubscriberAndRenegotiate(room, roomSlug, subscriberID, sub)
 		}
 	})
 
@@ -1763,7 +1802,7 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 	// is idempotent and covers the case where we were already replaced.
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
-		room.removeSubscriberIfSame(subscriberID, sub)
+		s.removeSubscriberAndRenegotiate(room, roomSlug, subscriberID, sub)
 		pc.Close()
 		return nil, nil, "", "", fmt.Errorf("failed to create offer: %w", err)
 	}
@@ -1771,7 +1810,7 @@ func (s *SFU) CreateSubscriberConnection(roomSlug, subscriberID string) (*webrtc
 	// Set local description — starts ICE gathering in the background.
 	// Candidates are buffered and sent via trickle ICE (no blocking wait).
 	if err := pc.SetLocalDescription(offer); err != nil {
-		room.removeSubscriberIfSame(subscriberID, sub)
+		s.removeSubscriberAndRenegotiate(room, roomSlug, subscriberID, sub)
 		pc.Close()
 		return nil, nil, "", "", fmt.Errorf("failed to set local description: %w", err)
 	}
@@ -2948,7 +2987,10 @@ func relayTrackLoop(remoteTrack *webrtc.TrackRemote, localTrack *webrtc.TrackLoc
 func stripHeaderExtensions(h *rtp.Header) {
 	h.Extension = false
 	h.ExtensionProfile = 0
-	h.Extensions = nil
+	// Truncate, don't nil: Unmarshal appends into the existing backing array,
+	// so keeping capacity is what makes the reused packet allocation-free.
+	// Marshal never touches Extensions while h.Extension is false.
+	h.Extensions = h.Extensions[:0]
 }
 
 // GetVoiceRelayTrack returns the relay local track for a voice source (if one exists)
@@ -3307,7 +3349,7 @@ func (s *SFU) AbortSubscriberRenegotiation(roomSlug, subscriberID, offerID strin
 	}
 	sub.SignalingMu.Unlock()
 
-	room.removeSubscriberIfSame(subscriberID, sub)
+	s.removeSubscriberAndRenegotiate(room, roomSlug, subscriberID, sub)
 	return nil
 }
 

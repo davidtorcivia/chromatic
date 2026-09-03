@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -563,5 +564,195 @@ func TestRoomHandler_OpenOnStreamStart(t *testing.T) {
 	}
 	if !participantAdmitted(t, db, participantID) {
 		t.Errorf("expected lobby guest admitted when the stream went live")
+	}
+}
+
+// TestRoomHandler_KickedNotReadmitted locks the kick semantics: a kicked
+// participant must not reappear as a waiting-room request, so neither an
+// individual admit nor "Admit All" can silently let them back in.
+func TestRoomHandler_KickedNotReadmitted(t *testing.T) {
+	db, cleanup := database.NewTestDB(t)
+	defer cleanup()
+
+	handler := newTestRoomHandler(db)
+	createRoomForTest(t, handler, map[string]interface{}{
+		"slug":          "kick-room",
+		"name":          "Kick Room",
+		"watermarkMode": "none",
+	})
+
+	rr := joinRoomForTest(t, handler, "kick-room", map[string]interface{}{"name": "Kicked Guest"}, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("join failed: %d %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	participantID := resp["participantId"].(string)
+	if !participantAdmitted(t, db, participantID) {
+		t.Fatalf("open room without waiting room should admit on join")
+	}
+
+	// Same statement handleAdminKick runs.
+	if _, err := db.Exec(`UPDATE participants SET is_admitted = FALSE, kicked_at = CURRENT_TIMESTAMP WHERE id = ?`, participantID); err != nil {
+		t.Fatalf("kick failed: %v", err)
+	}
+
+	listReq := httptest.NewRequest("GET", "/api/rooms/kick-room/waiting", nil)
+	listReq.SetPathValue("slug", "kick-room")
+	listRR := httptest.NewRecorder()
+	handler.ListWaiting(listRR, listReq)
+	if strings.Contains(listRR.Body.String(), participantID) {
+		t.Errorf("kicked participant listed as waiting: %s", listRR.Body.String())
+	}
+
+	if found, err := handler.AdmitWaitingParticipant("kick-room", participantID); err != nil || found {
+		t.Errorf("individual admit must not match a kicked row (found=%v err=%v)", found, err)
+	}
+
+	allReq := httptest.NewRequest("POST", "/api/rooms/kick-room/admit-all", nil)
+	allReq.SetPathValue("slug", "kick-room")
+	handler.AdmitAll(httptest.NewRecorder(), allReq)
+
+	if participantAdmitted(t, db, participantID) {
+		t.Fatalf("Admit All readmitted a kicked participant")
+	}
+}
+
+// TestRoomHandler_RescheduleResetsOpenTimer: the lobby open timer is armed for
+// the scheduled_at in effect when the first guest joins; a PATCH that moves
+// scheduled_at must re-arm it or the room opens at the stale time.
+func TestRoomHandler_RescheduleResetsOpenTimer(t *testing.T) {
+	db, cleanup := database.NewTestDB(t)
+	defer cleanup()
+
+	handler := newTestRoomHandler(db)
+	createRoomForTest(t, handler, map[string]interface{}{
+		"slug":             "resched-room",
+		"name":             "Resched Room",
+		"watermarkMode":    "none",
+		"scheduledAt":      time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+		"earlyOpenMinutes": 120,
+	})
+
+	rr := joinRoomForTest(t, handler, "resched-room", map[string]interface{}{"name": "Early Guest"}, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("lobby join failed: %d %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	participantID := resp["participantId"].(string)
+
+	// Pull the start forward to (almost) now.
+	body, _ := json.Marshal(map[string]interface{}{
+		"scheduledAt": time.Now().Add(300 * time.Millisecond).UTC().Format(time.RFC3339Nano),
+	})
+	req := httptest.NewRequest("PATCH", "/api/rooms/resched-room", bytes.NewReader(body))
+	req.SetPathValue("slug", "resched-room")
+	req.Header.Set("Content-Type", "application/json")
+	updRR := httptest.NewRecorder()
+	handler.Update(updRR, req)
+	if updRR.Code != http.StatusOK {
+		t.Fatalf("update failed: %d %s", updRR.Code, updRR.Body.String())
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if participantAdmitted(t, db, participantID) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("lobby participant not admitted after reschedule to an earlier time; timer still armed for the old scheduled_at")
+}
+
+// TestRoomHandler_RescheduleToPast_WaitingRoom: for a waiting-room room, the
+// open flow does not admit but switches lobby viewers to the approval queue
+// via the "open" SSE event. Moving scheduled_at into the past must trigger it.
+func TestRoomHandler_RescheduleToPast_WaitingRoom(t *testing.T) {
+	db, cleanup := database.NewTestDB(t)
+	defer cleanup()
+
+	handler := newTestRoomHandler(db)
+	createRoomForTest(t, handler, map[string]interface{}{
+		"slug":               "resched-wr",
+		"name":               "Resched WR",
+		"watermarkMode":      "none",
+		"waitingRoomEnabled": true,
+		"scheduledAt":        time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+		"earlyOpenMinutes":   120,
+	})
+
+	rr := joinRoomForTest(t, handler, "resched-wr", map[string]interface{}{"name": "Lobby Guest"}, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("lobby join failed: %d %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	participantID := resp["participantId"].(string)
+
+	ch, ok := handler.waitingManager.Subscribe(participantID)
+	if !ok {
+		t.Fatalf("failed to subscribe participant")
+	}
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"scheduledAt": time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano),
+	})
+	req := httptest.NewRequest("PATCH", "/api/rooms/resched-wr", bytes.NewReader(body))
+	req.SetPathValue("slug", "resched-wr")
+	req.Header.Set("Content-Type", "application/json")
+	updRR := httptest.NewRecorder()
+	handler.Update(updRR, req)
+	if updRR.Code != http.StatusOK {
+		t.Fatalf("update failed: %d %s", updRR.Code, updRR.Body.String())
+	}
+
+	select {
+	case event := <-ch:
+		if event != "open" {
+			t.Fatalf("expected 'open' event, got %q", event)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("lobby viewer never received 'open' after reschedule into the past")
+	}
+	if participantAdmitted(t, db, participantID) {
+		t.Fatal("waiting-room room must not auto-admit on open")
+	}
+}
+
+// TestRoomHandler_ClearScheduleAdmitsLobby: setting scheduledAt to null makes
+// the room open now; anyone already in the countdown lobby must be admitted
+// rather than stranded with no timer left to fire.
+func TestRoomHandler_ClearScheduleAdmitsLobby(t *testing.T) {
+	db, cleanup := database.NewTestDB(t)
+	defer cleanup()
+
+	handler := newTestRoomHandler(db)
+	createRoomForTest(t, handler, map[string]interface{}{
+		"slug":             "clear-sched",
+		"name":             "Clear Sched",
+		"watermarkMode":    "none",
+		"scheduledAt":      time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+		"earlyOpenMinutes": 120,
+	})
+
+	rr := joinRoomForTest(t, handler, "clear-sched", map[string]interface{}{"name": "Lobby Guest"}, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("lobby join failed: %d %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	participantID := resp["participantId"].(string)
+
+	req := httptest.NewRequest("PATCH", "/api/rooms/clear-sched", bytes.NewReader([]byte(`{"scheduledAt":null}`)))
+	req.SetPathValue("slug", "clear-sched")
+	req.Header.Set("Content-Type", "application/json")
+	updRR := httptest.NewRecorder()
+	handler.Update(updRR, req)
+	if updRR.Code != http.StatusOK {
+		t.Fatalf("update failed: %d %s", updRR.Code, updRR.Body.String())
+	}
+	if !participantAdmitted(t, db, participantID) {
+		t.Fatal("clearing the schedule left the lobby participant unadmitted")
 	}
 }

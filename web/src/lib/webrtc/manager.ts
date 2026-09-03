@@ -978,6 +978,12 @@ export class WebRTCManager {
     private async acquireMic(deviceId: string | null, exact: boolean): Promise<boolean> {
         if (this.isClosed()) return false;
         const previousRaw = this.rawMicStream;
+        // The previous cleanup chain stays alive until the new track is in the
+        // sender: if replaceTrack fails, the sender is still playing the old
+        // chain's output and disposing it early would kill the working mic.
+        // installMicStream overwrites this.micChain; this handle is what we
+        // dispose (on success) or reinstall (on failure).
+        const previousChain = this.micChain;
 
         // Whether talkback intends to run an in-app denoiser at all (mode +
         // chosen, implemented engine). When false (studio, or engine "off"), we
@@ -1028,6 +1034,10 @@ export class WebRTCManager {
 
             await this.installMicStream(raw, useDenoiser);
             if (this.isClosed()) {
+                // close() disposed the new chain; the previous one is only
+                // referenced here now.
+                previousChain?.dispose();
+                if (previousRaw && previousRaw !== raw) this.stopStream(previousRaw);
                 return false;
             }
 
@@ -1039,8 +1049,12 @@ export class WebRTCManager {
                 console.warn('In-app denoiser inactive; re-acquiring mic with native noise suppression');
                 this.disposeMicChain();
                 this.stopStream(raw);
-                this.rawMicStream = null;
-                this.localStream = null;
+                // Put the previous mic back while the fallback capture runs: if
+                // it fails too, the sender is still transmitting that chain
+                // and state must keep saying so.
+                this.micChain = previousChain;
+                this.rawMicStream = previousRaw;
+                this.localStream = previousChain?.stream ?? previousRaw;
                 continue;
             }
 
@@ -1049,33 +1063,51 @@ export class WebRTCManager {
                 try {
                     await this.audioSender.replaceTrack(newTrack);
                 } catch (err) {
-                    // Rare (same-kind replace). Don't leak the previous capture
-                    // and don't let the rejection escape as unhandled.
+                    // Rare (same-kind replace). The sender is still on the
+                    // previous track, so drop the new capture and restore the
+                    // previous chain instead of tearing down the working mic.
                     console.error('Failed to replace mic track:', err);
-                    if (previousRaw && previousRaw !== raw) {
-                        this.stopStream(previousRaw);
+                    this.disposeMicChain();
+                    this.stopStream(raw);
+                    if (this.isClosed()) {
+                        // close() only stopped the new capture; the previous
+                        // one is referenced nowhere else and would keep the
+                        // device open.
+                        previousChain?.dispose();
+                        if (previousRaw && previousRaw !== raw) this.stopStream(previousRaw);
+                        return false;
                     }
+                    this.micChain = previousChain;
+                    this.rawMicStream = previousRaw;
+                    this.localStream = previousChain?.stream ?? previousRaw;
                     return false;
                 }
-                if (this.isClosed()) return false;
             }
 
             // Release the previous capture only after the swap succeeded so a
-            // failed switch leaves the working mic untouched.
+            // failed switch leaves the working mic untouched. This runs even if
+            // close() landed during replaceTrack: close() only knows about the
+            // new capture, so the previous one would otherwise keep the device open.
+            previousChain?.dispose();
             if (previousRaw && previousRaw !== raw) {
                 this.stopStream(previousRaw);
             }
-            return true;
+            return !this.isClosed();
         }
+        // Both attempts failed to capture; the previous mic is still installed.
         return false;
     }
 
     // Routes a fresh mic capture through the RNNoise cleanup chain only when
     // that engine is active. "Noise reduction off" and the native-NS fallback
     // send the capture directly, avoiding the in-app gate on quiet Mac mics.
+    // Does not dispose the chain it replaces: acquireMic keeps that alive
+    // until the new track is confirmed in the sender.
     private async installMicStream(raw: MediaStream, useDenoiser: boolean): Promise<void> {
-        this.disposeMicChain();
         this.rawMicStream = raw;
+        // Detach the previous chain first so a close() racing createMicChain
+        // cannot dispose it out from under acquireMic's handle.
+        this.micChain = null;
         this.micChain = useDenoiser
             ? await createMicChain(raw, {
                     mode: this.audioMode,
@@ -1163,7 +1195,10 @@ export class WebRTCManager {
     private async reapplyAudioSettings(): Promise<void> {
         if (this.isClosed() || !this.rawMicStream) return;
         const deviceId = this.getCurrentMicDeviceId();
-        await this.acquireMic(deviceId, false);
+        if (!(await this.acquireMic(deviceId, false))) {
+            console.warn('Audio settings not applied: mic re-acquire failed; previous mic kept');
+            return;
+        }
         if (this.isClosed()) return;
         await this.tuneAudioSender();
         if (this.audioSender && this.publisherPc) {

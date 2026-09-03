@@ -37,7 +37,7 @@ Chromatic enables real-time color-critical streaming from DaVinci Resolve via OB
 ### Prerequisites
 
 - Production deployment: Docker Engine + Docker Compose plugin
-- Development only: Go 1.24+ and Node.js 20+
+- Development only: Go 1.26+ and Node.js 20+
 - OBS Studio 30+ (for streaming)
 
 ### Development
@@ -168,7 +168,7 @@ If anonymous pulls fail, set the GHCR package visibility to public.
 
 | Component | Technology |
 |-----------|------------|
-| Backend | Go 1.24+, Pion WebRTC v4 |
+| Backend | Go 1.26+, Pion WebRTC v4 |
 | Frontend | SvelteKit 2, Svelte 5 |
 | Database | SQLite with WAL mode |
 | Reverse Proxy | Caddy (auto SSL) |

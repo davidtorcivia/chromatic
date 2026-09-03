@@ -7,7 +7,7 @@ COPY web/ .
 RUN npm run build
 
 # Build stage for Go
-FROM golang:1.24.11-alpine3.22 AS backend
+FROM golang:1.26.8-alpine3.23 AS backend
 WORKDIR /build
 RUN apk add --no-cache gcc musl-dev
 
@@ -18,7 +18,7 @@ COPY . .
 RUN CGO_ENABLED=1 go build -o chromatic ./cmd/chromatic
 
 # Runtime stage
-FROM alpine:3.22
+FROM alpine:3.23
 WORKDIR /app
 
 RUN apk add --no-cache ca-certificates curl sqlite

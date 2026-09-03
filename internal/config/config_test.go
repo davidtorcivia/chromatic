@@ -329,3 +329,46 @@ func TestListenAddr(t *testing.T) {
 		t.Errorf("expected ':3000', got %q", cfg.ListenAddr())
 	}
 }
+
+func TestGetEnvBool_CaseInsensitive(t *testing.T) {
+	cases := map[string]bool{
+		"true": true, "True": true, "TRUE": true, "1": true, "yes": true, "Yes": true, " on ": true,
+		"false": false, "False": false, "0": false, "no": false, "NO": false, "off": false,
+	}
+	for raw, want := range cases {
+		t.Setenv("TEST_BOOL", raw)
+		if got := getEnvBool("TEST_BOOL", !want); got != want {
+			t.Errorf("getEnvBool(%q) = %v, want %v", raw, got, want)
+		}
+	}
+	t.Setenv("TEST_BOOL", "maybe")
+	if got := getEnvBool("TEST_BOOL", true); !got {
+		t.Error("unrecognized value should fall back to the default")
+	}
+}
+
+func TestLoad_RejectsMalformedProductionMode(t *testing.T) {
+	t.Setenv("PUBLIC_URL", "https://example.com")
+	t.Setenv("ADMIN_TOKEN", "x")
+	t.Setenv("TURN_MODE", "external")
+	t.Setenv("TURN_EXTERNAL_URLS", "turn:turn.example.com:3478")
+	t.Setenv("TURN_EXTERNAL_USER", "u")
+	t.Setenv("TURN_EXTERNAL_PASS", "p")
+	t.Setenv("ALLOWED_ORIGINS", "https://example.com")
+
+	// A typo must fail startup rather than silently running in dev mode
+	// (query-string join tokens accepted, Secure cookie flag off).
+	t.Setenv("PRODUCTION_MODE", "ture")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected Load to reject PRODUCTION_MODE=ture")
+	}
+
+	t.Setenv("PRODUCTION_MODE", "True")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load with PRODUCTION_MODE=True: %v", err)
+	}
+	if !cfg.ProductionMode {
+		t.Fatal("PRODUCTION_MODE=True must enable production mode")
+	}
+}
