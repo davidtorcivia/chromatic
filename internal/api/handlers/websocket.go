@@ -261,10 +261,10 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 		Conn:           conn,
 		Send:           make(chan []byte, 256),
 		Done:           make(chan struct{}),
-		IsAdmin:        isAdmin,
 		AdminSessionID: adminSessionID,
 		Browser:        websocket.SummarizeUserAgent(r.UserAgent()),
 	}
+	client.SetAdmin(isAdmin)
 	client.SetAudioEnabled(false)
 	client.SetVideoEnabled(true)
 	// Initialize chat rate limiter: 30 messages per minute
@@ -593,7 +593,7 @@ func (h *WebSocketHandler) handlePublishOffer(client *websocket.Client, payload 
 			}
 			// Screen share — only forward when the participant holds share
 			// permission (admins implicitly do).
-			if !client.IsAdmin && !h.participantCanScreenshare(roomSlug, pid) {
+			if !client.IsAdmin() && !h.participantCanScreenshare(roomSlug, pid) {
 				logger.Warn("Ignoring unauthorized published video track", "participant_id", pid, "room", roomSlug)
 				return
 			}
@@ -828,7 +828,7 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 			"color":          p.Color,
 			"audioEnabled":   p.AudioEnabled(),
 			"videoEnabled":   p.VideoEnabled(),
-			"canScreenshare": canShare[p.ID] || p.IsAdmin,
+			"canScreenshare": canShare[p.ID] || p.IsAdmin(),
 		})
 	}
 
@@ -907,7 +907,7 @@ func (h *WebSocketHandler) sendRoomState(client *websocket.Client, slug string) 
 // countdown-lobby headcount (lobby:count) to a newly connected admin so an
 // admin joining mid-session still sees pending requests. No-op for guests.
 func (h *WebSocketHandler) sendWaitingState(client *websocket.Client, slug string) {
-	if !client.IsAdmin {
+	if !client.IsAdmin() {
 		return
 	}
 
@@ -923,7 +923,7 @@ func (h *WebSocketHandler) sendWaitingState(client *websocket.Client, slug strin
 
 	rows, err := h.db.QueryContext(wsCtx, `
 		SELECT id, name, joined_at FROM participants
-		WHERE room_id = ? AND is_admitted = FALSE
+		WHERE room_id = ? AND is_admitted = FALSE AND kicked_at IS NULL
 		ORDER BY joined_at
 	`, roomID)
 	if err != nil {
@@ -1038,6 +1038,13 @@ func (h *WebSocketHandler) sendChatHistory(client *websocket.Client, slug string
 
 // handleMessage handles incoming WebSocket messages
 func (h *WebSocketHandler) handleMessage(client *websocket.Client, msg websocket.Message) {
+	switch msg.Type {
+	case "signal:offer", "signal:ice-restart", "signal:resubscribe", "publish:offer":
+		if !client.AllowSignal() {
+			logger.Warn("Signaling rate limit exceeded; dropping", "type", msg.Type, "participant_id", client.ID, "room", client.RoomSlug)
+			return
+		}
+	}
 	switch msg.Type {
 	case "chat:send":
 		metrics.Get().TotalMessagesChat.Add(1)
@@ -1642,13 +1649,13 @@ func (h *WebSocketHandler) handleResync(client *websocket.Client) {
 // It re-checks the session cookie captured at upgrade time so a mid-session
 // logout immediately revokes admin powers. Callers should log & return on false.
 func (h *WebSocketHandler) requireAdmin(client *websocket.Client, action string) bool {
-	if !client.IsAdmin {
+	if !client.IsAdmin() {
 		return false
 	}
 	if client.AdminSessionID != "" && h.validateSession != nil && !h.validateSession(client.AdminSessionID) {
 		logger.Warn("Admin session revoked mid-connection; denying action",
 			"action", action, "participant_id", client.ID, "room", client.RoomSlug)
-		client.IsAdmin = false
+		client.SetAdmin(false)
 		client.AdminSessionID = ""
 		return false
 	}
@@ -1766,7 +1773,7 @@ func (h *WebSocketHandler) handleAdminKick(client *websocket.Client, payload jso
 
 	kickCtx, kickCancel := database.WithTimeout(context.Background())
 	result, err := h.db.ExecContext(kickCtx, `
-		UPDATE participants SET is_admitted = FALSE
+		UPDATE participants SET is_admitted = FALSE, kicked_at = CURRENT_TIMESTAMP
 		WHERE id = ? AND room_id = (SELECT id FROM rooms WHERE slug = ?)
 	`, data.ParticipantID, client.RoomSlug)
 	kickCancel()
@@ -1900,7 +1907,7 @@ func (h *WebSocketHandler) handleScreenShareRequest(client *websocket.Client) {
 	}
 
 	// Admin auto-approves their own request
-	if client.IsAdmin {
+	if client.IsAdmin() {
 		client.SendJSON("screenshare:approved", map[string]interface{}{})
 		return
 	}
@@ -1916,7 +1923,7 @@ func (h *WebSocketHandler) handleScreenShareRequest(client *websocket.Client) {
 	// Find admin(s) in the room and send pending request
 	clients := h.hub.GetRoomClients(client.RoomSlug)
 	for _, c := range clients {
-		if c.IsAdmin {
+		if c.IsAdmin() {
 			c.SendJSON("screenshare:pending", map[string]interface{}{
 				"participantId": client.ID,
 				"name":          client.Name,
@@ -2066,7 +2073,7 @@ func (h *WebSocketHandler) handleScreenShareStop(client *websocket.Client) {
 	if sharerID == "" {
 		return
 	}
-	if client.ID != sharerID && !client.IsAdmin {
+	if client.ID != sharerID && !client.IsAdmin() {
 		return
 	}
 

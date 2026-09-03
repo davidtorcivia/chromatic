@@ -299,7 +299,7 @@ func TestHub_BroadcastToAdminsJSON(t *testing.T) {
 	defer stopHub(hub)
 
 	admin := newTestClient("admin-1", "Host", "test-room", hub)
-	admin.IsAdmin = true
+	admin.SetAdmin(true)
 	guest := newTestClient("guest-1", "Guest", "test-room", hub)
 
 	hub.Register(admin)
