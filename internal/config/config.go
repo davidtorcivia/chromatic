@@ -115,6 +115,11 @@ func Load() (*Config, error) {
 	}
 
 	// Validate required fields
+	if v := os.Getenv("PRODUCTION_MODE"); v != "" {
+		if _, ok := parseBool(v); !ok {
+			return nil, fmt.Errorf("PRODUCTION_MODE must be true/false (got %q)", v)
+		}
+	}
 	if cfg.PublicURL == "" {
 		return nil, fmt.Errorf("PUBLIC_URL is required")
 	}
@@ -210,13 +215,27 @@ func getEnvInt(key string, defaultValue int) int {
 	return defaultValue
 }
 
-// getEnvBool gets a boolean environment variable with a default value
+// getEnvBool gets a boolean environment variable with a default value.
+// Unrecognized values fall back to the default; Load rejects them for
+// PRODUCTION_MODE, where a typo would silently downgrade security posture.
 func getEnvBool(key string, defaultValue bool) bool {
-	if value := os.Getenv(key); value != "" {
-		// Accept "true", "1", "yes" as true
-		return value == "true" || value == "1" || value == "yes"
+	if b, ok := parseBool(os.Getenv(key)); ok {
+		return b
 	}
 	return defaultValue
+}
+
+// parseBool accepts the common spellings case-insensitively ("True", "YES",
+// "0") so hand-edited .env files and templating tools that emit capitalized
+// booleans do not silently read as false.
+func parseBool(value string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "1", "yes", "on":
+		return true, true
+	case "false", "0", "no", "off":
+		return false, true
+	}
+	return false, false
 }
 
 // getEnvList gets a comma-separated list environment variable
