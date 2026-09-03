@@ -873,10 +873,42 @@ func TestSFU_SetIngest_ReplacesOldOnReconnect(t *testing.T) {
 		t.Fatalf("stale ingest callback removed the replacement (got %v)", got)
 	}
 
+	// The old session's teardown must recognise it was replaced (so it skips
+	// the stream-end broadcast); the live one and an absent entry are not.
+	if !sfu.ingestSuperseded(token, old) {
+		t.Fatal("replaced ingest not reported as superseded")
+	}
+	if sfu.ingestSuperseded(token, newIng) {
+		t.Fatal("live ingest reported as superseded")
+	}
+	if sfu.ingestSuperseded("no-such-key", old) {
+		t.Fatal("absent ingest reported as superseded")
+	}
+
 	// Identity-matched removal clears it.
 	sfu.removeIngestIfSame(token, newIng)
 	if got := sfu.GetIngest(token); got != nil {
 		t.Fatal("matched removeIngestIfSame did not clear the ingest")
+	}
+
+	// A replacement of a session that never connected inherits nothing; one
+	// that replaces a live session must carry the stream-end duty.
+	if newIng.replacedLive.Load() {
+		t.Fatal("replacement of a never-connected ingest should not be marked replacedLive")
+	}
+	live := &IngestSession{StreamKeyToken: token, done: make(chan struct{})}
+	live.everConnected.Store(true)
+	sfu.SetIngest(token, live)
+	third := &IngestSession{StreamKeyToken: token, done: make(chan struct{})}
+	sfu.SetIngest(token, third)
+	if !third.replacedLive.Load() {
+		t.Fatal("replacement of a live ingest must be marked replacedLive")
+	}
+	// third never connects; a fourth replacement must still inherit it.
+	fourth := &IngestSession{StreamKeyToken: token, done: make(chan struct{})}
+	sfu.SetIngest(token, fourth)
+	if !fourth.replacedLive.Load() {
+		t.Fatal("replacedLive dropped across a chain of never-connected replacements")
 	}
 }
 
